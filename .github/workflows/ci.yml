@@ -1,0 +1,92 @@
+name: CI
+
+# Mandatory gates on every push and PR to main (hardening issue #1). The Rust
+# workspace lives under impl/, so every job runs there.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build / clippy / test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: impl
+    steps:
+      - uses: actions/checkout@v4
+      # System libraries the `desktop` (Tauri) crate links against.
+      - name: install desktop (Tauri) system deps
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: impl
+      # Warnings are errors: the tree is kept clippy-clean, so a new warning fails CI.
+      - name: clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      # The unaudited-crypto feature is a real build variant (tring); gate it too.
+      - name: clippy (unaudited-crypto)
+        run: cargo clippy --all-targets --features unaudited-crypto -- -D warnings
+      - name: test (default)
+        run: cargo test
+      # `unaudited-crypto` is defined and #[cfg]-gated ONLY in the admission crate (tring
+      # + token + lib); no other crate reads or enables it. Running the WHOLE workspace
+      # under the feature re-ran the slow gui/node integration suites for zero added
+      # coverage — scope it to the one crate the feature actually changes.
+      - name: test (unaudited-crypto, admission only)
+        run: cargo test -p admission --features unaudited-crypto
+
+  # Release build in its own job so it runs concurrently with the tests instead of
+  # tailing them on the critical path (same gate, shorter wall clock).
+  release:
+    name: release build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: impl
+    steps:
+      - uses: actions/checkout@v4
+      # System libraries the `desktop` (Tauri) crate links against.
+      - name: install desktop (Tauri) system deps
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: impl
+      - name: build release
+        run: cargo build --release
+
+  audit:
+    name: dependency security audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: impl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      # Prebuilt binary — no compile on the runner.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fail on any RustSec advisory affecting the locked dependency graph.
+      #
+      # RUSTSEC-2026-0194 / -0195 (quick-xml DoS) are ignored with justification, NOT
+      # hidden: quick-xml is a deep TRANSITIVE BUILD dependency (wayland-scanner, a
+      # compile-time proc-macro, parses the fixed/trusted Wayland protocol XML to generate
+      # bindings). The DoS needs attacker-controlled XML, which never reaches it — it runs
+      # at build time on shipped protocol files, not on runtime input. The fix requires a
+      # major eframe/winit bump; revisit and drop these ignores when that lands.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195

@@ -1,0 +1,714 @@
+//! TCP-сервер вокруг `RelayNode` + клиентский `SocketTransport`, **поверх
+//! Noise-сессии (§15)**.
+//!
+//! **СКЕЛЕТ.** Блокирующий, поток-на-соединение, std-only. Каждое соединение
+//! сначала проходит Noise_NK-handshake (`session`), потом обменивается ОДНИМ
+//! запрос-ответом внутри зашифрованного сеанса.
+//!
+//! **Обязательный туннель — без тихого fallback на plaintext.** Провалившийся/
+//! отсутствующий handshake = жёсткая ошибка, соединение закрывается; активный
+//! противник не может «раздеть» сессию до старого открытого протокола. Открытый
+//! путь остался только у `InMemoryTransport` (тесты).
+//!
+//! **Сервер ставит СВОЁ время** (см. `node`): `now` не едет по проводу.
+
+use std::io;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use admission::capability::Capability;
+use rand::rngs::OsRng;
+use rand::RngCore;
+use snow::Builder;
+
+use crate::discovery::DiscoveryRecord;
+use crate::node::{
+    AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, FetchRequest,
+    FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayNode,
+    RelayPolicy, Response, Transport, WireMessage,
+};
+use crate::pqxdh::PreKeyBundle;
+use crate::session::{Session, NOISE_PARAMS};
+use crate::transport::{Channel, Dest, DirectTcpAdapter, Path, TransportAdapter};
+use crate::wire::{
+    decode, encode, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME,
+};
+
+/// Часы сервера: возвращают текущее время в секундах.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Сгенерировать Noise-static-пару `(private, public)` тем же resolver'ом, что
+/// использует `RelayServer`. Бинарь зовёт на ПЕРВОМ запуске и персистит пару,
+/// затем на рестартах поднимает через `with_noise_keypair` (стабильный relay-id).
+pub fn generate_noise_keypair() -> ([u8; 32], [u8; 32]) {
+    let kp = Builder::new(NOISE_PARAMS.parse().expect("valid noise params"))
+        .generate_keypair()
+        .expect("noise keygen");
+    let private: [u8; 32] = kp.private.try_into().expect("25519 private is 32 bytes");
+    let public: [u8; 32] = kp.public.try_into().expect("25519 public is 32 bytes");
+    (private, public)
+}
+
+/// Per-connection read timeout: a hung/slow client (slowloris) becomes a clean
+/// error, not a thread pinned forever. Thread COUNT is bounded by `ConnLimiter` below.
+const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Hard bounds on a REUSED connection (§15 / FT4). A client may stream many requests over one
+/// Noise session, but never more than this many, and never for longer than the wall-clock
+/// deadline — so holding a `ConnLimiter` slot open can only ever be a small constant more costly
+/// than a one-shot connection, not an unbounded slowloris amplifier.
+const MAX_REQUESTS_PER_CONN: u32 = 4096;
+const CONN_TOTAL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Ceiling on connection-handler threads alive at once. A flood of connections
+/// otherwise spawns an unbounded number of threads (FD / memory exhaustion). This
+/// is RESOURCE HYGIENE for an untrusted relay — NOT the §7 admission gate (cookie/
+/// capability), which is a separate layer. Generous: it stops exhaustion, not a
+/// handful of legitimate concurrent clients.
+const MAX_CONNECTIONS: usize = 1024;
+
+/// Bounds live connection handlers. `try_acquire` reserves a slot iff under the cap;
+/// the returned `Permit` releases it on `Drop`, so a handler that errors OR PANICS
+/// on the Noise handshake (the common hostile case) still frees its slot — no manual
+/// decrement to leak.
+pub struct ConnLimiter {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    max: usize,
+}
+
+/// RAII slot reservation from [`ConnLimiter`]; releases on drop.
+pub struct Permit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl ConnLimiter {
+    pub fn new(max: usize) -> Self {
+        ConnLimiter { live: Arc::new(std::sync::atomic::AtomicUsize::new(0)), max }
+    }
+
+    /// Reserve a slot if fewer than `max` are live; `None` at capacity (the caller
+    /// drops the connection, DropNoReply-style). CAS loop so the check-and-increment
+    /// is atomic under concurrent accepts.
+    pub fn try_acquire(&self) -> Option<Permit> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut cur = self.live.load(SeqCst);
+        loop {
+            if cur >= self.max {
+                return None;
+            }
+            match self.live.compare_exchange_weak(cur, cur + 1, SeqCst, SeqCst) {
+                Ok(_) => return Some(Permit(self.live.clone())),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.live.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// TCP-сервер. `RelayNode` под `Mutex` (admission сериализуется). Держит СВОЙ
+/// Noise-static (транспортный ключ, отдельный от fetch-auth relay_identity —
+/// переиспользование Noise-static вне Noise ломает его анализ безопасности).
+pub struct RelayServer {
+    relay: Arc<Mutex<RelayNode>>,
+    clock: Clock,
+    noise_private: [u8; 32],
+    noise_public: [u8; 32],
+    /// Optional WebSocket-over-TLS carrier (§15): when set, each connection is TLS+WS
+    /// terminated (`wss`) BEFORE the Noise handshake, so the relay presents a
+    /// standards-compliant HTTPS/WSS endpoint. `None` = raw TCP + Noise (the default skeleton path).
+    tls: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl RelayServer {
+    pub fn new(relay: RelayNode, clock: Clock) -> Self {
+        let (noise_private, noise_public) = generate_noise_keypair();
+        Self::with_noise_keypair(relay, clock, noise_private, noise_public)
+    }
+
+    /// Как `new`, но с ЗАДАННОЙ Noise-static-парой — для персистентности ключа
+    /// relay (стабильный Noise-pub в relay-id между перезапусками). Персистится
+    /// пара (priv+pub) целиком, чтобы не полагаться на совпадение деривации pub
+    /// из priv у разных реализаций 25519.
+    pub fn with_noise_keypair(
+        relay: RelayNode,
+        clock: Clock,
+        noise_private: [u8; 32],
+        noise_public: [u8; 32],
+    ) -> Self {
+        RelayServer {
+            relay: Arc::new(Mutex::new(relay)),
+            clock,
+            noise_private,
+            noise_public,
+            tls: None,
+        }
+    }
+
+    /// Enable the WebSocket-over-TLS carrier: every accepted connection is TLS+WS
+    /// terminated before Noise. `config` carries the relay's cert/key. Off by default.
+    pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
+    /// Публичный Noise-ключ узла — клиент узнаёт его вне канала (аутентифицирует
+    /// relay при handshake). Бинарь печатает его.
+    pub fn noise_public(&self) -> [u8; 32] {
+        self.noise_public
+    }
+
+    /// A handle to the shared relay state, so a test can inspect it after handing the
+    /// server to a serving thread (e.g. assert a mailbox drained after a wire ACK). The
+    /// serving thread holds its own clone of the same `Arc`.
+    pub fn relay_handle(&self) -> Arc<Mutex<RelayNode>> {
+        Arc::clone(&self.relay)
+    }
+
+    /// Bind и обслуживать вечно (для бинаря).
+    pub fn serve<A: ToSocketAddrs>(self, addr: A) -> io::Result<()> {
+        let listener = TcpListener::bind(addr)?;
+        self.serve_listener(listener)
+    }
+
+    /// Serve an already-bound listener. Handler threads are capped by `ConnLimiter`
+    /// (`MAX_CONNECTIONS`): at capacity a new connection is dropped without a reply
+    /// (DropNoReply), so a flood can't spawn unbounded threads.
+    pub fn serve_listener(self, listener: TcpListener) -> io::Result<()> {
+        let limiter = ConnLimiter::new(MAX_CONNECTIONS);
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            // At capacity: drop the connection. The FD closes with `stream`.
+            let Some(permit) = limiter.try_acquire() else { continue };
+            let relay = self.relay.clone();
+            let clock = self.clock.clone();
+            let noise_priv = self.noise_private;
+            let tls = self.tls.clone();
+            thread::spawn(move || {
+                // The permit rides the thread and releases on exit — including a
+                // panic unwind, so a hostile handshake can't leak the slot.
+                let _permit = permit;
+                // A failed handshake/frame just closes the connection (DropNoReply).
+                let _ = handle_conn(stream, relay, clock, noise_priv, tls);
+            });
+        }
+        Ok(())
+    }
+}
+
+fn handle_conn(
+    stream: TcpStream,
+    relay: Arc<Mutex<RelayNode>>,
+    clock: Clock,
+    noise_priv: [u8; 32],
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(CONN_READ_TIMEOUT)).ok();
+    // If the wss carrier is on, terminate TLS + WebSocket first, then run Noise over
+    // the inner byte stream. Either way the Noise handshake comes BEFORE any
+    // plaintext processing; a failure closes the connection.
+    let channel: Box<dyn Channel> = match tls {
+        Some(config) => crate::wss::accept_wss(stream, config)?,
+        None => Box::new(stream),
+    };
+    let mut session = Session::accept(channel, &noise_priv)?;
+
+    // ONE Noise session, MANY requests (§15 / FT4): after the handshake the client may send a
+    // run of requests over the SAME connection — a file upload streams its chunks without paying
+    // a fresh TCP + Noise handshake each. The loop is HARD-BOUNDED so a reused connection can
+    // never become a cheaper DoS than a one-shot: at most `MAX_REQUESTS_PER_CONN` requests AND at
+    // most `CONN_TOTAL_DEADLINE` of wall-clock, each read still under `CONN_READ_TIMEOUT`, all
+    // while holding a single `ConnLimiter` slot. A one-shot client is unchanged: it sends one
+    // request, reads one response, closes — the next read hits EOF and the loop ends.
+    let started = std::time::Instant::now();
+    for _ in 0..MAX_REQUESTS_PER_CONN {
+        if started.elapsed() > CONN_TOTAL_DEADLINE {
+            break;
+        }
+        // Read with the blob ceiling: it covers both the tight normal requests and a
+        // ~60 KiB `BlobPut` chunk (the variant isn't known until decoded). Still a bounded,
+        // post-Noise-handshake allocation. A read error/EOF ends the connection cleanly (the
+        // normal way a client — one-shot or reusing — signals it is done).
+        let req_bytes = match session.read_msg(MAX_BLOB_FRAME) {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        let req: WireRequest = decode(&req_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"))?;
+
+        let resp = match req {
+        WireRequest::Send(msg) => {
+            let now = (clock)(); // время СЕРВЕРА
+            match relay.lock().expect("relay mutex").handle(&msg, now) {
+                Response::NeedCookie(c) => WireResponse::NeedCookie(c),
+                Response::Accepted => WireResponse::Accepted,
+                Response::Rejected(s) => WireResponse::Rejected(s),
+            }
+        }
+        WireRequest::Fetch(freq) => {
+            let now = (clock)();
+            match relay.lock().expect("relay mutex").handle_fetch(&freq, now) {
+                FetchResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
+                // Serialize the drained seals into a constant-size page: the
+                // response length no longer reveals how much mail was queued.
+                FetchResponse::Fetched(seals) => {
+                    WireResponse::Fetched(crate::wire::FetchPage::pack(&seals))
+                }
+                FetchResponse::Rejected(s) => WireResponse::Rejected(s),
+            }
+        }
+        WireRequest::Ack(areq) => {
+            let now = (clock)();
+            match relay.lock().expect("relay mutex").handle_ack(&areq, now) {
+                AckResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
+                AckResponse::Acked => WireResponse::Acked,
+                AckResponse::Rejected(s) => WireResponse::Rejected(s),
+            }
+        }
+        WireRequest::PublishBundle(preq) => {
+            let now = (clock)();
+            match relay.lock().expect("relay mutex").handle_publish(&preq, now) {
+                PublishResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
+                PublishResponse::Published => WireResponse::BundlePublished,
+                PublishResponse::Rejected(s) => WireResponse::Rejected(s),
+            }
+        }
+        WireRequest::FetchBundle(ik) => {
+            // Публичный read; время серверу не нужно.
+            let bundle = relay.lock().expect("relay mutex").get_bundle(&ik);
+            WireResponse::Bundle(bundle)
+        }
+        WireRequest::BlobPut(breq) => {
+            let now = (clock)();
+            WireResponse::Blob(relay.lock().expect("relay mutex").handle_blob_put(&breq, now))
+        }
+        WireRequest::BlobGet(breq) => {
+            let now = (clock)();
+            WireResponse::Blob(relay.lock().expect("relay mutex").handle_blob_get(&breq, now))
+        }
+        WireRequest::JoinChallenge => {
+            let now = (clock)();
+            let guard = relay.lock().expect("relay mutex");
+            match guard.pow_policy(now) {
+                Some((bucket, difficulty_bits)) => WireResponse::PowRequired {
+                    bucket,
+                    difficulty_bits,
+                    relay_id: *guard.relay_public().as_bytes(),
+                },
+                None => WireResponse::Rejected("issuance disabled (this relay is not public)".into()),
+            }
+        }
+        WireRequest::Join(jreq) => {
+            let now = (clock)();
+            match relay.lock().expect("relay mutex").handle_join(&jreq, now) {
+                Ok(cap) => WireResponse::Issued(cap),
+                Err(s) => WireResponse::Rejected(s),
+            }
+        }
+        WireRequest::GetNodeList => {
+            // Public read of the discovery plane; no time needed.
+            WireResponse::NodeList(relay.lock().expect("relay mutex").node_list())
+        }
+        WireRequest::GetPolicy => {
+            WireResponse::Policy(relay.lock().expect("relay mutex").policy())
+        }
+        WireRequest::BlobStat(blob_id) => {
+            WireResponse::BlobStat(relay.lock().expect("relay mutex").blob_stat(&blob_id))
+        }
+        WireRequest::PublishDiscovery { record, write_sig } => {
+            let now = (clock)();
+            let ok = relay.lock().expect("relay mutex").handle_publish_discovery(&record, &write_sig, now);
+            WireResponse::DiscoveryAck(ok)
+        }
+        WireRequest::DeleteDiscovery { discovery_pub, delete_sig } => {
+            let ok = relay.lock().expect("relay mutex").handle_delete_discovery(&discovery_pub, &delete_sig);
+            WireResponse::DiscoveryAck(ok)
+        }
+        WireRequest::LookupDiscovery(pseudonym) => {
+            let now = (clock)();
+            WireResponse::Discovery(relay.lock().expect("relay mutex").handle_lookup_discovery(&pseudonym, now))
+        }
+    };
+
+        // A blob chunk download needs the large frame; every other response is small and
+        // must stay on the tight ceiling (the fetch page's fixed 16 KiB size class).
+        let resp_max = match &resp {
+            WireResponse::Blob(BlobResponse::Chunk(Some(_))) => MAX_BLOB_FRAME,
+            _ => MAX_RESPONSE_FRAME,
+        };
+        let resp_bytes = encode(&resp).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encode"))?;
+        session.write_msg(&resp_bytes, resp_max)?;
+    }
+    Ok(())
+}
+
+/// Клиентский транспорт поверх Noise-сессии. Один запрос = одно соединение +
+/// один handshake (скелет). Держит Noise-pubkey relay (аутентификация при
+/// handshake) и адаптер транспорта (§15): direct-TCP или SOCKS5-к-внешнему-PT.
+#[derive(Clone)]
+pub struct SocketTransport {
+    /// Routes to the relay in priority order (§15 Path Manager). More than one = the
+    /// request fails over across them; see `round_trip_sized` for the retry boundary.
+    paths: Vec<Path>,
+    relay_noise_pub: [u8; 32],
+}
+
+impl SocketTransport {
+    /// Прямой TCP (без обфускации транспорта).
+    pub fn new(addr: impl Into<Dest>, relay_noise_pub: [u8; 32]) -> Self {
+        Self::with_adapter(addr.into(), relay_noise_pub, Arc::new(DirectTcpAdapter::default()))
+    }
+
+    /// Через заданный адаптер (напр. `Socks5Adapter` на локальный PT-порт).
+    pub fn with_adapter(
+        addr: impl Into<Dest>,
+        relay_noise_pub: [u8; 32],
+        adapter: Arc<dyn TransportAdapter>,
+    ) -> Self {
+        Self::with_paths(vec![Path::new(adapter, addr)], relay_noise_pub)
+    }
+
+    /// Over an ordered list of routes to the SAME relay identity (`relay_noise_pub`
+    /// authenticates it regardless of which path carried the bytes). Each request tries
+    /// them in order — see `round_trip_sized` for what may and may not be retried.
+    pub fn with_paths(paths: Vec<Path>, relay_noise_pub: [u8; 32]) -> Self {
+        SocketTransport { paths, relay_noise_pub }
+    }
+
+    fn round_trip(&self, req: &WireRequest) -> io::Result<WireResponse> {
+        self.round_trip_sized(req, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME)
+    }
+
+    /// `round_trip` on its own isolation scope — requests with different scopes are not
+    /// carried on the same circuit (see `TransportAdapter::connect_isolated`).
+    fn round_trip_scoped(&self, req: &WireRequest, scope: Option<&str>) -> io::Result<WireResponse> {
+        self.round_trip_scoped_sized(req, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME, scope)
+    }
+
+    /// Like `round_trip` but with explicit frame ceilings — blobs need the large one on
+    /// the side that carries the chunk (request for `BlobPut`, response for `BlobGet`).
+    ///
+    /// **§15 failover, and its deliberate boundary.** Paths are tried in order, and a
+    /// path is abandoned for the next one when its TCP connect OR its Noise handshake
+    /// fails. That covers an adversary who blackholes the IP (connect times out) AND one
+    /// that lets the SYN through and then interferes with the handshake — the case
+    /// connect-level failover could not see.
+    ///
+    /// **Nothing is retried once the request has been written.** Past that line the
+    /// relay may already have applied the request (a deposit is not idempotent), so
+    /// retrying it on another path could duplicate it. A failure there is returned as
+    /// an error — an honest failure beats a silent double-send. Connect/handshake
+    /// failures are safe precisely because no request byte has left yet.
+    fn round_trip_sized(
+        &self,
+        req: &WireRequest,
+        req_max: usize,
+        resp_max: usize,
+    ) -> io::Result<WireResponse> {
+        self.round_trip_scoped_sized(req, req_max, resp_max, None)
+    }
+
+    fn round_trip_scoped_sized(
+        &self,
+        req: &WireRequest,
+        req_max: usize,
+        resp_max: usize,
+        scope: Option<&str>,
+    ) -> io::Result<WireResponse> {
+        let req_bytes = encode(req).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encode"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Health order: paths out of cooldown first (in priority order), the cooling
+        // ones after — so a blackholed primary stops costing a CONNECT_TIMEOUT on every
+        // request, while a total outage can still recover (nothing is ever excluded).
+        let (fresh, cooling): (Vec<&Path>, Vec<&Path>) =
+            self.paths.iter().partition(|p| p.health.usable(now));
+        let mut last_err: Option<io::Error> = None;
+        for path in fresh.into_iter().chain(cooling) {
+            // Pre-request phase: connect through the carrier, then Noise on top. A
+            // failure of either means nothing was delivered → the next path is safe.
+            let session = path
+                .adapter
+                .connect_isolated(&path.dest, scope)
+                .and_then(|channel| Session::connect(channel, &self.relay_noise_pub));
+            let mut session = match session {
+                Ok(s) => s,
+                Err(e) => {
+                    path.health.record_failure(now);
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            path.health.record_success();
+            // Committed to this path: the request goes out now, no failover past here.
+            session.write_msg(&req_bytes, req_max)?;
+            let resp_bytes = session.read_msg(resp_max)?;
+            return decode(&resp_bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"));
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "transport: no paths configured")
+        }))
+    }
+
+    /// §7 slice 4a — earn a capability from a PUBLIC relay by solving its PoW. Two round
+    /// trips on the Noise session: fetch the challenge (bucket + difficulty + relay_id), then
+    /// redeem a freshly-mined solution. The capability (secret included) comes back inside the
+    /// encrypted session. Store it 0600 and use it for sends. A relay that is not Public
+    /// answers the challenge with a rejection (`PermissionDenied`).
+    pub fn join(&self) -> io::Result<Capability> {
+        let (bucket, difficulty_bits, relay_id) = match self.round_trip(&WireRequest::JoinChallenge)? {
+            WireResponse::PowRequired { bucket, difficulty_bits, relay_id } => {
+                (bucket, difficulty_bits, relay_id)
+            }
+            WireResponse::Rejected(s) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, s))
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on JoinChallenge")),
+        };
+        let mut client_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut client_seed);
+        let nonce = admission::pow::solve(&relay_id, bucket, &client_seed, difficulty_bits)
+            .ok_or_else(|| io::Error::other("pow: nonce space exhausted"))?;
+        match self.round_trip(&WireRequest::Join(JoinRequest { bucket, client_seed, nonce }))? {
+            WireResponse::Issued(cap) => Ok(cap),
+            WireResponse::Rejected(s) => Err(io::Error::new(io::ErrorKind::PermissionDenied, s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on Join")),
+        }
+    }
+
+    /// §12 discovery plane — ask this relay which relays it knows about (node-list). The
+    /// operator-curated set (self + configured peers); a client uses it to learn of more
+    /// relays than it was handed. Each descriptor self-authenticates on dial (its `noise_pub`
+    /// is checked in the Noise handshake), so a wrong-key entry fails closed when used.
+    pub fn get_node_list(&self) -> io::Result<Vec<RelayDescriptor>> {
+        match self.round_trip(&WireRequest::GetNodeList)? {
+            WireResponse::NodeList(v) => Ok(v),
+            WireResponse::Rejected(s) => Err(io::Error::other(s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on GetNodeList")),
+        }
+    }
+
+    /// Fetch this relay's advertised policy (operator-declared — see `RelayPolicy`).
+    pub fn get_policy(&self) -> io::Result<RelayPolicy> {
+        match self.round_trip(&WireRequest::GetPolicy)? {
+            WireResponse::Policy(p) => Ok(p),
+            WireResponse::Rejected(s) => Err(io::Error::other(s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on GetPolicy")),
+        }
+    }
+
+    /// §12 4c — publish (or rotate) an opt-in discovery record. Returns whether the relay applied
+    /// it (`false` = a failed signature check or a full directory).
+    pub fn publish_discovery(&self, record: &DiscoveryRecord, write_sig: &[u8]) -> io::Result<bool> {
+        match self.round_trip(&WireRequest::PublishDiscovery { record: record.clone(), write_sig: write_sig.to_vec() })? {
+            WireResponse::DiscoveryAck(ok) => Ok(ok),
+            WireResponse::Rejected(s) => Err(io::Error::other(s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on PublishDiscovery")),
+        }
+    }
+
+    /// §12 4c — delete a discovery record (turn discovery off at this relay).
+    pub fn delete_discovery(&self, discovery_pub: [u8; 32], delete_sig: &[u8]) -> io::Result<bool> {
+        match self.round_trip(&WireRequest::DeleteDiscovery { discovery_pub, delete_sig: delete_sig.to_vec() })? {
+            WireResponse::DiscoveryAck(ok) => Ok(ok),
+            WireResponse::Rejected(s) => Err(io::Error::other(s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on DeleteDiscovery")),
+        }
+    }
+
+    /// §12 4c — resolve a discovery `pseudonym` (hash of a contact code) to its record, or `None`
+    /// if not published here / expired. The caller must re-verify the IK binding before trusting.
+    pub fn lookup_discovery(&self, pseudonym: [u8; 32]) -> io::Result<Option<DiscoveryRecord>> {
+        match self.round_trip(&WireRequest::LookupDiscovery(pseudonym))? {
+            WireResponse::Discovery(rec) => Ok(rec),
+            WireResponse::Rejected(s) => Err(io::Error::other(s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on LookupDiscovery")),
+        }
+    }
+
+    /// §15: upload one ciphertext chunk (large request frame, small response).
+    pub fn blob_put(&self, req: &BlobPutRequest) -> BlobResponse {
+        match self.round_trip_sized(&WireRequest::BlobPut(req.clone()), MAX_BLOB_FRAME, MAX_RESPONSE_FRAME) {
+            Ok(WireResponse::Blob(b)) => b,
+            Ok(_) => BlobResponse::Rejected("protocol: unexpected on BlobPut".into()),
+            Err(e) => BlobResponse::Rejected(format!("transport: {e}")),
+        }
+    }
+
+    /// §15: a blob's upload progress `(next, count, complete)` — the watermark a resumable upload
+    /// continues from. `None` = the relay has no such blob yet (start at 0). Public read, no cookie.
+    pub fn blob_stat(&self, blob_id: [u8; 32]) -> io::Result<Option<(u32, u32, bool)>> {
+        match self.round_trip(&WireRequest::BlobStat(blob_id))? {
+            WireResponse::BlobStat(s) => Ok(s),
+            WireResponse::Rejected(s) => Err(io::Error::other(s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on BlobStat")),
+        }
+    }
+
+    /// §15: download one ciphertext chunk (small request, large response frame).
+    pub fn blob_get(&self, req: &BlobGetRequest) -> BlobResponse {
+        match self.round_trip_sized(&WireRequest::BlobGet(req.clone()), MAX_REQUEST_FRAME, MAX_BLOB_FRAME) {
+            Ok(WireResponse::Blob(b)) => b,
+            Ok(_) => BlobResponse::Rejected("protocol: unexpected on BlobGet".into()),
+            Err(e) => BlobResponse::Rejected(format!("transport: {e}")),
+        }
+    }
+
+    /// Open a REUSABLE session for streaming many `BlobPut`s over ONE Noise handshake (§15 / FT4).
+    /// Tries paths in health order (like `round_trip`); the relay then accepts a bounded run of
+    /// requests on this single connection, so a chunked upload amortizes the per-chunk TCP + Noise
+    /// handshake instead of paying it every chunk. Dropping the returned session closes it.
+    pub fn open_blob_session(&self) -> io::Result<BlobSession> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (fresh, cooling): (Vec<&Path>, Vec<&Path>) =
+            self.paths.iter().partition(|p| p.health.usable(now));
+        let mut last_err: Option<io::Error> = None;
+        for path in fresh.into_iter().chain(cooling) {
+            match path
+                .adapter
+                .connect_isolated(&path.dest, None)
+                .and_then(|channel| Session::connect(channel, &self.relay_noise_pub))
+            {
+                Ok(session) => {
+                    path.health.record_success();
+                    return Ok(BlobSession { session });
+                }
+                Err(e) => {
+                    path.health.record_failure(now);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "transport: no paths configured")))
+    }
+}
+
+/// A reusable client connection for blob uploads (§15 / FT4): one Noise handshake, then many
+/// `put`s over the same session. `Err` from `put` means the session is dead (the relay closed it
+/// after its bounded run, or the link dropped) — the caller opens a fresh one and retries the
+/// chunk, which is idempotent at the relay.
+pub struct BlobSession {
+    session: Session<Box<dyn Channel>>,
+}
+
+impl BlobSession {
+    /// Upload one chunk over the reused session. `Ok(BlobResponse)` is the relay's answer;
+    /// `Err` means the session is no longer usable.
+    pub fn put(&mut self, req: &BlobPutRequest) -> io::Result<BlobResponse> {
+        let req_bytes = encode(&WireRequest::BlobPut(req.clone()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encode"))?;
+        self.session.write_msg(&req_bytes, MAX_BLOB_FRAME)?;
+        let resp_bytes = self.session.read_msg(MAX_RESPONSE_FRAME)?;
+        match decode(&resp_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"))? {
+            WireResponse::Blob(b) => Ok(b),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on BlobPut")),
+        }
+    }
+}
+
+impl Transport for SocketTransport {
+    /// `now` — часы вызывающего, на провод НЕ уходят (сервер ставит своё).
+    fn send(&self, msg: &WireMessage, now: u64) -> Response {
+        self.send_isolated(msg, now, None)
+    }
+
+    fn fetch(&self, req: &FetchRequest, now: u64) -> FetchResponse {
+        self.fetch_isolated(req, now, None)
+    }
+
+    fn send_isolated(&self, msg: &WireMessage, _now: u64, scope: Option<&str>) -> Response {
+        match self.round_trip_scoped(&WireRequest::Send(msg.clone()), scope) {
+            Ok(WireResponse::NeedCookie(c)) => Response::NeedCookie(c),
+            Ok(WireResponse::Accepted) => Response::Accepted,
+            Ok(WireResponse::Rejected(s)) => Response::Rejected(s),
+            Ok(_) => Response::Rejected("protocol: unexpected на Send".into()),
+            Err(e) => Response::Rejected(format!("transport: {e}")),
+        }
+    }
+
+    fn fetch_isolated(&self, req: &FetchRequest, _now: u64, scope: Option<&str>) -> FetchResponse {
+        match self.round_trip_scoped(&WireRequest::Fetch(req.clone()), scope) {
+            Ok(WireResponse::NeedCookie(c)) => FetchResponse::NeedCookie(c),
+            Ok(WireResponse::Fetched(page)) => match page.unpack() {
+                Ok(seals) => FetchResponse::Fetched(seals),
+                Err(_) => FetchResponse::Rejected("protocol: malformed fetch page".into()),
+            },
+            Ok(WireResponse::Rejected(s)) => FetchResponse::Rejected(s),
+            Ok(WireResponse::Accepted) => FetchResponse::Rejected("protocol: Accepted на Fetch".into()),
+            // Ошибку транспорта НЕ выдаём за пустой mailbox — recv их различает.
+            Err(e) => FetchResponse::Rejected(format!("transport: {e}")),
+            Ok(_) => FetchResponse::Rejected("protocol: unexpected на Fetch".into()),
+        }
+    }
+
+    fn ack(&self, req: &AckRequest, now: u64) -> AckResponse {
+        self.ack_isolated(req, now, None)
+    }
+
+    fn ack_isolated(&self, req: &AckRequest, _now: u64, scope: Option<&str>) -> AckResponse {
+        match self.round_trip_scoped(&WireRequest::Ack(req.clone()), scope) {
+            Ok(WireResponse::NeedCookie(c)) => AckResponse::NeedCookie(c),
+            Ok(WireResponse::Acked) => AckResponse::Acked,
+            Ok(WireResponse::Rejected(s)) => AckResponse::Rejected(s),
+            Ok(_) => AckResponse::Rejected("protocol: unexpected на Ack".into()),
+            Err(e) => AckResponse::Rejected(format!("transport: {e}")),
+        }
+    }
+
+    fn publish_bundle(&self, req: &PublishRequest, _now: u64) -> PublishResponse {
+        match self.round_trip(&WireRequest::PublishBundle(req.clone())) {
+            Ok(WireResponse::NeedCookie(c)) => PublishResponse::NeedCookie(c),
+            Ok(WireResponse::BundlePublished) => PublishResponse::Published,
+            Ok(WireResponse::Rejected(s)) => PublishResponse::Rejected(s),
+            Ok(_) => PublishResponse::Rejected("protocol: unexpected на Publish".into()),
+            Err(e) => PublishResponse::Rejected(format!("transport: {e}")),
+        }
+    }
+
+    fn fetch_bundle(&self, ik: &[u8; 32], _now: u64) -> Result<Option<PreKeyBundle>, String> {
+        match self.round_trip(&WireRequest::FetchBundle(*ik)) {
+            Ok(WireResponse::Bundle(b)) => Ok(b),
+            Ok(WireResponse::Rejected(s)) => Err(s),
+            Ok(_) => Err("protocol: unexpected на FetchBundle".into()),
+            Err(e) => Err(format!("transport: {e}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conn_limiter_caps_and_releases_via_raii() {
+        // Deterministic (no sockets): the cap holds, a released slot is reusable, and
+        // dropping every permit returns the live count to zero. Neuter `try_acquire`
+        // to ignore `max` (always Some) and the capacity assertions go red.
+        let l = ConnLimiter::new(2);
+        let a = l.try_acquire().expect("slot 1");
+        let _b = l.try_acquire().expect("slot 2");
+        assert!(l.try_acquire().is_none(), "at capacity → None");
+        assert_eq!(l.live(), 2);
+        drop(a);
+        let c = l.try_acquire().expect("freed slot reusable");
+        assert!(l.try_acquire().is_none(), "full again");
+        drop(_b);
+        drop(c);
+        assert_eq!(l.live(), 0, "RAII released every slot");
+    }
+}

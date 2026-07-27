@@ -1,0 +1,21 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+edition = "2021"
+description = "KARST desktop app (Tauri shell over the client core)"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+client = { path = "../client" }
+node = { path = "../node" }
+hex = "0.4"
+base64 = "0.22"
+
+[[bin]]
+name = "karst-desktop"
+path = "src/main.rs"

@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an idea or improvement for KARST
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [docs/TECHNICAL_BOUNDARIES.md](https://github.com/bytesoffreedom/karst/blob/main/docs/TECHNICAL_BOUNDARIES.md)
+        first — some capabilities are deliberately out of scope.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What user or engineering problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Positioning
+      options:
+        - label: This does not require claiming anonymity, censorship resistance, or "unbreakable"/"quantum-proof" security
+          required: true

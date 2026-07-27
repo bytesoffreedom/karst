@@ -1,0 +1,28 @@
+# Rust build artefacts (workspace под impl/)
+/impl/target/
+**/target/
+
+# Локальное состояние запуска (relay-id, каталоги профилей демо)
+/impl/.run/
+.run/
+
+# Агент-инструменты и приватная память (email/личные данные — НЕ публиковать)
+/.claude/
+
+# Сырой лог проектных размышлений — НЕ публиковать
+/mosaic_chat.txt
+
+# Редакторы / ОС
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+KARST_logo_kit.zip
+/POSITIONING.md
+1.zip
+site/
+site_gitignore/
+KARST_logo_kit/
+KARST_screenshots/
+POS2_GITIGNORE.md

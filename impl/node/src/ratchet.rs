@@ -1,0 +1,518 @@
+//! §2.1 — Double Ratchet (classical X25519) поверх PQXDH-`root_key`.
+//!
+//! Пер-сообщенческая **forward secrecy** (ключ сообщения удаляется после
+//! использования, цепочка одностороння) + **post-compromise security** (DH-шаг
+//! на новом эфемере «лечит» компрометацию). PQ-защита — от начального PQXDH
+//! (§2.1: ratchet классический, гибрид живёт в handshake). Спека Signal Double
+//! Ratchet, reference-код над примитивами (как PQXDH), НЕ аудирован.
+//!
+//! # ЭТОТ СРЕЗ и не больше:
+//! - **out-of-order терпим** (skipped-message-keys, спека Signal): пропущенные
+//!   ключи выводятся и хранятся, входящее не по порядку (mailbox-пачка, DTN
+//!   store-and-forward) расшифровывается. Двойная граница анти-DoS: `MAX_SKIP`
+//!   на один шаг приёма (анти-unbounded-KDF) + `MAX_STORE` всего с FIFO-эвикцией
+//!   (анти-память/диск). Раньше был строго-in-order → один дроп = мёртвая сессия;
+//!   а crash-consistency (безусловное продвижение при encrypt) сам плодит дропы;
+//! - без header-encryption, без PQ-ratchet, без вплетения в node-путь (сессия
+//!   засевается сырым `root_key`); без time-based expiry пропущенных ключей.
+//!
+//! # Транзакционность (иначе один битый пакет ломает сессию — И сильнее):
+//! `decrypt` мутирует КОПИЮ и **проверяет AEAD ДО** коммита. Помимо «битый пакет
+//! не ломает сессию», это даёт свойство СВЕРХ спеки Signal: forged-сообщение с
+//! большим `n` НЕ наполняет skipped-store и НЕ двигает `nr` (в буквальном Signal
+//! `SkipMessageKeys` мутирует до DECRYPT) — противник без валидного AEAD-тега не
+//! может заставить хранить ключи. Откат безопасен: состояние цепочки откатывается
+//! вместе со store, ретрансмит выведет ключи заново.
+//!
+//! # FS-компромисс (назван): пропущенные ключи ЛОЖАТСЯ at-rest (в снимок — иначе
+//! между recv-вызовами клиента, load→process→save, теряются и фикс бесполезен).
+//! Это ослабляет FS-non-retention для ИМЕННО тех pending-сообщений на окно «пока
+//! не получены или не вытеснены». Стандартный Signal-компромисс за out-of-order;
+//! time-based expiry (есть `wall_clock`) прямо ограничил бы окно — след. шаг.
+
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use hkdf::Hkdf;
+use hmac::{Mac, SimpleHmac};
+use sha2::Sha256;
+use x25519_dalek::PublicKey;
+
+use crate::seal::Identity;
+
+const AAD_DOMAIN: &[u8] = b"KARST-ratchet-v1";
+
+/// Максимум ключей, выводимых за ОДИН шаг приёма (в каждой из до двух цепочек).
+/// Анти-DoS: forged `header.n`/`header.pn` не заставит вывести unbounded KDF.
+const MAX_SKIP: u32 = 1000;
+/// Максимум ВСЕГО хранимых пропущенных ключей (FIFO-эвикция старейших). Должен
+/// быть ≥ 2·MAX_SKIP: один decrypt через границу цепочек может добавить до
+/// MAX_SKIP (старая цепочка, `pn`) + MAX_SKIP (новая, `n`) — иначе эвикция
+/// сработала бы ПОСРЕДИ decrypt и выбросила ровно те gap-filler'ы, что мы кладём.
+const MAX_STORE: usize = 2048;
+
+/// Хранимый пропущенный ключ сообщения: идентифицируется (ratchet-pubkey цепочки,
+/// номер). `mk` — ключ сообщения; ложится at-rest (см. FS-компромисс в доке).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SkippedKey {
+    dh: [u8; 32],
+    n: u32,
+    mk: [u8; 32],
+}
+
+/// Заголовок сообщения: текущий ratchet-pubkey отправителя, длина предыдущей
+/// цепочки (`pn`), номер в текущей цепочке (`n`). Связывается в AEAD-AAD.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Header {
+    pub dh: [u8; 32],
+    pub pn: u32,
+    pub n: u32,
+}
+
+/// Сообщение на проводе.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RatchetMessage {
+    pub header: Header,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RatchetError {
+    /// Скачок номеров > `MAX_SKIP` за один шаг приёма (анти-DoS-граница). Не
+    /// «просто не по порядку» — умеренный out-of-order теперь терпим.
+    OutOfOrder,
+    /// Нет принимающей цепочки (не было первого сообщения).
+    NoReceivingChain,
+    /// AEAD не сошёлся (подмена/чужой ключ).
+    Decrypt,
+}
+
+/// Состояние Double-Ratchet-сессии. `Clone` — для транзакционного decrypt
+/// (мутируем копию, коммитим при успехе AEAD).
+#[derive(Clone)]
+pub struct Session {
+    dhs: Identity,           // наша ratchet-пара
+    dhr: Option<[u8; 32]>,   // ratchet-pubkey собеседника
+    rk: [u8; 32],            // root key
+    cks: Option<[u8; 32]>,   // sending chain key
+    ckr: Option<[u8; 32]>,   // receiving chain key
+    ns: u32,                 // номер отправки
+    nr: u32,                 // номер приёма
+    pn: u32,                 // длина предыдущей sending-цепочки
+    skipped: Vec<SkippedKey>, // пропущенные ключи (out-of-order), FIFO-огранич.
+}
+
+/// Персистентная форма сессии (для возобновления ratchet между процесс-вызовами
+/// CLI). Цепочные/root-ключи + приватный ratchet-ключ + ТОЛЬКО пропущенные
+/// (out-of-order) `mk`. Пер-сообщенческие ключи ПРИНЯТЫХ по порядку сообщений на
+/// диск НЕ попадают (локальны в encrypt/decrypt) — FS-non-retention для них цел;
+/// пропущенные же ложатся ОСОЗНАННО (без этого фикс не переживает reload — см.
+/// FS-компромисс в доке модуля). `dhs_secret` — приватный ключ в открытом виде:
+/// вызывающий обязан писать под 0600 (тут at-rest — через `client::Store`).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SessionSnapshot {
+    dhs_secret: [u8; 32],
+    dhr: Option<[u8; 32]>,
+    rk: [u8; 32],
+    cks: Option<[u8; 32]>,
+    ckr: Option<[u8; 32]>,
+    ns: u32,
+    nr: u32,
+    pn: u32,
+    /// Пропущенные ключи — персистятся ОСОЗНАННО (FS-компромисс, см. доку модуля):
+    /// без них out-of-order-фикс не переживает `load→process→save` клиента.
+    skipped: Vec<SkippedKey>,
+}
+
+impl Session {
+    /// Снять снимок для персистентности (см. `SessionSnapshot`).
+    pub fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            dhs_secret: self.dhs.to_secret_bytes(),
+            dhr: self.dhr,
+            rk: self.rk,
+            cks: self.cks,
+            ckr: self.ckr,
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            skipped: self.skipped.clone(),
+        }
+    }
+
+    /// Восстановить сессию из снимка.
+    pub fn restore(s: SessionSnapshot) -> Self {
+        Session {
+            dhs: Identity::from_secret_bytes(s.dhs_secret),
+            dhr: s.dhr,
+            rk: s.rk,
+            cks: s.cks,
+            ckr: s.ckr,
+            ns: s.ns,
+            nr: s.nr,
+            pn: s.pn,
+            skipped: s.skipped,
+        }
+    }
+
+    /// Инициатор (Alice): знает ratchet-pubkey получателя (его prekey из PQXDH).
+    pub fn init_sender(root_key: [u8; 32], their_ratchet_pub: [u8; 32]) -> Self {
+        let dhs = Identity::generate();
+        let dh_out = dhs.dh(&PublicKey::from(their_ratchet_pub));
+        let (rk, cks) = kdf_rk(&root_key, &dh_out);
+        Session {
+            dhs,
+            dhr: Some(their_ratchet_pub),
+            rk,
+            cks: Some(cks),
+            ckr: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Получатель (Bob): его ratchet-пара = prekey из PQXDH-bundle. Первую
+    /// sending-цепочку получит при DH-шаге на первом входящем сообщении.
+    pub fn init_receiver(root_key: [u8; 32], our_ratchet_key: Identity) -> Self {
+        Session {
+            dhs: our_ratchet_key,
+            dhr: None,
+            rk: root_key,
+            cks: None,
+            ckr: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Ratchet-pubkey нашей текущей пары (для init_sender собеседника).
+    pub fn ratchet_public(&self) -> [u8; 32] {
+        self.dhs.public.to_bytes()
+    }
+
+    /// Зашифровать сообщение. Требует sending-цепочку (Alice — с init; Bob —
+    /// после первого decrypt). Свежий ключ на сообщение → нулевой nonce безопасен.
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> RatchetMessage {
+        let ck = self.cks.expect("sending chain (получатель должен принять до отправки)");
+        let (ck_next, mk) = kdf_ck(&ck);
+        let header = Header { dh: self.dhs.public.to_bytes(), pn: self.pn, n: self.ns };
+        self.cks = Some(ck_next);
+        self.ns += 1;
+        let ciphertext = aead_encrypt(&mk, plaintext, &aad(&header));
+        RatchetMessage { header, ciphertext }
+    }
+
+    /// Расшифровать. ТРАНЗАКЦИОННО: мутируем копию, проверяем AEAD, коммитим
+    /// только при успехе — битый пакет не двигает и не ломает сессию.
+    pub fn decrypt(&mut self, msg: &RatchetMessage) -> Result<Vec<u8>, RatchetError> {
+        let mut staged = self.clone();
+        let mk = staged.advance_for_decrypt(&msg.header)?;
+        let pt = aead_decrypt(&mk, &msg.ciphertext, &aad(&msg.header))
+            .map_err(|_| RatchetError::Decrypt)?;
+        *self = staged; // коммит только после успешной AEAD
+        Ok(pt)
+    }
+
+    /// Продвинуть СТЕЙДЖ-состояние под заголовок и вернуть ключ сообщения.
+    /// Мутирует `self` (это копия из `decrypt`), НЕ трогает AEAD. Алгоритм —
+    /// Signal `RatchetDecrypt`: (1) пропущенный ключ; (2) DH-шаг при новом
+    /// ratchet-ключе, достраивая хвост прошлой цепочки; (3) пропуски в текущей
+    /// цепочке до `header.n`; (4) ключ ровно на `header.n`.
+    fn advance_for_decrypt(&mut self, header: &Header) -> Result<[u8; 32], RatchetError> {
+        // (1) Out-of-order из этой или ПРОШЛОЙ цепочки — ключ уже выведен и хранится.
+        if let Some(mk) = self.take_skipped(header.dh, header.n) {
+            return Ok(mk);
+        }
+        // (2) Новый ratchet-ключ собеседника → сохранить хвост прошлой receiving-
+        // цепочки (nr..header.pn) и сделать DH-шаг (PCS-«лечение»).
+        if self.dhr != Some(header.dh) {
+            self.skip_message_keys(header.pn)?;
+            self.dh_ratchet(header);
+        }
+        // (3) Пропуски в текущей цепочке до header.n (сохраняются).
+        self.skip_message_keys(header.n)?;
+        // (4) Ключ ровно на header.n (nr здесь == header.n при in-order/после skip).
+        let ck = self.ckr.ok_or(RatchetError::NoReceivingChain)?;
+        let (ck_next, mk) = kdf_ck(&ck);
+        self.ckr = Some(ck_next);
+        self.nr += 1;
+        Ok(mk)
+    }
+
+    /// Изъять пропущенный ключ по (ratchet-pubkey цепочки, номер), если хранится.
+    /// Изъятие фиксируется только при коммите `decrypt` (staged) — replay/forgery
+    /// без валидного AEAD не удалит ключ.
+    fn take_skipped(&mut self, dh: [u8; 32], n: u32) -> Option<[u8; 32]> {
+        let i = self.skipped.iter().position(|s| s.dh == dh && s.n == n)?;
+        Some(self.skipped.remove(i).mk)
+    }
+
+    /// Сохранить пропущенный ключ; при переполнении — FIFO-эвикция старейшего.
+    fn store_skipped(&mut self, dh: [u8; 32], n: u32, mk: [u8; 32]) {
+        if self.skipped.len() >= MAX_STORE {
+            self.skipped.remove(0);
+        }
+        self.skipped.push(SkippedKey { dh, n, mk });
+    }
+
+    /// Продвинуть receiving-цепочку до `until`, СОХРАНЯЯ пропущенные ключи под
+    /// текущим `dhr`. Анти-DoS: скачок > `MAX_SKIP` за раз → отказ (без вывода
+    /// ключей). `until <= nr` → no-op. Overflow-безопасно.
+    fn skip_message_keys(&mut self, until: u32) -> Result<(), RatchetError> {
+        if until > self.nr && until - self.nr > MAX_SKIP {
+            return Err(RatchetError::OutOfOrder);
+        }
+        if until <= self.nr {
+            return Ok(());
+        }
+        let dh = self.dhr.ok_or(RatchetError::NoReceivingChain)?;
+        while self.nr < until {
+            let ck = self.ckr.ok_or(RatchetError::NoReceivingChain)?;
+            let (ck_next, mk) = kdf_ck(&ck);
+            self.store_skipped(dh, self.nr, mk);
+            self.ckr = Some(ck_next);
+            self.nr += 1;
+        }
+        Ok(())
+    }
+
+    /// DH-ratchet-шаг: новая receiving/sending цепочки на ratchet-ключе собеседника.
+    fn dh_ratchet(&mut self, header: &Header) {
+        self.pn = self.ns;
+        self.ns = 0;
+        self.nr = 0;
+        let dh1 = self.dhs.dh(&PublicKey::from(header.dh));
+        let (rk1, ckr) = kdf_rk(&self.rk, &dh1);
+        let dhs_new = Identity::generate();
+        let dh2 = dhs_new.dh(&PublicKey::from(header.dh));
+        let (rk2, cks) = kdf_rk(&rk1, &dh2);
+        self.rk = rk2;
+        self.dhr = Some(header.dh);
+        self.dhs = dhs_new;
+        self.ckr = Some(ckr);
+        self.cks = Some(cks);
+    }
+}
+
+/// `KDF_RK`: HKDF-SHA256(salt=rk, ikm=dh) → 64 Б → (new_rk, chain_key).
+fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let hk = Hkdf::<Sha256>::new(Some(rk), dh_out);
+    let mut okm = [0u8; 64];
+    hk.expand(b"KARST-ratchet-rk-v1", &mut okm).expect("64 within HKDF output limit");
+    let mut new_rk = [0u8; 32];
+    let mut ck = [0u8; 32];
+    new_rk.copy_from_slice(&okm[..32]);
+    ck.copy_from_slice(&okm[32..]);
+    (new_rk, ck)
+}
+
+/// `KDF_CK`: (next_chain_key, message_key) через раздельные HMAC-константы.
+/// Односторонняя: из `next_ck` не восстановить `mk` (основа forward secrecy).
+fn kdf_ck(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let mk = hmac(ck, &[0x01]);
+    let next_ck = hmac(ck, &[0x02]);
+    (next_ck, mk)
+}
+
+fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut m = <SimpleHmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key len");
+    m.update(data);
+    let out = m.finalize().into_bytes();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&out);
+    r
+}
+
+fn aad(header: &Header) -> Vec<u8> {
+    let mut a = Vec::with_capacity(AAD_DOMAIN.len() + 40);
+    a.extend_from_slice(AAD_DOMAIN);
+    a.extend_from_slice(&header.dh);
+    a.extend_from_slice(&header.pn.to_le_bytes());
+    a.extend_from_slice(&header.n.to_le_bytes());
+    a
+}
+
+fn aead_encrypt(mk: &[u8; 32], pt: &[u8], aad: &[u8]) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
+    cipher
+        .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: pt, aad })
+        .expect("AEAD encryption")
+}
+
+fn aead_decrypt(mk: &[u8; 32], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>, ()> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
+    cipher
+        .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: ct, aad })
+        .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PCS (лечение), дискриминирующий — как dh1/pq_shared: свежий DH реально
+    /// входит в новый root_key. Противник со СТАРЫМ rk, но без нового эфемера
+    /// (значит другой DH) не выведет новый root_key.
+    #[test]
+    fn fresh_dh_is_load_bearing_in_new_root_key() {
+        let rk = [5u8; 32];
+        let (rk_a, _) = kdf_rk(&rk, &[1u8; 32]);
+        let (rk_b, _) = kdf_rk(&rk, &[2u8; 32]);
+        assert_ne!(rk_a, rk_b, "новый root_key должен зависеть от свежего DH (PCS)");
+    }
+
+    /// Forward secrecy как NON-RETENTION: после расшифровки сессия НЕ хранит
+    /// ключ израсходованного сообщения. Не «разные ключи» и не «replay падает»
+    /// (это replay-защита) — именно отсутствие материала ключа в состоянии.
+    #[test]
+    fn message_key_not_retained_in_session_state() {
+        let root = [7u8; 32];
+        let bob_prekey = Identity::generate();
+        let mut alice = Session::init_sender(root, bob_prekey.public.to_bytes());
+        let mut bob = Session::init_receiver(root, bob_prekey);
+
+        let m = alice.encrypt(b"hello");
+        // Ключ, которым Bob расшифрует это сообщение (из его текущего состояния
+        // после DH-шага). Вычислим тем же путём, что decrypt, но до него.
+        let mut probe = bob.clone();
+        let mk = probe.advance_for_decrypt(&m.header).unwrap();
+
+        assert_eq!(bob.decrypt(&m).unwrap(), b"hello");
+
+        // Дамп ВСЕГО ключевого материала сессии Bob (вкл. skipped-store) — ключа
+        // принятого ПО ПОРЯДКУ сообщения там нет.
+        let dump = dump_key_material(&bob);
+        assert!(
+            !dump.windows(32).any(|w| w == mk),
+            "ключ израсходованного сообщения не должен оставаться в состоянии (FS)"
+        );
+    }
+
+    /// Свежая пара сессий на общем root (Alice-отправитель, Bob-получатель).
+    fn pair() -> (Session, Session) {
+        let root = [7u8; 32];
+        let bob_prekey = Identity::generate();
+        let alice = Session::init_sender(root, bob_prekey.public.to_bytes());
+        let bob = Session::init_receiver(root, bob_prekey);
+        (alice, bob)
+    }
+
+    /// Весь ключевой материал сессии, включая пропущенные mk.
+    fn dump_key_material(s: &Session) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&s.rk);
+        if let Some(c) = s.cks {
+            d.extend_from_slice(&c);
+        }
+        if let Some(c) = s.ckr {
+            d.extend_from_slice(&c);
+        }
+        for sk in &s.skipped {
+            d.extend_from_slice(&sk.mk);
+        }
+        d
+    }
+
+    /// Out-of-order В ОДНОЙ цепочке: приняли m0, затем m2 (m1 сохранён), затем
+    /// «догоняет» m1 — все расшифрованы. Раньше m2 после m0 → OutOfOrder.
+    #[test]
+    fn out_of_order_within_chain_decrypts_via_skipped() {
+        let (mut alice, mut bob) = pair();
+        let m0 = alice.encrypt(b"zero");
+        let m1 = alice.encrypt(b"one");
+        let m2 = alice.encrypt(b"two");
+
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two", "пропуск m1 → m1-ключ сохранён");
+        assert_eq!(bob.skipped.len(), 1, "ровно один пропущенный ключ (m1)");
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"one", "догнавший m1 — из store");
+        assert!(bob.skipped.is_empty(), "потреблённый пропущенный ключ удалён (FS)");
+    }
+
+    /// Out-of-order ЧЕРЕЗ границу цепочек: хвост старой цепочки (m1) сохраняется
+    /// при DH-шаге и расшифровывается после сообщения из новой цепочки.
+    #[test]
+    fn out_of_order_across_ratchet_boundary() {
+        let (mut alice, mut bob) = pair();
+        let a0 = alice.encrypt(b"a0"); // цепочка A, n0
+        let a1 = alice.encrypt(b"a1"); // цепочка A, n1 (будет задержан)
+        assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
+
+        // Bob отвечает → Alice делает DH-шаг → новая цепочка Alice.
+        let r0 = bob.encrypt(b"r0");
+        assert_eq!(alice.decrypt(&r0).unwrap(), b"r0");
+        let b0 = alice.encrypt(b"b0"); // НОВАЯ цепочка Alice, pn=2
+
+        // Bob принимает b0 (новая цепочка): хвост старой (a1) сохраняется, DH-шаг.
+        assert_eq!(bob.decrypt(&b0).unwrap(), b"b0");
+        assert_eq!(bob.skipped.len(), 1, "хвост старой цепочки (a1) сохранён");
+        // Догнавший a1 из СТАРОЙ цепочки — из store.
+        assert_eq!(bob.decrypt(&a1).unwrap(), b"a1");
+        assert!(bob.skipped.is_empty());
+    }
+
+    /// Load-bearing (ради чего фикс): пропущенный ключ переживает snapshot→restore
+    /// (зеркалит `load→process→save` клиента), затем догнавший gap-filler
+    /// расшифровывается из ВОССТАНОВЛЕННОГО store.
+    #[test]
+    fn skipped_key_survives_snapshot_restore() {
+        let (mut alice, mut bob) = pair();
+        let m0 = alice.encrypt(b"zero");
+        let m1 = alice.encrypt(b"one");
+        let m2 = alice.encrypt(b"two");
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two"); // m1 сохранён
+
+        // Круг через персистентную форму.
+        let mut bob2 = Session::restore(bob.snapshot());
+        assert_eq!(bob2.decrypt(&m1).unwrap(), b"one", "gap-filler из ВОССТАНОВЛЕННОГО store");
+    }
+
+    /// Анти-DoS СВЕРХ спеки: forged-сообщение с большим `n` (валидный header, но
+    /// битый AEAD) НЕ наполняет skipped-store и НЕ двигает `nr` — откат staged.
+    /// Дискриминирующий: коммит до AEAD → store вырос бы, nr прыгнул бы.
+    #[test]
+    fn forged_high_n_does_not_populate_skipped_store() {
+        let (mut alice, mut bob) = pair();
+        let m0 = alice.encrypt(b"zero");
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
+        let dhr = bob.dhr.unwrap();
+
+        // Валидный header (та же цепочка), n=50, но мусорный ciphertext.
+        let forged = RatchetMessage {
+            header: Header { dh: dhr, pn: 0, n: 50 },
+            ciphertext: vec![0u8; 48],
+        };
+        assert_eq!(bob.decrypt(&forged), Err(RatchetError::Decrypt));
+        assert!(bob.skipped.is_empty(), "forged не наполнил store (откат staged)");
+        assert_eq!(bob.nr, 1, "forged не сдвинул nr");
+
+        // Сессия цела: следующее легитимное in-order сообщение проходит.
+        let m1 = alice.encrypt(b"one");
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"one");
+    }
+
+    /// `MAX_SKIP`: скачок больше предела за один шаг → отказ, сессия НЕ тронута
+    /// (staged отброшен). Граница анти-unbounded-KDF.
+    #[test]
+    fn gap_larger_than_max_skip_is_rejected_session_intact() {
+        let (mut alice, mut bob) = pair();
+        let m0 = alice.encrypt(b"zero");
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
+        let dhr = bob.dhr.unwrap();
+
+        let too_far = RatchetMessage {
+            header: Header { dh: dhr, pn: 0, n: MAX_SKIP + 5 },
+            ciphertext: vec![0u8; 48],
+        };
+        assert_eq!(bob.decrypt(&too_far), Err(RatchetError::OutOfOrder));
+        assert!(bob.skipped.is_empty(), "ключи не выведены");
+        assert_eq!(bob.nr, 1, "nr не тронут");
+        // И сессия продолжает работать в пределах допустимого.
+        let m1 = alice.encrypt(b"one");
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"one");
+    }
+}

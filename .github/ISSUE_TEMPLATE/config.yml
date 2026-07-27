@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/bytesoffreedom/karst/security/advisories/new
+    about: Never file security issues in public. Use the private advisory channel.
+  - name: Security policy & threat model
+    url: https://github.com/bytesoffreedom/karst/blob/main/SECURITY.md
+    about: What is audited, what is not, and how the threat model is scoped.
+  - name: What KARST is (and is not)
+    url: https://github.com/bytesoffreedom/karst/blob/main/docs/TECHNICAL_BOUNDARIES.md
+    about: Scope and boundaries before proposing a feature.

@@ -1,0 +1,48 @@
+[package]
+name = "node"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+admission = { path = "../admission" }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+xeddsa = "1.1"
+# rand 0.10 ONLY to supply the CryptoRng xeddsa::sign wants (its own rand major); node's
+# other RNG use stays on rand 0.8. Renamed to avoid clashing with that.
+rand010 = { package = "rand", version = "0.10" }
+# Ristretto prime-order group for the mailbox fetch-key separation spike (blind.rs). Direct +
+# pinned (it also arrives transitively via xeddsa, but a crypto dep should be explicit).
+curve25519-dalek = { version = "4.1.3", features = ["digest"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# postcard: компактный no_std-дружественный кодек. Формат скелетный —
+# §15 transport rewrite will replace the wire wholesale; freeze byte-vectors then.
+postcard = { version = "1", features = ["use-std"] }
+snow = "0.10.0"
+ml-kem = { version = "0.3", features = ["getrandom"] }
+# WebSocket-over-TLS carrier (§15): sync tungstenite + rustls on the `ring` backend
+# (reuses the cached crypto; no aws-lc C build). TLS here is TRANSPORT ENCAPSULATION, not security —
+# Noise already authenticates the relay end-to-end.
+tungstenite = "0.24"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+rustls-pemfile = "2"
+
+[[bin]]
+name = "karst-relay"
+path = "src/bin/relay.rs"
+
+[dev-dependencies]
+# Self-signed cert/key generation for wss carrier tests (test-only trust root).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Serialize `PeerState` to bytes in the lease/ACK crash-injection test — the same codec
+# the client's on-disk store uses, so the test's "disk" round-trip is faithful.
+postcard = { version = "1", features = ["use-std"] }

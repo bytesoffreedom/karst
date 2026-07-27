@@ -1,0 +1,27 @@
+{
+  "note": "KARST §7 admission test vectors. Deterministic; for cross-implementation conformance (§14). hash_to_field = SHA-512 wide-reduce over curve25519 scalar field (reference substitute for Poseidon; slashing property is field-only).",
+  "cookie": {
+    "description": "§7.1 cookie issued and verified with fixed relay key",
+    "relay_key_current_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "epoch_duration_secs": 600,
+    "now_secs": 1000000,
+    "client_addr_hex": "3139382e35312e3130302e373a3434333231",
+    "carrier_id_hex": "636172726965722d41",
+    "issued_at": 1000000,
+    "cookie_wire_hex": "01000006825e3d1f5adf178dc514193f4520454dea000f42401040a977a59d793456659d5e43aea544",
+    "verifies": true
+  },
+  "rln": {
+    "description": "§7.4 two shares in one epoch recover identity_secret",
+    "identity_secret_hex": "e5c0ad0b00000000000000000000000000000000000000000000000000000000",
+    "epoch_id": 99,
+    "relay_scope_id_hex": "72656c61792d73636f70652d31",
+    "message_hash_1": "6f00000000000000000000000000000000000000000000000000000000000000",
+    "message_hash_2": "de00000000000000000000000000000000000000000000000000000000000000",
+    "share_a1_1_hex": "80718cd88dc749f2b44d91fba6b2bb1d7a3bfb1a652b6afcfb0e526cb33f0508",
+    "share_a1_2_hex": "2e4e7548012c818c93fe2a546f6b9826f476f635ca56d4f8f71da4d8667f0a00",
+    "nullifier_hex": "085a94187605850d6d0e5d2e4e958873b0f4d43c7f25cee1b0eb5fbe2c834806",
+    "recovered_secret_hex": "e5c0ad0b00000000000000000000000000000000000000000000000000000000",
+    "recovery_matches": true
+  }
+}

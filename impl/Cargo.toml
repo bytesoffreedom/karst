@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["admission", "node", "client", "gui", "desktop"]
+
+# Deterministic codegen for reproducible release builds: parallel codegen units can reorder
+# output, so pin to one. Slower to compile, but a release must be byte-reproducible.
+# (See docs/design/reproducible-builds.md for the remaining sources — build paths, Tauri.)
+[profile.release]
+codegen-units = 1

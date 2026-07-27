@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible problem in KARST (NOT a security vulnerability)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security vulnerabilities here.** Use the private channel:
+        GitHub → **Security** → **Report a vulnerability**. This form is for
+        functional bugs only. KARST is experimental and unaudited.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - client
+        - node (relay)
+        - admission
+        - desktop
+        - gui
+        - docs / build / CI
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version (commit hash)
+      placeholder: e.g. faceaf0
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: OS, Rust version (rustc -V), how you built/ran it
+    validations:
+      required: false

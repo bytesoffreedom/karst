@@ -1,0 +1,81 @@
+name: release
+
+# Cut a signed, reproducible release on a version tag (e.g. `git tag v0.1.0 && git push --tags`).
+# Builds the CLI + relay binaries with the SAME reproducible-build script anyone can run
+# (scripts/build-reproducible.sh), signs the SHA256SUMS with minisign, and publishes a GitHub
+# Release. See docs/RELEASING.md for the one-time key setup. NOTE: this workflow is only
+# exercised on a tag push, so it is correct-by-construction, not covered by PR CI.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the Release and upload assets
+
+jobs:
+  release:
+    name: signed reproducible release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      # The SAME script a verifier runs — so the published binaries are byte-for-byte what
+      # anyone rebuilding from this tag produces.
+      - name: reproducible build (karst, karst-relay)
+        working-directory: impl
+        run: ./scripts/build-reproducible.sh
+
+      - name: checksums
+        working-directory: impl/target/release
+        run: sha256sum karst karst-relay > SHA256SUMS
+
+      - name: install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      # Sign the CHECKSUMS file (one signature covers every artifact by its hash). The private
+      # key is a repo secret (passwordless: a password would also live in a secret, so it adds
+      # nothing against a GitHub compromise — see docs/RELEASING.md).
+      - name: sign checksums
+        working-directory: impl/target/release
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set (see docs/RELEASING.md)"; exit 1
+          fi
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          minisign -S -s minisign.key -m SHA256SUMS -t "KARST ${GITHUB_REF_NAME}" </dev/null
+          shred -u minisign.key 2>/dev/null || rm -f minisign.key
+
+      # Release notes to a file (avoids fragile heredoc-in-command-substitution indentation).
+      - name: release notes
+        run: |
+          cat > /tmp/notes.md <<'NOTES'
+          Reproducible + signed build of the CLI (`karst`) and relay (`karst-relay`).
+
+          **Verify** (do not skip this) — public key in the README:
+          ```
+          minisign -Vm SHA256SUMS -P <KARST_MINISIGN_PUBLIC_KEY>
+          sha256sum -c SHA256SUMS
+          ```
+          **Or rebuild and compare**, trusting neither this build nor the signature — a
+          signed-but-backdoored binary is still signed; a reproduced one provably matches source:
+          ```
+          git checkout TAG && impl/scripts/build-reproducible.sh   # same sha256s as SHA256SUMS
+          ```
+          The desktop (Tauri) bundle is not yet bit-for-bit reproducible — see
+          docs/design/reproducible-builds.md.
+          NOTES
+
+      # Built-in gh CLI — no third-party release action in the most security-sensitive job.
+      - name: publish release
+        working-directory: impl/target/release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            karst karst-relay SHA256SUMS SHA256SUMS.minisig \
+            --title "KARST ${GITHUB_REF_NAME}" --notes-file /tmp/notes.md

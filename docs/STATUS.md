@@ -1829,6 +1829,21 @@ std-TCP, thread-per-connection, bare (no §15 transport obfuscation), `RelayNode
 `Mutex` — §15 (QUIC + transport obfuscation) will replace the loop with async; only the
 `Transport` contract is durable.
 
+**An unadmitted connection is on a short leash (R2-13).** Admission is applied per
+request, INSIDE the Noise session — it cannot be applied earlier, because the
+credential travels encrypted, so a peer with no intention of authenticating still
+gets a connection slot and a handshake. Nothing fixes that ordering. What is fixed
+is the cost of holding the slot: after `MAX_UNADMITTED_REQUESTS` (8) requests
+without a single one getting past admission, the relay drops the connection instead
+of letting it sit until `CONN_TOTAL_DEADLINE` (2 min). "Got past admission" is an
+allowlist on purpose — only the classes that actually run the cookie/capability/quota
+gate count, and only when the answer was not a refusal. The obvious denylist
+("anything that is not `NeedCookie`/`Rejected`") would let a stranger buy the full
+deadline with one `BlobStat`, since the public reads answer without looking at a
+credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_leash`
+(client e2e), which carries its own control: a legitimate upload sends MORE requests
+than the leash allows and is untouched, because its second request is admitted.
+
 **Mailbox cap — no silent loss.** `fetch` drains the box before writing the frame;
 if the queue outgrew `MAX_RESPONSE_FRAME`, the frame would not be written but the
 box is already deleted → a silent loss of the entire queue of an offline

@@ -69,6 +69,52 @@ const CONN_TOTAL_DEADLINE: Duration = Duration::from_secs(120);
 /// handful of legitimate concurrent clients.
 const MAX_CONNECTIONS: usize = 1024;
 
+/// How many requests a connection may make WITHOUT ever having one admitted, before it is
+/// dropped (R2-13).
+///
+/// Admission is applied per REQUEST, after the Noise handshake — it cannot be applied earlier,
+/// because the credential travels inside the encrypted channel. So a peer that never intends to
+/// authenticate still costs a connection slot and a handshake, and could then sit in the request
+/// loop until `CONN_TOTAL_DEADLINE` (two minutes) issuing rejects. With `MAX_CONNECTIONS` slots
+/// that is a cheap way to hold the whole pool against everyone else.
+///
+/// This does not make admission happen sooner; nothing can. It makes an UNADMITTED connection
+/// cheap to hold and expensive to keep. Eight is generous for the legitimate shape — the cookie
+/// challenge costs one round trip, and a client that just had its cookie epoch rotate may spend
+/// another — while a peer with no credential runs out almost immediately.
+pub const MAX_UNADMITTED_REQUESTS: usize = 8;
+
+/// Can this request class prove the sender was admitted?
+///
+/// True only for the classes that actually run the cookie/capability/quota gate. The public
+/// reads (bundle lookup without a one-time prekey, node list, policy, blob stat, discovery
+/// resolution) answer from state the relay publishes to anyone, so serving one says nothing
+/// about the peer and must not extend its leash.
+fn requires_admission(req: &WireRequest) -> bool {
+    matches!(
+        req,
+        WireRequest::Send(_)
+            | WireRequest::Fetch(_)
+            | WireRequest::Ack(_)
+            | WireRequest::PublishBundle(_)
+            | WireRequest::FetchBundleOpk(_)
+            | WireRequest::BlobPut(_)
+            | WireRequest::BlobGet(_)
+            | WireRequest::Join(_)
+    )
+}
+
+/// Is this response the relay turning the peer away rather than serving it?
+fn is_refusal(resp: &WireResponse) -> bool {
+    matches!(
+        resp,
+        WireResponse::NeedCookie(_)
+            | WireResponse::Rejected(_)
+            | WireResponse::PowRequired { .. }
+            | WireResponse::Blob(BlobResponse::NeedCookie(_) | BlobResponse::Rejected(_))
+    )
+}
+
 /// SEC-41 (#226): ceiling on the PoW difficulty a relay's `PowRequired` challenge may
 /// declare before `join()` refuses to solve it. `admission::pow::solve` is a plain loop
 /// over `WireResponse::PowRequired.difficulty_bits` — nothing bounded what the RELAY could
@@ -248,8 +294,15 @@ fn handle_conn(
     // while holding a single `ConnLimiter` slot. A one-shot client is unchanged: it sends one
     // request, reads one response, closes — the next read hits EOF and the loop ends.
     let started = std::time::Instant::now();
+    // Has this connection ever had a request ADMITTED? Until it has, it is a stranger holding a
+    // slot, and is held to a much shorter leash (R2-13).
+    let mut admitted = false;
+    let mut unadmitted_requests = 0usize;
     for _ in 0..MAX_REQUESTS_PER_CONN {
         if started.elapsed() > CONN_TOTAL_DEADLINE {
+            break;
+        }
+        if !admitted && unadmitted_requests >= MAX_UNADMITTED_REQUESTS {
             break;
         }
         // Read with the blob ceiling: it covers both the tight normal requests and a
@@ -279,6 +332,11 @@ fn handle_conn(
             ));
         }
 
+        if !admitted {
+            unadmitted_requests += 1;
+        }
+        // Whether THIS class can prove admission has to be read before `req` is consumed below.
+        let credentialed = requires_admission(&req);
         let resp = match req {
         WireRequest::Send(msg) => {
             let now = (clock)(); // время СЕРВЕРА
@@ -383,6 +441,18 @@ fn handle_conn(
             WireResponse::Discovery(relay.lock().expect("relay mutex").handle_lookup_discovery(&pseudonym, now))
         }
     };
+
+        // R2-13: did this request PROVE admission? Only a credentialed class that came back
+        // with something other than a refusal does. The rule is an allowlist on purpose — the
+        // obvious denylist ("anything that isn't NeedCookie/Rejected counts") would let a
+        // stranger buy the full deadline with one `BlobStat`, since the public reads answer
+        // without ever looking at a credential.
+        //
+        // Once earned, admission is not revoked by a later reject: a legitimate client that
+        // trips a quota mid-upload should get its error responses, not a severed connection.
+        if credentialed && !is_refusal(&resp) {
+            admitted = true;
+        }
 
         // A blob chunk download needs the large frame; every other response is small and
         // must stay on the tight ceiling (the fetch page's fixed 16 KiB size class).

@@ -2201,6 +2201,100 @@ fn one_session_streams_a_whole_blob() {
     );
 }
 
+/// R2-13 (#164): admission is applied per request, INSIDE the Noise session — it cannot be
+/// applied before the handshake, because the credential travels encrypted. So a peer with no
+/// intention of authenticating still gets a connection slot and a handshake, and (before this
+/// fix) could then sit in the request loop until `CONN_TOTAL_DEADLINE` — two minutes — issuing
+/// requests that are all refused. `MAX_CONNECTIONS` such peers hold the whole handler pool
+/// against everyone else, for free.
+///
+/// The fix cannot make admission happen sooner. It makes an UNADMITTED connection cheap to
+/// hold: after `MAX_UNADMITTED_REQUESTS` requests without a single one getting past admission,
+/// the relay drops it. This test drives the attack shape — a `BlobPut` that never presents the
+/// cookie it is handed, so every response is `NeedCookie` — and asserts the connection dies at
+/// the leash, NOT after 20 free requests. Neuter the check and the loop runs to 20 → RED.
+///
+/// The control below is the point: the same leash must be invisible to a legitimate upload,
+/// which crosses the same threshold in request count but is admitted early.
+#[test]
+fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
+    let (addr, id) = spawn_relay_with_blobs();
+    let t = SocketTransport::new(addr, id.noise_pub);
+    let mut sess = t.open_blob_session().expect("open a reusable session");
+
+    let attempts = node::socket::MAX_UNADMITTED_REQUESTS + 12;
+    let mut served = 0usize;
+    for index in 0..attempts {
+        let nonce = node::node::blob_put_nonce(&[0x77; 32], index as u32);
+        let req = BlobPutRequest {
+            request_nonce: nonce.clone(),
+            capability_proof: client::dev_capability().prove(&nonce, 0),
+            client_addr: vec![0x22u8; 32],
+            carrier_id: b"karst-blob".to_vec(),
+            // Never presented, though the relay hands one back every time: this is the whole
+            // attack — stay unadmitted while holding the slot.
+            cookie: None,
+            blob_id: [0x77; 32],
+            index: index as u32,
+            count: 1,
+            data: vec![0u8; 16],
+        };
+        match sess.put(&req) {
+            Ok(BlobResponse::NeedCookie(_)) => served += 1,
+            Ok(other) => panic!("a cookie-less put must be refused, got {other:?}"),
+            Err(_) => break, // the relay closed the connection — the leash
+        }
+    }
+    assert_eq!(
+        served,
+        node::socket::MAX_UNADMITTED_REQUESTS,
+        "an unadmitted connection must be dropped after exactly {} refused requests, not held \
+         open for {attempts}",
+        node::socket::MAX_UNADMITTED_REQUESTS
+    );
+
+    // CONTROL: a legitimate upload sends MORE requests than the leash allows and must be
+    // untouched by it, because its second request is admitted. Without this arm the test above
+    // would also pass a fix that simply capped every connection at 8 requests — which would
+    // break real uploads.
+    let mut sess = t.open_blob_session().expect("open a second reusable session");
+    let count = (node::socket::MAX_UNADMITTED_REQUESTS + 4) as u32;
+    let blob_id = [0x78; 32];
+    let mut cookie = None;
+    let mut requests = 0usize;
+    for index in 0..count {
+        loop {
+            requests += 1;
+            let nonce = node::node::blob_put_nonce(&blob_id, index);
+            let req = BlobPutRequest {
+                request_nonce: nonce.clone(),
+                capability_proof: client::dev_capability().prove(&nonce, 0),
+                client_addr: vec![0x33u8; 32],
+                carrier_id: b"karst-blob".to_vec(),
+                cookie,
+                blob_id,
+                index,
+                count,
+                data: vec![index as u8; 32],
+            };
+            match sess.put(&req).expect("an ADMITTED session must survive past the leash") {
+                BlobResponse::NeedCookie(c) => cookie = Some(c),
+                BlobResponse::Stored | BlobResponse::Complete => break,
+                other => panic!("unexpected blob response: {other:?}"),
+            }
+        }
+    }
+    assert!(
+        requests > node::socket::MAX_UNADMITTED_REQUESTS,
+        "the control must actually cross the leash: {requests} requests"
+    );
+    assert_eq!(
+        t.blob_stat(blob_id).unwrap(),
+        Some((count, count, true)),
+        "the whole blob completed over one admitted session"
+    );
+}
+
 /// A dead loopback address (nothing listens on these low ports).
 fn dead_addr(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()

@@ -27,7 +27,12 @@ fn main() {
     vault.create_account_dir(&id).unwrap();
     let store = vault.account(&id);
     store.save_seed(&entropy).unwrap();
-    store.save_capability(&client::dev_capability()).unwrap();
+    // A capability belongs to ONE relay (CRYPTO-24), so the demo seeds the dev credential for
+    // each relay it configures below — primary and backup.
+    for id_hex in [env("PRIMARY_ID"), env("BACKUP_ID")] {
+        let rid = client::RelayId::parse(&id_hex).expect("relay-id hex");
+        store.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    }
     vault.save_registry(&[AccountEntry { id: id.clone(), label: "Демо".into(), ik }]).unwrap();
 
     store

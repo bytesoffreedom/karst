@@ -736,12 +736,51 @@ pub fn discover_relays(relay: &Relay) -> Result<Vec<node::node::RelayDescriptor>
         .map_err(|e| format!("node-list fetch failed: {e}"))
 }
 
+/// Dial a heard descriptor's address hint and return an address the relay declares for ITSELF.
+///
+/// CRYPTO-23. `node::gossip::verify` proves that whoever answers at `hint` holds `d.noise_pub`
+/// and serves a node-list containing the full relay-id — but it never asks whether `hint` is an
+/// address of that relay. A transparent TCP/WebSocket proxy in front of an honest relay passes
+/// both checks: the Noise handshake terminates at the real relay, so the byte stream really is
+/// authenticated, while the client stores the PROXY as its route. That hands whoever put the
+/// address into the node-list a permanent vantage point on the route — client IP on a direct
+/// carrier, connection timing, volume, and selective delay/drop — without ever breaking Noise.
+///
+/// The fix is not to compare `hint` against the relay's self-descriptor: comparing addresses
+/// needs canonicalization rules (host vs IP, carrier, port, path) and every rule that says "these
+/// two strings are different" also refuses an honest relay reached by a different spelling. So
+/// the hint is used ONLY as a place to dial, and the address that gets STORED comes out of the
+/// authenticated self-descriptor. An address nobody but the gossiping peer vouches for is then
+/// never adopted as a route, whatever it looks like.
+///
+/// Returns `None` when the dial fails, when the relay does not advertise its own full relay-id
+/// (it is then undiscoverable by design — see `gossip::verify`), or when every address it
+/// declares is one we may not dial (`allow_private`, the SSRF gate — the self-declared address
+/// is peer-controlled data too, just controlled by a different peer).
+fn verified_self_address(
+    d: &node::node::RelayDescriptor,
+    hint: &str,
+    allow_private: bool,
+) -> Option<String> {
+    if !node::gossip::addr_is_dialable(hint, allow_private) {
+        return None; // never dial into private/loopback space on a peer's say-so (A3-12)
+    }
+    let dest = Dest::parse(hint).ok()?;
+    let list = SocketTransport::new(dest, d.noise_pub).get_node_list().ok()?;
+    // Noise authenticated the far end as the holder of `d.noise_pub`; among the descriptors IT
+    // serves, its own entry (full relay-id: noise AND fetch key) is the only one it vouches for
+    // with that key, so its addresses are the only ones this exchange can attribute to it.
+    let self_entry = list.iter().find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
+    self_entry.addrs.iter().find(|a| node::gossip::addr_is_dialable(a, allow_private)).cloned()
+}
+
 /// §12 — discover relays from a known one and IMPORT the verified ones into this account's
 /// multi-homing set (secondaries). This is the client side of the STATUS "auto-dial" pin:
-/// a discovered relay is added ONLY after `node::gossip::verify` confirms, by dialing it, that
-/// its address really serves the claimed full relay-id — so the client never multi-homes onto a
-/// relay it hasn't confirmed (no reflection, no fetch-key spoof). Dedups against the primary and
-/// existing secondaries. Returns how many new relays were added.
+/// a discovered relay is added ONLY after a dial confirms it serves the claimed full relay-id —
+/// so the client never multi-homes onto a relay it hasn't confirmed (no reflection, no fetch-key
+/// spoof) — and the route that gets stored is the one the relay itself advertises, not the
+/// address the gossiping peer supplied (`verified_self_address`, CRYPTO-23). Dedups against the
+/// primary and existing secondaries. Returns how many new relays were added.
 pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, String> {
     let discovered = discover_relays(from)?;
     let mut extras = store.load_extra_relays().map_err(|e| format!("relay list: {e}"))?;
@@ -778,12 +817,12 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
         if known.contains(&id_hex) || d.addrs.is_empty() {
             continue;
         }
-        let addr = d.addrs[0].clone();
         // VERIFY-BEFORE-ADD: dial and confirm the relay serves its own full relay-id before
-        // trusting it enough to route our mail through it.
-        if !node::gossip::verify(&d, &addr, allow_private) {
+        // trusting it enough to route our mail through it — and take the ROUTE from what it
+        // says about itself, not from the peer that told us about it (CRYPTO-23).
+        let Some(addr) = verified_self_address(&d, &d.addrs[0], allow_private) else {
             continue;
-        }
+        };
         // POLICY PREFERENCE: skip a verified relay whose advertised policy does not match.
         // ONE fetch covers both knobs — asking twice would double the dial cost and could even
         // straddle a policy change.
@@ -828,6 +867,14 @@ impl RelayId {
         noise_pub.copy_from_slice(&bytes[..32]);
         fetch_pub.copy_from_slice(&bytes[32..]);
         Ok(RelayId { noise_pub, fetch_pub })
+    }
+
+    /// The canonical 128-hex form (`noise_pub ‖ fetch_pub`, lowercase) — the key everything
+    /// relay-scoped is stored under. Same string `RelayDescriptor::relay_id_hex` produces, so a
+    /// discovered relay and a configured one land on the same key.
+    pub fn hex(&self) -> String {
+        node::node::RelayDescriptor { noise_pub: self.noise_pub, fetch_pub: self.fetch_pub, addrs: vec![] }
+            .relay_id_hex()
     }
 }
 
@@ -1069,8 +1116,15 @@ pub const OPK_TARGET: usize = 16;
 /// Publish this account's bundle WITH a topped-up batch of one-time prekeys, persisting the
 /// secrets in the sidecar so `recv_session` can accept openers that used them. This is the
 /// end-to-end one-time-prekey publish path (the plain `publish_bundle` advertises none).
-pub fn publish_with_opks(store: &Store, relay: &Relay, cap: Capability, now: u64) -> Result<PublishResponse, String> {
+pub fn publish_with_opks(store: &Store, relay: &Relay, now: u64) -> Result<PublishResponse, String> {
     let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
+    // The credential for THIS relay (CRYPTO-24): creating a bundle slot is metered on the
+    // reference relay (`handle_publish`), so presenting another relay's capability here is a
+    // rejection, not a harmless extra field — it is what kept an account from ever becoming
+    // reachable on its backup relays.
+    let cap = store
+        .load_capability_for(&relay.id)
+        .map_err(|e| format!("cannot publish to this relay: {e}"))?;
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
@@ -1084,6 +1138,13 @@ pub fn publish_with_opks(store: &Store, relay: &Relay, cap: Capability, now: u64
     // contacts fall back to 3-DH. Bounded and self-healing; correctness beats that efficiency.
     // Persist BEFORE publishing: the relay must never advertise an OPK whose secret we have not
     // durably stored, or an opener using it could not be accepted.
+    //
+    // Under the sessions flock: the prekey secrets share the session file (CRYPTO-26), so
+    // topping them up is a read-modify-write that a concurrent send/receive would otherwise
+    // interleave with — one of the two writes would drop the other's half. Publish is not on a
+    // hot path, and no caller of this function holds the lock already (checked: nothing between
+    // `publish_all` and the desktop/CLI entry points takes it).
+    let _lock = store.lock_sessions().map_err(|e| format!("session lock: {e}"))?;
     peer.load_opks(&store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?);
     let fresh = if peer.opk_count() < OPK_TARGET {
         peer.add_opks(OPK_TARGET - peer.opk_count())
@@ -1108,22 +1169,30 @@ pub fn publish_with_opks(store: &Store, relay: &Relay, cap: Capability, now: u64
 /// unreachable or rejects is logged and skipped: a dead backup relay must not fail the whole
 /// publish, the same resilience the receive path has.
 ///
-/// NOTE: publish is capability-free in this REFERENCE relay (cookie + IK-ownership proof
-/// only — see `RelayNode::handle_publish`), so every relay takes the same stored capability
-/// slot. If publish ever becomes admission-gated, this inherits the send-side's need for a
-/// per-relay capability.
-pub fn publish_all(
-    store: &Store,
-    relays: &[Relay],
-    cap: Capability,
-    now: u64,
-) -> Result<PublishResponse, String> {
+/// NOTE, corrected (CRYPTO-24): publish is NOT capability-free. Refreshing a slot you already
+/// own is unmetered, but CREATING one presents a capability proof and is charged
+/// (`RelayNode::handle_publish`, CRYPTO-18) — which is exactly the first publish to a new
+/// secondary. So each relay's own credential is loaded here, and a relay this account has no
+/// credential for is skipped with a reason rather than published to under another's.
+pub fn publish_all(store: &Store, relays: &[Relay], now: u64) -> Result<PublishResponse, String> {
     let (primary, secondaries) = relays.split_first().ok_or("no relays configured")?;
-    let primary_resp = publish_with_opks(store, primary, cap.clone(), now)?;
+    let primary_resp = publish_with_opks(store, primary, now)?;
     for relay in secondaries {
+        // Each relay gets ITS OWN credential (CRYPTO-24). A relay we hold none for is SKIPPED
+        // with a reason, not published to under the primary's: that would be rejected there
+        // anyway (creating a slot is metered) and would hand a second operator the same
+        // `capability_id`, linking two otherwise-unrelated deployments' view of this account for
+        // nothing in return.
+        let cap = match store.load_capability_for(&relay.id) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("not publishing to secondary relay {}: {e}", relay.addr);
+                continue;
+            }
+        };
         // Fresh account = empty OPK batch → advertises NONE (see the OPK note above).
         let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
-        match publish_bundle(relay, account, cap.clone(), now) {
+        match publish_bundle(relay, account, cap, now) {
             PublishResponse::Published => {}
             other => eprintln!("publish to secondary relay {}: {other:?}", relay.addr),
         }
@@ -1236,8 +1305,8 @@ pub fn send_session(
 ) -> Result<bool, String> {
     let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
     let cap = store
-        .load_capability()
-        .map_err(|_| "нет capability (karst dev-cap / import-cap)".to_string())?;
+        .load_capability_for(&relay.id)
+        .map_err(|e| format!("cannot send through this relay: {e}"))?;
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
@@ -1380,8 +1449,8 @@ pub fn send_session_batch(
     }
     let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
     let cap = store
-        .load_capability()
-        .map_err(|_| "нет capability (karst dev-cap / import-cap)".to_string())?;
+        .load_capability_for(&relay.id)
+        .map_err(|e| format!("cannot send through this relay: {e}"))?;
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
@@ -1440,8 +1509,8 @@ pub fn flush_outbox(store: &Store, relay: &Relay, now: u64) -> Result<usize, Str
     // while the sender believes the message passed normal admission (A8-11). A capability we
     // cannot read is a reason to stop retrying, not to downgrade silently.
     let cap = store
-        .load_capability()
-        .map_err(|e| format!("cannot read this account's admission capability: {e}"))?;
+        .load_capability_for(&relay.id)
+        .map_err(|e| format!("cannot flush through this relay: {e}"))?;
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
@@ -1870,8 +1939,8 @@ pub fn send_file(
     // The upload now presents a capability (CRYPTO-15): storing bytes on a relay is metered like
     // every other write, and this is the path that stores the most.
     let cap = store
-        .load_capability()
-        .map_err(|_| "no capability for the blob upload (karst dev-cap / import-cap)".to_string())?;
+        .load_capability_for(&relay.id)
+        .map_err(|e| format!("no credential for the blob upload: {e}"))?;
     let (blob_id, key, hash, count) =
         blob_upload_resumable(relay, &cap, std::io::Cursor::new(bytes), size, blob_id, key)?;
     let fileref = content::Content::FileRef { blob_id, key, hash, name: name.to_string(), size, chunks: count };
@@ -1954,7 +2023,7 @@ pub fn send_gallery_blob(
     let (blob_id, key, hash, count) =
         blob_upload(
             relay,
-            &store.load_capability().map_err(|_| "no capability for the blob upload".to_string())?,
+            &store.load_capability_for(&relay.id).map_err(|e| format!("no credential for the blob upload: {e}"))?,
             std::io::Cursor::new(&packed),
             packed.len() as u64,
         )?;
@@ -2040,7 +2109,7 @@ pub fn send_post_attachment_blob(
     let (blob_id, key, hash, count) =
         blob_upload(
             relay,
-            &store.load_capability().map_err(|_| "no capability for the blob upload".to_string())?,
+            &store.load_capability_for(&relay.id).map_err(|e| format!("no credential for the blob upload: {e}"))?,
             std::io::Cursor::new(bytes),
             bytes.len() as u64,
         )?;
@@ -2948,16 +3017,18 @@ pub fn recv_session(
     // deletes the used ones, and we persist the remainder so they are never reused.
     peer.load_opks(&store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?);
     let msgs = peer.receive(now)?;
-    // PLAINTEXT-FIRST: persist the decrypted text to history BEFORE burning OPKs, saving the
-    // ratchet, or acking. This closes both former loss windows — `[save_opks → save_sessions]`
-    // (burned OPK, unsaved session: a redelivered opener can't re-derive the 4th DH) and
-    // `[save_sessions → history]` (advanced ratchet, unpersisted plaintext) — because the
-    // plaintext is now durable before either commit. A crash here just redelivers; the dedup
-    // (or the ratchet's fail-closed on an already-advanced session) prevents a double. The
-    // whole op runs under the sessions flock, so no concurrent receive can interleave.
+    // PLAINTEXT-FIRST: persist the decrypted text to history BEFORE the state commit or the ACK,
+    // so a crash between them cannot lose the message (`[save_sessions → history]`: advanced
+    // ratchet, unpersisted plaintext). A crash here just redelivers; the dedup (or the ratchet's
+    // fail-closed on an already-advanced session) prevents a double. The whole op runs under the
+    // sessions flock, so no concurrent receive can interleave.
     persist_incoming_history(store, &msgs, now)?;
-    store.save_opks(&peer.export_opks()).map_err(|e| format!("saving one-time prekeys: {e}"))?;
-    store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий: {e}"))?;
+    // The burnt one-time prekey and the session derived from it commit TOGETHER (CRYPTO-26):
+    // two writes here meant a crash could leave the prekey gone with no session to show for it,
+    // and the redelivered opener then had nothing left to re-derive the 4th DH term from.
+    store
+        .save_receive_commit(&peer.export_state(), &peer.export_opks())
+        .map_err(|e| format!("saving the receive commit: {e}"))?;
     // Plaintext + ratchet + OPKs durable ⇒ safe to delete the leased messages from the relay.
     peer.ack_all(now);
     Ok(msgs)
@@ -3183,12 +3254,14 @@ pub fn recv_session_multi(store: &Store, relays: &[Relay], now: u64) -> Result<M
     let opks = store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?;
     let out = receive_threaded(account, state, opks, &pairs, now);
     // PLAINTEXT-FIRST (same discipline as `recv_session`, all under the sessions flock):
-    // persist decrypted text to history BEFORE saving OPKs/sessions and BEFORE the ACKs, so a
+    // persist decrypted text to history BEFORE the state commit and BEFORE the ACKs, so a
     // crash between the commit and the plaintext write cannot lose the message. Deduped by
-    // `payload_id`.
+    // `payload_id`. The prekeys and the ratchet then commit as ONE write (CRYPTO-26) — see
+    // `Store::save_receive_commit`.
     persist_incoming_history(store, &out.messages, now)?;
-    store.save_opks(&out.opks).map_err(|e| format!("saving one-time prekeys: {e}"))?;
-    store.save_sessions(&out.state).map_err(|e| format!("saving sessions: {e}"))?;
+    store
+        .save_receive_commit(&out.state, &out.opks)
+        .map_err(|e| format!("saving the receive commit: {e}"))?;
     // Plaintext + state are durable IN THIS STORE — which is the whole story for a file-tree
     // account and only half of it for a container-backed one (SEC-34). So the leases are handed
     // back instead of acked here: each receipt carries the transport of the relay that leased it
@@ -3209,7 +3282,9 @@ pub fn recv_session_multi(store: &Store, relays: &[Relay], now: u64) -> Result<M
 /// relay itself this is only cover once the two legs ride independent paths.
 pub fn send_loop(store: &Store, relay: &Relay, now: u64) -> Result<usize, String> {
     let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
-    let cap = store.load_capability().map_err(|_| "no capability".to_string())?;
+    let cap = store
+        .load_capability_for(&relay.id)
+        .map_err(|e| format!("cannot send a loop through this relay: {e}"))?;
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);

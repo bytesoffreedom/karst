@@ -60,7 +60,9 @@ b() { KARST_HOME="$BOB"   KARST_PASSPHRASE=pw KARST_WSS=localhost KARST_WSS_ROOT
 echo "== both accounts init + publish (through wss) =="
 a init >/dev/null; b init >/dev/null
 ALICE_IK="$(a account)"; BOB_IK="$(b account)"
-a dev-cap >/dev/null; b dev-cap >/dev/null
+# A capability belongs to ONE relay now, so name it (CRYPTO-24).
+a dev-cap --relay "$ADDR" --relay-id "$RID" >/dev/null
+b dev-cap --relay "$ADDR" --relay-id "$RID" >/dev/null
 a publish --relay "$ADDR" --relay-id "$RID"
 b publish --relay "$ADDR" --relay-id "$RID"
 

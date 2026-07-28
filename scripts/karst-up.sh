@@ -37,7 +37,7 @@ relay-id: $RID
   (saved in $RUN/relay-id; log $RELAY_LOG)
 
 ── Option A: the desktop app (the product) ───────────────────────────────────
-  cd impl && cargo run -p desktop        # the Tauri client
+  cd impl && KARST_DEV_CAP=1 cargo run -p desktop   # the Tauri client (dev cap: local demo only)
   First run: "Create account" → write down the 12 words (recovery phrase) →
   confirm the words → set a passphrase → "Create account". Point it at the relay
   address and relay-id above. Copy your IK, paste it as a contact in the other
@@ -47,7 +47,7 @@ relay-id: $RID
   export R="--relay $ADDR --relay-id $RID"
   # Alice:
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI init
-  KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI dev-cap
+  KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI dev-cap \$R
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI publish \$R
   # Bob (in another window) — same, then find each other's IK:
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI account   # → Alice's IK

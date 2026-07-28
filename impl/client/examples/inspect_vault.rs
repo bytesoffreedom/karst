@@ -129,8 +129,12 @@ fn main() {
     // `... <dir> <pw> refreshcap` — overwrite the account's dev capability with the current (raised
     // quota) one, so stuck-in-outbox chunks flush without waiting for the old window.
     if mode.as_deref() == Some("refreshcap") {
-        root.save_capability(&client::dev_capability()).expect("save capability");
-        println!("dev capability refreshed (raised quota)");
+        // Per relay (CRYPTO-24): there is no account-wide credential to refresh any more, so this
+        // refreshes the configured primary's — the one this account actually sends through.
+        let net = root.load_net().unwrap_or_default();
+        let rid = client::RelayId::parse(&net.relay_id).expect("this account has no primary relay configured");
+        root.save_capability_for(&rid, &client::dev_capability()).expect("save capability");
+        println!("dev capability refreshed for the primary relay (raised quota)");
         return;
     }
 

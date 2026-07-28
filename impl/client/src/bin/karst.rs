@@ -34,7 +34,7 @@ fn main() -> ExitCode {
         "qr" => cmd_qr(),
         "discovery" => cmd_discovery(rest),
         "find" => cmd_find(rest),
-        "dev-cap" => cmd_dev_cap(),
+        "dev-cap" => cmd_dev_cap(rest),
         "join" => cmd_join(rest),
         "relays" => cmd_relays(rest),
         "relay-info" => cmd_relay_info(rest),
@@ -78,12 +78,12 @@ fn print_usage() {
          karst discovery rotate --relay H:P --relay-id X   mint a fresh code (old one stops working)\n\
          karst discovery off --relay H:P --relay-id X  stop being findable; delete the code\n\
          karst find <CODE> --relay H:P --relay-id X    resolve a contact code to an address\n\
-         karst dev-cap                       write the dev capability (local test)\n\
+         karst dev-cap --relay H:P --relay-id X  write the dev capability FOR that relay (local test)\n\
          karst join --relay H:P --relay-id X earn a capability from a PUBLIC relay (PoW)\n\
          karst relays --relay H:P --relay-id X  list relays this one knows about (--add to multi-home)\n\
          karst relay-info --relay H:P --relay-id X  show a relay's advertised policy (persistence, door)\n\
          karst relay-prefs [--persist durable|ephemeral|any]  prefer relays matching a policy (used by relays --add)\n\
-         karst import-cap <file.json>        import a capability (private-relay invite)\n\
+         karst import-cap <file.json> --relay H:P --relay-id X  import a capability FOR that relay (invite)\n\
          karst publish --relay A --relay-id ID  publish your §2.1 bundle (§12)\n\
          karst send --relay A --relay-id ID --to HEX <msg>  send text\n\
          karst send-file --relay A --relay-id ID --to HEX --file PATH  send a file\n\
@@ -225,7 +225,7 @@ fn cmd_discovery(args: &[String]) -> Result<(), String> {
             println!("It's random and unguessable (no username to squat or brute-force), it stays on");
             println!("until you rotate (karst discovery rotate) or turn it off (karst discovery off), and");
             println!("your identity never changes so existing contacts are unaffected.");
-            if !s.has_capability() {
+            if !s.has_capability_for(&r.id) {
                 println!("\nTip: also run `karst publish` at this relay — otherwise someone who finds you");
                 println!("has your address but no bundle to open a conversation with.");
             }
@@ -266,11 +266,14 @@ fn cmd_find(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_dev_cap() -> Result<(), String> {
+/// A capability belongs to ONE relay (CRYPTO-24), so even the dev credential is written against
+/// the relay it will be presented to — there is no account-wide slot left to fall back on.
+fn cmd_dev_cap(args: &[String]) -> Result<(), String> {
+    let r = relay_arg(args)?;
     let s = store()?;
-    s.save_capability(&client::dev_capability())
+    s.save_capability_for(&r.id, &client::dev_capability())
         .map_err(|e| format!("writing capability: {e}"))?;
-    println!("wrote the dev capability (LOCAL TEST; the secret is public)");
+    println!("wrote the dev capability for this relay (LOCAL TEST; the secret is public)");
     Ok(())
 }
 
@@ -367,18 +370,23 @@ fn cmd_join(args: &[String]) -> Result<(), String> {
     println!("solving proof-of-work…");
     let cap = client::earn_capability(&r)?;
     let s = store()?;
-    s.save_capability(&cap).map_err(|e| format!("writing capability: {e}"))?;
+    s.save_capability_for(&r.id, &cap).map_err(|e| format!("writing capability: {e}"))?;
     println!("joined: earned a capability via proof-of-work (you can now send)");
     Ok(())
 }
 
+/// An invite file carries a bare capability with NO relay-id in it (the relay writes exactly the
+/// serialized credential — see `karst-relay`'s `write_invite`), so the relay it is FOR has to be
+/// named here. Storing it against that relay is what keeps it from being presented anywhere else.
 fn cmd_import_cap(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("provide a file: karst import-cap <file.json>")?;
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let path = positional_after_flags(args)
+        .ok_or("usage: karst import-cap <file.json> --relay H:P --relay-id X")?;
+    let r = relay_arg(args)?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let cap = serde_json::from_slice(&bytes).map_err(|e| format!("parsing capability: {e}"))?;
     let s = store()?;
-    s.save_capability(&cap).map_err(|e| format!("writing capability: {e}"))?;
-    println!("capability imported");
+    s.save_capability_for(&r.id, &cap).map_err(|e| format!("writing capability: {e}"))?;
+    println!("capability imported for this relay");
     Ok(())
 }
 
@@ -389,8 +397,8 @@ fn cmd_publish(args: &[String]) -> Result<(), String> {
     let s = store()?;
     let acct = s.load_account().map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "no account (karst init)".to_string() } else { format!("account not decrypted (wrong KARST_PASSPHRASE?): {e}") })?;
     let cap = s
-        .load_capability()
-        .map_err(|_| "no capability (karst dev-cap / import-cap)".to_string())?;
+        .load_capability_for(&r.id)
+        .map_err(|e| format!("cannot publish to this relay: {e}"))?;
 
     match client::publish_bundle(&r, acct, cap, wall_clock()) {
         PublishResponse::Published => {

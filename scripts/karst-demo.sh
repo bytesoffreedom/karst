@@ -42,7 +42,9 @@ echo "Alice IK: $ALICE_IK"
 echo "Bob   IK: $BOB_IK"
 
 echo "== both publish their bundle (§12 discovery) =="
-a dev-cap >/dev/null; b dev-cap >/dev/null
+# A capability belongs to ONE relay now, so name it (CRYPTO-24).
+a dev-cap --relay "$ADDR" --relay-id "$RID" >/dev/null
+b dev-cap --relay "$ADDR" --relay-id "$RID" >/dev/null
 a publish --relay "$ADDR" --relay-id "$RID"
 b publish --relay "$ADDR" --relay-id "$RID"
 

@@ -76,12 +76,12 @@ fn set_up() -> (Store, Store, [u8; 32], client::Relay) {
     let bstore = Store::unlock(temp_dir("outbox-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let live = ctx(addr, &rid);
     assert!(matches!(
-        client::publish_bundle(&live, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&live, bstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
     let delivered = client::send_text(&astore, &live, &bob_ik, b"hello", NOW, NOW).unwrap();

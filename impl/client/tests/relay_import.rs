@@ -102,6 +102,77 @@ fn import_adds_only_verified_relays() {
     assert_eq!(client::import_discovered_relays(&store, &relay_a).unwrap(), 0, "re-import is a no-op");
 }
 
+/// A transparent TCP relay-in-the-middle: accepts on a fresh loopback port and splices every
+/// connection to `upstream` byte-for-byte. It sees no plaintext (Noise runs end-to-end through
+/// it) — which is exactly the point: an attacker does not need to break Noise to become the
+/// route. Returns its address; the threads live for the test.
+fn transparent_proxy(upstream: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(down) = stream else { continue };
+            let Ok(up) = std::net::TcpStream::connect(&upstream) else { continue };
+            let (down_r, up_r) = (down.try_clone().unwrap(), up.try_clone().unwrap());
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut { down_r }, &mut { up });
+            });
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut { up_r }, &mut { down });
+            });
+        }
+    });
+    addr
+}
+
+/// CRYPTO-23: a verified relay must be routed to at the address IT advertises, never at the
+/// address the gossiping peer supplied.
+///
+/// The attack needs no key material and does not touch Noise: relay A (which the client is
+/// discovering from) hands out C's real relay-id with the ATTACKER's endpoint as its address,
+/// and that endpoint transparently splices to C. The Noise handshake authenticates C, and C's
+/// own node-list contains C, so "dial it and check it serves its own relay-id" passes — and the
+/// client used to persist the attacker's endpoint as its route to C, giving the attacker the
+/// client's IP, every connection time and volume, and a selective drop switch, permanently.
+#[test]
+fn import_routes_to_the_relays_own_address_not_a_gossiped_proxy() {
+    let (c_addr, c_np, c_fp) = spawn(vec![]);
+    let proxy_addr = transparent_proxy(c_addr.clone());
+    // A advertises C's REAL relay-id at the PROXY's address — the only thing the attacker lies
+    // about, and the one thing verify-before-add never checked.
+    let (a_addr, a_np, a_fp) = spawn(vec![desc(&proxy_addr, c_np, c_fp)]);
+
+    let store = Store::unlock(temp_dir("proxy-hint"), b"pw").unwrap();
+    let relay_a =
+        Relay::new(a_addr.parse::<std::net::SocketAddr>().unwrap(), RelayId { noise_pub: a_np, fetch_pub: a_fp }, None);
+    let added = client::import_discovered_relays(&store, &relay_a).unwrap();
+    let _ = a_fp;
+
+    assert_eq!(added, 1, "C is a real relay and still imports — the fix must not drop honest peers");
+    let stored: Vec<(String, String)> = store.load_extra_relays().unwrap();
+    let route = &stored.iter().find(|(_, id)| *id == id_hex(c_np, c_fp)).expect("C imported").0;
+    assert_eq!(route, &c_addr, "the stored route must be C's OWN advertised address");
+    assert_ne!(route, &proxy_addr, "the gossiped man-in-the-middle endpoint must never become the route");
+}
+
+/// The other half of CRYPTO-23: an address nobody vouches for is not adopted just because
+/// SOMETHING answered there. The proxy splices to C, but the descriptor claims a relay-id whose
+/// fetch key is not C's, so no self-entry matches and nothing is imported — the pre-existing
+/// fetch-key-spoof defense must survive the change of where the address comes from.
+#[test]
+fn import_refuses_a_descriptor_whose_relay_id_the_endpoint_does_not_serve() {
+    let (c_addr, c_np, c_fp) = spawn(vec![]);
+    let proxy_addr = transparent_proxy(c_addr);
+    let (a_addr, a_np, a_fp) = spawn(vec![desc(&proxy_addr, c_np, [7; 32])]);
+
+    let store = Store::unlock(temp_dir("proxy-spoof"), b"pw").unwrap();
+    let relay_a =
+        Relay::new(a_addr.parse::<std::net::SocketAddr>().unwrap(), RelayId { noise_pub: a_np, fetch_pub: a_fp }, None);
+    assert_eq!(client::import_discovered_relays(&store, &relay_a).unwrap(), 0, "spoofed fetch key must not import");
+    assert!(store.load_extra_relays().unwrap().is_empty());
+    let _ = c_fp;
+}
+
 #[test]
 fn import_honors_a_persistence_preference() {
     // Two real relays advertising DIFFERENT blob policies.

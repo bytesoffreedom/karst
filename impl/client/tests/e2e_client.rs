@@ -48,6 +48,33 @@ fn spawn_relay() -> (SocketAddr, client::RelayId) {
     (addr, client::RelayId { noise_pub, fetch_pub })
 }
 
+/// Like `spawn_relay`, but the relay admits exactly ONE credential of its own — what a
+/// production relay actually does (a Private relay mints a random `capability_id + secret` into
+/// its `capability.key`; a Public one derives a stateless secret from its own issuer key). The
+/// globally-known dev capability is NOT issued here, so a credential from another relay fails
+/// admission exactly as it would in production.
+fn spawn_relay_admitting(cap: admission::capability::Capability) -> (SocketAddr, client::RelayId) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut relay = RelayNode::new(NOW);
+    relay.issue_capability(cap);
+    let fetch_pub = relay.relay_public().to_bytes();
+    let server = RelayServer::new(relay, Arc::new(move || NOW));
+    let noise_pub = server.noise_public();
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+    (addr, client::RelayId { noise_pub, fetch_pub })
+}
+
+/// A credential with its own id and secret, shaped like the dev one (same scope/quota/validity).
+fn own_capability(id: u8, secret: u8) -> admission::capability::Capability {
+    let mut cap = client::dev_capability();
+    cap.capability_id = [id; 16];
+    cap.secret = [secret; 32];
+    cap
+}
+
 /// The connection context for a spawned relay (single direct path, no proxy).
 /// Ask a relay for ONE one-time prekey over the admission-gated path, driving the cookie
 /// round trip by hand. The public `FetchBundle` never carries an OPK any more (R2-3), so any
@@ -328,13 +355,13 @@ fn recv_session_persists_a_fileref_as_a_pending_download() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
     assert!(matches!(
-        client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
 
@@ -367,12 +394,12 @@ fn send_file_large_uploads_a_blob_that_the_recipient_downloads_byte_identical() 
     let bstore = Store::unlock(temp_dir("sfl-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
     assert!(matches!(
-        client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
 
@@ -557,12 +584,12 @@ fn a_post_quantum_opener_carries_a_full_length_first_message() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     // The biggest text a message may carry, as the very FIRST thing said.
@@ -594,12 +621,12 @@ fn a_route_offer_round_trips_with_its_routes_and_relay_key() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     let routes = "wss://relay.example:443 socks5://127.0.0.1:9050";
@@ -632,13 +659,13 @@ fn recv_session_persists_incoming_text_to_history() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     assert!(bstore.load_history().unwrap().is_empty(), "history starts empty");
@@ -670,8 +697,8 @@ fn a_message_between_proxies_delivers_and_the_root_ik_never_appears() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
     bstore.create_proxy("p0", NOW).unwrap();
 
@@ -685,7 +712,7 @@ fn a_message_between_proxies_delivers_and_the_root_ik_never_appears() {
 
     let r = ctx(relay_addr, &relay_id);
     // Bob's PROXY publishes its bundle (the root never publishes).
-    let pr = client::publish_bundle(&r, b.load_account().unwrap(), b.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, b.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "proxy publish: {pr:?}");
 
     // Alice's proxy sends to Bob's PROXY address.
@@ -723,16 +750,16 @@ fn a_first_contact_without_a_one_time_prekey_is_recorded_as_reduced() {
     let cstore = Store::unlock(&cdir, b"pw").unwrap();
     for st in [&astore, &bstore, &cstore] {
         seed_provision(st);
-        st.save_capability(&client::dev_capability()).unwrap();
+        st.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     }
     let r = ctx(relay_addr, &relay_id);
 
     // Bob publishes WITH one-time prekeys; Carol publishes a bundle with none at all.
-    client::publish_with_opks(&bstore, &r, bstore.load_capability().unwrap(), NOW).unwrap();
+    client::publish_with_opks(&bstore, &r,  NOW).unwrap();
     client::publish_bundle(
         &r,
         cstore.load_account().unwrap(),
-        cstore.load_capability().unwrap(),
+        client::dev_capability(),
         NOW,
     );
     let b_ik = bstore.load_account().unwrap().identity_public();
@@ -771,8 +798,8 @@ fn a_proxy_message_via_a_published_opk_delivers() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
     bstore.create_proxy("p0", NOW).unwrap();
 
@@ -782,7 +809,7 @@ fn a_proxy_message_via_a_published_opk_delivers() {
 
     let r = ctx(relay_addr, &relay_id);
     // Desktop path: publish the proxy bundle WITH one-time prekeys (4-DH first contact).
-    client::publish_with_opks(&b, &r, b.load_capability().unwrap(), NOW).unwrap();
+    client::publish_with_opks(&b, &r,  NOW).unwrap();
 
     // Alice's proxy sends — first contact consumes one of Bob's published OPKs.
     client::send_text(&a, &r, &b_proxy, b"hi via proxy opk", NOW, NOW).unwrap();
@@ -817,15 +844,15 @@ fn republishing_opks_never_hands_the_same_prekey_twice() {
     let bdir = temp_dir("opkrepub-b");
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&bstore);
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     bstore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
     let b = bstore.as_proxy(0);
     let b_ik = b.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
 
     // Publish a full OPK batch, then REPUBLISH it unchanged (no consumption between).
-    client::publish_with_opks(&b, &r, b.load_capability().unwrap(), NOW).unwrap();
-    client::publish_with_opks(&b, &r, b.load_capability().unwrap(), NOW).unwrap();
+    client::publish_with_opks(&b, &r,  NOW).unwrap();
+    client::publish_with_opks(&b, &r,  NOW).unwrap();
 
     // Drain every OPK the relay will hand out; each must be distinct, then the batch exhausts
     // (opk_pub == None → 3-DH fallback). A repeat means a republished duplicate is being served.
@@ -863,12 +890,12 @@ fn a_story_delivers_with_its_expiry() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     let id = client::store::random16();
@@ -902,13 +929,13 @@ fn an_avatar_delivers_and_lands_in_the_recipients_peer_profile() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     let avatar = vec![7u8; 5000]; // stand-in PNG bytes, multi-chunk
@@ -954,8 +981,8 @@ fn a_channel_migration_repoints_a_contact_and_clears_verified() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints indices' own random secrets (#207)
     astore.create_proxy("p1", NOW).unwrap();
     bstore.create_proxy("p0", NOW).unwrap();
@@ -973,7 +1000,7 @@ fn a_channel_migration_repoints_a_contact_and_clears_verified() {
         .unwrap();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, b0.load_account().unwrap(), b0.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, b0.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "bob proxy publish: {pr:?}");
 
     // Alice's P0 tells Bob to move to P1 (over the authenticated P0 session).
@@ -1011,8 +1038,8 @@ fn a_queued_channel_migration_blocks_burn_until_it_is_actually_delivered() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap();
     astore.create_proxy("p1", NOW).unwrap();
     bstore.create_proxy("p0", NOW).unwrap();
@@ -1024,7 +1051,7 @@ fn a_queued_channel_migration_blocks_burn_until_it_is_actually_delivered() {
     let b0_ik = b0.load_account().unwrap().identity_public();
 
     let live = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&live, b0.load_account().unwrap(), b0.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&live, b0.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "bob proxy publish: {pr:?}");
 
     // Establish a real ratchet session P0(Alice) <-> P0(Bob) over the LIVE relay first — a
@@ -1077,13 +1104,13 @@ fn a_publication_arrives_in_the_feed_not_the_chat_history() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     let id = client::store::random16();
@@ -1130,13 +1157,13 @@ fn a_publication_image_delivers_and_reunites_with_its_post() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     // Alice publishes a post, then its image as a separate chunked slice tied to the post id.
@@ -1182,13 +1209,13 @@ fn send_text_reports_delivered_when_the_relay_is_up() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
     assert!(matches!(
-        client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
 
@@ -1212,13 +1239,13 @@ fn a_sealed_opener_still_authenticates_the_sender_to_the_recipient() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     client::send_text(&astore, &r, &bob_ik, b"first contact", NOW, NOW).unwrap();
@@ -1252,12 +1279,12 @@ fn recv_session_acks_and_drains_the_relay_over_the_wire() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     client::send_text(&astore, &r, &bob_ik, b"ack me", NOW, NOW).unwrap();
@@ -1340,14 +1367,14 @@ fn a_failed_container_commit_leaves_the_batch_redeliverable() {
     let astore = Store::unlock(&adir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     // The container now holds the PROVISIONED, pre-message account — the state a rollback lands on.
     cv.save().unwrap();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
     client::send_text(&astore, &r, &bob_ik, b"survive the failed commit", NOW, NOW).unwrap();
 
@@ -1415,12 +1442,12 @@ fn a_control_only_batch_still_carries_a_commit_barrier() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
     client::send_reaction(&astore, &r, &bob_ik, [9u8; 16], "👍", true, NOW).unwrap();
 
@@ -1496,8 +1523,11 @@ fn recv_session_multi_delivers_from_live_relays_and_flags_the_dead_one() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    // A credential per relay — this account multi-homes onto both, so it needs both (CRYPTO-24).
+    for id in [&id1, &id2] {
+        astore.save_capability_for(id, &client::dev_capability()).unwrap();
+        bstore.save_capability_for(id, &client::dev_capability()).unwrap();
+    }
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r1 = ctx(addr1, &id1);
@@ -1553,11 +1583,13 @@ fn publish_all_puts_the_bundle_on_every_relay_opks_on_the_primary_only() {
     let bdir = temp_dir("puball-b");
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&bstore);
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    for id in [&id1, &id2] {
+        bstore.save_capability_for(id, &client::dev_capability()).unwrap();
+    }
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let resp =
-        client::publish_all(&bstore, &[ctx(addr1, &id1), ctx(addr2, &id2)], client::dev_capability(), NOW)
+        client::publish_all(&bstore, &[ctx(addr1, &id1), ctx(addr2, &id2)],  NOW)
             .unwrap();
     assert!(matches!(resp, PublishResponse::Published), "primary publish: {resp:?}");
 
@@ -2330,13 +2362,14 @@ fn corrupt_meta_file_loads_as_empty_not_error() {
 
 // ---- Передача файлов через relay (чанкинг + пересборка) ----
 
-/// Провизия §2.1-клиента: account + дев-capability на диске.
-fn provision(tag: &str) -> (PathBuf, Store, [u8; 32]) {
+/// Провизия §2.1-клиента: account + дев-capability ДЛЯ ДАННОГО relay на диске
+/// (capability теперь привязана к relay — CRYPTO-24).
+fn provision(tag: &str, relay: &client::RelayId) -> (PathBuf, Store, [u8; 32]) {
     let dir = temp_dir(tag);
     let store = Store::unlock(&dir, b"pw").unwrap();
     let acct = client::seed::derive(&seed_provision(&store)).account;
     let ik = acct.identity_public();
-    store.save_capability(&client::dev_capability()).unwrap();
+    store.save_capability_for(relay, &client::dev_capability()).unwrap();
     (dir, store, ik)
 }
 
@@ -2344,14 +2377,14 @@ fn provision(tag: &str) -> (PathBuf, Store, [u8; 32]) {
 fn file_transfer_roundtrips_through_relay_byte_identical() {
     use client::content::{decode, Content, Reassembler};
     let (relay, relay_id) = spawn_relay();
-    let (adir, astore, _aik) = provision("file-alice");
-    let (bdir, bstore, bob_ik) = provision("file-bob");
+    let (adir, astore, _aik) = provision("file-alice", &relay_id);
+    let (bdir, bstore, bob_ik) = provision("file-bob", &relay_id);
 
     // Bob публикует bundle (§12) — иначе Alice не инициирует сессию.
     let pr = client::publish_bundle(
         &ctx(relay, &relay_id),
         bstore.load_account().unwrap(),
-        bstore.load_capability().unwrap(),
+        client::dev_capability(),
         NOW,
     );
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
@@ -2694,7 +2727,7 @@ fn a_loop_survives_the_client_seam_and_comes_back() {
     let dir = temp_dir("loop-seam");
     let store = Store::unlock(&dir, b"pw").unwrap();
     seed_provision(&store);
-    store.save_capability(&client::dev_capability()).unwrap();
+    store.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
 
     let r = ctx(relay_addr, &relay_id);
     let back = client::send_loop(&store, &r, NOW).expect("a loop sends and reads back");
@@ -2757,13 +2790,13 @@ fn one_time_prekeys_work_and_persist_across_the_process_per_call_client() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     for s in [&astore, &a2store, &bstore] {
         seed_provision(s);
-        s.save_capability(&client::dev_capability()).unwrap();
+        s.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     }
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
 
     // Bob publishes WITH one-time prekeys (persisted). The sidecar now holds the secrets.
-    let pr = client::publish_with_opks(&bstore, &r, client::dev_capability(), NOW).unwrap();
+    let pr = client::publish_with_opks(&bstore, &r,  NOW).unwrap();
     assert!(matches!(pr, PublishResponse::Published));
     assert!(!bstore.load_opks().unwrap().is_empty(), "OPK secrets were not persisted");
     let opks_after_publish = bstore.load_opks().unwrap().len();
@@ -2811,12 +2844,12 @@ fn two_concurrent_image_posts_both_reunite_with_their_posts() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     let id1 = client::store::random16();
@@ -2884,14 +2917,14 @@ fn simultaneous_first_contact_publications_both_deliver() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
     // Both publish bundles so each is reachable; they exchange nothing else.
-    client::publish_bundle(&r, astore.load_account().unwrap(), astore.load_capability().unwrap(), NOW);
-    client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    client::publish_bundle(&r, astore.load_account().unwrap(), client::dev_capability(), NOW);
+    client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
 
     // Simultaneous first contact: each posts to the other BEFORE either has received anything.
     let ida = client::store::random16();
@@ -2969,12 +3002,12 @@ fn post_attachments_round_trip_images_and_file() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
-    client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
 
     let post_id = client::store::random16();
     client::send_publication(&astore, &r, &bob_ik, post_id, "album", 7, NOW).unwrap();
@@ -3028,12 +3061,12 @@ fn three_large_attachments_all_arrive() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
-    client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
 
     let post_id = client::store::random16();
     client::send_publication(&astore, &r, &bob_ik, post_id, "album", 7, NOW).unwrap();
@@ -3083,13 +3116,13 @@ fn contact_request_and_accept_exchange_profiles() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
-    client::publish_bundle(&r, astore.load_account().unwrap(), astore.load_capability().unwrap(), NOW);
-    client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    client::publish_bundle(&r, astore.load_account().unwrap(), client::dev_capability(), NOW);
+    client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
 
     // A → B: contact request carrying A's profile.
     client::send_contact_request(&astore, &r, &bob_ik, "Alice", "privacy first", NOW).unwrap();
@@ -3145,13 +3178,13 @@ fn post_attachment_blob_round_trips_into_the_feed_sidecar() {
     let bstore = Store::unlock(temp_dir("pab-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
     assert!(matches!(
-        client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
 
@@ -3252,13 +3285,13 @@ fn gallery_blob_round_trips_and_replaces_peer_photos() {
     let bstore = Store::unlock(temp_dir("gal-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
     assert!(matches!(
-        client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
     // Bob must have Alice as a CONFIRMED contact, or her gallery ref is dropped (the gate).
@@ -3301,12 +3334,12 @@ fn gallery_blob_round_trips_and_replaces_peer_photos() {
     // A stranger's gallery ref is DROPPED (not a confirmed contact) — no pending, no fetch.
     let cstore = Store::unlock(temp_dir("gal-c"), b"pw").unwrap();
     seed_provision(&cstore);
-    cstore.save_capability(&client::dev_capability()).unwrap();
+    cstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
     let carol_ik = cstore.load_account().unwrap().identity_public();
     let _ = carol_ik;
     // (Alice is NOT Carol's contact.) Carol receives Alice's ref → nothing pending.
     assert!(matches!(
-        client::publish_bundle(&r, cstore.load_account().unwrap(), cstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, cstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
     let carol_bob_ik = cstore.load_account().unwrap().identity_public();
@@ -3330,8 +3363,8 @@ fn contact_accept_comes_from_the_proxy_that_received_the_request() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints indices' own random secrets (#207)
     bstore.create_proxy("p0", NOW).unwrap();
     bstore.create_proxy("p1", NOW).unwrap();
@@ -3347,11 +3380,11 @@ fn contact_accept_comes_from_the_proxy_that_received_the_request() {
 
     // A must be reachable (for B's accept) and B-proxy-1 reachable (for A's request).
     assert!(matches!(
-        client::publish_bundle(&r, a.load_account().unwrap(), a.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, a.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
     assert!(matches!(
-        client::publish_bundle(&r, b1.load_account().unwrap(), b1.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, b1.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
 
@@ -3391,14 +3424,14 @@ fn posts_request_and_reply_round_trip() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let a_ik = astore.load_account().unwrap().identity_public();
     let b_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
     // Both publish so first-contact can open a session in each direction.
-    assert!(matches!(client::publish_bundle(&r, astore.load_account().unwrap(), astore.load_capability().unwrap(), NOW), PublishResponse::Published));
-    assert!(matches!(client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW), PublishResponse::Published));
+    assert!(matches!(client::publish_bundle(&r, astore.load_account().unwrap(), client::dev_capability(), NOW), PublishResponse::Published));
+    assert!(matches!(client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW), PublishResponse::Published));
 
     // B visits A's profile → PostsRequest to A.
     client::send_posts_request(&bstore, &r, &a_ik, NOW).unwrap();
@@ -3435,12 +3468,12 @@ fn send_multihoming_fails_over_to_a_secondary_relay() {
     let bstore = Store::unlock(temp_dir("mh-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let live = ctx(addr, &rid);
     assert!(matches!(
-        client::publish_bundle(&live, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&live, bstore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
 
@@ -3474,12 +3507,12 @@ fn cover_traffic_deposits_via_the_real_path_and_is_self_addressed() {
     let (addr, rid) = spawn_relay();
     let astore = Store::unlock(temp_dir("cov-a"), b"pw").unwrap();
     seed_provision(&astore);
-    astore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
     let a_ik = astore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
     // We must have a published bundle so the self-session's first contact can fetch it.
     assert!(matches!(
-        client::publish_bundle(&r, astore.load_account().unwrap(), astore.load_capability().unwrap(), NOW),
+        client::publish_bundle(&r, astore.load_account().unwrap(), client::dev_capability(), NOW),
         PublishResponse::Published
     ));
 
@@ -3507,12 +3540,12 @@ fn an_expiring_message_is_delivered_but_never_persisted() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     client::send_text_expiring(&astore, &r, &bob_ik, b"burn after reading", 300, NOW).unwrap();
@@ -3547,12 +3580,12 @@ fn delete_for_everyone_reaches_the_peer_with_the_shared_timestamp() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     client::send_text(&astore, &r, &bob_ik, b"regrettable", NOW, NOW).unwrap();
@@ -3586,13 +3619,13 @@ fn clearing_a_chat_wipes_it_from_disk_across_a_reload() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability(&client::dev_capability()).unwrap();
-    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
-    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
     client::send_text(&astore, &r, &bob_ik, b"one", NOW, NOW).unwrap();
@@ -3609,6 +3642,171 @@ fn clearing_a_chat_wipes_it_from_disk_across_a_reload() {
         reopened.load_history().unwrap().is_empty(),
         "the conversation must be gone from DISK, not merely hidden until the next start"
     );
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}
+
+/// Copy every file in `dir` (flat — the account's network files all live at the top level) so a
+/// later `restore_files` can put chosen ones back exactly as they were.
+fn snapshot_files(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+        .collect()
+}
+
+/// Put back exactly the named files from a snapshot — the simulation of a crash in which those
+/// writes never landed while every other write did.
+fn restore_files(snap: &[(PathBuf, Vec<u8>)], names: &[&str]) {
+    for (path, bytes) in snap {
+        if names.contains(&path.file_name().unwrap().to_str().unwrap()) {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
+/// CRYPTO-26 — a crash between burning a one-time prekey and saving the session it produced
+/// must not strand the contact permanently.
+///
+/// The receive path used to write the two halves as two files and two renames: prekeys first,
+/// ratchet second. Each rename was atomic alone, the PAIR was not, and a crash (or an I/O error)
+/// in between left the prekey burnt with no session to show for it. Nothing was acked, so the
+/// relay redelivered the exact opener — and there was no longer a prekey secret to re-derive the
+/// 4th DH term with, while the sender kept ratcheting into a mailbox its contact could never
+/// open again. Recovery needed a manual forget/reconnect.
+///
+/// The crash is simulated the only way that keeps it honest: the poll's lease receipts are
+/// DROPPED (so the relay still holds the ciphertext, exactly as a crash before the ACK leaves
+/// it) and the file(s) carrying the session half are restored to their pre-receive bytes. Then
+/// the lease expires on the relay's own clock (driven, never slept on) and the opener comes back.
+#[test]
+fn a_crash_before_the_session_commit_leaves_the_prekey_to_reopen_the_contact() {
+    let (relay_addr, relay_id, _handle, clock) = spawn_relay_handle_clock();
+    let adir = temp_dir("crash26-a");
+    let bdir = temp_dir("crash26-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    for s in [&astore, &bstore] {
+        seed_provision(s);
+        s.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    }
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+    let r = ctx(relay_addr, &relay_id);
+
+    // Bob publishes one-time prekeys, so Alice's first contact really consumes one (4-DH).
+    client::publish_with_opks(&bstore, &r,  NOW).unwrap();
+    let opks_before = bstore.load_opks().unwrap();
+    assert!(!opks_before.is_empty(), "the batch must be persisted for this test to mean anything");
+    client::send_text(&astore, &r, &bob_ik, b"first contact", NOW, NOW).unwrap();
+
+    // The disk as it looked BEFORE the receive.
+    let snapshot = snapshot_files(&bdir);
+
+    // Bob receives — and crashes before acking: the receipts are dropped, never committed, so
+    // the ciphertext stays leased on the relay.
+    let poll = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+    assert_eq!(poll.messages.iter().flatten().count(), 1, "the opener must decrypt the first time");
+    assert!(!poll.acks.is_empty(), "the poll must have taken a lease to drop");
+    drop(poll);
+
+    // The crash: the session write never reached the disk. Everything else did.
+    restore_files(&snapshot, &["sessions.dat", "sessions.anchor"]);
+
+    // The invariant the pair commit exists for: never "prekey burnt AND no session". With the
+    // session rolled back, the prekey set must be rolled back with it.
+    assert!(
+        bstore.load_sessions().unwrap().debug_peers().0.is_empty(),
+        "test setup: the session half is supposed to be rolled back here"
+    );
+    let (mut back, mut before) = (bstore.load_opks().unwrap(), opks_before.clone());
+    back.sort_unstable();
+    before.sort_unstable();
+    assert_eq!(
+        back, before,
+        "the prekey was burnt but its session did not survive — the contact can never be reopened"
+    );
+
+    // And operationally: the lease expires, the relay redelivers the exact opener, and it still
+    // opens — the state that redelivery is supposed to recover from.
+    let later = NOW + node::node::LEASE_SECS + 1;
+    clock.store(later, AtomicOrdering::SeqCst);
+    let again = recv_multi(&bstore, std::slice::from_ref(&r), later).unwrap();
+    let texts = poll_texts(&again.messages);
+    assert!(
+        texts.contains(&b"first contact".to_vec()),
+        "the redelivered opener no longer opens — the contact is stranded"
+    );
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}
+
+/// CRYPTO-24 — multi-homing across relays that issued their OWN credentials.
+///
+/// Every other multi-homing test here runs against dev relays, which all admit the same globally
+/// known dev capability — so one account-wide credential worked and the production shape of the
+/// problem was invisible. In production a capability is relay-specific (a Private relay mints a
+/// random id+secret, a Public one derives a stateless secret from its own issuer key), and the
+/// two relays below model exactly that: each admits one credential, and neither knows the
+/// other's.
+///
+/// Two things break when there is only one account-wide slot, and the first was NOT in the
+/// finding: publishing a bundle on a second relay CREATES a slot there, which is metered
+/// (`RelayNode::handle_publish`, CRYPTO-18) — so the account never becomes reachable on its
+/// backup at all, which is receive-side multi-homing, not just send failover. The second is the
+/// filed one: a queued ciphertext flushed to a secondary presents a proof minted for the primary
+/// and is refused, so the failover that censorship-resilience rests on silently does nothing.
+#[test]
+fn multi_homing_presents_each_relay_the_credential_that_relay_issued() {
+    let cap1 = own_capability(0x11, 0xA1);
+    let cap2 = own_capability(0x22, 0xB2);
+    let (addr1, id1) = spawn_relay_admitting(cap1.clone());
+    let (addr2, id2) = spawn_relay_admitting(cap2.clone());
+    let adir = temp_dir("percap-a");
+    let bdir = temp_dir("percap-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    seed_provision(&astore);
+    seed_provision(&bstore);
+    for s in [&astore, &bstore] {
+        s.save_capability_for(&id1, &cap1).unwrap();
+        s.save_capability_for(&id2, &cap2).unwrap();
+    }
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+    let (r1, r2) = (ctx(addr1, &id1), ctx(addr2, &id2));
+
+    // STAGE 1 — reachability on the SECONDARY. `publish_all` must present relay 2 its own
+    // credential, or the slot is never created there.
+    client::publish_all(&bstore, &[r1.clone(), r2.clone()], NOW).unwrap();
+    // Proven by USE, not by the publish response (which only reports the primary): Alice opens
+    // the conversation through relay 2, which needs Bob's bundle to exist there.
+    assert!(
+        client::send_text(&astore, &r2, &bob_ik, b"via the backup", NOW, NOW).unwrap(),
+        "the deposit on relay 2 did not reach it"
+    );
+    let got = poll_texts(&client::recv_session(&bstore, &r2, NOW).unwrap());
+    assert!(got.contains(&b"via the backup".to_vec()), "Bob is not reachable on his backup relay");
+
+    // STAGE 2 — failover. The session now exists; relay 1 is the primary and it goes down, so the
+    // queued ciphertext has to be flushed through relay 2 under RELAY 2's credential.
+    assert!(
+        client::send_text(&astore, &r1, &bob_ik, b"through the primary", NOW, NOW).unwrap(),
+        "the primary must work before we kill it"
+    );
+    let dead = client::Relay::new("127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(), id1, None);
+    let payload = client::content::encode(&client::content::Content::TextStamped {
+        text: b"failed over".to_vec(),
+        ts: NOW,
+    });
+    assert!(
+        client::send_session_multi(&astore, &[dead, r2.clone()], &bob_ik, &payload, NOW).unwrap(),
+        "the failover deposit was refused — the secondary got a credential it never issued"
+    );
+    let after = poll_texts(&client::recv_session(&bstore, &r2, NOW).unwrap());
+    assert!(after.contains(&b"failed over".to_vec()), "the failed-over message never arrived");
 
     std::fs::remove_dir_all(&adir).ok();
     std::fs::remove_dir_all(&bdir).ok();

@@ -62,6 +62,35 @@ Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests g
   re-encrypt, no ratchet double-advance; the desktop poll retransmits across every relay. So a
   blocked primary no longer strands an ongoing conversation (first-contact-via-a-secondary is a
   documented residual). e2e-tested.
+- **Admission credentials are PER RELAY (CRYPTO-24).** An account used to hold exactly one
+  `capability.dat` and present it to every relay. Against dev relays that works — they all admit the
+  same globally known dev capability — but in production a capability is relay-specific (a Private
+  relay mints a random `capability_id + secret`; a Public relay derives a stateless secret from its
+  own issuer key), so a second relay answers `UnknownCapability`/`BadMac`. The finding named send
+  failover; it was **worse than filed**, because CREATING a bundle slot is metered too
+  (`handle_publish`, CRYPTO-18): the account never became reachable on a backup relay at all, so
+  receive-side multi-homing was broken as well, not just the failover. It also handed every relay the
+  same `capability_id`, linking one account's traffic across independent operators. Now
+  `capabilities.dat` is a map `relay-id → capability`; there is no way to ask for "the" capability
+  without naming the relay (`Store::load_capability_for`), `karst dev-cap`/`import-cap`/`join` write
+  against a named relay, and `publish_all` skips — loudly — any relay this account holds no
+  credential for rather than presenting another's. Pinned by
+  `multi_homing_presents_each_relay_the_credential_that_relay_issued`, which runs against two relays
+  admitting DIFFERENT credentials (the dev cap deliberately not issued) and covers both halves.
+  **What this does NOT do: it does not acquire credentials.** Failover works only for relays the
+  account has actually joined or imported an invite for; for the rest it now fails honestly (skip +
+  reason) instead of silently presenting a credential that would be rejected. The desktop therefore
+  no longer seeds the forgeable DEV capability on its own: seeding it per relay would have handed a
+  REAL relay (one whose `earn_capability` just failed because it is invite-only) a public-secret
+  credential and made the honest skip unreachable — the `unwrap_or(dev_capability())` shape A8-11
+  removed from the send path, one layer up. The client cannot tell a dev relay from a real one, so
+  it does not guess: the demo states it with **`KARST_DEV_CAP=1`** (loud, per relay, never
+  overwriting a real credential), the same way `KARST_INSECURE_FAST_KDF` is stated rather than
+  inferred. Auto-earning a
+  capability when a relay is discovered is a deliberate non-goal here — it would make discovery emit
+  a PoW admission round trip on its own. Related node-side gap: an invite file (`invite.json`) is a
+  bare serialized capability with NO relay-id in it, so the CLI/desktop must be TOLD which relay an
+  invite belongs to (`--relay-id`; the desktop binds it to the configured primary).
 - **Metadata hardening (Loopix-style) — status.** The impactful pieces are already shipped and
   verified: the relay fetch response is a FIXED 16 000-byte page whether it carries 0 or `FETCH_CAP`
   seals (§2.2 — message COUNT never leaks through response length), polling is jittered, and messages
@@ -669,9 +698,19 @@ else, and we either refused it (an authority, a token) or could not verify it
   delayed, not lost); the ratchet's transactional decrypt fails closed on an already-consumed
   duplicate, so redelivery is effectively-once with no dedup store. The two former residual loss windows
   are now **closed** by persisting plaintext-first: `recv_session`/`recv_session_multi` write the
-  decrypted text to history BEFORE burning OPKs, saving the ratchet, or acking (all under the sessions
-  flock). So a crash in `[OPK burned → session saved]` or `[session saved → history]` no longer loses
-  the message — the plaintext is already durable, and a redelivered copy is skipped by a **payload_id**
+  decrypted text to history BEFORE the state commit or the ack (all under the sessions flock), and the
+  burnt one-time prekey and the session derived from it commit **together, in one durable write**
+  (`Store::save_receive_commit`, CRYPTO-26 — the prekey secrets now live INSIDE `sessions.dat`, so one
+  rename commits the pair; `opks.dat` is gone and `STATE_VERSION` is 5). That last one was never a
+  plaintext-loss window but an unrecoverable state one: two files meant a crash between them left
+  "prekey burnt, no session", the unacked opener redelivered into an `accept_key_agreement` that no
+  longer had the secret for the 4th DH term, and the sender kept ratcheting into a mailbox its contact
+  could never open — manual forget/reconnect was the only way out. Swapping the write order would have
+  traded it for a reuse window on a one-time secret, so the pair had to become one commit rather than a
+  better order. Pinned by `a_crash_before_the_session_commit_leaves_the_prekey_to_reopen_the_contact`
+  (drops the lease receipts, rolls the session file back, drives the relay clock past the lease, and
+  requires the redelivered opener to still open). So a crash in `[session saved → history]` no longer
+  loses the message — the plaintext is already durable, and a redelivered copy is skipped by a **payload_id**
   dedup over the recent history tail (collision-free, unlike a content hash, which would eat a genuine
   double-tap of the same text in the same second). Both single-homed (`recv_session`, CLI) and
   multi-homed (`recv_session_multi`, desktop/GUI) carry lease/ACK; the multi-homed path acks each leased
@@ -2169,9 +2208,12 @@ implementation. NOT feature-gated (E2E is the core of the product, unlike tring)
   increments: (1) the key-agreement mechanism (`dh4` mixed in + bound in the transcript,
   the OPK consumed on accept); (2) the relay stores a published batch and hands out ONE
   distinct OPK per fetch (`opk_batches`, capped, exhaustion → 3-DH fallback); (3) the
-  client persists the OPK secrets in a **sidecar** (`opks.dat`, deliberately out of
-  `account.key` so the identity is never at migration risk) — `publish_with_opks` tops up
-  and persists before publishing, `recv_session` reloads to accept and saves the remainder.
+  client persists the OPK secrets **inside the session state file** (`sessions.dat`,
+  deliberately out of `account.key` so the identity is never at migration risk; they were a
+  separate `opks.dat` sidecar until CRYPTO-26 needed the burn and the session it produces to
+  commit in ONE rename) — `publish_with_opks` tops up and persists before publishing (under
+  the sessions flock, since the file is now shared), `recv_session` reloads to accept and
+  commits the remainder together with the new session.
   Pinned at every layer: `a_one_time_prekey_is_mixed_in_and_consumed_once`,
   `dh4_one_time_prekey_secret_is_load_bearing_in_root_key`,
   `the_relay_hands_a_distinct_one_time_prekey_to_each_fetcher`,
@@ -2345,7 +2387,8 @@ The first thing usable by hand: `karst init` (create an account — **prints the
 12-word recovery phrase**), `karst restore <12 words>` (restore into an empty
 `$KARST_HOME`), `karst show-phrase` (show your phrase), `karst id` (the skeleton
 pubkey), `karst account` (the §2.1 IK — the address for discovery),
-`karst dev-cap`/`import-cap` (capability), `karst publish --relay A --relay-id ID`
+`karst dev-cap`/`import-cap` (a capability, which now names the relay it is FOR:
+both take `--relay/--relay-id`, see CRYPTO-24 below), `karst publish --relay A --relay-id ID`
 (§12: publish the §2.1 bundle), `karst send … --to HEX <msg>`, `karst recv …`
 (+ optional `--socks5 HOST:PORT` through an external PT). The directory is
 `$KARST_HOME` (or `~/.config/karst`). The identity is derived from the **root
@@ -2785,10 +2828,22 @@ Four smaller conclusions the discussion reached that belong in the record:
   (`MAX_DIALS_PER_ROUND`). Self is seeded FIRST so it always survives the frame trim and stays
   verifiable. The CLIENT side honours verify-before-add too now: `client::import_discovered_relays`
   (`karst relays --add`) fetches a relay's node-list and adds a discovered relay to this account's
-  multi-homing secondaries (`extra_relays.dat`) ONLY after `node::gossip::verify` confirms it by
-  dialing — so a client never routes its mail through a relay it hasn't confirmed. **Both
-  auto-dialers (gossip + client import) verify before adding; any FUTURE auto-dial path must reuse
-  the same `node::gossip::verify` gate.**
+  multi-homing secondaries (`extra_relays.dat`) ONLY after dialing it and confirming it serves its
+  own full relay-id — so a client never routes its mail through a relay it hasn't confirmed.
+  **CRYPTO-23 — the client also no longer stores the address the gossiping peer supplied.**
+  Dialing proves who answers, not that the *address* belongs to them: a transparent TCP/WSS proxy
+  in front of an honest relay passes the handshake (it terminates at the real relay) while the
+  client persists the proxy as its route — a permanent vantage point on IP, timing, volume and a
+  selective-drop switch, with Noise intact. `verified_self_address` therefore uses the peer's
+  address only as a place to DIAL and stores an address out of the relay's own authenticated
+  self-descriptor (re-checked against the SSRF gate). Deliberately NOT the audit's suggested
+  "compare the hint against the self-descriptor": address comparison needs canonicalization rules
+  (host vs IP, carrier, port, path) and every such rule also refuses honest relays reached by a
+  different spelling. **Residual, node side (`gossip::gossip_round`, out of this change's scope):
+  a relay merging a heard descriptor still verifies with, and re-serves, the peer-supplied
+  addresses — so a hostile peer can still inject a proxy address into other relays' node-lists.
+  The client no longer adopts it as a route, but the class is only half dead until `gossip_round`
+  keeps the self-declared addresses too.** Any FUTURE auto-dial path must reuse the same gate.
 
 - **The relay does NOT automatically reconstruct your whole graph — a precision that
   corrects an earlier overstatement in this doc.** Post-3b, what a Public node sees cleanly

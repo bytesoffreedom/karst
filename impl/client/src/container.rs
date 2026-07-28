@@ -104,6 +104,39 @@ pub fn restore_dir(dir: &Path, blob: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Does `mounts` (the `/proc/mounts` format: `src mountpoint fstype …`) say `mountpoint` is
+/// backed by RAM? Split out as a PURE function so the decision is testable on any machine,
+/// including ones that do have `/dev/shm` (a test cannot un-mount it to check the refusal path).
+pub(crate) fn mounts_say_ram_backed(mounts: &str, mountpoint: &str) -> bool {
+    mounts.lines().any(|line| {
+        let mut f = line.split_whitespace();
+        let _src = f.next();
+        let mp = f.next().unwrap_or("");
+        let fstype = f.next().unwrap_or("");
+        mp == mountpoint && (fstype == "tmpfs" || fstype == "ramfs")
+    })
+}
+
+/// A work dir that is VERIFIED to live in RAM, for materializing a HIDDEN account — or `None`
+/// when this system cannot prove one exists.
+///
+/// **Fail-closed (CRYPTO-02).** The old code took `/dev/shm` if the path merely *existed* and
+/// otherwise silently fell back to a predictable directory on the real disk. That put a hidden
+/// account's plaintext tree, filenames, sizes, and lock/temp files onto persistent storage (and
+/// into journals and backups) on macOS, Windows, minimal Linux, and containers without a working
+/// `/dev/shm` — disproving the "zero external artifacts" claim and breaking the deniability the
+/// container exists for, with no cleanup at all after a crash. Checking existence was itself too
+/// weak: a path can exist and be an ordinary disk directory, so we check the mount TYPE.
+///
+/// `None` means the caller must REFUSE to open a hidden account, not pick somewhere else.
+pub fn ram_backed_hidden_dir(tag: &str) -> Option<PathBuf> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    ["/dev/shm", "/run/shm"].into_iter().find_map(|cand| {
+        (mounts_say_ram_backed(&mounts, cand) && Path::new(cand).is_dir())
+            .then(|| Path::new(cand).join(format!("karst-hid-{tag}")))
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     /// The everyday account. Carries a `Policy` (Protect = P1, Blind = P3).
@@ -740,10 +773,19 @@ pub enum Unlocked {
 }
 
 /// Open a container and route by the password's role: a Wipe password erases the whole container
-/// and reports `Wiped`; a HIDDEN account is materialized into `hidden_work` (the caller passes a
-/// RAM/tmpfs path so no plaintext hits the real disk); a main account into `main_work`. Wrong
-/// password / no such compartment → `Err` (indistinguishable).
-pub fn open_container(path: &Path, password: &[u8], main_work: PathBuf, hidden_work: PathBuf) -> io::Result<Unlocked> {
+/// and reports `Wiped`; a HIDDEN account is materialized into `hidden_work`; a main account into
+/// `main_work`. Wrong password / no such compartment → `Err` (indistinguishable).
+///
+/// `hidden_work` is an `Option` on purpose: `None` = "this system has no VERIFIED RAM-backed
+/// store" (see [`ram_backed_hidden_dir`]). Opening a hidden account then FAILS CLOSED rather
+/// than writing its plaintext to the real disk (CRYPTO-02). A MAIN account is unaffected — it is
+/// disk-backed by design — so this never breaks ordinary use on a platform without tmpfs.
+pub fn open_container(
+    path: &Path,
+    password: &[u8],
+    main_work: PathBuf,
+    hidden_work: Option<PathBuf>,
+) -> io::Result<Unlocked> {
     let mut container = Container::load(path)?;
     match container.open(password)? {
         Opened::Wipe => {
@@ -751,7 +793,17 @@ pub fn open_container(path: &Path, password: &[u8], main_work: PathBuf, hidden_w
             Ok(Unlocked::Wiped)
         }
         Opened::Compartment { role, policy, payload, region_key } => {
-            let work_dir = if role == Role::Hidden { hidden_work } else { main_work };
+            // Fail CLOSED before anything is written: no verified RAM store ⇒ no hidden account.
+            let work_dir = if role == Role::Hidden {
+                hidden_work.ok_or_else(|| {
+                    io_err(
+                        "a hidden account needs a RAM-backed store (tmpfs); none is available on \
+                         this system — refusing to materialize it on disk",
+                    )
+                })?
+            } else {
+                main_work
+            };
             std::fs::create_dir_all(&work_dir)?;
             restore_dir(&work_dir, &payload)?;
             Ok(Unlocked::Account(ContainerVault {
@@ -1207,7 +1259,7 @@ mod tests {
         }
 
         // The hidden password opens the hidden account.
-        match open_container(&cpath, b"hiddenpw", root.join("mw2"), root.join("hw")).unwrap() {
+        match open_container(&cpath, b"hiddenpw", root.join("mw2"), Some(root.join("hw"))).unwrap() {
             Unlocked::Account(cv) => {
                 assert_eq!(cv.role, Role::Hidden);
                 assert_eq!(std::fs::read(cv.work_dir.join("seed.key")).unwrap(), b"hidden seed material");
@@ -1215,7 +1267,7 @@ mod tests {
             _ => panic!("hiddenpw → hidden account"),
         }
         // The main account still opens intact.
-        match open_container(&cpath, b"realpw", root.join("mw3"), root.join("hw3")).unwrap() {
+        match open_container(&cpath, b"realpw", root.join("mw3"), Some(root.join("hw3"))).unwrap() {
             Unlocked::Account(cv) => {
                 assert_eq!(cv.role, Role::Main);
                 assert_eq!(std::fs::read(cv.work_dir.join("contacts.dat")).unwrap(), b"main contacts");
@@ -1246,7 +1298,7 @@ mod tests {
             cv.add_wipe(b"burnpw").unwrap();
         }
         // Cover password opens the MAIN account…
-        match open_container(&cpath, b"coverpw", root.join("mw2"), root.join("hw")).unwrap() {
+        match open_container(&cpath, b"coverpw", root.join("mw2"), Some(root.join("hw"))).unwrap() {
             Unlocked::Account(cv) => assert_eq!(cv.role, Role::Main),
             _ => panic!("coverpw → main"),
         }
@@ -1255,8 +1307,8 @@ mod tests {
         assert!(c.read_dir(&c.key_for(b"coverpw").unwrap()).is_err(), "cover password must not expose the slot directory");
         assert!(c.read_dir(&c.key_for(b"mainpw").unwrap()).is_ok(), "the main password manages slots");
         // Wipe erases the whole container.
-        assert!(matches!(open_container(&cpath, b"burnpw", root.join("mw3"), root.join("hw3")).unwrap(), Unlocked::Wiped));
-        assert!(open_container(&cpath, b"mainpw", root.join("mw4"), root.join("hw4")).is_err());
+        assert!(matches!(open_container(&cpath, b"burnpw", root.join("mw3"), Some(root.join("hw3"))).unwrap(), Unlocked::Wiped));
+        assert!(open_container(&cpath, b"mainpw", root.join("mw4"), Some(root.join("hw4"))).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1284,7 +1336,7 @@ mod tests {
         }
 
         // Open via the COVER password → same account key, and the profile decrypts.
-        match open_container(&cpath, b"coverpw", root.join("cw"), root.join("hw")).unwrap() {
+        match open_container(&cpath, b"coverpw", root.join("cw"), Some(root.join("hw"))).unwrap() {
             Unlocked::Account(cv) => {
                 assert_eq!(cv.account_key().as_bytes(), main_key.as_bytes(), "P3 shares the main region key");
                 let vault = Vault::adopt(&cv.work_dir, cv.account_key());
@@ -1312,22 +1364,81 @@ mod tests {
             c.add_wipe(b"realpw", b"burnpw").unwrap();
         }
 
-        match open_container(&cpath, b"realpw", main_w.clone(), hid_w.clone()).unwrap() {
+        match open_container(&cpath, b"realpw", main_w.clone(), Some(hid_w.clone())).unwrap() {
             Unlocked::Account(cv) => { assert_eq!(cv.role, Role::Main); assert_eq!(cv.work_dir, main_w); }
             _ => panic!("realpw → main"),
         }
-        match open_container(&cpath, b"hiddenpw", main_w.clone(), hid_w.clone()).unwrap() {
+        match open_container(&cpath, b"hiddenpw", main_w.clone(), Some(hid_w.clone())).unwrap() {
             Unlocked::Account(cv) => { assert_eq!(cv.role, Role::Hidden); assert_eq!(cv.work_dir, hid_w); }
             _ => panic!("hiddenpw → hidden (tmpfs work dir)"),
         }
-        match open_container(&cpath, b"blindpw", main_w.clone(), hid_w.clone()).unwrap() {
+        match open_container(&cpath, b"blindpw", main_w.clone(), Some(hid_w.clone())).unwrap() {
             Unlocked::Account(cv) => { assert_eq!(cv.role, Role::Main); assert_eq!(cv.policy, Policy::Blind); }
             _ => panic!("blindpw → main/blind"),
         }
         // Wipe erases the whole container.
-        assert!(matches!(open_container(&cpath, b"burnpw", main_w.clone(), hid_w.clone()).unwrap(), Unlocked::Wiped));
-        assert!(open_container(&cpath, b"realpw", main_w, hid_w).is_err(), "container wiped → nothing opens");
+        assert!(matches!(open_container(&cpath, b"burnpw", main_w.clone(), Some(hid_w.clone())).unwrap(), Unlocked::Wiped));
+        assert!(open_container(&cpath, b"realpw", main_w, Some(hid_w)).is_err(), "container wiped → nothing opens");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CRYPTO-02 — with NO verified RAM-backed store, opening a hidden account must FAIL rather
+    /// than materialize its plaintext onto the real disk. Discriminating on the part that
+    /// actually mattered: not just "returns Err", but that **nothing was written** — the old code
+    /// silently restored the whole account tree into a predictable `base/.hidden-work`, which is
+    /// what disproved "zero external artifacts" and killed deniability on any system without a
+    /// working `/dev/shm` (macOS, Windows, minimal containers). A MAIN account must still open,
+    /// so the refusal cannot be "break the container on platforms without tmpfs".
+    #[test]
+    fn a_hidden_account_refuses_to_open_without_a_ram_backed_store() {
+        let root = tmp("no-ramfs");
+        std::fs::create_dir_all(&root).unwrap();
+        let cpath = root.join("container.dat");
+        let main_w = root.join("mw");
+        Container::create(&cpath, 256 * 1024, b"realpw", 96 * 1024).unwrap();
+        {
+            let mut c = Container::load(&cpath).unwrap();
+            c.add_hidden(b"realpw", b"hiddenpw", 96 * 1024).unwrap();
+        }
+
+        // `None` = this system could not prove a RAM-backed store exists.
+        assert!(
+            open_container(&cpath, b"hiddenpw", main_w.clone(), None).is_err(),
+            "a hidden account must not open without a verified RAM-backed store"
+        );
+        // Nothing of the hidden account may have been written anywhere under the vault.
+        let blob = snapshot_dir(&root).unwrap();
+        let on_disk: Vec<(String, Vec<u8>)> = postcard::from_bytes(&blob).unwrap();
+        let names: Vec<&String> = on_disk.iter().map(|(rel, _)| rel).collect();
+        assert!(
+            names.iter().all(|rel| rel.as_str() == "container.dat"),
+            "the hidden account leaked files to disk: {names:?}"
+        );
+
+        // The MAIN account is disk-backed by design and must still open on such a system.
+        match open_container(&cpath, b"realpw", main_w.clone(), None).unwrap() {
+            Unlocked::Account(cv) => assert_eq!(cv.role, Role::Main),
+            _ => panic!("a main account must still open without tmpfs"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The mount check must look at the fstype, not merely at whether the path exists — a
+    /// directory called `/dev/shm` on an ordinary disk must NOT qualify.
+    #[test]
+    fn only_a_real_tmpfs_mount_counts_as_ram_backed() {
+        let mounts = "\
+proc /proc proc rw,nosuid 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/dev/sda1 /home ext4 rw,relatime 0 0
+";
+        assert!(mounts_say_ram_backed(mounts, "/dev/shm"), "a real tmpfs mount qualifies");
+        assert!(!mounts_say_ram_backed(mounts, "/home"), "an ext4 mount must not qualify");
+        assert!(!mounts_say_ram_backed(mounts, "/run/shm"), "an absent mount must not qualify");
+        assert!(
+            !mounts_say_ram_backed("/dev/sdb1 /dev/shm ext4 rw 0 0\n", "/dev/shm"),
+            "a disk-backed directory that merely LOOKS like /dev/shm must not qualify"
+        );
     }
 
     /// Reload from disk round-trips; wipe destroys everything.

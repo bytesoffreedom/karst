@@ -877,18 +877,16 @@ fn container_unlock(app: State<App>, password: String, vault_dir: Option<String>
 }
 
 /// RAM-backed (tmpfs) work dir for a HIDDEN account, so its plaintext files never touch the real
-/// disk. `/dev/shm` is tmpfs on Linux; keyed by the vault base so parallel vaults don't collide.
-fn hidden_work_dir(base: &std::path::Path) -> std::path::PathBuf {
+/// disk. Keyed by the vault base so parallel vaults don't collide.
+///
+/// `None` = this system cannot prove a RAM-backed store exists, and `open_container` then refuses
+/// to open a hidden account. It used to fall back to `base/.hidden-work` — a predictable path on
+/// the REAL disk — which silently voided the deniability the container exists for (CRYPTO-02).
+fn hidden_work_dir(base: &std::path::Path) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     base.hash(&mut h);
-    let tag = format!("{:016x}", h.finish());
-    let shm = std::path::Path::new("/dev/shm");
-    if shm.is_dir() {
-        shm.join(format!("karst-hid-{tag}"))
-    } else {
-        base.join(".hidden-work")
-    }
+    client::container::ram_backed_hidden_dir(&format!("{:016x}", h.finish()))
 }
 
 /// Snapshot the container-backed account's work dir back into the deniable container. Called after

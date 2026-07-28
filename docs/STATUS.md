@@ -168,7 +168,11 @@ build; clippy clean.**
   8-slot keyslot table so the number of passwords never leaks. **Three passwords:** P1 (main, protect),
   P2 (a full HIDDEN account — not a note), P3 (main, blind-cover), plus Wipe (whole-container erase). The
   management slot-directory is sealed under the P1 key, so revealing P3 under duress cannot enumerate
-  P1/P2 (test-pinned). Hidden account materializes into a RAM/tmpfs work dir (deleted on lock), refuses
+  P1/P2 (test-pinned). Hidden account materializes into a **VERIFIED** RAM/tmpfs work dir (deleted on
+  lock) — the mount TYPE is checked against `/proc/mounts`, and if no RAM-backed store can be proven the
+  hidden account **refuses to open** rather than falling back to disk (it used to fall back silently to a
+  predictable `base/.hidden-work`, which voided this claim on macOS/Windows/minimal containers; a main
+  account is unaffected). It also refuses
   disk-export + bulk media (zero external artifacts), and defaults to OFFLINE (emits no network traffic
   until a deliberate sync). GUI-verified end-to-end: create a 64 MB container account, add a hidden
   account, both open with their own password, container size unchanged. **Honest ceiling (say it):

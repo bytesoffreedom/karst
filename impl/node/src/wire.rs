@@ -380,6 +380,10 @@ mod tests {
             client_addr: Vec::new(),
             carrier_id: Vec::new(),
             cookie: None,
+            // Just needs to decode/frame here — this module tests framing, not admission, so an
+            // all-zero proof (which `handle_blob_put` would reject) is fine.
+            request_nonce: Vec::new(),
+            capability_proof: CapabilityProof { capability_id: [0u8; 16], epoch_id: 0, not_after: 0, mac: [0u8; 16] },
             blob_id: [0u8; 32],
             index: 0,
             count: 0,

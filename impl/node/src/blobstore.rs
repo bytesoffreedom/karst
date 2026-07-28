@@ -6,10 +6,16 @@
 //! opaque ciphertext, TTL-swept, and hard-capped so it cannot be turned into free
 //! unbounded storage.
 //!
-//! **DoS honesty:** with the skeleton's public dev-cap (anyone can authenticate), these
-//! caps are the ONLY thing bounding an abusive uploader — real per-identity provisioning
-//! is a separate layer that does not exist yet (see docs/STATUS.md). Caps + TTL keep it
-//! bounded; they are not a substitute for admission that actually attributes cost.
+//! **DoS honesty:** `sender` here is a self-declared, freely-mintable address (a Sybil mints a
+//! fresh one per blob at zero cost), so the per-sender/global caps in this module bound how much
+//! any ONE claimed identity can accumulate, not how much a real attacker can accumulate — that
+//! requires the caller to have already paid for something the caps don't check (CRYPTO-15/#169:
+//! `RelayNode::handle_blob_put` now requires a verified `admission::capability::Capability` and
+//! meters chunk bytes against `node::BLOB_CAP_QUOTA` BEFORE a chunk reaches `put_chunk`, so
+//! minting a fresh `sender` to reset these caps no longer also resets the cost of getting past
+//! admission). These caps stay in place as a SEPARATE, complementary bound — even a legitimately
+//! admitted capability shouldn't be able to fill the whole store through one claimed identity —
+//! not as the admission layer themselves.
 //!
 //! Streaming: chunks are appended to one file per blob and served by byte offset, so
 //! neither upload nor download holds the whole blob in RAM — peak RAM is O(chunk).

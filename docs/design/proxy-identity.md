@@ -1,6 +1,7 @@
 # Proxy identity — a root with no address, reached only through disposable channels
 
-**Status: DESIGN. Phase 1 (HD derivation) in progress; nothing here is shipped yet.**
+**Status: DESIGN. Phase 1 (per-proxy random secret; see #207 below) in progress; nothing here is
+shipped yet.**
 This document is the authoritative description of the model so the code, the roadmap,
 and the honesty in the UI stay aligned as it is built. Source of truth is the code; when
 they disagree, fix this doc.
@@ -33,8 +34,9 @@ exist on the wire.*
 **Connection accounts ("proxies") are the only network objects — and a proxy is just a
 communication channel, not a persona.** A proxy carries only:
 
-- its **HD index** and the **keypair** derived from the seed at that index (its IK is the
-  address a contact uses to reach you),
+- a **random 32-byte secret**, minted (`OsRng`) once when the proxy is created, and the
+  **keypair** derived from that secret (its IK is the address a contact uses to reach you) — see
+  "Proxy derivation and destruction" below,
 - its own **prekey / bundle / one-time-prekey state** on the relay,
 - a **label**.
 
@@ -58,23 +60,49 @@ Incoming mail to any proxy is routed to the single root inbox; you reply *from* 
 contact knows. Spam is handled at the channel level — reject a contact request, block an accepted
 contact, or rotate the whole proxy — never by changing your identity.
 
-## HD derivation (and its freeze discipline)
+## Proxy derivation and destruction (#207, A6-4)
 
-Proxies are deterministic children of the same phrase:
+**A proxy's keys come from a random per-proxy secret, never from the phrase.** An earlier version
+of this design derived proxies as deterministic HD children of the phrase
+(`proxy_n = HKDF-Expand(PRK, info = "KARST-proxy-derive-v1" ‖ le32(n))`, on a domain separate from
+the frozen root `derive`). That was wrong: "burning" a proxy only flipped an `active` flag in the
+registry, so the phrase alone could still regenerate ANY past proxy's private keys forever — match
+them against historical relay logs, enumerate proxies never even created yet, and link identities
+the UI presented as independently destroyed. Burn was an operational label, not erasure.
+
+The fix, now shipped in `Store`/`seed.rs`:
 
 ```text
-proxy_n = HKDF-Expand(PRK, info = "KARST-proxy-derive-v1" ‖ le32(n))
+secret         = OsRng() — 32 random bytes, minted ONCE when the proxy is created
+proxy_identity = HKDF-Expand(HKDF-Extract(salt=∅, ikm=secret), info = "KARST-proxy-secret-derive-v1")
 ```
 
-on a **separate, independent HKDF domain** from the frozen root `derive` (`seed.rs`,
-`"KARST-identity-derive-v1"`) — so proxies never collide with the (untouched) root contract, and
-the root's frozen phrase→IK vector is unaffected. Consequences:
+The `secret` lives ONLY inside the sealed proxy registry (`proxies.dat`, `ProxyEntry::secret`) —
+it is never derived from, or storable back into, the recovery phrase. Consequences:
 
-- **Unlimited disposable identities, all recoverable from the 12 words**, with no extra backup —
-  "burning" a proxy is just ceasing to use an index.
-- **This domain is ALSO frozen the moment the first real proxy exists** — changing the info string
-  or the index encoding would orphan every proxy anyone has handed out. A conformance vector is
-  pinned in the first commit, exactly like the root's `frozen_derivation_vector`.
+- **Burning a proxy DELETES its registry entry, secret included.** This is not reversible: once
+  the secret is gone, nothing — not the recovery phrase, not the device password, nobody —  can
+  reproduce that identity's keys again. That irreversibility is the fix, not a side effect.
+- **The phrase recovers the ROOT identity, not its proxies — and never the vault data either.**
+  Entering the 12 words on any device re-derives the SAME root `seal`/`account` (as always — this
+  is unchanged by #207), which is all the phrase ever gave you. Contacts, history, feed and the
+  proxy registry itself are vault DATA, encrypted at rest under the device password, not the
+  phrase — recovering the phrase alone was never a way to get that data back, on a new device you
+  provision a fresh, empty vault. What #207 changes is narrower and specific to proxies: even if
+  you DO still have the old vault (same device, forgot nothing), a burned proxy's keys are gone —
+  the vault's own copy of the secret was deleted, and the phrase was never able to reproduce it
+  either way. So "recoverable, no extra backup" (which described the *old*, phrase-derived proxy
+  keys) no longer applies to proxies at all: a restore flow must mint fresh proxies and
+  re-establish channels with contacts out of band; it cannot regenerate the old ones from anything.
+- **The proxy `index` is still a stable, monotonically-increasing identifier** — it namespaces a
+  proxy's on-disk network files (`sessions.p<index>.dat`, `opks.p<index>.dat`, …) and tags
+  contacts with which proxy reaches them, but it plays no role in deriving keys, and burned
+  indices are never reissued (reusing one would let a freshly-minted proxy inherit a burned
+  identity's leftover session/OPK files and contact tags).
+- **No conformance vector is pinned for the secret→identity derivation.** Unlike the root's
+  `frozen_derivation_vector`, there is nothing here that a phrase-holder wrote down and would be
+  orphaned by a future change — the secret itself is the only backup, and it lives only in
+  whatever `proxies.dat` says right now.
 
 ## Honest limits (these must be surfaced in the UI, not just here)
 
@@ -88,10 +116,16 @@ the root's frozen phrase→IK vector is unaffected. Consequences:
    profile. Proxies give **network-level** rotation and disposal; profile-level unlinkability is a
    deliberate per-channel choice (the default is that people you *accept* see your profile — they
    already know it is you). The data model does not duplicate either way.
-3. **Recovery gives keys, not conversations.** The phrase re-derives your proxy *keys*
-   deterministically — but **not** which indices are live, **not** the contact↔proxy mapping, and
-   **not** ratchet state; those live only in the encrypted vault. So "recoverable, no extra
-   backup" means *empty, re-derivable identities*, not your history. Say exactly that.
+3. **Recovery gives you the root's network identity back, nothing else — and now not even proxy
+   keys (#207).** The phrase only ever re-derives the root `seal`/`account`; vault data (profile,
+   contacts, history, feed, the proxy registry) is a separate, device-password-encrypted thing the
+   phrase never touched. What changed: proxy identities used to ALSO be phrase-derived (by HD
+   index), so even without the old vault you could regenerate a proxy's keys from the 12 words
+   alone. Now each proxy's keys come from a random secret that lives only inside that
+   device-encrypted registry, so losing the vault (or burning the entry) loses the proxy for good —
+   the phrase was never, and is not now, a backup for it. Restoring an account (new device, phrase
+   only) means *zero proxies*: every channel must be re-created and every contact re-established
+   out of band. Say exactly that in the restore UI — do not imply proxies come back with the phrase.
 4. **Whoever you accept learns that proxy's IK** — it is unavoidable for E2E — but it is a
    disposable proxy IK, not your identity, and it is per-channel revocable.
 5. **Continuity across rotation costs a re-handshake.** With no stable public identity there is no
@@ -112,10 +146,12 @@ the root's frozen phrase→IK vector is unaffected. Consequences:
 
 ## Phased build
 
-1. **Crypto core** — `seed::derive_proxy(entropy, index)` on its own frozen domain + a pinned
-   conformance vector. Additive; nothing breaks.
-2. **Data model** — the root store keeps a proxy registry (indices + labels + active), tags
-   contacts / sessions with a `proxy_id`, and is marked "does not publish."
+1. **Crypto core** — `seed::derive_proxy_from_secret(secret)` on its own domain (#207: no longer
+   phrase-derived, no conformance vector to pin — see "Proxy derivation and destruction" above).
+   Additive; nothing breaks.
+2. **Data model** — the root store keeps a proxy registry (index + label + its own random
+   `secret`), tags contacts / sessions with a `proxy_id`, and is marked "does not publish."
+   Burning removes a registry entry outright, not a flag flip.
 3. **Network** — each proxy publishes its own bundle / OPKs; poll every proxy's mailbox;
    discovery / invites / add-by-code target a chosen proxy; inbound binds to (contact, proxy).
 4. **Unified inbox** — aggregate every proxy's chats into one list under the root; a chat opens as

@@ -17,6 +17,8 @@ use admission::capability::Capability;
 use node::peer::PeerState;
 use node::pqxdh::Account;
 use node::seal::Identity;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::secretbox::{random_salt, MasterKey};
@@ -344,11 +346,16 @@ pub struct Store {
     key: MasterKey,
     /// PROXY MODE (proxy-identity model). `None` = root store — identical paths and the frozen
     /// root `derive`, so existing behaviour is byte-for-byte unchanged (the regression guard).
-    /// `Some(index)` = act AS that proxy: `load_account`/`load_identity` return the HD-derived
-    /// proxy identity, and the IDENTITY-keyed network files (sessions/opks/discovery) are
-    /// namespaced by index so proxies never cross session/ratchet state. DEVICE/RELAY-scoped
-    /// state (the relay capability, blob transfer queues) and all DATA (contacts/history/feed/
-    /// profile/…) stay on the root paths, one copy — a proxy is a channel, not a persona.
+    /// `Some(index)` = act AS that proxy: `load_account`/`load_identity` return the identity
+    /// derived from THAT PROXY'S OWN random secret (`ProxyEntry::secret`, looked up in
+    /// `proxies.dat` by `index` — see `Store::proxy_identity`), NOT from the seed/phrase (#207,
+    /// A6-4). If the registry has no live entry for `index` (burned, or never created), this
+    /// FAILS LOUDLY (`io::Error`) rather than falling back to any phrase-derivation — a silent
+    /// fallback there would reinstate the exact "burn doesn't destroy" bug this model closes. The
+    /// IDENTITY-keyed network files (sessions/opks/discovery) are namespaced by index so proxies
+    /// never cross session/ratchet state. DEVICE/RELAY-scoped state (the relay capability, blob
+    /// transfer queues) and all DATA (contacts/history/feed/profile/…) stay on the root paths, one
+    /// copy — a proxy is a channel, not a persona.
     proxy: Option<u32>,
     /// At-rest CONTEXT prefix for this store (CRYPTO-05): `acct:<id>` inside a vault, `vault`
     /// for the vault's own files, `store` for a standalone single-account directory. Combined
@@ -570,8 +577,11 @@ impl Store {
     }
 
     /// A handle onto the SAME vault dir + key that acts AS proxy `index` (proxy-identity model):
-    /// `load_account`/`load_identity` return that proxy's HD-derived identity, and the network
-    /// files are namespaced by index. Data files are unchanged (root-owned). Cheap clone.
+    /// `load_account`/`load_identity` return that proxy's identity, derived from ITS OWN random
+    /// secret stored in the registry (never from the seed — see the `proxy` field doc above), and
+    /// the network files are namespaced by index. Data files are unchanged (root-owned). Cheap
+    /// clone. Does NOT require the proxy to already exist in the registry — the failure (if any)
+    /// only happens lazily, the first time something on this handle actually needs the identity.
     pub fn as_proxy(&self, index: u32) -> Store {
         Store { dir: self.dir.clone(), key: self.key.clone(), proxy: Some(index), scope: self.scope.clone() }
     }
@@ -1349,25 +1359,29 @@ impl Store {
             .map_err(|_| io_err("seed: не 16 байт энтропии"))
     }
 
-    /// seal-ключ (relay-facing) — **выводится** из корня, не хранится отдельно. В proxy-режиме —
-    /// seal этого прокси (тот же отдельный HD-домен, что и account прокси).
+    /// seal-ключ (relay-facing). В корневом режиме **выводится** из фразы, не хранится отдельно.
+    /// В proxy-режиме — seal ЭТОГО прокси, выведенный из его собственного случайного секрета
+    /// (`proxy_identity`), НЕ из фразы (#207): если запись прокси сожжена/не существует, это
+    /// ошибка, а не тихий откат на HD-вывод из фразы (см. `proxy_identity`).
     pub fn load_identity(&self) -> io::Result<Identity> {
-        let ent = self.load_entropy()?;
         Ok(match self.proxy {
-            None => crate::seed::derive(&ent).seal,
-            Some(idx) => crate::seed::derive_proxy(&ent, idx).seal,
+            None => crate::seed::derive(&self.load_entropy()?).seal,
+            Some(idx) => self.proxy_identity(idx)?.seal,
         })
     }
 
-    /// §2.1-account (ik‖prekey‖KEM) — **выводится** из корня, не хранится отдельно. В proxy-режиме
-    /// возвращает личность ПРОКСИ (`derive_proxy`), поэтому весь session-слой (mailbox = IK,
-    /// ownership-proof, ratchet) работает как этот прокси, а не как корень. Это единственное место,
-    /// где сетевой identity подменяется — все сетевые операции идут через него.
+    /// §2.1-account (ik‖prekey‖KEM). В корневом режиме **выводится** из фразы, не хранится
+    /// отдельно. В proxy-режиме возвращает личность ПРОКСИ — выведенную из ЕЁ СОБСТВЕННОГО
+    /// секрета в реестре (`proxy_identity`), НЕ из фразы (#207, A6-4) — поэтому весь session-слой
+    /// (mailbox = IK, ownership-proof, ratchet) работает как этот прокси, а не как корень. Это
+    /// единственное место, где сетевой identity подменяется — все сетевые операции идут через
+    /// него. Если запись прокси сожжена (или никогда не создавалась), это `Err`: НИКАКОГО тихого
+    /// отката на вывод из фразы — именно такой откат воссоздал бы "сожжённую" личность и обнулил
+    /// бы весь смысл сжигания.
     pub fn load_account(&self) -> io::Result<Account> {
-        let ent = self.load_entropy()?;
         Ok(match self.proxy {
-            None => crate::seed::derive(&ent).account,
-            Some(idx) => crate::seed::derive_proxy(&ent, idx).account,
+            None => crate::seed::derive(&self.load_entropy()?).account,
+            Some(idx) => self.proxy_identity(idx)?.account,
         })
     }
 
@@ -2429,18 +2443,51 @@ impl Store {
         self.write_sealed(&self.channel_peers_path(), &plain)
     }
 
-    // ----- Connection proxies: disposable HD-derived channels (proxy-identity model) -----
+    // ----- Connection proxies: disposable per-proxy-secret channels (proxy-identity model) -----
     //
-    // The registry (`proxies.dat`) lists indices/labels/active; the KEYS are never stored — they
-    // re-derive from the seed via `seed::derive_proxy(entropy, index)`, so a proxy costs one small
-    // record and is fully recoverable from the phrase. The contact→proxy tag is a SEPARATE sidecar
-    // (`contact_proxy.dat`) so it never touches the postcard layout of `contacts.dat`.
+    // #207 (A6-4): the registry (`proxies.dat`) used to list indices/labels/active and re-derive
+    // every proxy's KEYS from the seed (`seed::derive_proxy(entropy, index)`). That made "burning"
+    // a proxy (flipping `active`) an operational label, not destruction: the phrase alone could
+    // still regenerate ANY past proxy's private keys forever, match them against historical relay
+    // logs, enumerate future proxies, and link identities the UI presented as independently
+    // destroyed. Now each `ProxyEntry` carries its OWN random 32-byte `secret`, minted (`OsRng`)
+    // only at creation and stored ONLY in this sealed registry — never derivable from the seed.
+    // Burning REMOVES the entry (and the secret with it): once gone, NOTHING — not even the
+    // recovery phrase — can reproduce that identity's keys again. The honest cost: the phrase
+    // recovers the ROOT account, not its proxies — a restored account starts with zero proxies,
+    // by design (see `docs/design/proxy-identity.md`).
+    //
+    // The contact→proxy tag is a SEPARATE sidecar (`contact_proxy.dat`) so it never touches the
+    // postcard layout of `contacts.dat`.
 
     fn proxies_path(&self) -> PathBuf {
         self.dir.join("proxies.dat")
     }
 
-    /// Every proxy in the registry (active and burned), oldest index first.
+    fn load_registry(&self) -> io::Result<ProxyRegistry> {
+        match std::fs::read(self.proxies_path()) {
+            Ok(b) => {
+                let plain = self
+                    .key
+                    .open(&self.label(&self.proxies_path()), &b)
+                    .map_err(|e| io_err(format!("proxy list fails authentication: {e}")))?;
+                let mut reg: ProxyRegistry = postcard::from_bytes(&plain)
+                    .map_err(|e| io_err(format!("proxy list malformed: {e}")))?;
+                reg.entries.sort_by_key(|p| p.index);
+                Ok(reg)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ProxyRegistry::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn save_registry(&self, reg: &ProxyRegistry) -> io::Result<()> {
+        let plain = postcard::to_stdvec(reg).map_err(io_err)?;
+        self.write_sealed(&self.proxies_path(), &plain)
+    }
+
+    /// Every LIVE proxy in the registry (burned ones are gone, not merely flagged), oldest
+    /// index first.
     pub fn load_proxies(&self) -> Vec<ProxyEntry> {
         self.try_load_proxies().unwrap_or_else(|e| {
             // Not a silent default: an unreadable proxy list does not merely lose settings, it
@@ -2453,65 +2500,112 @@ impl Store {
     }
 
     /// Fallible form of [`Store::load_proxies`]: distinguishes "none configured" (absent file)
-    /// from "cannot be authenticated" (present but undecryptable/malformed).
+    /// from "cannot be authenticated" (present but undecryptable/malformed). Used (rather than the
+    /// infallible form) by anything that DERIVES an identity from the registry — an unreadable
+    /// registry must never present as "no such proxy, must be burned" (that would be the same
+    /// CRYPTO-29 misclassification the infallible form's eprintln guards against, just one layer
+    /// deeper: "corrupt" and "burned" are different failures and must stay distinguishable).
     pub fn try_load_proxies(&self) -> io::Result<Vec<ProxyEntry>> {
-        match std::fs::read(self.proxies_path()) {
-            Ok(b) => {
-                let plain = self
-                    .key
-                    .open(&self.label(&self.proxies_path()), &b)
-                    .map_err(|e| io_err(format!("proxy list fails authentication: {e}")))?;
-                let mut v: Vec<ProxyEntry> = postcard::from_bytes(&plain)
-                    .map_err(|e| io_err(format!("proxy list malformed: {e}")))?;
-                v.sort_by_key(|p| p.index);
-                Ok(v)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
-        }
+        Ok(self.load_registry()?.entries)
     }
 
-    fn save_proxies(&self, list: &[ProxyEntry]) -> io::Result<()> {
-        let plain = postcard::to_stdvec(list).map_err(io_err)?;
-        self.write_sealed(&self.proxies_path(), &plain)
-    }
-
-    /// Mint a new proxy: the next unused index gets a registry entry. Keys are NOT stored (they
-    /// derive from the seed). Bounded by `MAX_PROXIES`. Returns the new entry.
+    /// Mint a new proxy: a monotonic index (never reused, even across burns — see
+    /// `ProxyRegistry::next_index`) and a fresh random 32-byte secret (`OsRng`) that is the ONLY
+    /// thing this proxy's keys ever derive from. Bounded by `MAX_PROXIES`. Returns the new entry.
     pub fn create_proxy(&self, label: &str, now: u64) -> io::Result<ProxyEntry> {
-        let mut list = self.load_proxies();
-        if list.len() >= MAX_PROXIES {
+        let mut reg = self.load_registry()?;
+        if reg.entries.len() >= MAX_PROXIES {
             return Err(io_err("too many proxies"));
         }
-        let index = list.iter().map(|p| p.index).max().map(|m| m + 1).unwrap_or(0);
+        let index = reg.next_index;
+        reg.next_index =
+            reg.next_index.checked_add(1).ok_or_else(|| io_err("proxy index space exhausted"))?;
+        let mut secret = [0u8; 32];
+        OsRng.fill_bytes(&mut secret);
         let entry = ProxyEntry {
             index,
             label: clamp_str(label, crate::content::MAX_PROFILE_NAME),
             created_at: now,
-            active: true,
+            secret,
         };
-        list.push(entry.clone());
-        self.save_proxies(&list)?;
+        reg.entries.push(entry.clone());
+        self.save_registry(&reg)?;
         Ok(entry)
     }
 
-    /// Burn / un-burn a proxy (flip `active`). Burning stops offering it; its keys stay derivable
-    /// so any last in-flight mail still decrypts. Idempotent.
-    pub fn set_proxy_active(&self, index: u32, active: bool) -> io::Result<()> {
-        let mut list = self.load_proxies();
-        let Some(p) = list.iter_mut().find(|p| p.index == index) else { return Ok(()) };
-        if p.active == active {
-            return Ok(());
+    /// Burn a proxy: DELETE its registry entry — and with it, its secret — outright (#207, A6-4).
+    /// This is NOT a flag flip and NOT reversible: once the secret is gone, NOTHING can regenerate
+    /// this identity's keys again, including the recovery phrase, because the phrase was never
+    /// part of the derivation. That irreversibility is the fix, not a side effect — see the module
+    /// note above and `docs/design/proxy-identity.md`. Also removes this proxy's own namespaced
+    /// network files (`net_file`: sessions/OPKs/discovery-key/quarantine/…, best-effort — a proxy
+    /// that never published anything simply has none) and any contact→proxy tags still pointing at
+    /// it, so no trace of a burned identity's channel state lingers on disk. Idempotent: burning an
+    /// already-absent index is not an error. Deliberately does NOT refuse to burn the account's
+    /// last remaining proxy — "you must always keep one reachable channel" is a UX/session policy,
+    /// not a data-integrity invariant, and belongs in the caller (see the desktop `burn_proxy`
+    /// command, which enforces exactly that before calling this).
+    pub fn burn_proxy(&self, index: u32) -> io::Result<()> {
+        let mut reg = self.load_registry()?;
+        let before = reg.entries.len();
+        reg.entries.retain(|p| p.index != index);
+        if reg.entries.len() != before {
+            self.save_registry(&reg)?;
         }
-        p.active = active;
-        self.save_proxies(&list)
+
+        // Drop the namespaced network files this proxy owned. Best-effort: NotFound just means
+        // this proxy never got that far (e.g. burned before its first publish).
+        let victim = self.as_proxy(index);
+        for path in [
+            victim.net_file("discovery.key"),
+            victim.net_file("reduced_fs.dat"),
+            victim.net_file("opks.dat"),
+            victim.net_file("partials.dat"),
+            victim.net_file("sessions.dat"),
+            victim.net_file("sessions.lock"),
+            victim.net_file("sessions.anchor"),
+            victim.net_file("quarantine.dat"),
+        ] {
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    eprintln!("warning: could not remove burned proxy file {}: {e}", path.display());
+                }
+            }
+        }
+
+        // A contact tagged to this now-dead index would otherwise sit pointing at nothing
+        // forever (indices are never reused, so it can never silently reattach to a different,
+        // newer identity either — but a stale tag is dead weight worth clearing).
+        let mut map = self.load_contact_proxy();
+        let before = map.len();
+        map.retain(|_, v| *v != index);
+        if map.len() != before {
+            let plain = postcard::to_stdvec(&map).map_err(io_err)?;
+            self.write_sealed(&self.contact_proxy_path(), &plain)?;
+        }
+        Ok(())
     }
 
-    /// The derived identity (seal ‖ account) for proxy `index` — recomputed from the seed on
-    /// demand, never stored. The network layer uses this to publish that proxy's bundle and run
-    /// its sessions. `Err` if the seed is unreadable.
+    /// The derived identity (seal ‖ account) for proxy `index` — derived from THAT PROXY'S OWN
+    /// random secret in the registry, never from the seed/phrase (#207, A6-4). `Err` if `index`
+    /// names no live entry (burned, or never created) OR if the registry itself cannot be
+    /// authenticated — deliberately using [`Store::try_load_proxies`] rather than the infallible
+    /// [`Store::load_proxies`], so a corrupt registry reports as "registry unreadable", not as
+    /// "no such proxy" (which would misrepresent a tampered/corrupt disk as an ordinary burn).
+    /// There is NO fallback path to phrase-derivation here: that fallback is exactly the bug #207
+    /// fixes, so its absence is load-bearing, not an oversight.
     pub fn proxy_identity(&self, index: u32) -> io::Result<crate::seed::DerivedIdentity> {
-        Ok(crate::seed::derive_proxy(&self.load_entropy()?, index))
+        let entry = self
+            .try_load_proxies()?
+            .into_iter()
+            .find(|p| p.index == index)
+            .ok_or_else(|| {
+                io_err(format!(
+                    "proxy #{index} has no live registry entry (burned or never created) — \
+                     refusing to fall back to deriving it from the phrase"
+                ))
+            })?;
+        Ok(crate::seed::derive_proxy_from_secret(&entry.secret))
     }
 
     fn contact_proxy_path(&self) -> PathBuf {
@@ -3401,18 +3495,41 @@ pub struct AccountEntry {
     pub ik: [u8; 32],
 }
 
-/// One CONNECTION PROXY in the root's registry (`proxies.dat`) — a disposable HD-derived channel
-/// (see docs/design/proxy-identity.md). Carries only what a channel needs: its HD `index` (the
-/// keys are re-derived deterministically via `seed::derive_proxy(entropy, index)`, never stored),
-/// a human `label`, when it was made, and whether it is `active` (burning a proxy flips this off —
-/// its keys stay derivable for in-flight mail but it is no longer offered/rotated to). A proxy owns
-/// NO contacts/profile/feed — those are the root's, one copy.
+/// One CONNECTION PROXY in the root's registry (`proxies.dat`) — a disposable channel (see
+/// docs/design/proxy-identity.md). Carries only what a channel needs: a stable `index` (used to
+/// namespace this proxy's network files and to tag contacts — never reused, even after this entry
+/// is burned), a random 32-byte `secret` (minted at creation, `OsRng` — the ONLY thing this
+/// proxy's keys ever derive from; see `seed::derive_proxy_from_secret`), a human `label`, and when
+/// it was made. A proxy owns NO contacts/profile/feed — those are the root's, one copy.
+///
+/// There is deliberately no `active` flag any more (#207, A6-4): existence in the registry IS
+/// "active". Burning (`Store::burn_proxy`) removes the entry — and its `secret` — outright, so a
+/// burned identity's keys become unrecoverable, including from the recovery phrase. The old model
+/// (HD-derived from the phrase by index, burn = flip a flag) left every burned proxy's keys
+/// forever re-derivable by anyone holding the phrase — burning was a label, not destruction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyEntry {
     pub index: u32,
     pub label: String,
     pub created_at: u64,
-    pub active: bool,
+    /// Random per-proxy secret (32 bytes, `OsRng`), minted once at creation and never derived
+    /// from the seed. This — not any HD index — is the sole root of this proxy's keys
+    /// (`seed::derive_proxy_from_secret`). Deleting it (via `Store::burn_proxy`) is what makes a
+    /// burned proxy's identity actually unrecoverable.
+    pub secret: [u8; 32],
+}
+
+/// Full persisted payload of `proxies.dat`: the live entries AND the next index to mint.
+/// Kept separate from `entries.len()`/`max(index)` because burning REMOVES an entry outright —
+/// without a separately-tracked, monotonically-increasing counter, burning the highest-numbered
+/// proxy would free its index for reuse, and the next mint would inherit that index's namespaced
+/// network files (`net_file`: sessions/OPKs/discovery-key/…) and any stale contact→proxy tags
+/// still pointing at it — silently reanimating state that belonged to the identity just burned.
+/// `next_index` only ever increases.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ProxyRegistry {
+    next_index: u32,
+    entries: Vec<ProxyEntry>,
 }
 
 /// Network configuration remembered between launches, at the VAULT (device) level and
@@ -4962,26 +5079,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The proxy registry mints sequential indices, burns (flips active), derives each proxy's
-    /// identity deterministically from the seed (recoverable, not stored), and tags a contact with
-    /// its proxy via a sidecar — all round-tripping sealed on disk.
+    /// The proxy registry mints sequential indices with a fresh random secret each, derives each
+    /// proxy's identity from ITS OWN secret (differing per proxy), and tags a contact with its
+    /// proxy via a sidecar — all round-tripping sealed on disk. Burning removes the entry (and its
+    /// tag) rather than flipping a flag — see `burning_a_proxy_deletes_its_secret_so_the_phrase_can_never_reproduce_it`
+    /// for the discriminating check that this is real deletion, not a label.
     #[test]
-    fn proxy_registry_mints_burns_derives_and_tags() {
+    fn proxy_registry_mints_indices_sequentially_and_derives_from_its_own_secret() {
         let dir = std::env::temp_dir().join(format!("karst-store-proxy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::unlock(&dir, b"pw").unwrap();
-        s.save_seed(&[3u8; 16]).unwrap(); // provision the seed so proxy identities can derive
+        s.save_seed(&[3u8; 16]).unwrap(); // the root's own seed; proxies do NOT use it
 
         assert!(s.load_proxies().is_empty(), "no proxies initially");
         let p0 = s.create_proxy("work", 10).unwrap();
         let p1 = s.create_proxy("family", 11).unwrap();
         assert_eq!((p0.index, p1.index), (0, 1), "sequential indices");
+        assert_ne!(p0.secret, p1.secret, "each proxy mints its own random secret");
+        assert_ne!(p0.secret, [0u8; 32], "the secret is not left zeroed");
 
-        // Derived identity matches the frozen HD derivation and differs per index.
-        let ent = s.load_entropy().unwrap();
+        // Derived identity matches derivation from the entry's OWN secret, and differs per proxy.
         assert_eq!(
             s.proxy_identity(0).unwrap().account.identity_public(),
-            crate::seed::derive_proxy(&ent, 0).account.identity_public()
+            crate::seed::derive_proxy_from_secret(&p0.secret).account.identity_public()
         );
         assert_ne!(
             s.proxy_identity(0).unwrap().account.identity_public(),
@@ -4989,13 +5109,99 @@ mod tests {
         );
 
         // Burn p0, tag a contact to p1 — reload from disk and check both persisted.
-        s.set_proxy_active(0, false).unwrap();
+        s.burn_proxy(0).unwrap();
         s.set_contact_proxy([9u8; 32], 1).unwrap();
         let s2 = Store::unlock(&dir, b"pw").unwrap(); // reopen from disk
         let list = s2.load_proxies();
-        assert_eq!(list.len(), 2);
-        assert!(!list[0].active && list[1].active, "p0 burned, p1 active");
+        assert_eq!(list, vec![p1.clone()], "p0 gone entirely, p1 untouched");
         assert_eq!(s2.contact_proxy(&[9u8; 32]), Some(1), "contact tagged to its proxy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Burning the highest-numbered proxy must NOT free its index for reuse: since burning now
+    /// deletes the entry outright (rather than flagging it inactive), a naive `max(existing) + 1`
+    /// would hand the next mint the exact index whose namespaced session/OPK files and contact
+    /// tags used to belong to the just-destroyed identity — silently reanimating its leftover
+    /// state under a "new" proxy. Discriminating: swap `create_proxy`'s index allocation back to
+    /// `list.iter().map(|p| p.index).max().map(|m| m + 1).unwrap_or(0)` (the old formula) and this
+    /// goes red, because burning p1 then minting again reissues index 1.
+    #[test]
+    fn burning_the_newest_proxy_does_not_free_its_index_for_reuse() {
+        let dir = std::env::temp_dir().join(format!("karst-store-noreuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let p0 = s.create_proxy("p0", 1).unwrap();
+        let p1 = s.create_proxy("p1", 2).unwrap();
+        assert_eq!((p0.index, p1.index), (0, 1));
+
+        s.burn_proxy(1).unwrap(); // burn the newest (highest index)
+        let p2 = s.create_proxy("p2", 3).unwrap();
+        assert_eq!(p2.index, 2, "the burned index 1 must never be reissued");
+
+        s.burn_proxy(0).unwrap();
+        s.burn_proxy(2).unwrap();
+        let p3 = s.create_proxy("p3", 4).unwrap();
+        assert_eq!(p3.index, 3, "monotonic even once the registry is entirely burned empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE fix for #207 (A6-4): burning a proxy must destroy its identity, not just relabel it.
+    /// Before, burning only flipped `active`; the keys stayed forever re-derivable from the
+    /// recovery phrase (`seed::derive_proxy(entropy, index)`), so a "destroyed" proxy was really
+    /// still live to anyone holding the phrase. Now each proxy's keys come from a random secret
+    /// that lives ONLY in the registry, and burning deletes that secret — so after a burn, NOTHING
+    /// (not `as_proxy(index).load_account()`, not a fresh `Store::unlock` from disk, not minting a
+    /// replacement) reproduces the old identity, even though the very same phrase is still in use.
+    ///
+    /// Discriminating: give `load_account`'s proxy arm a fallback like
+    /// `.or_else(|_| Ok(crate::seed::derive(&self.load_entropy()?).account))` (the exact silent
+    /// fallback the fix must not have) and the "burned proxy is now an error" assertions below go
+    /// red — the fallback happily reconstructs SOME identity instead of failing.
+    #[test]
+    fn burning_a_proxy_deletes_its_secret_so_the_phrase_can_never_reproduce_it() {
+        let dir = std::env::temp_dir().join(format!("karst-store-burn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        s.save_seed(&[42u8; 16]).unwrap();
+
+        // Control: a LIVE proxy derives the same identity across independent reloads from disk.
+        let entry = s.create_proxy("keeper", 1).unwrap();
+        let ik_before = s.as_proxy(entry.index).load_account().unwrap().identity_public();
+        let reopened = Store::unlock(&dir, b"pw").unwrap();
+        let ik_reloaded = reopened.as_proxy(entry.index).load_account().unwrap().identity_public();
+        assert_eq!(ik_before, ik_reloaded, "control: a live proxy is stable across reloads");
+
+        // Burn a SECOND proxy and record its identity before burning.
+        let burned = s.create_proxy("burned", 2).unwrap();
+        let burned_ik = s.as_proxy(burned.index).load_account().unwrap().identity_public();
+        s.burn_proxy(burned.index).unwrap();
+
+        // Post-burn: this store, in-process, can no longer produce that identity.
+        assert!(
+            s.as_proxy(burned.index).load_account().is_err(),
+            "a burned proxy must fail loudly, not silently hand back some identity"
+        );
+        assert!(s.as_proxy(burned.index).load_identity().is_err(), "same for the seal half");
+
+        // Post-burn, reopened from disk (rules out any in-memory-only state): still gone, even
+        // though the very same phrase (`load_entropy`) is still on disk and readable.
+        let s2 = Store::unlock(&dir, b"pw").unwrap();
+        assert!(
+            s2.as_proxy(burned.index).load_account().is_err(),
+            "not recoverable after a fresh unlock from the SAME phrase either"
+        );
+        assert!(s2.load_entropy().is_ok(), "sanity: the phrase itself is still intact and readable");
+
+        // A brand-new proxy minted after the burn gets a FRESH, unrelated identity — the phrase +
+        // registry cannot reproduce the burned one under a new index either.
+        let replacement = s2.create_proxy("replacement", 3).unwrap();
+        let replacement_ik = s2.as_proxy(replacement.index).load_account().unwrap().identity_public();
+        assert_ne!(
+            replacement_ik, burned_ik,
+            "a fresh proxy must never coincide with the identity that was destroyed"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5134,24 +5340,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Proxy mode: identities differ (per HD index, and from the root), NETWORK state is isolated
-    /// per proxy (OPKs saved as one proxy never leak to another or to the root), while DATA
-    /// (contacts) is shared root state. This is the isolation gate for the proxy-identity network
-    /// layer — neuter `net_file`'s namespacing and the "p1 has its own opks" assert reddens.
+    /// Proxy mode: identities differ (each from its OWN secret, and from the root), NETWORK state
+    /// is isolated per proxy (OPKs saved as one proxy never leak to another or to the root), while
+    /// DATA (contacts) is shared root state. This is the isolation gate for the proxy-identity
+    /// network layer — neuter `net_file`'s namespacing and the "p1 has its own opks" assert reddens.
     #[test]
     fn proxy_mode_isolates_network_state_but_shares_data() {
         let dir = std::env::temp_dir().join(format!("karst-store-pmode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::unlock(&dir, b"pw").unwrap();
         s.save_seed(&[7u8; 16]).unwrap();
-        let p0 = s.as_proxy(0);
-        let p1 = s.as_proxy(1);
+        let e0 = s.create_proxy("p0", 1).unwrap();
+        let e1 = s.create_proxy("p1", 2).unwrap();
+        let p0 = s.as_proxy(e0.index);
+        let p1 = s.as_proxy(e1.index);
 
-        // Identity: proxy != proxy, proxy != root, and matches the frozen HD derivation.
+        // Identity: proxy != proxy, proxy != root, and matches derivation from the entry's secret.
         let ik_p0 = p0.load_account().unwrap().identity_public();
         assert_ne!(ik_p0, p1.load_account().unwrap().identity_public(), "proxies differ");
         assert_ne!(ik_p0, s.load_account().unwrap().identity_public(), "proxy != root");
-        assert_eq!(ik_p0, crate::seed::derive_proxy(&[7u8; 16], 0).account.identity_public());
+        assert_eq!(ik_p0, crate::seed::derive_proxy_from_secret(&e0.secret).account.identity_public());
         // The seal (relay-facing) is proxy-scoped too.
         assert_ne!(
             p0.load_identity().unwrap().public.to_bytes(),
@@ -5638,7 +5846,12 @@ mod tests {
 
         assert!(store.try_load_proxies().unwrap().is_empty(), "absent = legitimately none");
 
-        store.save_proxies(&[ProxyEntry { index: 0, label: "p0".into(), created_at: 1, active: true }]).unwrap();
+        store
+            .save_registry(&ProxyRegistry {
+                next_index: 1,
+                entries: vec![ProxyEntry { index: 0, label: "p0".into(), created_at: 1, secret: [5u8; 32] }],
+            })
+            .unwrap();
         assert_eq!(store.try_load_proxies().unwrap().len(), 1, "control: it round-trips");
 
         // Corrupt the sealed file the way a bad disk or a tamper would.

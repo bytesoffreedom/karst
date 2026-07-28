@@ -671,6 +671,8 @@ fn a_message_between_proxies_delivers_and_the_root_ik_never_appears() {
     seed_provision(&bstore);
     astore.save_capability(&client::dev_capability()).unwrap();
     bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
+    bstore.create_proxy("p0", NOW).unwrap();
 
     // Both parties act AS their proxy 0 — the only thing that ever touches the relay.
     let a = astore.as_proxy(0);
@@ -770,6 +772,8 @@ fn a_proxy_message_via_a_published_opk_delivers() {
     seed_provision(&bstore);
     astore.save_capability(&client::dev_capability()).unwrap();
     bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
+    bstore.create_proxy("p0", NOW).unwrap();
 
     let a = astore.as_proxy(0);
     let b = bstore.as_proxy(0);
@@ -813,6 +817,7 @@ fn republishing_opks_never_hands_the_same_prekey_twice() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&bstore);
     bstore.save_capability(&client::dev_capability()).unwrap();
+    bstore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
     let b = bstore.as_proxy(0);
     let b_ik = b.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -950,6 +955,9 @@ fn a_channel_migration_repoints_a_contact_and_clears_verified() {
     seed_provision(&bstore);
     astore.save_capability(&client::dev_capability()).unwrap();
     bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.create_proxy("p0", NOW).unwrap(); // mints indices' own random secrets (#207)
+    astore.create_proxy("p1", NOW).unwrap();
+    bstore.create_proxy("p0", NOW).unwrap();
 
     let a0 = astore.as_proxy(0); // Alice's current (soon-compromised) channel
     let a1 = astore.as_proxy(1); // the fresh channel she moves keepers to
@@ -2957,6 +2965,9 @@ fn contact_accept_comes_from_the_proxy_that_received_the_request() {
     seed_provision(&bstore);
     astore.save_capability(&client::dev_capability()).unwrap();
     bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.create_proxy("p0", NOW).unwrap(); // mints indices' own random secrets (#207)
+    bstore.create_proxy("p0", NOW).unwrap();
+    bstore.create_proxy("p1", NOW).unwrap();
     // A acts as proxy 0; B is reached on proxy 1 (NOT B's default proxy 0).
     let a = astore.as_proxy(0);
     let b0 = bstore.as_proxy(0);

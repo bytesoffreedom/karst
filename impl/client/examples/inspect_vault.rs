@@ -74,7 +74,9 @@ fn main() {
         let id = client::RelayId::parse(net.relay_id.trim()).expect("relay id");
         let relay = client::Relay::configured(addr, id, None, "");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        for p in root.load_proxies().into_iter().filter(|p| p.active) {
+        // `load_proxies()` already lists only LIVE proxies — burning removes the entry outright
+        // now (#207), there is no more `active` flag to filter on.
+        for p in root.load_proxies() {
             let ps = root.as_proxy(p.index);
             match client::recv_session_multi(&ps, std::slice::from_ref(&relay), now) {
                 Ok(poll) => {
@@ -96,11 +98,13 @@ fn main() {
         return;
     }
 
-    // `... <dir> <pw> burn <index>` — deactivate a junk/auto-created channel.
+    // `... <dir> <pw> burn <index>` — destroy a junk/auto-created channel. NOT reversible: this
+    // deletes the proxy's secret from the registry (#207), so nothing (not even the recovery
+    // phrase) can reproduce that identity afterward.
     if mode.as_deref() == Some("burn") {
         let idx: u32 = a.next().expect("proxy index").parse().expect("index");
-        root.set_proxy_active(idx, false).expect("burn");
-        println!("proxy #{idx} deactivated");
+        root.burn_proxy(idx).expect("burn");
+        println!("proxy #{idx} burned (its secret is gone — unrecoverable)");
         return;
     }
     // `... <dir> <pw> rmcontact <ik_prefix>` — remove a stale contact (by hex prefix).
@@ -150,7 +154,7 @@ fn main() {
         let ik = ps.load_account().map(|ac| ac.identity_public()).unwrap_or([0; 32]);
         let st = ps.load_sessions().unwrap_or_else(|_| node::peer::PeerState::empty());
         let (out, inb) = st.debug_peers();
-        println!("  proxy #{} active={} IK={} outbox={}", p.index, p.active, short(&ik), st.outbox_len());
+        println!("  proxy #{} IK={} outbox={}", p.index, short(&ik), st.outbox_len());
         for (peer, seed) in &out {
             println!("      OUT  → peer {}  drop_seed {}", short(peer), short(seed));
         }

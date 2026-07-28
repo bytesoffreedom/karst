@@ -303,10 +303,19 @@ impl App {
     }
 
     /// Reset per-account transient state (called when the active account changes): drop
-    /// half-received inline files, and CANCEL + drop any in-flight transfers so a new account
-    /// never inherits another's threads or partial files.
+    /// half-received inline files, half-SENT streamed uploads, and CANCEL + drop any in-flight
+    /// transfers so a new account never inherits another's threads or partial files.
+    ///
+    /// **A3-10 — `pending_sends` was the one thing this did not clear.** An upload id is minted by
+    /// `file_begin` under the account that was unlocked then, but `file_commit` dispatches through
+    /// whatever session is current when it runs — so a file a user started uploading as account A
+    /// and committed after switching to account B went out from B, to B's contact, over B's relay.
+    /// Clearing here gives the same guarantee an `upload_id → account` binding would (a commit can
+    /// only ever reach the account that began it) at the one place that already exists to enforce
+    /// exactly this, and it frees the buffered bytes on the switch as a side effect.
     fn reset_transient(&self) {
         self.reasm.lock().unwrap().clear();
+        self.pending_sends.lock().unwrap().clear();
         let mut t = self.transfers.lock().unwrap();
         for st in t.values() {
             st.cancel.store(true, Ordering::Relaxed);
@@ -1088,7 +1097,17 @@ fn container_unlock(app: State<App>, password: String, vault_dir: Option<String>
         base.join("work"),
         hidden_work_dir(&base),
     )
-    .map_err(|_| "wrong password".to_string())?;
+    // An ordinary open failure collapses to ONE opaque string on purpose: "wrong password" and "no
+    // such compartment" must be the same answer, or the error itself proves whether a compartment
+    // exists. But two failures here are not about the password at all — the container is locked by
+    // another session (A3-8), or it is over the size this build will hold in RAM (A3-9) — and
+    // reporting either of those as "wrong password" leaves a user with a working password and no
+    // way to find out what is actually wrong. They are surfaced by `ErrorKind`, which leaks
+    // nothing: both are properties of the file, observable without any password.
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::OutOfMemory => e.to_string(),
+        _ => "wrong password".to_string(),
+    })?;
     let cv = match outcome {
         client::container::Unlocked::Wiped => return Err("WIPED".to_string()),
         client::container::Unlocked::Account(cv) => cv,
@@ -4425,6 +4444,32 @@ mod tests {
     fn pushing_to_an_unknown_id_errors() {
         let mut sends: HashMap<String, Vec<u8>> = HashMap::new();
         assert!(append_chunk(&mut sends, "nope", b"x", MAX_STREAM_BYTES).is_err());
+    }
+
+    /// **A3-10 — a streamed upload must not survive an account switch.** `file_begin` mints the id
+    /// under one account; `file_commit` dispatches through whatever session is current when it runs.
+    /// `reset_transient` — the single choke point every account change goes through — cleared the
+    /// inline reassembly buffers and the transfers but not `pending_sends`, so a file begun as
+    /// account A could be committed, and sent, as account B.
+    ///
+    /// Discriminating: it asserts the entry is GONE, which is exactly what a later `file_commit`
+    /// keys off ("unknown upload id"). Neuter by removing the `pending_sends` line from
+    /// `reset_transient` and the id survives the switch → RED. The `reasm` half is asserted
+    /// alongside it purely as a control: it proves the reset ran at all, so a failure on
+    /// `pending_sends` can only mean that one line.
+    #[test]
+    fn an_account_switch_drops_a_half_uploaded_file() {
+        let app = App::default();
+        app.pending_sends.lock().unwrap().insert("upload-a".into(), vec![1, 2, 3]);
+        app.reasm.lock().unwrap().insert([9u8; 32], Default::default());
+
+        app.reset_transient();
+
+        assert!(
+            app.pending_sends.lock().unwrap().is_empty(),
+            "an upload begun by the previous account must not be committable by the next one"
+        );
+        assert!(app.reasm.lock().unwrap().is_empty(), "control: the reset did run");
     }
 
     /// A3-7 — the startup sweep must never delete a directory another process is USING.

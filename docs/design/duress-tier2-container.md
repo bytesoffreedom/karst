@@ -173,6 +173,26 @@ container.dat  (exactly N bytes, every byte indistinguishable from random)
   after the fact — so prevent it, and advise the user to disable/encrypt swap and
   disable hibernation). VISIBLE accounts, being non-secret, may use a normal working
   copy.
+- **The container is the AUTHORITY for what a compartment contains (A3-3, implemented).**
+  Opening a compartment makes the work dir *equal* its snapshot: `restore_dir` clears the
+  directory and lays the snapshot down fresh. It used to overlay the snapshot onto whatever
+  was already there, and since a visible account's work dir (`<vault>/work`) survives between
+  sessions, anything left in it outlived the snapshot meant to replace it — deleted contacts
+  and settings came back and were re-snapshotted, and two generations of state could mix
+  file-by-file. **Named cost, not hidden:** work that never reached a `save()` is now
+  discarded cleanly at the next open rather than left behind torn. For received mail that is
+  safe — relay ACKs are deferred behind a successful container commit, so unsaved messages
+  redeliver — but a queued outbound send or an in-progress download has no relay copy and is
+  simply lost. That is the price of making the container authoritative, and it is the right
+  price: the alternative is resurrection.
+- **One writer per container, enforced (A3-8, implemented; UNIX only).** `Container` holds an
+  exclusive `flock` on `container.dat` for its whole life, so a second window — or a second
+  instance inside one process — is refused instead of racing. Without it, two savers shared one
+  `<container>.tmp` and could rename an interleaved mixture over the file (destroying *every*
+  compartment, not just the loser's), `load` could unlink another process's in-flight save, and
+  a stale in-memory image could silently revert regions its holder never touched. The lock is
+  advisory, and there is **no equivalent on non-UNIX platforms** — a lock *file* is not an
+  option, because a hidden account's directory must contain `container.dat` and nothing else.
 - **P1 vs P3 = the allocation ceiling only.** P1: visible region confined to its A cap.
   P3: allowed the whole container → may spill into B (accepted-risk masking). Hidden
   always confined to its region.
@@ -264,10 +284,18 @@ not while absent. Document the weakened‑absence limit. `wipe` password destroy
 
 ## 7. Sizing, migration, UI
 
-- **User chooses N** at creation (up to `free − max(2 GiB, 10%)`), plus an **A/B
-  slider** (main vs hidden reserve) with the honest warning that hidden is
-  best‑effort under P3 and best kept light. Writing N random bytes is slow → progress
-  off the UI thread.
+- **User chooses N** at creation, plus an **A/B slider** (main vs hidden reserve) with the
+  honest warning that hidden is best‑effort under P3 and best kept light. Writing N random
+  bytes is slow → progress off the UI thread.
+- **N is capped at 1 GiB by RAM, not by free disk (A3-9, implemented).** The earlier
+  `free − max(2 GiB, 10%)` framing was wrong about which resource binds: this is a
+  whole-file-in-RAM design, and `client::container::MAX_CONTAINER_BYTES` refuses anything
+  larger at both `create` and `load`. Memory-mapping would not lift the ceiling, which is why
+  the cap is the fix rather than a placeholder for a rewrite: format (b) keeps **one sealed
+  blob per compartment**, so a save necessarily builds the entire account snapshot in RAM and
+  then its entire ciphertext. Peak is roughly **2 × N** (file + snapshot + ciphertext), of
+  which only the file term is what mmap would remove. 1 GiB ⇒ ~2 GiB peak and ~384 MiB of
+  usable main account. A container the machine cannot hold twice over is unusable by design.
 - **Main‑region full policy (settled with user):** format (b) hard‑caps the main
   account at A, so its growing metadata (sessions/history/contacts) can fill it.
   Policy = **generous A default + an always‑on "container nearly full" warning** +

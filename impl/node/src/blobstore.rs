@@ -120,12 +120,28 @@ impl Meta {
     }
 }
 
+/// A sender's running totals across all their blobs — maintained INCREMENTALLY (put_chunk,
+/// sweep, recover all update it), never recomputed by scanning. `sender_bytes`/
+/// `sender_blob_count` back the `MAX_SENDER_BYTES`/`MAX_BLOBS_PER_SENDER` caps and are called on
+/// EVERY `put_chunk`, so a full `self.blobs.values().filter(...)` scan here would itself become
+/// an O(total blobs) cost paid on every chunk of every upload — exactly the "O(n) scan on every
+/// insert is its own denial of service" trap `MAX_BLOBS_TOTAL` exists to keep small, except this
+/// one would still bite even with the count bounded, since `MAX_BLOBS_TOTAL` is deliberately
+/// large.
+#[derive(Default)]
+struct SenderStats {
+    blobs: usize,
+    bytes: u64,
+}
+
 /// Disk-backed, capped, TTL-swept blob store. The index is DURABLE (rebuilt from per-blob
 /// metadata sidecars on [`open`](BlobStore::open)), so parked blobs survive a relay restart.
 pub struct BlobStore {
     dir: PathBuf,
     blobs: HashMap<[u8; 32], Meta>,
     total_bytes: u64,
+    /// Per-sender aggregate (see [`SenderStats`]) — O(1) lookups for the per-sender caps.
+    senders: HashMap<[u8; 32], SenderStats>,
 }
 
 impl BlobStore {
@@ -137,7 +153,7 @@ impl BlobStore {
             std::fs::remove_dir_all(&dir)?;
         }
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir, blobs: HashMap::new(), total_bytes: 0 })
+        Ok(Self { dir, blobs: HashMap::new(), total_bytes: 0, senders: HashMap::new() })
     }
 
     /// Open the store directory, RECOVERING the index from the on-disk metadata sidecars so parked
@@ -146,7 +162,7 @@ impl BlobStore {
     /// valid sidecar, or an orphan sidecar), and TTL-sweeps against `now`.
     pub fn open(dir: PathBuf, now: u64) -> io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let mut store = Self { dir, blobs: HashMap::new(), total_bytes: 0 };
+        let mut store = Self { dir, blobs: HashMap::new(), total_bytes: 0, senders: HashMap::new() };
         store.recover(now)?;
         Ok(store)
     }
@@ -160,15 +176,16 @@ impl BlobStore {
         self.dir.join(format!("{}.c{index}", hex::encode(id)))
     }
 
+    /// O(1): see [`SenderStats`] for why this is not a scan over `blobs`.
     fn sender_bytes(&self, sender: &[u8; 32]) -> u64 {
-        self.blobs.values().filter(|m| &m.sender == sender).map(Meta::size).sum()
+        self.senders.get(sender).map(|s| s.bytes).unwrap_or(0)
     }
 
     /// How many DISTINCT blob ids this sender currently owns (in-flight or complete). Backs
     /// `MAX_BLOBS_PER_SENDER` — a count-based cap the byte caps cannot substitute for (see that
-    /// constant's doc).
+    /// constant's doc). O(1): see [`SenderStats`].
     fn sender_blob_count(&self, sender: &[u8; 32]) -> usize {
-        self.blobs.values().filter(|m| &m.sender == sender).count()
+        self.senders.get(sender).map(|s| s.blobs).unwrap_or(0)
     }
 
     /// Append one ciphertext chunk. Enforces (in order): per-chunk size, ownership
@@ -211,12 +228,17 @@ impl BlobStore {
             None
         };
 
-        // Count caps (per-sender, global): checked ONLY when this chunk would CREATE a new blob
-        // id — a later chunk on an already-known blob never re-pays this. These exist because a
-        // zero- or near-zero-byte blob (declare `count=1`, send one tiny chunk) completes and
-        // costs a full `Meta` + sidecar entry while adding (almost) nothing to the byte caps
-        // below, so byte totals alone cannot stop an id-minting flood.
-        if !self.blobs.contains_key(&id) {
+        // Whether this chunk would CREATE a new blob id — computed once, reused below for the
+        // count caps, the meta-header write, and the sender-aggregate update, so the three never
+        // drift into disagreeing about which put "was" the new one.
+        let is_new_blob = !self.blobs.contains_key(&id);
+
+        // Count caps (per-sender, global): checked ONLY on a new blob id — a later chunk on an
+        // already-known blob never re-pays this. These exist because a zero- or near-zero-byte
+        // blob (declare `count=1`, send one tiny chunk) completes and costs a full `Meta` +
+        // sidecar entry while adding (almost) nothing to the byte caps below, so byte totals
+        // alone cannot stop an id-minting flood.
+        if is_new_blob {
             if self.blobs.len() >= MAX_BLOBS_TOTAL {
                 return BlobPut::Rejected("blob store at capacity".into());
             }
@@ -243,7 +265,7 @@ impl BlobStore {
         // On the FIRST sight of a blob, persist the sidecar header BEFORE any chunk file: a crash
         // after the header but before the chunk just leaves an in-progress blob with fewer chunks
         // (the client resumes); a chunk file with no header would be an unrecoverable orphan.
-        if !self.blobs.contains_key(&id) {
+        if is_new_blob {
             if let Err(e) = self.write_meta_header(&id, &sender, count, now) {
                 return BlobPut::Rejected(format!("store meta io: {e}"));
             }
@@ -270,6 +292,13 @@ impl BlobStore {
             m.contiguous += 1;
         }
         self.total_bytes += delta;
+        // Keep the O(1) per-sender aggregate (`senders`) in lockstep with `blobs`/`total_bytes` —
+        // incremented here, decremented in `sweep`, rebuilt in `recover`. See `SenderStats`.
+        let stats = self.senders.entry(sender).or_default();
+        if is_new_blob {
+            stats.blobs += 1;
+        }
+        stats.bytes += delta;
         if m.received() == m.count {
             m.complete = true;
             BlobPut::Complete
@@ -336,10 +365,18 @@ impl BlobStore {
     pub fn sweep(&mut self, now: u64) {
         let dir = self.dir.clone();
         let mut freed = 0u64;
+        // Per-sender (blob-count, bytes) reaped this pass — applied to `senders` AFTER `retain`
+        // (not from inside its closure) so this stays a plain local accumulator, not a second
+        // mutable borrow of `self` alongside the one `self.blobs.retain` already holds.
+        let mut reaped: HashMap<[u8; 32], (usize, u64)> = HashMap::new();
         self.blobs.retain(|id, m| {
             let keep = now.saturating_sub(m.created_at) <= BLOB_TTL_SECS;
             if !keep {
-                freed += m.size();
+                let size = m.size();
+                freed += size;
+                let r = reaped.entry(m.sender).or_insert((0, 0));
+                r.0 += 1;
+                r.1 += size;
                 // Only the indices that actually ARRIVED (#209) — not `0..m.count`, which for a
                 // sparse blob would turn every sweep pass into `count` mostly-ENOENT removes for
                 // a blob that only ever held a couple of real chunks.
@@ -351,6 +388,15 @@ impl BlobStore {
             keep
         });
         self.total_bytes -= freed.min(self.total_bytes);
+        for (sender, (count, bytes)) in reaped {
+            if let Some(s) = self.senders.get_mut(&sender) {
+                s.blobs = s.blobs.saturating_sub(count);
+                s.bytes = s.bytes.saturating_sub(bytes);
+                if s.blobs == 0 {
+                    self.senders.remove(&sender);
+                }
+            }
+        }
     }
 
     /// Rebuild the in-memory index from the on-disk sidecars. Called by [`open`](Self::open).
@@ -365,6 +411,11 @@ impl BlobStore {
     /// make every future relay restart do tens of thousands of pointless syscalls per blob.
     /// Building straight from the directory listing instead makes recovery cost proportional to
     /// the files really on disk.
+    ///
+    /// NOT re-checked here: `MAX_BLOBS_TOTAL`/`MAX_BLOBS_PER_SENDER`. What's on disk was already
+    /// under-cap when written, so this only matters if an operator LOWERS either constant and
+    /// then restarts — the recovered table can briefly sit above the new ceiling until TTL
+    /// sweeps it back down. Pre-alpha, no live operators yet; revisit if that changes.
     fn recover(&mut self, now: u64) -> io::Result<()> {
         let dir = self.dir.clone();
         let mut meta_bytes: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
@@ -441,6 +492,9 @@ impl BlobStore {
                 contiguous += 1;
             }
             self.total_bytes += acc;
+            let stats = self.senders.entry(sender).or_default();
+            stats.blobs += 1;
+            stats.bytes += acc;
             self.blobs.insert(blob_id, Meta { sender, count, lengths, created_at, complete, contiguous });
         }
         Ok(())
@@ -865,11 +919,21 @@ mod tests {
         assert_eq!(s2.get_chunk(&b, 499).as_deref(), Some(&[(499u32 % 251) as u8; 10][..]));
     }
 
-    /// A synthetic, all-zero-bytes `Meta` for pre-filling the table in bulk without paying real
-    /// disk I/O — only `put_chunk`'s in-memory count check is under test here, not recovery or
-    /// sweep, so the entries don't need real chunk files backing them.
-    fn synthetic_meta(sender: [u8; 32]) -> Meta {
-        Meta { sender, count: 1, lengths: HashMap::new(), created_at: 0, complete: true, contiguous: 1 }
+    /// Pre-fill the table in bulk with a synthetic, all-zero-bytes `Meta` WITHOUT paying real
+    /// disk I/O — only `put_chunk`'s in-memory count check is under test in the callers below,
+    /// not recovery or sweep, so the entries don't need real chunk files backing them. Updates
+    /// `blobs` AND `senders` together so the O(1) aggregate stays truthful for what these tests
+    /// go on to assert (see `SenderStats`).
+    fn insert_synthetic(s: &mut BlobStore, id: [u8; 32], sender: [u8; 32]) {
+        s.blobs.insert(id, Meta { sender, count: 1, lengths: HashMap::new(), created_at: 0, complete: true, contiguous: 1 });
+        s.senders.entry(sender).or_default().blobs += 1;
+    }
+
+    /// Ground truth for a sender's stats, by a full scan — the oracle `the_incremental_sender_
+    /// aggregate_...` test below checks the O(1) `senders` map against.
+    fn recomputed_sender_stats(s: &BlobStore, sender: &[u8; 32]) -> (usize, u64) {
+        let matching: Vec<&Meta> = s.blobs.values().filter(|m| &m.sender == sender).collect();
+        (matching.len(), matching.iter().map(|m| Meta::size(m)).sum())
     }
 
     #[test]
@@ -884,7 +948,7 @@ mod tests {
         for n in 0..MAX_BLOBS_PER_SENDER as u32 {
             let mut bid = [0u8; 32];
             bid[4..8].copy_from_slice(&n.to_le_bytes());
-            s.blobs.insert(bid, synthetic_meta(attacker));
+            insert_synthetic(&mut s, bid, attacker);
         }
         assert_eq!(s.sender_blob_count(&attacker), MAX_BLOBS_PER_SENDER, "table filled to this sender's cap");
         assert_eq!(s.total_bytes, 0, "the whole flood so far paid ZERO real bytes");
@@ -919,7 +983,7 @@ mod tests {
             bid[..4].copy_from_slice(&n.to_le_bytes());
             let mut snd = [0u8; 32];
             snd[4..8].copy_from_slice(&n.to_le_bytes()); // a DISTINCT sender per blob
-            s.blobs.insert(bid, synthetic_meta(snd));
+            insert_synthetic(&mut s, bid, snd);
         }
         assert_eq!(s.blobs.len(), MAX_BLOBS_TOTAL, "table filled to the global cap");
         assert_eq!(s.total_bytes, 0, "the whole flood so far paid ZERO real bytes");
@@ -933,5 +997,55 @@ mod tests {
             "global blob-count cap must reject a brand-new id once the table is full"
         );
         assert_eq!(s.blobs.len(), MAX_BLOBS_TOTAL, "the table did not grow past the global cap");
+    }
+
+    #[test]
+    fn the_incremental_sender_aggregate_survives_puts_sweep_and_recovery_without_drifting_from_a_rescan() {
+        // The per-sender aggregate (`senders`) exists so `sender_blob_count`/`sender_bytes` are
+        // O(1) instead of an O(total blobs) scan on EVERY `put_chunk` (see `SenderStats`'s doc —
+        // without this, the very MAX_BLOBS_TOTAL cap the tests above rely on being large would
+        // make that scan itself an O(n) cost paid on every chunk of every upload). An aggregate
+        // maintained by hand can drift from the truth if any code path (put, sweep, recover)
+        // forgets to update it — this test is the oracle: it recomputes from a full scan and the
+        // two must always agree, through all three paths.
+        let dir = tmp().join("aggregate-invariant");
+        let a = sender(1);
+        let b = sender(2);
+        {
+            let mut s = BlobStore::new(dir.clone()).unwrap();
+            assert_eq!(s.put_chunk(a, id(1), 0, 2, b"hello", 0), BlobPut::Ok);
+            assert_eq!(s.put_chunk(a, id(1), 1, 2, b"world", 0), BlobPut::Complete);
+            assert_eq!(s.put_chunk(a, id(2), 0, 1, b"solo", 0), BlobPut::Complete);
+            assert_eq!(s.put_chunk(b, id(3), 0, 1, b"other", 100), BlobPut::Complete);
+            assert_eq!(
+                (s.sender_blob_count(&a), s.sender_bytes(&a)),
+                recomputed_sender_stats(&s, &a),
+                "after puts: a's aggregate agrees with a rescan"
+            );
+            assert_eq!(
+                (s.sender_blob_count(&b), s.sender_bytes(&b)),
+                recomputed_sender_stats(&s, &b),
+                "after puts: b's aggregate agrees with a rescan"
+            );
+
+            // Sweep past a's TTL (created at 0) but not b's (created at 100).
+            s.sweep(BLOB_TTL_SECS + 50);
+            assert_eq!(s.sender_blob_count(&a), 0, "a's blobs were reaped by the sweep");
+            assert_eq!(s.sender_bytes(&a), 0, "a's bytes were freed by the sweep");
+            assert_eq!(
+                (s.sender_blob_count(&b), s.sender_bytes(&b)),
+                recomputed_sender_stats(&s, &b),
+                "after sweep: b (untouched) still agrees with a rescan"
+            );
+        }
+
+        // And across a restart: `recover` rebuilds `senders` from the sidecars, not just `blobs`.
+        let s2 = BlobStore::open(dir, BLOB_TTL_SECS + 50).unwrap();
+        assert_eq!(s2.sender_blob_count(&a), 0, "a stays reaped after recovery re-sweeps");
+        assert_eq!(
+            (s2.sender_blob_count(&b), s2.sender_bytes(&b)),
+            recomputed_sender_stats(&s2, &b),
+            "after recovery: b's rebuilt aggregate agrees with a rescan"
+        );
     }
 }

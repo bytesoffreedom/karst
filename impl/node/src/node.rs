@@ -67,13 +67,30 @@ pub const MAILBOX_TTL_SECS: u64 = 7 * 24 * 3600;
 /// independent of `MAILBOX_TTL_SECS` and of the per-mailbox `MAX_FETCH_SEALS` cap. `recipient`
 /// in `WireMessage` is any 32 bytes the SENDER picks — never checked against a published
 /// bundle or any other proof the address belongs to someone — so an admitted sender can deposit
-/// one message to a fresh fabricated address every send. `sweep_mailboxes` already drops an
-/// empty mailbox and TTL-expired entries, but that only reclaims a key AFTER
-/// `MAILBOX_TTL_SECS` (7 days) — until then, admission (capability + quota) throttles the RATE
-/// new keys appear, never their total COUNT, so the table can still grow without bound over
-/// that window. Same order of magnitude as `MAX_BUNDLES` — this relay's other "one entry per
-/// addressable identity" table.
-pub const MAX_MAILBOXES: usize = 100_000;
+/// one message to a fresh fabricated address every send, and admission (capability + quota)
+/// throttles the RATE new keys appear, never their total COUNT.
+///
+/// This is NOT a one-entry-per-identity table like `bundles` — do not size it that way.
+/// `drop.rs`'s rotating drop-boxes mean one ACTIVE session alone can hold up to `2` (directions,
+/// `drop::direction`) `× (TTL_EPOCHS + 2)` distinct live keys — `TTL_EPOCHS =
+/// MAILBOX_TTL_SECS / DROP_EPOCH_SECS = 7`, so up to 18 keys for a single busy two-way
+/// conversation, on top of one long-term identity-key mailbox per user (polled for a stranger's
+/// first contact). Honest organic churn for a `MAX_BUNDLES`-sized population with even a modest
+/// number of concurrently-active conversations per user reaches the high hundreds of thousands
+/// to low millions — nowhere near `MAX_BUNDLES` itself. Set well above that (this is a rough
+/// calibration pending real telemetry, not a derived exact bound; pre-alpha makes raising it
+/// free).
+///
+/// Mitigating fact that makes a flat cap tenable at all: a mailbox drained by `handle_fetch`
+/// (delete-on-fetch) or `handle_ack` is removed from the table IMMEDIATELY, not just at the TTL
+/// sweep — so a key only occupies a table slot for mail that is genuinely UNDELIVERED, not for
+/// every key a conversation has ever used.
+///
+/// Honest residual (same shape as `BundleSlot`'s CRYPTO-18 note): once the table is completely
+/// full, first-contact delivery to a BRAND-NEW recipient is refused until TTL reclaims a slot —
+/// this cap cannot distinguish a hostile flood from a legitimate surge of new correspondents. An
+/// already-known recipient (already a key in the table) is never affected.
+pub const MAX_MAILBOXES: usize = 2_000_000;
 
 /// How long a leased (fetched-but-unacked) message stays invisible to a subsequent
 /// fetch before it becomes deliverable again. A client that fetches with

@@ -351,8 +351,16 @@ struct Vectors {
 // достигнут. Тест ниже падает при любом дрейфе (другой hash_to_field,
 // другая сериализация, другой MAC), а не пересчитывает «правильный» ответ
 // на лету. Регенерация — только явно, через KARST_REGEN_VECTORS=1.
+//
+// REGENERATED 2026-07-28, deliberately, for ONE reason: the cookie MAC input became
+// canonical (domain tag ‖ version ‖ length-prefixed client_addr ‖ length-prefixed
+// carrier_id ‖ addr_hash ‖ issued_at) to remove a split ambiguity where ("a","bc") and
+// ("ab","c") produced the same MAC — CRYPTO-07. Only the trailing 16 MAC bytes moved;
+// the version, epoch, addr_hash and issued_at prefix is byte-identical, which is the
+// evidence that nothing else in the wire format changed. Any OTHER drift in this
+// constant is a bug, not a regeneration.
 const FROZEN_COOKIE_WIRE_HEX: &str =
-    "01000006825e3d1f5adf178dc514193f4520454dea000f42401040a977a59d793456659d5e43aea544";
+    "01000006825e3d1f5adf178dc514193f4520454dea000f42408b9b02ff74814d007784248ef5975384";
 const FROZEN_RLN_SECRET_HEX: &str =
     "e5c0ad0b00000000000000000000000000000000000000000000000000000000";
 const FROZEN_RLN_A1_1_HEX: &str =

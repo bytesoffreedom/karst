@@ -183,6 +183,14 @@ impl CookieKeyring {
 }
 
 /// cookie.mac = HMAC-SHA256(key, client_addr || carrier_id || issued_at)[:16]
+/// CANONICAL, LENGTH-PREFIXED MAC input (CRYPTO-07 / A10-7).
+///
+/// The fields used to be concatenated raw. Two of them are variable length, so `("a", "bc")` and
+/// `("ab", "c")` produced the SAME MAC message at the same time — a cookie issued for one
+/// (address, carrier) split verified under another, weakening exactly the binding the cookie
+/// exists to provide. A domain tag and a version are included too, so a MAC can never be
+/// reinterpreted under a different scheme, and `client_addr_hash` is now covered rather than being
+/// a field nobody authenticates.
 fn compute_mac(
     key: &[u8; 32],
     client_addr: &[u8],
@@ -190,8 +198,13 @@ fn compute_mac(
     issued_at: u32,
 ) -> [u8; 16] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(b"KARST-cookie-mac-v1");
+    mac.update(&[COOKIE_VERSION]);
+    mac.update(&(client_addr.len() as u32).to_be_bytes());
     mac.update(client_addr);
+    mac.update(&(carrier_id.len() as u32).to_be_bytes());
     mac.update(carrier_id);
+    mac.update(&addr_hash(client_addr));
     mac.update(&issued_at.to_be_bytes());
     let full = mac.finalize().into_bytes();
     let mut truncated = [0u8; 16];

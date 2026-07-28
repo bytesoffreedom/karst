@@ -211,3 +211,29 @@ fn reap_uses_each_capabilitys_own_window_not_one_default() {
         "the early reap must not have erased the spend and handed back extra quota"
     );
 }
+
+/// CRYPTO-07 / A10-7 — the cookie MAC must bind its fields UNAMBIGUOUSLY.
+///
+/// The inputs were concatenated raw, and two of them are variable length, so ("a","bc") and
+/// ("ab","c") produced the same MAC message at the same instant: a cookie issued for one
+/// (address, carrier) split verified under the other, weakening the very binding a cookie exists
+/// to provide. Length prefixes (plus a domain tag and version) make the encoding injective.
+#[test]
+fn cookie_mac_binds_address_and_carrier_unambiguously() {
+    use admission::cookie::CookieKeyring;
+    use admission::params::EPOCH_DURATION_SECS;
+
+    let kr = CookieKeyring::new(EPOCH_DURATION_SECS, NOW, [0x11; 32], [0x22; 32]);
+    // The classic split-collision pair: same bytes, different boundary.
+    let c = kr.issue(b"a", b"bc", NOW as u32);
+    assert!(kr.verify(&c, b"a", b"bc", NOW).is_ok(), "control: it verifies for its own split");
+    assert!(
+        kr.verify(&c, b"ab", b"c", NOW).is_err(),
+        "a cookie must not verify under a DIFFERENT split of the same bytes"
+    );
+
+    // And the mirror direction, so the test cannot pass by rejecting everything.
+    let c2 = kr.issue(b"ab", b"c", NOW as u32);
+    assert!(kr.verify(&c2, b"ab", b"c", NOW).is_ok());
+    assert!(kr.verify(&c2, b"a", b"bc", NOW).is_err());
+}

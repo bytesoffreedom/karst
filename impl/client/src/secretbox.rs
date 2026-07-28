@@ -47,7 +47,7 @@ pub(crate) const MAGIC: &[u8; 4] = b"KRS2";
 /// новые поля тихо исчезают (A6-5). Теперь такой файл не читается вовсе: «written by a newer
 /// KARST». Обратная сторона — осознанная: поднятие версии ЛОМАЕТ существующие локальные
 /// данные. Пользователей нет, миграций нет (см. docs/POSITIONING.md), ломать сейчас дёшево.
-pub const STATE_VERSION: u16 = 1;
+pub const STATE_VERSION: u16 = 2;
 
 /// The pinned Argon2id cost parameters (see [`MasterKey::derive`]). Owned by KARST, not by the
 /// `argon2` crate's defaults, so a dependency bump cannot silently change key derivation.

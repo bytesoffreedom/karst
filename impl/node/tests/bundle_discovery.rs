@@ -459,3 +459,58 @@ fn abandoned_key_distribution_state_is_swept() {
         "the swept bundle must really be gone, not merely uncounted"
     );
 }
+
+/// The DISCOVERY half of the same lifecycle, and the harder one to get right. Expired records
+/// used to be dropped only by `handle_lookup_discovery` — i.e. only when somebody happened to
+/// resolve that exact pseudonym. The pseudonym is a random per-user value, so a record nobody
+/// will ever look up (an abandoned code, or one an attacker minted precisely because nobody will
+/// resolve it) held its slot until the relay process restarted.
+///
+/// Discriminating: it publishes TWO records, expires only one, and asserts the live one survives
+/// — a sweep that dropped everything would pass a single-record test. And it counts the map
+/// directly rather than looking a record up, because looking it up is what used to do the
+/// removal: measuring through that door would show a "pass" even with the sweep deleted.
+#[test]
+fn an_expired_discovery_record_is_swept_even_if_nobody_looks_it_up() {
+    use node::discovery::{binding_msg, public_of, sign, write_msg, DiscoveryRecord};
+    use node::node::RelayNode;
+
+    let mut relay = RelayNode::new(NOW);
+
+    let publish = |relay: &mut RelayNode, seed: u8, expiry: u64| {
+        let ik_secret = [seed; 32];
+        let disc_secret = [seed.wrapping_add(1); 32];
+        let (ik, dpub) = (public_of(&ik_secret), public_of(&disc_secret));
+        let loc = node::node::RelayDescriptor {
+            noise_pub: [seed; 32],
+            fetch_pub: [seed.wrapping_add(2); 32],
+            addrs: vec!["127.0.0.1:1".into()],
+        };
+        let rec = DiscoveryRecord {
+            discovery_pub: dpub,
+            ik,
+            location: loc.clone(),
+            expiry,
+            single_use: false,
+            ik_sig: sign(&ik_secret, &binding_msg(&dpub, &ik, &loc, expiry, false)),
+        };
+        let wsig = sign(&disc_secret, &write_msg(&dpub, &ik, &loc, expiry, false));
+        assert!(relay.handle_publish_discovery(&rec, &wsig, NOW), "record {seed} publishes");
+    };
+
+    let short = NOW + 60;
+    let long = NOW + 30 * 24 * 60 * 60;
+    publish(&mut relay, 40, short);
+    publish(&mut relay, 60, long);
+    assert_eq!(relay.key_distribution_len_for_test().1, 2, "control: both records are there");
+
+    // Past the short expiry, past an epoch boundary — and NOBODY looks anything up.
+    relay.tick_for_test(short + 10_000);
+
+    assert_eq!(
+        relay.key_distribution_len_for_test().1,
+        1,
+        "an expired discovery record survived because no one happened to resolve it — the map \
+         only ever shrank on lookup, so unresolved records were immortal"
+    );
+}

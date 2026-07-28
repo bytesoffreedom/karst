@@ -2545,13 +2545,46 @@ impl Store {
 
     /// Загрузить персистентное состояние сессий (пусто, если файла нет).
     /// Держите `lock_sessions` вокруг load→save. Расшифровывается at-rest-ключом.
+    fn sessions_anchor_path(&self) -> PathBuf {
+        self.net_file("sessions.anchor")
+    }
+
+    /// The highest session-state generation this account has ever written, kept in a DIFFERENT
+    /// file from the state it describes.
+    ///
+    /// Rolling the ratchet back is the one thing at-rest encryption cannot prevent: an attacker
+    /// (or a helpful backup tool) who restores `sessions.dat` from yesterday replays chain keys.
+    /// The per-message salt already makes that HARMLESS — two encryptions under a replayed chain
+    /// key no longer collide (see `node::ratchet::message_aead`) — but harmless is not the same
+    /// as unnoticed, and a user whose ratchet silently went backwards deserves to be told.
+    ///
+    /// HONEST LIMIT, and the reason this is detection rather than prevention: it catches a
+    /// PARTIAL rollback — one file restored while the rest of the directory stayed current, which
+    /// is what a backup restore, a file-level sync conflict or a targeted swap actually looks
+    /// like. An attacker who restores the WHOLE directory, or simply deletes this file, is not
+    /// caught: no purely local state can survive an adversary who controls all local state. A
+    /// missing anchor reads as zero (never a false alarm on a fresh account).
+    fn load_sessions_anchor(&self) -> u64 {
+        let Ok(blob) = std::fs::read(self.sessions_anchor_path()) else { return 0 };
+        let Ok(plain) = self.key.open(&self.label(&self.sessions_anchor_path()), &blob) else {
+            return 0;
+        };
+        postcard::from_bytes(&plain).unwrap_or(0)
+    }
+
     pub fn load_sessions(&self) -> io::Result<PeerState> {
         match std::fs::read(self.sessions_path()) {
             Ok(blob) => {
                 let bytes = self.key.open(&self.label(&self.sessions_path()), &blob).map_err(io_err)?;
-                // Tolerate a state file written before the outbox field: never brick an
-                // in-flight ratchet to add a field (see `PeerState::from_bytes`).
-                PeerState::from_bytes(&bytes).map_err(io_err)
+                let (generation, state): (u64, Vec<u8>) =
+                    postcard::from_bytes(&bytes).map_err(io_err)?;
+                let anchor = self.load_sessions_anchor();
+                if generation < anchor {
+                    return Err(io_err(format!(
+                        "session state rolled back: on disk is generation {generation}, but this                          account has already written {anchor}. Something restored sessions.dat                          from an older copy. Message keys are not reused (each message derives                          its own), but replies may be undecryptable until the session is                          re-established — reconnect the affected chats."
+                    )));
+                }
+                PeerState::from_bytes(&state).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(PeerState::empty()),
             Err(e) => Err(e),
@@ -2563,7 +2596,11 @@ impl Store {
     /// файл (иначе — wedge/потеря позиции). temp в том же каталоге (rename атомарен
     /// в пределах ФС). Ratchet-ключи шифруются at-rest перед записью.
     pub fn save_sessions(&self, state: &PeerState) -> io::Result<()> {
-        let plain = postcard::to_stdvec(state).map_err(io_err)?;
+        // One past the highest generation EITHER file knows about, so a rolled-back state file
+        // cannot lower the mark by being written over.
+        let generation = self.load_sessions_anchor().max(self.sessions_generation()) + 1;
+        let inner = postcard::to_stdvec(state).map_err(io_err)?;
+        let plain = postcard::to_stdvec(&(generation, inner)).map_err(io_err)?;
         let bytes = self.key.seal(&self.label(&self.sessions_path()), &plain);
         let tmp = self.net_file("sessions.dat.tmp");
         {
@@ -2576,7 +2613,20 @@ impl Store {
             f.write_all(&bytes)?;
             f.sync_all()?; // durability до rename
         }
-        rename_durable(&tmp, &self.sessions_path())
+        rename_durable(&tmp, &self.sessions_path())?;
+        // The anchor goes LAST, deliberately. A crash between the two leaves the state AHEAD of
+        // the anchor, which reads as fine — the state is newer, not older. Writing the anchor
+        // first would make the same crash look exactly like a rollback and refuse to open a
+        // perfectly good account.
+        self.write_sealed(&self.sessions_anchor_path(), &postcard::to_stdvec(&generation).map_err(io_err)?)
+    }
+
+    /// The generation recorded INSIDE the current session file (0 if absent/unreadable — a
+    /// corrupt state file is reported by `load_sessions`, not silently by this helper).
+    fn sessions_generation(&self) -> u64 {
+        let Ok(blob) = std::fs::read(self.sessions_path()) else { return 0 };
+        let Ok(plain) = self.key.open(&self.label(&self.sessions_path()), &blob) else { return 0 };
+        postcard::from_bytes::<(u64, Vec<u8>)>(&plain).map(|(g, _)| g).unwrap_or(0)
     }
 
     // ----- Зашифрованный append-лог истории чатов -----
@@ -4122,6 +4172,49 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRYPTO-01 residual, the DETECTION half. The per-message salt already made a ratchet
+    /// rollback harmless — two encryptions under a replayed chain key no longer collide — but
+    /// harmless is not unnoticed. Restoring `sessions.dat` from an older copy while the rest of
+    /// the account stays current is what a backup restore, a file-level sync conflict or a
+    /// targeted swap actually looks like, and it used to load in silence.
+    ///
+    /// Discriminating: it restores the OLD bytes over the current file and requires a loud error,
+    /// AND requires that the same state loads fine when it is the newest one — so it cannot pass
+    /// by refusing everything. Deleting the anchor comparison reds it.
+    #[test]
+    fn a_rolled_back_session_file_is_refused_not_loaded_in_silence() {
+        use node::peer::PeerState;
+        let dir = std::env::temp_dir().join(format!("karst-anchor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        s.save_sessions(&PeerState::empty()).unwrap();
+        let old_bytes = std::fs::read(s.sessions_path()).unwrap();
+        assert!(s.load_sessions().is_ok(), "control: the state we just wrote loads");
+
+        // Time passes; the account writes more state.
+        for _ in 0..3 {
+            s.save_sessions(&PeerState::empty()).unwrap();
+        }
+        assert!(s.load_sessions().is_ok(), "control: the newest state still loads");
+
+        // The rollback: yesterday's sessions.dat, today's everything else.
+        std::fs::write(s.sessions_path(), &old_bytes).unwrap();
+        let err = match s.load_sessions() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!(
+                "an older session file loaded without a word — the ratchet silently went backwards"
+            ),
+        };
+        assert!(
+            err.contains("rolled back"),
+            "an older session file loaded without a word — the ratchet silently went backwards; \
+             got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// CRYPTO-05, THE carrying test. Two accounts in ONE vault share the device key, so before
     /// per-context derivation an attacker with disk write access could drop account A's

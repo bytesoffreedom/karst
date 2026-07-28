@@ -2720,10 +2720,22 @@ Four smaller conclusions the discussion reached that belong in the record:
   (`MAX_DIALS_PER_ROUND`). Self is seeded FIRST so it always survives the frame trim and stays
   verifiable. The CLIENT side honours verify-before-add too now: `client::import_discovered_relays`
   (`karst relays --add`) fetches a relay's node-list and adds a discovered relay to this account's
-  multi-homing secondaries (`extra_relays.dat`) ONLY after `node::gossip::verify` confirms it by
-  dialing — so a client never routes its mail through a relay it hasn't confirmed. **Both
-  auto-dialers (gossip + client import) verify before adding; any FUTURE auto-dial path must reuse
-  the same `node::gossip::verify` gate.**
+  multi-homing secondaries (`extra_relays.dat`) ONLY after dialing it and confirming it serves its
+  own full relay-id — so a client never routes its mail through a relay it hasn't confirmed.
+  **CRYPTO-23 — the client also no longer stores the address the gossiping peer supplied.**
+  Dialing proves who answers, not that the *address* belongs to them: a transparent TCP/WSS proxy
+  in front of an honest relay passes the handshake (it terminates at the real relay) while the
+  client persists the proxy as its route — a permanent vantage point on IP, timing, volume and a
+  selective-drop switch, with Noise intact. `verified_self_address` therefore uses the peer's
+  address only as a place to DIAL and stores an address out of the relay's own authenticated
+  self-descriptor (re-checked against the SSRF gate). Deliberately NOT the audit's suggested
+  "compare the hint against the self-descriptor": address comparison needs canonicalization rules
+  (host vs IP, carrier, port, path) and every such rule also refuses honest relays reached by a
+  different spelling. **Residual, node side (`gossip::gossip_round`, out of this change's scope):
+  a relay merging a heard descriptor still verifies with, and re-serves, the peer-supplied
+  addresses — so a hostile peer can still inject a proxy address into other relays' node-lists.
+  The client no longer adopts it as a route, but the class is only half dead until `gossip_round`
+  keeps the self-declared addresses too.** Any FUTURE auto-dial path must reuse the same gate.
 
 - **The relay does NOT automatically reconstruct your whole graph — a precision that
   corrects an earlier overstatement in this doc.** Post-3b, what a Public node sees cleanly

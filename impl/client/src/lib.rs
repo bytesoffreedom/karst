@@ -736,12 +736,51 @@ pub fn discover_relays(relay: &Relay) -> Result<Vec<node::node::RelayDescriptor>
         .map_err(|e| format!("node-list fetch failed: {e}"))
 }
 
+/// Dial a heard descriptor's address hint and return an address the relay declares for ITSELF.
+///
+/// CRYPTO-23. `node::gossip::verify` proves that whoever answers at `hint` holds `d.noise_pub`
+/// and serves a node-list containing the full relay-id — but it never asks whether `hint` is an
+/// address of that relay. A transparent TCP/WebSocket proxy in front of an honest relay passes
+/// both checks: the Noise handshake terminates at the real relay, so the byte stream really is
+/// authenticated, while the client stores the PROXY as its route. That hands whoever put the
+/// address into the node-list a permanent vantage point on the route — client IP on a direct
+/// carrier, connection timing, volume, and selective delay/drop — without ever breaking Noise.
+///
+/// The fix is not to compare `hint` against the relay's self-descriptor: comparing addresses
+/// needs canonicalization rules (host vs IP, carrier, port, path) and every rule that says "these
+/// two strings are different" also refuses an honest relay reached by a different spelling. So
+/// the hint is used ONLY as a place to dial, and the address that gets STORED comes out of the
+/// authenticated self-descriptor. An address nobody but the gossiping peer vouches for is then
+/// never adopted as a route, whatever it looks like.
+///
+/// Returns `None` when the dial fails, when the relay does not advertise its own full relay-id
+/// (it is then undiscoverable by design — see `gossip::verify`), or when every address it
+/// declares is one we may not dial (`allow_private`, the SSRF gate — the self-declared address
+/// is peer-controlled data too, just controlled by a different peer).
+fn verified_self_address(
+    d: &node::node::RelayDescriptor,
+    hint: &str,
+    allow_private: bool,
+) -> Option<String> {
+    if !node::gossip::addr_is_dialable(hint, allow_private) {
+        return None; // never dial into private/loopback space on a peer's say-so (A3-12)
+    }
+    let dest = Dest::parse(hint).ok()?;
+    let list = SocketTransport::new(dest, d.noise_pub).get_node_list().ok()?;
+    // Noise authenticated the far end as the holder of `d.noise_pub`; among the descriptors IT
+    // serves, its own entry (full relay-id: noise AND fetch key) is the only one it vouches for
+    // with that key, so its addresses are the only ones this exchange can attribute to it.
+    let self_entry = list.iter().find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
+    self_entry.addrs.iter().find(|a| node::gossip::addr_is_dialable(a, allow_private)).cloned()
+}
+
 /// §12 — discover relays from a known one and IMPORT the verified ones into this account's
 /// multi-homing set (secondaries). This is the client side of the STATUS "auto-dial" pin:
-/// a discovered relay is added ONLY after `node::gossip::verify` confirms, by dialing it, that
-/// its address really serves the claimed full relay-id — so the client never multi-homes onto a
-/// relay it hasn't confirmed (no reflection, no fetch-key spoof). Dedups against the primary and
-/// existing secondaries. Returns how many new relays were added.
+/// a discovered relay is added ONLY after a dial confirms it serves the claimed full relay-id —
+/// so the client never multi-homes onto a relay it hasn't confirmed (no reflection, no fetch-key
+/// spoof) — and the route that gets stored is the one the relay itself advertises, not the
+/// address the gossiping peer supplied (`verified_self_address`, CRYPTO-23). Dedups against the
+/// primary and existing secondaries. Returns how many new relays were added.
 pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, String> {
     let discovered = discover_relays(from)?;
     let mut extras = store.load_extra_relays().map_err(|e| format!("relay list: {e}"))?;
@@ -778,12 +817,12 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
         if known.contains(&id_hex) || d.addrs.is_empty() {
             continue;
         }
-        let addr = d.addrs[0].clone();
         // VERIFY-BEFORE-ADD: dial and confirm the relay serves its own full relay-id before
-        // trusting it enough to route our mail through it.
-        if !node::gossip::verify(&d, &addr, allow_private) {
+        // trusting it enough to route our mail through it — and take the ROUTE from what it
+        // says about itself, not from the peer that told us about it (CRYPTO-23).
+        let Some(addr) = verified_self_address(&d, &d.addrs[0], allow_private) else {
             continue;
-        }
+        };
         // POLICY PREFERENCE: skip a verified relay whose advertised policy does not match.
         // ONE fetch covers both knobs — asking twice would double the dial cost and could even
         // straddle a policy change.

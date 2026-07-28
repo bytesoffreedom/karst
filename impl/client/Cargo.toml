@@ -27,3 +27,6 @@ name = "karst"
 path = "src/bin/karst.rs"
 
 [dev-dependencies]
+# Build capabilities with relay-specific ids/secrets in the tests (CRYPTO-24), instead of the
+# single globally-known dev credential every dev relay accepts.
+admission = { path = "../admission" }

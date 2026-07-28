@@ -1372,11 +1372,11 @@ impl Store {
         // .dat, а не .json: на диске зашифрованный blob, не JSON.
         //
         // Deliberately `self.dir`, NOT `net_file` — unlike every IDENTITY-keyed network file
-        // (sessions/opks/discovery), the capability is NOT namespaced per proxy: every proxy this
-        // account has reads and presents the SAME capability_id (A8-4, see the `proxy` field doc
-        // above and `docs/design/proxy-identity.md` § Honest limits #6 for why this is a named,
-        // deliberate limit rather than a gap to close here).
-        self.dir.join("capability.dat")
+        // (sessions/opks/discovery), the capabilities are NOT namespaced per proxy: every proxy
+        // this account has reads and presents the SAME capability_id per relay (A8-4, see the
+        // `proxy` field doc above and `docs/design/proxy-identity.md` § Honest limits #6 for why
+        // this is a named, deliberate limit rather than a gap to close here).
+        self.dir.join("capabilities.dat")
     }
 
     /// **Единый корень личности** — 16 байт энтропии мнемонической фразы (§seed).
@@ -1391,8 +1391,10 @@ impl Store {
         self.seed_path().exists()
     }
 
-    pub fn has_capability(&self) -> bool {
-        self.capability_path().exists()
+    /// Does this account hold an admission credential for THIS relay? (A credential for some
+    /// other relay is not one for this one — see `save_capability_for`.)
+    pub fn has_capability_for(&self, relay: &crate::RelayId) -> bool {
+        self.load_capability_for(relay).is_ok()
     }
 
     /// Записать корень (энтропию фразы). `create_new` → НЕ перезаписывает: смена
@@ -1445,12 +1447,40 @@ impl Store {
         })
     }
 
-    /// Сохранить capability (импорт можно повторять → перезапись разрешена).
-    /// Секрет capability = admission-credential → шифруется at-rest (как остальные
-    /// секреты), а не только 0600. Дев-capability публична, но `import-cap` примет
-    /// и настоящую — единый режим, без исключения.
-    pub fn save_capability(&self, cap: &Capability) -> io::Result<()> {
-        let json = serde_json::to_vec(cap).map_err(io_err)?;
+    /// Every admission credential this account holds, keyed by the full relay-id (128 hex,
+    /// `noise_pub ‖ fetch_pub`) of the relay that ISSUED it. Absent → none held.
+    fn load_capabilities(&self) -> io::Result<std::collections::BTreeMap<String, Capability>> {
+        match std::fs::read(self.capability_path()) {
+            Ok(blob) => {
+                let json = self.key.open(&self.label(&self.capability_path()), &blob).map_err(|e| {
+                    io_err(format!("admission credentials unreadable ({e}) — refusing to treat \
+                         them as absent; restore the file or re-import the invite"))
+                })?;
+                serde_json::from_slice(&json).map_err(io_err)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Store an admission credential AS THE CREDENTIAL FOR ONE RELAY (import can repeat →
+    /// overwrite allowed). The secret is an admission credential, so it is encrypted at rest like
+    /// every other secret, not merely 0600. The dev capability is public, but `import-cap` takes
+    /// a real one too — one code path, no exception.
+    ///
+    /// CRYPTO-24: a capability is relay-specific in production. A Private relay mints its own
+    /// random `capability_id + secret`; a Public relay derives a stateless secret from ITS OWN
+    /// issuer key. So one account-wide credential presented to a second relay is not merely
+    /// useless there — it is rejected (`UnknownCapability`/`BadMac`), which silently broke the
+    /// two things multi-homing exists for: publishing a bundle on a backup relay (creating a slot
+    /// is metered — see `RelayNode::handle_publish`) and failing a send over to it. It also
+    /// handed every relay the SAME `capability_id`, linking one account's traffic across relays
+    /// that otherwise share nothing. Keyed by relay-id, none of that can happen by construction:
+    /// there is no way to ask for "the" capability without naming the relay it is for.
+    pub fn save_capability_for(&self, relay: &crate::RelayId, cap: &Capability) -> io::Result<()> {
+        let mut all = self.load_capabilities()?;
+        all.insert(relay.hex(), cap.clone());
+        let json = serde_json::to_vec(&all).map_err(io_err)?;
         let blob = self.key.seal(&self.label(&self.capability_path()), &json);
         let mut f = OpenOptions::new()
             .write(true)
@@ -1461,10 +1491,20 @@ impl Store {
         f.write_all(&blob)
     }
 
-    pub fn load_capability(&self) -> io::Result<Capability> {
-        let blob = std::fs::read(self.capability_path())?;
-        let json = self.key.open(&self.label(&self.capability_path()), &blob).map_err(io_err)?;
-        serde_json::from_slice(&json).map_err(io_err)
+    /// The credential to present to THIS relay, or `NotFound` if this account holds none for it.
+    /// Never falls back to another relay's credential (that is the whole point — see
+    /// `save_capability_for`); a caller that cannot get one must skip the relay, not substitute.
+    pub fn load_capability_for(&self, relay: &crate::RelayId) -> io::Result<Capability> {
+        self.load_capabilities()?.remove(&relay.hex()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no admission credential for relay {} — join it (karst join) or import its \
+                     invite (karst import-cap)",
+                    &relay.hex()[..16]
+                ),
+            )
+        })
     }
 
     // ----- Discovery key (opt-in contact code), encrypted at-rest -----
@@ -4657,7 +4697,10 @@ impl Vault {
         let store = self.account(&id);
         store.save_seed(&entropy)?;
         self.save_registry(&[AccountEntry { id, label: "Account 1".into(), ik }])?;
-        let _ = store.save_capability(&crate::dev_capability());
+        // No admission credential is seeded: a capability now belongs to a specific relay
+        // (CRYPTO-24) and this compartment has no relay configured yet, so writing one would mean
+        // inventing a relay-id. The desktop seeds the dev credential per relay when one IS
+        // configured, which is also what a real account looks like at this stage.
         Ok(())
     }
 

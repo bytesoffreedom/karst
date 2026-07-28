@@ -779,10 +779,29 @@ fn proxy_for_contact(store: &Store, ik: &[u8; 32]) -> u32 {
     }
 }
 
+/// Give every configured relay a credential to present to it.
+///
+/// A capability belongs to ONE relay (CRYPTO-24), so a fresh account holds none until it joins
+/// (PoW) or imports an invite. The reference dev relay accepts the (public-secret, forgeable) dev
+/// capability, and seeding it per relay is what keeps a local dev setup working at all. Never
+/// overwrites a REAL credential: only a missing entry or our own dev id (0xCA..) is written, so an
+/// earned or imported one survives — and it is refreshed so an account made on an older build
+/// picks up quota changes.
+fn seed_dev_capabilities(store: &Store, relays: &[Relay]) {
+    for r in relays {
+        let held = store.load_capability_for(&r.id).ok();
+        if held.map(|c| c.capability_id == [0xCA; 16]).unwrap_or(true) {
+            let _ = store.save_capability_for(&r.id, &client::dev_capability());
+        }
+    }
+}
+
 /// Announce presence. ROOT-NEVER-PUBLISHES INVARIANT: publish each ACTIVE PROXY's bundle via
 /// `as_proxy`, never the root account — so the permanent identity never appears on a relay. A
-/// proxy shares the device's relay capability (un-namespaced); publish itself is capability-free
-/// on the reference relay, so a fresh proxy still announces.
+/// proxy shares the device's per-relay capabilities (un-namespaced), and `publish_all` presents
+/// each relay its own — a relay this account holds no credential for is skipped by that call
+/// (creating a bundle slot is metered, so publishing there under another relay's credential would
+/// only be rejected).
 fn do_publish(store: &Store, relays: &[Relay], offline: bool) {
     // The ONE choke every publish goes through: OFFLINE emits nothing, so no caller can accidentally
     // leak a bundle (some read `s.relays` directly, bypassing `relays_or_empty`).
@@ -803,13 +822,10 @@ fn do_publish(store: &Store, relays: &[Relay], offline: bool) {
     }
     for pidx in proxies {
         let p = store.as_proxy(pidx);
-        // Never fall back to the DEV capability: its secret is public, so publishing under it
-        // would advertise this identity with a forgeable credential (A8-11).
-        let Ok(cap) = p.load_capability() else {
-            eprintln!("warning: proxy {pidx} has no readable capability — not publishing it");
-            continue;
-        };
-        let _ = client::publish_all(&p, relays, cap, now_secs());
+        // The credential per relay is loaded inside `publish_all`, which skips (loudly) any relay
+        // this account holds none for. Never a DEV fallback: its secret is public, so publishing
+        // under it would advertise this identity with a forgeable credential (A8-11).
+        let _ = client::publish_all(&p, relays, now_secs());
     }
 }
 
@@ -837,13 +853,10 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
     *app.container.lock().unwrap() = None;
     app.offline.store(offline, Ordering::SeqCst);
     let store = vault.account(&id);
-    // Refresh the DEV capability so an account made on an older build picks up quota changes (the
-    // dev cap's request/byte window grew a lot so multi-image posts fit). ONLY overwrite our own
-    // forgeable dev cap (id 0xCA..), never a real imported capability.
-    if store.load_capability().map(|c| c.capability_id == [0xCA; 16]).unwrap_or(true) {
-        let _ = store.save_capability(&client::dev_capability());
-    }
     let relays = build_relays(&store);
+    // Seed/refresh the DEV capability for each configured relay (see `seed_dev_capabilities`) —
+    // an account made on an older build picks up quota changes here too.
+    seed_dev_capabilities(&store, &relays);
     // Pick up any inline transfer that was mid-flight when the process last stopped. Its carrier
     // messages were already acked, so the relay will not resend them — without this the chunks
     // were simply gone (Bug E).
@@ -974,10 +987,6 @@ fn create_account(app: State<App>, phrase: String, password: String, vault_dir: 
         reg.push(AccountEntry { id: id.clone(), label: format!("Account {}", reg.len() + 1), ik });
         vault.save_registry(&reg).map_err(|e| format!("registry: {e}"))?;
     }
-    let store = vault.account(&id);
-    if !store.has_capability() {
-        let _ = store.save_capability(&client::dev_capability());
-    }
     Ok(enter(&app, vault, id, false, false))
 }
 
@@ -1061,10 +1070,6 @@ fn container_create(app: State<App>, phrase: String, password: String, vault_dir
         vault.account(&id).save_seed(&entropy).map_err(|e| e.to_string())?;
         reg.push(AccountEntry { id: id.clone(), label: format!("Account {}", reg.len() + 1), ik });
         vault.save_registry(&reg).map_err(|e| e.to_string())?;
-    }
-    let store = vault.account(&id);
-    if !store.has_capability() {
-        let _ = store.save_capability(&client::dev_capability());
     }
     cv.save().map_err(|e| e.to_string())?; // persist the provisioned account into the container
     let me = enter(&app, vault, id, false, false);
@@ -1211,10 +1216,6 @@ fn container_add_hidden(app: State<App>, hidden_password: String) -> Result<Vec<
             let mut reg = hvault.load_registry()?;
             reg.push(AccountEntry { id: id.clone(), label: "Hidden".into(), ik });
             hvault.save_registry(&reg)?;
-            let store = hvault.account(&id);
-            if !store.has_capability() {
-                let _ = store.save_capability(&client::dev_capability());
-            }
             // The REAL usable capacity of the hidden region, threaded in from `add_hidden`.
             // Passing `usize::MAX` here would reopen SEC-35 on this exact path: the snapshot is
             // read into RAM before anything can refuse it, so the ceiling has to bind the READ.
@@ -1302,7 +1303,7 @@ fn set_relay(app: State<App>, addr: String, relay_id: String, socks5: String, mi
     // itself or Offline would still emit a request the moment a relay is configured.
     if !app.offline.load(Ordering::SeqCst) {
         if let Ok(cap) = client::earn_capability(&relay) {
-            let _ = store.save_capability(&cap);
+            let _ = store.save_capability_for(&relay.id, &cap);
         }
     }
     s.relays = build_relays(&store);
@@ -1366,10 +1367,15 @@ fn remove_extra_relay(app: State<App>, addr: String) -> Result<(), String> {
 /// `karst import-cap`.
 #[tauri::command]
 fn import_capability(app: State<App>, invite_json: String) -> Result<(), String> {
-    // Type inferred from `save_capability(&cap)` — no need to name the capability type here.
+    // Type inferred from `save_capability_for` — no need to name the capability type here.
     let cap = serde_json::from_str(invite_json.trim()).map_err(|e| format!("parsing invite: {e}"))?;
     let (store, relays) = app.snapshot()?;
-    store.save_capability(&cap).map_err(|e| format!("writing capability: {e}"))?;
+    // An invite is a bare capability: the relay writes exactly the serialized credential, with no
+    // relay-id inside it (CRYPTO-25's file format), so the only thing that can say WHICH relay it
+    // is for is the relay this account is currently configured against. It is stored against that
+    // one and presented nowhere else (CRYPTO-24).
+    let primary = relays.first().ok_or("configure this account's relay before importing its invite")?;
+    store.save_capability_for(&primary.id, &cap).map_err(|e| format!("writing capability: {e}"))?;
     do_publish(&store, &relays, app.offline.load(Ordering::SeqCst));
     Ok(())
 }
@@ -1755,10 +1761,7 @@ fn create_proxy(app: State<App>, label: String) -> Result<Proxy, String> {
     // immediately. Without this the channel is unreachable ("bundle not published") until the next
     // unlock re-runs do_publish — the exact "send failed: bundle not published" you hit.
     let np = store.as_proxy(e.index);
-    let cap = np
-        .load_capability()
-        .map_err(|err| format!("cannot read the new proxy's capability: {err}"))?;
-    let _ = client::publish_all(&np, &relays, cap, now_secs());
+    let _ = client::publish_all(&np, &relays, now_secs());
     Ok(proxy_of(&store, &e))
 }
 
@@ -1827,10 +1830,7 @@ fn migrate_channel(app: State<App>, old_index: u32, contacts: Vec<String>, new_l
     // Mint + publish the new channel so contacts can open a session to it.
     let new_e = store.create_proxy(new_label.trim(), now_secs()).map_err(|e| format!("creating channel: {e}"))?;
     let np = store.as_proxy(new_e.index);
-    let cap = np
-        .load_capability()
-        .map_err(|e| format!("cannot read the new channel's capability: {e}"))?;
-    let _ = client::publish_all(&np, &relays, cap, now_secs());
+    let _ = client::publish_all(&np, &relays, now_secs());
     let new_ik = np.load_account().map_err(|e| e.to_string())?.identity_public();
     // Over the OLD channel's authenticated session, tell each chosen contact to move; re-tag locally
     // ONLY once that message is confirmed to have reached the relay (see the doc comment above).
@@ -3001,8 +3001,8 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
             // The upload presents a capability now (CRYPTO-15): storing bytes on a relay is
             // metered like every other write, and this path stores the most of them.
             let cap = store
-                .load_capability()
-                .map_err(|_| "no capability to upload with".to_string())?;
+                .load_capability_for(&relay.id)
+                .map_err(|e| format!("no credential to upload through this relay: {e}"))?;
             let (blob_id, key, hash, chunks) = client::blob_upload_with(
                 &relay,
                 &cap,

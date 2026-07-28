@@ -62,6 +62,28 @@ Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests g
   re-encrypt, no ratchet double-advance; the desktop poll retransmits across every relay. So a
   blocked primary no longer strands an ongoing conversation (first-contact-via-a-secondary is a
   documented residual). e2e-tested.
+- **Admission credentials are PER RELAY (CRYPTO-24).** An account used to hold exactly one
+  `capability.dat` and present it to every relay. Against dev relays that works — they all admit the
+  same globally known dev capability — but in production a capability is relay-specific (a Private
+  relay mints a random `capability_id + secret`; a Public relay derives a stateless secret from its
+  own issuer key), so a second relay answers `UnknownCapability`/`BadMac`. The finding named send
+  failover; it was **worse than filed**, because CREATING a bundle slot is metered too
+  (`handle_publish`, CRYPTO-18): the account never became reachable on a backup relay at all, so
+  receive-side multi-homing was broken as well, not just the failover. It also handed every relay the
+  same `capability_id`, linking one account's traffic across independent operators. Now
+  `capabilities.dat` is a map `relay-id → capability`; there is no way to ask for "the" capability
+  without naming the relay (`Store::load_capability_for`), `karst dev-cap`/`import-cap`/`join` write
+  against a named relay, and `publish_all` skips — loudly — any relay this account holds no
+  credential for rather than presenting another's. Pinned by
+  `multi_homing_presents_each_relay_the_credential_that_relay_issued`, which runs against two relays
+  admitting DIFFERENT credentials (the dev cap deliberately not issued) and covers both halves.
+  **What this does NOT do: it does not acquire credentials.** Failover works only for relays the
+  account has actually joined or imported an invite for; for the rest it now fails honestly (skip +
+  reason) instead of silently presenting a credential that would be rejected. Auto-earning a
+  capability when a relay is discovered is a deliberate non-goal here — it would make discovery emit
+  a PoW admission round trip on its own. Related node-side gap: an invite file (`invite.json`) is a
+  bare serialized capability with NO relay-id in it, so the CLI/desktop must be TOLD which relay an
+  invite belongs to (`--relay-id`; the desktop binds it to the configured primary).
 - **Metadata hardening (Loopix-style) — status.** The impactful pieces are already shipped and
   verified: the relay fetch response is a FIXED 16 000-byte page whether it carries 0 or `FETCH_CAP`
   seals (§2.2 — message COUNT never leaks through response length), polling is jittered, and messages
@@ -2293,7 +2315,8 @@ The first thing usable by hand: `karst init` (create an account — **prints the
 12-word recovery phrase**), `karst restore <12 words>` (restore into an empty
 `$KARST_HOME`), `karst show-phrase` (show your phrase), `karst id` (the skeleton
 pubkey), `karst account` (the §2.1 IK — the address for discovery),
-`karst dev-cap`/`import-cap` (capability), `karst publish --relay A --relay-id ID`
+`karst dev-cap`/`import-cap` (a capability, which now names the relay it is FOR:
+both take `--relay/--relay-id`, see CRYPTO-24 below), `karst publish --relay A --relay-id ID`
 (§12: publish the §2.1 bundle), `karst send … --to HEX <msg>`, `karst recv …`
 (+ optional `--socks5 HOST:PORT` through an external PT). The directory is
 `$KARST_HOME` (or `~/.config/karst`). The identity is derived from the **root

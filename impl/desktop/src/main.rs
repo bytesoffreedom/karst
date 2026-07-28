@@ -1669,8 +1669,9 @@ fn create_proxy(app: State<App>, label: String) -> Result<Proxy, String> {
     Ok(proxy_of(&store, &e))
 }
 
-/// Burn a proxy: stop offering it (its contacts can no longer be reached through it). Reversible
-/// flag flip; the keys stay derivable so any last in-flight mail still decrypts.
+/// Burn a proxy: stop offering it (its contacts can no longer be reached through it). NOT
+/// reversible — the entry and its secret are deleted outright (#207, A6-4), so no in-flight mail
+/// still addressed to it can ever be decrypted again once it's gone; see `Store::burn_proxy`.
 #[tauri::command]
 fn burn_proxy(app: State<App>, index: u32) -> Result<(), String> {
     let (store, _) = app.snapshot()?;
@@ -1683,7 +1684,10 @@ fn burn_proxy(app: State<App>, index: u32) -> Result<(), String> {
     }
     // Burn now DESTROYS: the entry, its secret, and the proxy's namespaced network state go, so
     // the identity cannot be reproduced by anyone — including the holder of the recovery phrase.
-    // That is the whole point of A6-4, and it is why this is not undoable.
+    // That is the whole point of A6-4, and it is why this is not undoable. `Store::burn_proxy`
+    // also refuses outright (CRYPTO-27) while this proxy still has anything undelivered queued in
+    // its outbox — that error surfaces to the user here verbatim, telling them to retry the send
+    // (or wait for the relay) before burning.
     store.burn_proxy(index).map_err(|e| e.to_string())
 }
 
@@ -1714,6 +1718,15 @@ fn contacts_on_proxy(app: State<App>, index: u32) -> Result<Vec<Contact>, String
 /// publish the new channel, tell each chosen contact over the OLD (authenticated) session to move
 /// to it, and re-tag them locally. The unchosen (e.g. a spammer/attacker) stay on the old channel,
 /// which you can then burn — they never learn the new address. Returns the new channel.
+///
+/// CRYPTO-27: a contact is re-tagged onto the new proxy ONLY when `send_channel_migrate` reports
+/// `Ok(true)` (reached the relay this call). If it comes back `Ok(false)` (durably queued, relay
+/// down) or `Err`, the contact is left on `old_index` — the migration message is still sitting in
+/// the old proxy's outbox and a later flush/poll can still deliver it; re-tagging early would make
+/// the UI show the contact as "migrated" while the one message that actually tells THEM to move
+/// was never sent. `Store::burn_proxy` separately refuses to burn `old_index` while that outbox is
+/// non-empty, so the un-migrated contact cannot be stranded by an immediate burn either — but
+/// skipping the re-tag here is what keeps the contact LIST honest about who has actually moved.
 #[tauri::command]
 fn migrate_channel(app: State<App>, old_index: u32, contacts: Vec<String>, new_label: String) -> Result<Proxy, String> {
     let (store, relays) = app.snapshot()?;
@@ -1726,12 +1739,21 @@ fn migrate_channel(app: State<App>, old_index: u32, contacts: Vec<String>, new_l
         .map_err(|e| format!("cannot read the new channel's capability: {e}"))?;
     let _ = client::publish_all(&np, &relays, cap, now_secs());
     let new_ik = np.load_account().map_err(|e| e.to_string())?.identity_public();
-    // Over the OLD channel's authenticated session, tell each chosen contact to move; re-tag locally.
+    // Over the OLD channel's authenticated session, tell each chosen contact to move; re-tag locally
+    // ONLY once that message is confirmed to have reached the relay (see the doc comment above).
     let old = store.as_proxy(old_index);
     for hex_ik in &contacts {
         if let Ok(peer) = parse_ik(hex_ik) {
-            let _ = client::send_channel_migrate(&old, &relay, &peer, new_ik, now_secs());
-            let _ = store.set_contact_proxy(peer, new_e.index);
+            match client::send_channel_migrate(&old, &relay, &peer, new_ik, now_secs()) {
+                Ok(true) => {
+                    let _ = store.set_contact_proxy(peer, new_e.index);
+                }
+                Ok(false) => eprintln!(
+                    "warning: channel migration to {hex_ik} is queued, not yet delivered — \
+                     not re-tagging until it reaches the relay"
+                ),
+                Err(e) => eprintln!("warning: channel migration to {hex_ik} failed: {e}"),
+            }
         }
     }
     Ok(proxy_of(&store, &new_e))

@@ -1753,15 +1753,26 @@ pub fn send_posts_request(store: &Store, relay: &Relay, to_ik: &[u8; 32], now: u
 /// Tell a contact to move to a new channel: send `Content::ChannelMigrate { new_ik }` over the
 /// EXISTING session (call this on the OLD proxy's store, so it rides that authenticated ratchet).
 /// The recipient re-points us to `new_ik`. Send only to the contacts you keep.
+///
+/// Returns `send_session`'s delivery bit VERBATIM (CRYPTO-27) instead of discarding it: `true` =
+/// this migration ciphertext reached the relay this call; `false` = the relay was down and it is
+/// durably QUEUED in the OLD proxy's outbox, not yet delivered. A migration message is the ONLY
+/// authenticated proof-of-continuity between the old and new identity — burning the old proxy
+/// while it is `false` would delete that queued ciphertext for good (the outbox lives in
+/// `sessions.dat`, one of the files `Store::burn_proxy` removes), leaving the contact permanently
+/// split: they never learn `new_ik`, and the next message from it looks like an unknown sender.
+/// The caller MUST treat `false` (and `Err`) as "not migrated yet": do not re-point the local
+/// contact→proxy tag, and rely on `Store::burn_proxy`'s own outbox check to refuse the burn until
+/// this is `Ok(true)` (or a later flush drains the outbox).
 pub fn send_channel_migrate(
     store: &Store,
     relay: &Relay,
     to_ik: &[u8; 32],
     new_ik: [u8; 32],
     now: u64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let payload = content::encode(&content::Content::ChannelMigrate { new_ik });
-    send_session(store, relay, to_ik, &payload, now).map(|_| ())
+    send_session(store, relay, to_ik, &payload, now)
 }
 
 /// Tell `to_ik` their subscribe request was accepted (`is_channel` = we're a channel).

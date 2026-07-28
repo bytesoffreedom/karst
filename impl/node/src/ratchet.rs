@@ -84,6 +84,10 @@ pub enum RatchetError {
     NoReceivingChain,
     /// AEAD не сошёлся (подмена/чужой ключ).
     Decrypt,
+    /// Заголовок принёс ratchet-ключ малого порядка: DH-шаг был бы НЕ contributory
+    /// (общий секрет — нули, известные атакующему), что убило бы PCS-«лечение».
+    /// Состояние НЕ продвигается (`decrypt` транзакционен) — CRYPTO-06.
+    NonContributoryDh,
 }
 
 /// Состояние Double-Ratchet-сессии. `Clone` — для транзакционного decrypt
@@ -230,7 +234,7 @@ impl Session {
         // цепочки (nr..header.pn) и сделать DH-шаг (PCS-«лечение»).
         if self.dhr != Some(header.dh) {
             self.skip_message_keys(header.pn)?;
-            self.dh_ratchet(header);
+            self.dh_ratchet(header)?;
         }
         // (3) Пропуски в текущей цепочке до header.n (сохраняются).
         self.skip_message_keys(header.n)?;
@@ -280,20 +284,26 @@ impl Session {
     }
 
     /// DH-ratchet-шаг: новая receiving/sending цепочки на ratchet-ключе собеседника.
-    fn dh_ratchet(&mut self, header: &Header) {
+    fn dh_ratchet(&mut self, header: &Header) -> Result<(), RatchetError> {
+        // Reject a small-order ratchet key BEFORE touching state: its DH is all-zero, i.e. known
+        // to the attacker, so the step would inject no fresh entropy and silently defeat the
+        // healing (PCS) property this ratchet exists to provide (CRYPTO-06). `decrypt` stages a
+        // clone and commits only on success, so returning Err here leaves the session untouched.
+        let their = PublicKey::from(header.dh);
+        let dh1 = self.dhs.dh_checked(&their).ok_or(RatchetError::NonContributoryDh)?;
+        let dhs_new = Identity::generate();
+        let dh2 = dhs_new.dh_checked(&their).ok_or(RatchetError::NonContributoryDh)?;
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
-        let dh1 = self.dhs.dh(&PublicKey::from(header.dh));
         let (rk1, ckr) = kdf_rk(&self.rk, &dh1);
-        let dhs_new = Identity::generate();
-        let dh2 = dhs_new.dh(&PublicKey::from(header.dh));
         let (rk2, cks) = kdf_rk(&rk1, &dh2);
         self.rk = rk2;
         self.dhr = Some(header.dh);
         self.dhs = dhs_new;
         self.ckr = Some(ckr);
         self.cks = Some(cks);
+        Ok(())
     }
 }
 

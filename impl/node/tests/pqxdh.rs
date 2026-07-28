@@ -77,6 +77,52 @@ fn malformed_kem_ciphertext_length_rejected() {
     assert!(bob.accept_key_agreement(&ka).is_none(), "KEM-ct кривой длины → None");
 }
 
+/// CRYPTO-06 — a bundle advertising a small-order prekey must be REFUSED. X25519 against the
+/// identity point yields an all-zero shared secret that the attacker also knows, so folding it
+/// in would silently drop a whole DH leg's contribution. Note the bundle SIGNATURE says nothing
+/// about a key's order, so this check is the only thing standing between a malicious contact's
+/// degenerate key and the agreement.
+#[test]
+fn a_small_order_prekey_in_a_bundle_is_refused() {
+    let bob = Account::generate();
+    let alice = Identity::generate();
+
+    let good = bob.prekey_bundle();
+    assert!(
+        initiate_key_agreement(&alice, &[7u8; 32], &good).is_ok(),
+        "control: a healthy bundle agrees"
+    );
+
+    let mut degenerate = good.clone();
+    degenerate.prekey_pub = [0u8; 32];
+    assert!(
+        initiate_key_agreement(&alice, &[7u8; 32], &degenerate).is_err(),
+        "a small-order prekey must be refused"
+    );
+
+    let mut degenerate_opk = good.clone();
+    degenerate_opk.opk_pub = Some([0u8; 32]);
+    assert!(
+        initiate_key_agreement(&alice, &[7u8; 32], &degenerate_opk).is_err(),
+        "a small-order one-time prekey must be refused too"
+    );
+}
+
+/// The mirror on the RECIPIENT's side: an initial agreement carrying a small-order ephemeral is
+/// refused instead of deriving a root key from an all-zero DH.
+#[test]
+fn a_small_order_ephemeral_is_refused_on_accept() {
+    let mut bob = Account::generate();
+    let alice = Identity::generate();
+    let (_rk, mut ka) =
+        initiate_key_agreement(&alice, &[7u8; 32], &bob.prekey_bundle()).expect("well-formed bundle");
+    ka.ek_a_pub = [0u8; 32];
+    assert!(
+        bob.accept_key_agreement(&ka).is_none(),
+        "a non-contributory ephemeral must be refused on accept"
+    );
+}
+
 #[test]
 fn wrong_recipient_derives_different_key() {
     // Согласование адресовано bob'у (его bundle); другой аккаунт выведет другой

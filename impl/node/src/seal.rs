@@ -73,6 +73,22 @@ impl Identity {
         self.secret.diffie_hellman(peer).to_bytes()
     }
 
+    /// Static-static DH that REJECTS a non-contributory result — i.e. a peer point of small
+    /// order, for which the shared secret is all-zero and therefore KNOWN to everyone. This is
+    /// the guard `node::mailbox_owner_ok` already applies to the fetch proof, lifted into one
+    /// place so every PROTOCOL DH can use it (CRYPTO-06).
+    ///
+    /// Why it matters most in the ratchet: an active adversary who knows the current state can
+    /// offer a small-order ratchet key so the DH step contributes NOTHING, stripping the fresh
+    /// entropy that gives post-compromise security (healing). In PQXDH the ML-KEM leg and the
+    /// other DH legs blunt a single zero leg, but a zero leg is never legitimate — reject it.
+    ///
+    /// `None` = non-contributory (constant-time check via `was_contributory`).
+    pub fn dh_checked(&self, peer: &PublicKey) -> Option<[u8; 32]> {
+        let shared = self.secret.diffie_hellman(peer);
+        shared.was_contributory().then(|| shared.to_bytes())
+    }
+
     /// Key for issuing STATELESS PoW capabilities (slice 4a, the Public door). A
     /// domain-separated hash of the node's static secret, so it is PERSISTENT with the node
     /// key (a PoW cap survives a relay restart) yet never exposes the raw secret. Third use

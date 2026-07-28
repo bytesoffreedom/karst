@@ -281,16 +281,18 @@ impl Account {
         let ik_a = PublicKey::from(ka.ik_a_pub);
         let ek_a = PublicKey::from(ka.ek_a_pub);
         // Зеркало DH отправителя (симметрия static-static X25519).
-        let dh1 = self.prekey.dh(&ik_a); // PK_B × IK_A  (аутентификация отправителя)
-        let dh2 = self.ik.dh(&ek_a); //     IK_B × EK_A
-        let dh3 = self.prekey.dh(&ek_a); //  PK_B × EK_A
+        // Every DH must be CONTRIBUTORY: a small-order peer point yields an all-zero shared
+        // secret that the attacker also knows, so reject rather than fold it in (CRYPTO-06).
+        let dh1 = self.prekey.dh_checked(&ik_a)?; // PK_B × IK_A  (аутентификация отправителя)
+        let dh2 = self.ik.dh_checked(&ek_a)?; //     IK_B × EK_A
+        let dh3 = self.prekey.dh_checked(&ek_a)?; //  PK_B × EK_A
 
         // If the sender used a one-time prekey, find its secret and mirror dh4. A missing
         // OPK (already consumed, or never ours) fails the agreement rather than silently
         // downgrading — the sender committed to it in the transcript, so proceeding without
         // it would derive a different root key anyway.
         let dh4 = match ka.opk_pub {
-            Some(opk_pub) => Some(self.opks.get(&opk_pub)?.dh(&ek_a)),
+            Some(opk_pub) => Some(self.opks.get(&opk_pub)?.dh_checked(&ek_a)?),
             None => None,
         };
 
@@ -357,11 +359,18 @@ pub fn initiate_key_agreement(
     let prekey_b = PublicKey::from(bundle.prekey_pub);
     let ek_a = Identity::generate(); // эфемер отправителя
 
-    let dh1 = sender_ik.dh(&prekey_b); // IK_A × PK_B  (аутентификация отправителя)
-    let dh2 = ek_a.dh(&ik_b); //         EK_A × IK_B
-    let dh3 = ek_a.dh(&prekey_b); //     EK_A × PK_B
+    // Every DH must be CONTRIBUTORY. A malicious contact can publish a small-order prekey / OPK
+    // (the signature covers it, but "signed" says nothing about order): the shared secret would
+    // be all-zero and therefore public, so refuse the bundle instead of folding it in (CRYPTO-06).
+    const NON_CONTRIB: &str = "bundle contains a non-contributory (small-order) X25519 key";
+    let dh1 = sender_ik.dh_checked(&prekey_b).ok_or(NON_CONTRIB)?; // IK_A × PK_B
+    let dh2 = ek_a.dh_checked(&ik_b).ok_or(NON_CONTRIB)?; //         EK_A × IK_B
+    let dh3 = ek_a.dh_checked(&prekey_b).ok_or(NON_CONTRIB)?; //     EK_A × PK_B
     // Fourth DH against the recipient's ONE-TIME prekey, iff the bundle carried one.
-    let dh4 = bundle.opk_pub.map(|opk| ek_a.dh(&PublicKey::from(opk)));
+    let dh4 = match bundle.opk_pub {
+        Some(opk) => Some(ek_a.dh_checked(&PublicKey::from(opk)).ok_or(NON_CONTRIB)?),
+        None => None,
+    };
 
     let (ct, pq_shared) = ek.encapsulate();
     let kem_ct = ct.as_slice().to_vec();

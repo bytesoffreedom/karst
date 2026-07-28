@@ -168,6 +168,31 @@ fn populated_skipped_store_survives_postcard_roundtrip() {
     assert_eq!(bob2.decrypt(&m1).unwrap(), b"m1", "gap-filler из store, пережившего байты");
 }
 
+/// CRYPTO-06 — a small-order ratchet key must be REFUSED, not folded into the DH step. Its
+/// shared secret is all-zero, i.e. known to the attacker, so the "healing" step would inject no
+/// fresh entropy and silently void post-compromise security. Discriminating on BOTH sides: the
+/// poisoned header must be rejected, AND the session must be left untouched (a guard that
+/// wedged the session would be its own bug), so the next genuine message still decrypts.
+#[test]
+fn a_small_order_ratchet_key_is_refused_without_wedging_the_session() {
+    let (mut alice, mut bob) = establish();
+    let m1 = alice.encrypt(b"one");
+    assert_eq!(bob.decrypt(&m1).unwrap(), b"one", "control: normal traffic flows");
+
+    // The identity point is the canonical small-order X25519 key: X25519(x, 0) == 0 for any x.
+    let mut poisoned = alice.encrypt(b"two");
+    poisoned.header.dh = [0u8; 32];
+    assert_eq!(
+        bob.decrypt(&poisoned),
+        Err(RatchetError::NonContributoryDh),
+        "a non-contributory ratchet key must be rejected, not ratcheted on"
+    );
+
+    // Session untouched → a later genuine message from the real chain still opens.
+    let m3 = alice.encrypt(b"three");
+    assert_eq!(bob.decrypt(&m3).unwrap(), b"three", "the rejection must not wedge the session");
+}
+
 #[test]
 fn cross_message_serialization_roundtrip() {
     // Сообщение переживает сериализацию (пойдёт в wire/mailbox позже).

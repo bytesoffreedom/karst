@@ -255,3 +255,45 @@ fn a_pow_capability_survives_a_relay_restart() {
         "a PoW capability must survive a restart (stateless — no stored record)"
     );
 }
+
+/// A4-7. The quota stamped on an issued capability is what the client BELIEVES it may spend.
+/// It used to be `quota_policy.unwrap_or(POW_CAP_QUOTA)`, while enforcement computes
+/// `POW_CAP_QUOTA.clamped_by(policy)` — an element-wise MIN. The two agree only while the
+/// operator's ceiling sits at or below the door's own bound. Raise it (the `unlimited` and
+/// `media-friendly` presets both do) and the relay handed out a capability advertising a budget
+/// the pipeline would then refuse, so the client saw an unexplained rejection well inside its
+/// stated quota.
+///
+/// Discriminating in both directions: a RAISED policy must not lift the stamped quota above the
+/// door's bound, and a LOWERED one must still bite. A test that only checked the raise could pass
+/// by ignoring the policy entirely.
+#[test]
+fn an_issued_pow_capability_advertises_the_quota_enforcement_will_actually_grant() {
+    use admission::capability::{Quota, POW_CAP_QUOTA};
+
+    // The operator RAISES the ceiling far above the Public door's spam bound.
+    let relay = public_relay(NOW, Identity::generate());
+    relay.borrow_mut().set_quota_policy(Some(Quota {
+        max_requests: POW_CAP_QUOTA.max_requests * 100,
+        max_bytes: POW_CAP_QUOTA.max_bytes * 100,
+        window_secs: POW_CAP_QUOTA.window_secs,
+    }));
+    let (cap, _) = earn(&relay, [0x11; 32], NOW);
+    assert_eq!(
+        cap.quota.max_requests, POW_CAP_QUOTA.max_requests,
+        "an operator ceiling ABOVE the Public door's bound must not raise what a PoW capability \
+         is told it has — enforcement will still clamp to the door's bound, and the gap is what \
+         the holder experiences as an unexplained rejection"
+    );
+
+    // ...and a ceiling BELOW the bound must still lower it, or the policy would be decorative.
+    let relay = public_relay(NOW, Identity::generate());
+    relay.borrow_mut().set_quota_policy(Some(Quota {
+        max_requests: 3,
+        max_bytes: 4096,
+        window_secs: POW_CAP_QUOTA.window_secs,
+    }));
+    let (cap, _) = earn(&relay, [0x22; 32], NOW);
+    assert_eq!(cap.quota.max_requests, 3, "a tighter operator ceiling must bind the issued quota");
+    assert_eq!(cap.quota.max_bytes, 4096);
+}

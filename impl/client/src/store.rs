@@ -256,6 +256,11 @@ struct ReceivedFileV0 {
 /// prefix'а из мусорного хвоста → не аллоцируем гигабайты по битой длине).
 const MAX_HISTORY_RECORD: usize = 1 << 20; // 1 MiB — с запасом на любой текст
 
+/// How many recent incoming `msg_id`s the dedup ring keeps. Must be >= the window any caller
+/// asks `recent_incoming_ids` for (`client::HISTORY_DEDUP_WINDOW`), or the answer would silently
+/// be short and a duplicate would slip through. 2048 leaves a factor of two of headroom.
+const DEDUP_RING_CAP: usize = 2048;
+
 /// Cap on the number of cached peer profiles (anti-flood from unknown IKs).
 const MAX_PEER_PROFILES: usize = 10_000;
 /// Cap on connection proxies in one root's registry. Generous for real use (one per contact/group
@@ -2743,7 +2748,9 @@ impl Store {
     /// the plaintext-first receive path: the plaintext lands here BEFORE the ratchet commit,
     /// and the id lets a redelivered copy be recognised and skipped.
     pub fn append_history_incoming(&self, rec: &HistoryRecord, msg_id: [u8; 32]) -> io::Result<()> {
-        self.append_history_with_id(rec, msg_id)
+        self.append_history_with_id(rec, msg_id)?;
+        self.note_incoming_id(msg_id);
+        Ok(())
     }
 
     fn append_history_with_id(&self, rec: &HistoryRecord, msg_id: [u8; 32]) -> io::Result<()> {
@@ -2834,19 +2841,60 @@ impl Store {
     /// flagged as a follow-up (a record index / reverse scan would bound it). Zeroed ids
     /// (outgoing / pre-`msg_id` legacy) are excluded — they never match a real id.
     pub fn recent_incoming_ids(&self, limit: usize) -> io::Result<std::collections::HashSet<[u8; 32]>> {
-        let _lock = self.lock_history()?;
-        let bytes = match std::fs::read(self.history_path()) {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Default::default()),
-            Err(e) => return Err(e),
-        };
-        let (records, _) = self.scan_history(&bytes);
-        let start = records.len().saturating_sub(limit);
-        Ok(records[start..]
-            .iter()
-            .filter(|s| !s.rec.from_me && s.msg_id != [0u8; 32])
-            .map(|s| s.msg_id)
-            .collect())
+        let ring = self.load_dedup_ring()?;
+        let start = ring.len().saturating_sub(limit);
+        Ok(ring[start..].iter().copied().collect())
+    }
+
+    fn dedup_ring_path(&self) -> PathBuf {
+        self.dir.join("dedup.dat")
+    }
+
+    /// The newest incoming `msg_id`s, kept in their OWN small file.
+    ///
+    /// This used to be answered by reading and AEAD-opening the ENTIRE history log and slicing
+    /// its tail — for a caller that wants at most a thousand 32-byte ids. It ran once per ack
+    /// pass, including on an empty mailbox, and the desktop poll does that up to eighty times
+    /// across its proxies, so a remote sender could grow your history legitimately and thereby
+    /// turn every future poll into O(history) — and O(pages x history) while paging (SEC-42).
+    ///
+    /// The framed append-log has no reverse index, so "read the tail" was never possible in
+    /// place. A dedicated ring makes the read proportional to the WINDOW instead of the log.
+    fn load_dedup_ring(&self) -> io::Result<Vec<[u8; 32]>> {
+        match std::fs::read(self.dedup_ring_path()) {
+            Ok(blob) => {
+                let plain =
+                    self.key.open(&self.label(&self.dedup_ring_path()), &blob).map_err(io_err)?;
+                postcard::from_bytes(&plain).map_err(io_err)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record an incoming `msg_id` in the dedup ring, oldest evicted past `DEDUP_RING_CAP`.
+    ///
+    /// Best-effort ON PURPOSE, and the reason is worth stating: this ring only suppresses a
+    /// DUPLICATE, and the duplicate it suppresses is the one produced by a crash between the
+    /// history append and the ratchet save. Losing a ring entry costs one re-appended message,
+    /// never a lost one — so failing the whole receive because a cache write failed would trade
+    /// a cosmetic problem for a real one.
+    fn note_incoming_id(&self, msg_id: [u8; 32]) {
+        if msg_id == [0u8; 32] {
+            return; // outgoing / unstamped: never matches a real id anyway
+        }
+        let Ok(mut ring) = self.load_dedup_ring() else { return };
+        if ring.last() == Some(&msg_id) {
+            return;
+        }
+        ring.push(msg_id);
+        let over = ring.len().saturating_sub(DEDUP_RING_CAP);
+        if over > 0 {
+            ring.drain(..over);
+        }
+        if let Ok(plain) = postcard::to_stdvec(&ring) {
+            let _ = self.write_sealed(&self.dedup_ring_path(), &plain);
+        }
     }
 
     /// Перезаписать историю, оставив только записи, для которых `keep` вернул `true`
@@ -4242,6 +4290,60 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-42. Answering "which messages did I recently receive?" used to read and AEAD-open the
+    /// WHOLE history log and slice its tail — for a caller that wants at most a thousand ids. It
+    /// ran once per ack pass, on an empty mailbox too, and the desktop poll does that up to
+    /// eighty times across its proxies: a remote sender could grow your history legitimately and
+    /// thereby make every future poll cost O(history).
+    ///
+    /// Asserted STRUCTURALLY rather than by timing, which is both stronger and honest: the
+    /// history file is deleted outright, and the query must still answer correctly. It cannot be
+    /// reading what is not there. A timing test would only have shown "faster", would have needed
+    /// a stopwatch that lies on a loaded machine, and would still have grown with the ring.
+    #[test]
+    fn recent_incoming_ids_does_not_read_the_history_log_at_all() {
+        let dir = std::env::temp_dir().join(format!("karst-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let id = |n: u32| {
+            let mut m = [0u8; 32];
+            m[..4].copy_from_slice(&n.to_le_bytes());
+            m
+        };
+        let rec = |n: u32| HistoryRecord {
+            from_me: false,
+            peer_ik: [3u8; 32],
+            text: format!("msg {n}").into_bytes(),
+            ts: n as u64,
+        };
+
+        // Ids start at 1: an all-zero id is the "outgoing / unstamped" sentinel the ring skips by
+        // design, so n = 0 would produce exactly that and be (correctly) ignored.
+        for n in 1..9 {
+            s.append_history_incoming(&rec(n), id(n)).unwrap();
+        }
+        // An outgoing record must never appear: it carries no incoming id to dedup against.
+        s.append_history(&HistoryRecord { from_me: true, ..rec(999) }).unwrap();
+
+        assert_eq!(s.load_history().unwrap().len(), 9, "control: the log really holds the records");
+
+        // The history log is now gone. Under the old implementation this query WAS the log scan,
+        // so it could only return nothing.
+        std::fs::remove_file(s.history_path()).unwrap();
+
+        let ids = s.recent_incoming_ids(1024).unwrap();
+        assert_eq!(
+            ids.len(),
+            8,
+            "the dedup query still depends on the history log — that dependency is what made \
+             every poll cost O(history); got {ids:?}"
+        );
+        assert!(ids.contains(&id(1)) && ids.contains(&id(8)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// CRYPTO-01 residual, the DETECTION half. The per-message salt already made a ratchet
     /// rollback harmless — two encryptions under a replayed chain key no longer collide — but

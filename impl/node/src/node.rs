@@ -744,9 +744,21 @@ impl RelayNode {
         Ok(Capability {
             capability_id: cap_id,
             scope,
-            // Stamp the operator's policy quota on the issued cap (so a cap holder SEES its budget);
-            // enforcement clamps to the live policy again anyway. `None` policy ⇒ the built-in default.
-            quota: self.quota_policy.unwrap_or(POW_CAP_QUOTA),
+            // The quota the holder is TOLD it has must be the quota enforcement will actually
+            // grant. This used to stamp `quota_policy.unwrap_or(POW_CAP_QUOTA)` while enforcement
+            // computes `POW_CAP_QUOTA.clamped_by(policy)` — an element-wise MIN. The two agree
+            // only while the policy is at or below the door's own bound; an operator who RAISES
+            // the ceiling (the `unlimited` and `media-friendly` presets both do) handed clients a
+            // capability advertising a budget the pipeline would then refuse, and the client saw
+            // it as an unexplained rejection well inside its stated quota (A4-7).
+            //
+            // Same expression as enforcement, deliberately: `POW_CAP_QUOTA` is the Public door's
+            // spam bound and a security parameter in its own right, so a policy may lower it,
+            // never lift it.
+            quota: match self.quota_policy {
+                Some(p) => POW_CAP_QUOTA.clamped_by(&p),
+                None => POW_CAP_QUOTA,
+            },
             not_before: now as u32,
             not_after,
             secret,

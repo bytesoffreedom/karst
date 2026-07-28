@@ -2773,26 +2773,57 @@ pub fn receive_threaded<T: Transport + Clone>(
     for (i, (transport, relay_pub)) in relays.iter().enumerate() {
         // capability is unused on receive (fetch-auth = cookie + ownership-proof), same as
         // `recv_session`; the dev capability fills the slot.
+        // TRANSACTIONAL per relay (A5-10). The snapshot is taken BEFORE this relay touches
+        // anything, because "the state comes back the way it went in" was simply not true: by
+        // the time a later fetch fails, `receive` may already have cleared handles, refreshed
+        // cookies, minted fresh routing identities and — the one with teeth — advanced
+        // `last_sweep`. Keeping that on an error deferred the next full drop-box sweep on the
+        // strength of a sweep that never finished.
+        //
+        // Serialised rather than cloned so the rollback is the same bytes the disk would hold:
+        // if a field is ever added that a clone would share rather than copy, this still
+        // restores exactly what was there. The cost is one encode per relay of state that is
+        // already bounded, on a path that is doing network round trips anyway.
+        let before = postcard::to_stdvec(&state).map_err(|e| e.to_string());
         let mut peer = Peer::new(transport.clone(), account.clone(), dev_capability(), *relay_pub);
         peer.enable_ack();
         peer.import_state(state);
         peer.load_opks(&opks);
+        let opks_before = opks.clone();
         match peer.receive(now) {
             // Collect this relay's ACK receipts ONLY on success: a failed relay's advance is
-            // rolled back below (state re-exported == imported), so acking its leased
-            // messages would delete mail that was never durably received. Tag by relay index
-            // so `recv_session_multi` acks each through the right transport after its save.
+            // rolled back, so acking its leased messages would delete mail that was never
+            // durably received. Tag by relay index so `recv_session_multi` acks each through
+            // the right transport after its save.
             Ok(mut got) => {
                 messages.append(&mut got);
                 acks.extend(peer.take_pending_acks().into_iter().map(|r| (i, r)));
+                opks = peer.export_opks();
+                state = peer.export_state();
             }
-            // Reclaim the state/OPKs from the peer either way: on a clean unreachability
-            // (the first fetch is rejected) they are exactly the values we imported, so the
-            // healthy relays' advance is preserved rather than dropped with the error.
-            Err(_) => failed.push(i),
+            Err(_) => {
+                failed.push(i);
+                // Roll this relay back, keeping every healthy relay's advance. Messages this
+                // relay did decrypt before failing are dropped WITH their state change, not
+                // without it: unacked, they stay leased and redeliver, and the rolled-back
+                // ratchet can still open them. Keeping the advance while dropping the messages
+                // is what would have lost them for good.
+                match before.as_ref().map(|b| PeerState::from_bytes(b)) {
+                    Ok(Ok(restored)) => {
+                        state = restored;
+                        opks = opks_before;
+                    }
+                    // A state we serialised ourselves failed to come back: keep the peer's
+                    // version rather than losing everything, and say so — silence here would
+                    // hide a corruption bug behind a network error.
+                    _ => {
+                        eprintln!("KARST: could not roll back relay {i}'s state after a failure");
+                        opks = peer.export_opks();
+                        state = peer.export_state();
+                    }
+                }
+            }
         }
-        opks = peer.export_opks();
-        state = peer.export_state();
     }
     MultiReceive { messages, state, opks, failed, acks }
 }
@@ -2923,6 +2954,68 @@ mod tests {
     fn rx(sender: [u8; 32], text: &[u8], ts: u64, msg_id: [u8; 32]) -> node::peer::Received {
         let plaintext = content::encode(&content::Content::TextStamped { text: text.to_vec(), ts });
         node::peer::Received { sender, plaintext, msg_id }
+    }
+
+    /// A5-10, THE carrying test. The multi-relay receive claimed a failed relay's state change
+    /// was rolled back "because the state re-exported equals the state imported". It was not: a
+    /// peer mints its per-relay handle and updates its bookkeeping BEFORE the transport call that
+    /// fails, so the failure left that work behind — including an advanced sweep mark, which
+    /// defers the next full drop-box sweep on the strength of a sweep that never finished.
+    ///
+    /// Discriminating and structural: the dead relay must own NO handle afterwards, while the
+    /// healthy one keeps its own. It is second on purpose — it mints its per-relay handle before
+    /// it discovers the transport is down, so there IS something to roll back; a test with only
+    /// the dead relay would pass without any fix, because nothing would have happened yet.
+    ///
+    /// Compared by structure rather than by bytes: handles are freshly random per run, so two
+    /// independent runs never serialise identically even when both are correct — an equality
+    /// check on the bytes would fail for a reason that has nothing to do with the bug.
+    #[test]
+    fn a_relay_that_fails_leaves_no_trace_in_the_state() {
+        use node::node::{AckResponse, AckRequest, FetchRequest, FetchResponse, Response, Transport, WireMessage};
+        use node::peer::PeerState;
+
+        #[derive(Clone)]
+        struct Fake {
+            up: bool,
+        }
+        impl Transport for Fake {
+            fn send(&self, _m: &WireMessage, _now: u64) -> Response {
+                Response::Rejected("not used".into())
+            }
+            fn fetch(&self, _r: &FetchRequest, _now: u64) -> FetchResponse {
+                if self.up {
+                    FetchResponse::Fetched(Vec::new())
+                } else {
+                    FetchResponse::Rejected("relay down".into())
+                }
+            }
+            fn ack(&self, _r: &AckRequest, _now: u64) -> AckResponse {
+                AckResponse::Rejected("not used".into())
+            }
+        }
+
+        let account = node::pqxdh::Account::generate();
+        let pub_a = x25519_dalek::PublicKey::from([7u8; 32]);
+        let pub_b = x25519_dalek::PublicKey::from([9u8; 32]);
+
+        let with_dead = receive_threaded(
+            account,
+            PeerState::empty(),
+            Vec::new(),
+            &[(Fake { up: true }, pub_a), (Fake { up: false }, pub_b)],
+            1_000,
+        );
+
+        assert_eq!(with_dead.failed, vec![1], "control: the second relay really did fail");
+        let owners = with_dead.state.relay_ids_for_test();
+        assert_eq!(
+            owners,
+            vec![pub_a.to_bytes()],
+            "the healthy relay must keep its handle and the dead one must keep NOTHING — a dead \
+             relay mints its handle before it ever learns the transport is down, and leaving it \
+             behind is the half-finished state this rollback exists to remove"
+        );
     }
 
     /// SEC-40, THE carrying test. An ACK tells the relay to delete its ONLY copy of a message.

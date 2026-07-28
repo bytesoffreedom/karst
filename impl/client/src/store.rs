@@ -2743,6 +2743,65 @@ impl Store {
     // сообщение → O(n²)). Конкурентность — ВЫДЕЛЕННЫЙ `history.lock` (никогда не
     // переименовывается, стабильный inode — как `sessions.lock`).
 
+    fn outstanding_requests_path(&self) -> PathBuf {
+        self.dir.join("outstanding_requests.dat")
+    }
+
+    /// The peers we have actually SENT a contact- or join-request to, and are therefore willing
+    /// to accept an answer from.
+    ///
+    /// Nothing recorded what we had asked for, so an "accept" was applied unconditionally: a
+    /// stranger could inject a `ContactAccept` and be written straight into the confirmed
+    /// contacts, profile and all, having been invited by nobody (SEC-29). Consent has two halves
+    /// and only one of them was on disk.
+    ///
+    /// Its own file rather than a field on an existing struct, so no state-version bump is needed
+    /// and an absent file simply reads as "we have asked for nothing" — the same shape the
+    /// INCOMING request list already uses.
+    pub fn load_outstanding_requests(&self) -> io::Result<BTreeSet<[u8; 32]>> {
+        match std::fs::read(self.outstanding_requests_path()) {
+            Ok(blob) => {
+                let plain = self
+                    .key
+                    .open(&self.label(&self.outstanding_requests_path()), &blob)
+                    .map_err(io_err)?;
+                postcard::from_bytes(&plain).map_err(io_err)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record that we asked `ik` for something, so their answer can be matched against it.
+    /// Bounded by the same budget as the contact list — an outstanding request is a promise to
+    /// accept state from that peer later, and unbounded promises are unbounded state.
+    pub fn note_outstanding_request(&self, ik: [u8; 32]) -> io::Result<()> {
+        let mut set = self.load_outstanding_requests()?;
+        if set.contains(&ik) {
+            return Ok(());
+        }
+        if set.len() >= MAX_CONTACTS {
+            return Err(io_err("too many outstanding requests"));
+        }
+        set.insert(ik);
+        let plain = postcard::to_stdvec(&set).map_err(io_err)?;
+        self.write_sealed(&self.outstanding_requests_path(), &plain)
+    }
+
+    /// Consume an outstanding request: `true` if we really had asked this peer, `false` if not.
+    ///
+    /// CONSUMES on purpose — one request authorises exactly one accept. Otherwise a single
+    /// request we once sent would keep validating replayed accepts forever.
+    pub fn take_outstanding_request(&self, ik: &[u8; 32]) -> io::Result<bool> {
+        let mut set = self.load_outstanding_requests()?;
+        if !set.remove(ik) {
+            return Ok(false);
+        }
+        let plain = postcard::to_stdvec(&set).map_err(io_err)?;
+        self.write_sealed(&self.outstanding_requests_path(), &plain)?;
+        Ok(true)
+    }
+
     fn quarantine_path(&self) -> PathBuf {
         self.net_file("quarantine.dat")
     }
@@ -4380,6 +4439,39 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-29, the ledger half. An "accept" writes the sender's profile into our contacts and
+    /// marks them confirmed. Nothing recorded what WE had asked for, so a stranger's unsolicited
+    /// accept did exactly what a real answer did — consent has two halves and only one was on
+    /// disk.
+    ///
+    /// Discriminating on all three properties that matter: an unasked peer is refused, an asked
+    /// one is admitted, and the request is CONSUMED so a single ask cannot validate a stream of
+    /// replayed accepts. A test that only checked the refusal would pass with accepts broken
+    /// outright.
+    #[test]
+    fn an_accept_is_only_honoured_from_a_peer_we_actually_asked() {
+        let dir = std::env::temp_dir().join(format!("karst-consent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        let (asked, stranger) = ([0xA1; 32], [0xB2; 32]);
+
+        s.note_outstanding_request(asked).unwrap();
+
+        assert!(
+            !s.take_outstanding_request(&stranger).unwrap(),
+            "an accept from a peer we never asked must not be honoured — that is a stranger \
+             writing themselves into the contact list"
+        );
+        assert!(s.take_outstanding_request(&asked).unwrap(), "the peer we DID ask must be honoured");
+        assert!(
+            !s.take_outstanding_request(&asked).unwrap(),
+            "the request must be consumed: one ask authorises exactly one accept, or a replayed \
+             accept keeps re-validating forever"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// SEC-42. Answering "which messages did I recently receive?" used to read and AEAD-open the
     /// WHOLE history log and slice its tail — for a caller that wants at most a thousand ids. It

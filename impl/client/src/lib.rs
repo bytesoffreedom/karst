@@ -1497,7 +1497,11 @@ pub fn send_profile(
 /// add). Best-effort like any first send: queues + retransmits if the relay/bundle isn't ready yet.
 pub fn send_contact_request(store: &Store, relay: &Relay, to_ik: &[u8; 32], name: &str, bio: &str, now: u64) -> Result<(), String> {
     let payload = content::encode(&content::Content::ContactRequest { name: name.to_string(), bio: bio.to_string() });
-    send_session(store, relay, to_ik, &payload, now).map(|_| ())
+    send_session(store, relay, to_ik, &payload, now)?;
+    // Record the ASK before we can be answered. Their accept writes their profile into our
+    // contacts, so without a record of having invited them a stranger's unsolicited accept did
+    // exactly the same thing (SEC-29). Noted AFTER the send so a failed send leaves no promise.
+    store.note_outstanding_request(*to_ik).map_err(|e| format!("recording the request: {e}"))
 }
 
 /// Send a CONTACT ACCEPT — the consent handshake's second half; carries our profile so the original
@@ -1583,7 +1587,8 @@ pub fn send_retraction(
 /// Ask to SUBSCRIBE to `to_ik`'s posts. A channel auto-accepts; a private account queues it.
 pub fn send_join_request(store: &Store, relay: &Relay, to_ik: &[u8; 32], now: u64) -> Result<(), String> {
     let payload = content::encode(&content::Content::JoinRequest);
-    send_session(store, relay, to_ik, &payload, now).map(|_| ())
+    send_session(store, relay, to_ik, &payload, now)?;
+    store.note_outstanding_request(*to_ik).map_err(|e| format!("recording the request: {e}"))
 }
 
 /// Live-pull: ask `to_ik` for their recent PUBLIC posts (visiting a profile you don't subscribe to).

@@ -3136,9 +3136,20 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
             }
             // Our subscribe request was accepted: remember whether they're a channel (for the
             // contact badge) and surface it. NEVER touches our own channel flag.
+            // Only from someone we actually asked (SEC-29). Consent has two halves; without a
+            // record of the ask, an unsolicited "accept" from a stranger changed local trust just
+            // as an answer to a real request would.
             Content::JoinAccept { is_channel } => {
-                let _ = store.set_channel_peer(r.sender, is_channel);
-                out.push(Incoming::join(r.sender, "accepted"));
+                match store.take_outstanding_request(&r.sender) {
+                    Ok(true) => {
+                        let _ = store.set_channel_peer(r.sender, is_channel);
+                        out.push(Incoming::join(r.sender, "accepted"));
+                    }
+                    Ok(false) => eprintln!(
+                        "KARST: dropping a join accept from a peer we never asked to join"
+                    ),
+                    Err(e) => eprintln!("KARST: reading outstanding requests: {e}"),
+                }
                 continue;
             }
             // A live-pull visitor asked for our posts: answer with our recent PUBLIC posts only (never
@@ -3182,10 +3193,21 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
             }
             // Our request was accepted: NOW we may see their name+bio. Ensure they're a contact
             // (we initiated) and refresh so their chosen name replaces the bare address.
+            // Same gate as `JoinAccept`, and the profile write sits INSIDE it: `name`/`bio` are
+            // attacker-controlled state, so storing them before checking who asked would keep
+            // half of the bug (SEC-29).
             Content::ContactAccept { name, bio } => {
-                let _ = store.set_peer_profile(r.sender, &name, &bio);
-                ensure_confirmed_contact(&root, r.sender);
-                out.push(Incoming::contactreq(r.sender, "accepted"));
+                match store.take_outstanding_request(&r.sender) {
+                    Ok(true) => {
+                        let _ = store.set_peer_profile(r.sender, &name, &bio);
+                        ensure_confirmed_contact(&root, r.sender);
+                        out.push(Incoming::contactreq(r.sender, "accepted"));
+                    }
+                    Ok(false) => eprintln!(
+                        "KARST: dropping a contact accept from a peer we never sent a request to"
+                    ),
+                    Err(e) => eprintln!("KARST: reading outstanding requests: {e}"),
+                }
                 continue;
             }
             // They asked to delete the conversation. We do NOT wipe automatically — you can't be

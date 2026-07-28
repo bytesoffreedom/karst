@@ -671,9 +671,18 @@ pub fn discovery_rotate(store: &Store, relay: &Relay, now: u64) -> Result<String
     discovery_publish(store, relay, now)
 }
 
+/// How far our clock may be BEHIND the publisher's before we call a record expired. Only ever
+/// makes us more lenient: a record is refused solely when it is expired even after the allowance.
+pub const DISCOVERY_CLOCK_SKEW_SECS: u64 = 5 * 60;
+
 /// Resolve a contact code at `relay` to the IK + location it points at. Verifies the code→IK
-/// binding itself (the relay never vouches), so a tampered or wrong-code record is refused.
-pub fn find_contact(relay: &Relay, code: &str) -> Result<([u8; 32], node::node::RelayDescriptor), String> {
+/// binding itself (the relay never vouches), so a tampered or wrong-code record is refused, and
+/// enforces the record's own `expiry` against `now`.
+pub fn find_contact(
+    relay: &Relay,
+    code: &str,
+    now: u64,
+) -> Result<([u8; 32], node::node::RelayDescriptor), String> {
     use node::discovery;
     let dpub = discovery::decode_code(code).ok_or("that is not a valid KARST contact code")?;
     let rec = relay
@@ -686,6 +695,18 @@ pub fn find_contact(relay: &Relay, code: &str) -> Result<([u8; 32], node::node::
     }
     if !discovery::verify_binding(&rec) {
         return Err("the record's identity signature is invalid — refusing".into());
+    }
+    // `expiry` rides INSIDE the signed binding, but the relay is not a trusted anchor: an honest
+    // one drops stale records, a hostile one can replay an old — still validly signed — record
+    // forever. Without this check expiry had no client-side force at all, so retiring a location,
+    // limiting a one-time invite, and revocation-by-expiry were all unenforceable (CRYPTO-21).
+    if rec.expiry.saturating_add(DISCOVERY_CLOCK_SKEW_SECS) <= now {
+        return Err("that contact code has expired — ask for a fresh one".into());
+    }
+    // A far-future expiry means the publisher (or a tampering relay) exceeded the protocol's own
+    // ceiling, so the record can never be pinned open beyond `MAX_TTL_SECS`.
+    if rec.expiry > now.saturating_add(discovery::MAX_TTL_SECS + DISCOVERY_CLOCK_SKEW_SECS) {
+        return Err("that record claims an impossible lifetime — refusing".into());
     }
     Ok((rec.ik, rec.location))
 }

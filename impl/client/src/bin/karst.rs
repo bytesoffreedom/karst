@@ -257,7 +257,7 @@ fn cmd_find(args: &[String]) -> Result<(), String> {
     let code = positional_after_flags(args)
         .ok_or("usage: karst find <CONTACT-CODE> --relay H:P --relay-id X")?;
     let r = relay_arg(args)?;
-    let (ik, loc) = client::find_contact(&r, &code)?;
+    let (ik, loc) = client::find_contact(&r, &code, wall_clock())?;
     println!("found. Their KARST address (IK):\n  {}", hex::encode(ik));
     if !loc.addrs.is_empty() {
         println!("reachable at relay {} @ {}", loc.relay_id_hex(), loc.addrs.join(", "));

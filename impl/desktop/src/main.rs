@@ -1631,7 +1631,7 @@ fn create_invite(app: State<App>) -> Result<String, String> {
 fn add_by_code(app: State<App>, code: String, name: String, via_proxy: Option<u32>) -> Result<String, String> {
     let (store, relays) = app.snapshot()?;
     let relay = relays.into_iter().next().ok_or("configure a relay first")?;
-    let (ik, _loc) = client::find_contact(&relay, code.trim())?;
+    let (ik, _loc) = client::find_contact(&relay, code.trim(), now_secs())?;
     let mut cs = store.load_contacts().map_err(|e| e.to_string())?;
     if !cs.iter().any(|c| c.ik == ik) {
         // Empty name resolves to the peer's own profile name / a short IK at display time.

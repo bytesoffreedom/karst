@@ -254,11 +254,43 @@ impl PeerState {
     }
 
     pub fn forget_peer(&mut self, peer_ik: &[u8; 32]) -> bool {
-        let before = self.sessions.len() + self.inbound_sessions.len() + self.outbox.len();
+        let before = self.sessions.len()
+            + self.inbound_sessions.len()
+            + self.outbox.len()
+            + self.handles.len()
+            + self.cookies.len();
         self.sessions.retain(|s| &s.peer_ik != peer_ik);
         self.inbound_sessions.retain(|s| &s.peer_ik != peer_ik);
         self.outbox.retain(|o| &o.peer_ik != peer_ik);
-        before != self.sessions.len() + self.inbound_sessions.len() + self.outbox.len()
+
+        // ...and the TRANSPORT identifiers that name this peer, which used to survive being
+        // "forgotten" (A5-9). `Handle::Opener` and `Handle::Box` embed the peer's identity key
+        // directly, so a forgotten contact's IK stayed sitting in `sessions.dat` in plaintext —
+        // and `Opener` is not epoch-keyed, so ordinary rotation never aged it out either. The
+        // cookies keyed by those handles' addresses are the same trace one layer down: they bind
+        // the relay's view of "this address knocked on Bob" to state we claimed to have deleted.
+        //
+        // Forgetting a contact is a user-facing promise. It has to cascade, or the promise is
+        // only about what the UI stops showing.
+        let mut orphaned: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+        self.handles.retain(|(relay, handle, addr)| {
+            let names_peer = match handle {
+                Handle::Opener(ik) | Handle::Box(ik, _) => ik == peer_ik,
+                Handle::Identity | Handle::LoopSend(_) | Handle::LoopRecv(_) => false,
+            };
+            if names_peer {
+                orphaned.push((*relay, addr.to_vec()));
+            }
+            !names_peer
+        });
+        self.cookies.retain(|(relay, addr, _)| !orphaned.contains(&(*relay, addr.clone())));
+
+        before
+            != self.sessions.len()
+                + self.inbound_sessions.len()
+                + self.outbox.len()
+                + self.handles.len()
+                + self.cookies.len()
     }
 
     /// The distinct relay ids that own a handle in this state — for tests asserting that a
@@ -1487,6 +1519,63 @@ mod outbox_state_tests {
         assert_eq!(st.sessions[0].peer_ik, [2u8; 32], "peer 2 spared");
         assert!(st.inbound_sessions.is_empty(), "peer 1's inbound half cleared");
         assert!(!st.forget_peer(&[9u8; 32]), "unknown peer: nothing to clear");
+    }
+
+    /// A5-9. "Forget this contact" is a user-facing promise, and it used to be a promise about
+    /// what the UI stops showing. `Handle::Opener` and `Handle::Box` embed the peer's identity key
+    /// directly, so a forgotten contact's IK stayed in `sessions.dat` — and `Opener` is not
+    /// epoch-keyed, so ordinary rotation never aged it out. The cookies keyed by those handles'
+    /// addresses are the same trace one layer down.
+    ///
+    /// Discriminating on both axes: it asserts the forgotten peer's IK appears NOWHERE in the
+    /// serialized state (so a handle that merely stopped being used but stayed on disk fails),
+    /// and that ANOTHER peer's handle and cookie survive (so a cascade that wiped everything
+    /// would fail too).
+    #[test]
+    fn forget_peer_erases_the_handles_and_cookies_that_name_them() {
+        use super::Handle;
+        let relay = [7u8; 32];
+        let (gone, kept) = ([0xAB; 32], [0xCD; 32]);
+        let mut st = PeerState::empty();
+        st.handles = vec![
+            (relay, Handle::Identity, [1u8; 32]),
+            (relay, Handle::Opener(gone), [2u8; 32]),
+            (relay, Handle::Box(gone, 9), [3u8; 32]),
+            (relay, Handle::Opener(kept), [4u8; 32]),
+        ];
+        let cookie = |n: u8| Cookie {
+            version: 1,
+            epoch_id: 0,
+            client_addr_hash: [n; 16],
+            issued_at: 0,
+            mac: [n; 16],
+        };
+        st.cookies = vec![
+            (relay, vec![2u8; 32], cookie(2)),
+            (relay, vec![3u8; 32], cookie(3)),
+            (relay, vec![4u8; 32], cookie(4)),
+        ];
+
+        assert!(st.forget_peer(&gone), "handles/cookies alone are enough to count as state");
+
+        let on_disk = postcard::to_stdvec(&st).unwrap();
+        assert!(
+            !on_disk.windows(32).any(|w| w == gone),
+            "the forgotten contact's identity key is still in the persisted state — 'forget' has \
+             to cascade to the transport identifiers that embed it, or it only means 'hidden'"
+        );
+        assert!(
+            st.handles.iter().any(|(_, h, _)| matches!(h, Handle::Opener(ik) if *ik == kept)),
+            "another contact's handle must survive"
+        );
+        assert!(
+            st.cookies.iter().any(|(_, addr, _)| addr == &vec![4u8; 32]),
+            "another contact's cookie must survive"
+        );
+        assert!(
+            st.handles.iter().any(|(_, h, _)| matches!(h, Handle::Identity)),
+            "our own identity handle is not a trace of THEM"
+        );
     }
 
     /// Migration safety: a session restored from a state file written BEFORE blinded mailboxes has

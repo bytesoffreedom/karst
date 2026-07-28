@@ -302,6 +302,9 @@ pub struct RelayNode {
     bundles: HashMap<[u8; 32], PreKeyBundle>,
     /// One-time prekey batches per IK; a fetch pops one (see `PublishRequest::opks`).
     opk_batches: HashMap<[u8; 32], VecDeque<[u8; 32]>>,
+    /// Rotating start offset for `node_list`, so advertisement is fair rather than always
+    /// favouring whoever was learned first (A3-13). `Cell` because serving a list is a READ.
+    gossip_cursor: std::cell::Cell<usize>,
     /// Статический ключ узла: основа fetch-auth (и §12 publish-auth). Задаётся
     /// извне (`with_identity`) для персистентности — `karst-relay` хранит его на
     /// диске, relay-id стабилен между перезапусками.
@@ -364,6 +367,7 @@ impl RelayNode {
             mailboxes: HashMap::new(),
             bundles: HashMap::new(),
             opk_batches: HashMap::new(),
+            gossip_cursor: std::cell::Cell::new(0),
             relay_identity,
             blobs: None,
             blob_persistence: None,
@@ -494,12 +498,17 @@ impl RelayNode {
         let id = d.id();
         if let Some(existing) = self.known_relays.iter_mut().find(|e| e.id() == id) {
             for a in d.addrs {
+                if existing.addrs.contains(&a) {
+                    continue;
+                }
+                // Addresses used to be append-only up to the cap, so once four STALE addresses were
+                // stored, a relay that changed address could never be reached again — its new,
+                // working address was silently dropped (A3-13). Evict the oldest instead: entries
+                // are kept newest-last, and only a freshly VERIFIED descriptor reaches this point.
                 if existing.addrs.len() >= MAX_ADDRS_PER_RELAY {
-                    break;
+                    existing.addrs.remove(0);
                 }
-                if !existing.addrs.contains(&a) {
-                    existing.addrs.push(a);
-                }
+                existing.addrs.push(a);
             }
         } else if self.known_relays.len() < MAX_KNOWN_RELAYS {
             self.known_relays.push(d);
@@ -587,10 +596,27 @@ impl RelayNode {
         let budget = crate::wire::MAX_RESPONSE_FRAME - 512; // headroom for enum tag + framing
         let mut out = Vec::new();
         let mut used = 0usize;
-        for d in &self.known_relays {
+        let n = self.known_relays.len();
+        if n == 0 {
+            return out;
+        }
+        // Start at a ROTATING offset, and keep walking past an entry that does not fit instead of
+        // stopping at it. Always starting from index 0 and breaking on the first oversized
+        // descriptor meant the relays at the front propagated on every single round while the tail
+        // could never leave this node — a permanent centrality bias toward whoever was learned
+        // first, and no recovery for a relay that changed address (A3-13). Self is seeded at index
+        // 0 and must still be advertised, or a peer cannot verify us, so it is always included.
+        let start = self.gossip_cursor.get() % n;
+        self.gossip_cursor.set(start.wrapping_add(1));
+        for k in 0..n {
+            let i = if k == 0 { 0 } else { (start + k) % n };
+            if k > 0 && i == 0 {
+                continue; // self already emitted
+            }
+            let d = &self.known_relays[i];
             let sz = postcard::to_stdvec(d).map(|v| v.len()).unwrap_or(usize::MAX);
             if used + sz > budget {
-                break;
+                continue; // too big for what is left — try the next one, do not end the page
             }
             used += sz;
             out.push(d.clone());

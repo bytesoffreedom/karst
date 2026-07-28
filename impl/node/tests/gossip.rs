@@ -131,3 +131,57 @@ fn gossip_refuses_private_and_loopback_destinations() {
     // Local testing keeps working with the escape hatch on (that is how these tests run).
     assert!(addr_is_dialable("127.0.0.1:9000", true), "loopback allowed only in local testing");
 }
+
+/// A3-13 — advertisement must be FAIR, and a changed address must be able to replace a stale one.
+///
+/// The node list used to be built from index 0 and to STOP at the first descriptor that did not
+/// fit the frame, so the relays learned first propagated on every round while the tail could
+/// never leave the node. Addresses were likewise append-only up to the cap, so four stale entries
+/// permanently shut out a relay's new, working address.
+#[test]
+fn advertisement_rotates_and_a_new_address_replaces_the_oldest() {
+    use node::node::{RelayDescriptor, RelayNode};
+
+    let mut relay = RelayNode::new(1_000_000);
+    let desc = |n: u8, addr: &str| RelayDescriptor {
+        noise_pub: [n; 32],
+        fetch_pub: [n; 32],
+        addrs: vec![addr.to_string()],
+    };
+    for n in 1..=6u8 {
+        relay.add_relay(desc(n, &format!("198.51.100.{n}:9000")));
+    }
+
+    // Across successive pages the STARTING entry must move — otherwise the tail never propagates.
+    let first: Vec<_> = relay.node_list().into_iter().map(|d| d.noise_pub[0]).collect();
+    let mut seen_starts = std::collections::HashSet::new();
+    for _ in 0..6 {
+        let page: Vec<_> = relay.node_list().into_iter().map(|d| d.noise_pub[0]).collect();
+        assert!(!page.is_empty(), "a page must never be empty");
+        // index 0 is always self/seed; the rotation shows up right after it
+        if page.len() > 1 {
+            seen_starts.insert(page[1]);
+        }
+    }
+    assert!(
+        seen_starts.len() > 1,
+        "the advertised window never rotated — the tail can never propagate (got {seen_starts:?}, first page {first:?})"
+    );
+
+    // A relay that moved: fill its address slots, then offer a NEW one.
+    let id = desc(1, "x").relay_id_hex();
+    for i in 0..8 {
+        relay.add_relay(desc(1, &format!("198.51.100.1{i}:9000")));
+    }
+    relay.add_relay(desc(1, "203.0.113.77:9000"));
+    let moved = relay
+        .known_relays()
+        .into_iter()
+        .find(|d| d.relay_id_hex() == id)
+        .expect("the relay is still known");
+    assert!(
+        moved.addrs.contains(&"203.0.113.77:9000".to_string()),
+        "a newly verified address must displace an old one, not be dropped: {:?}",
+        moved.addrs
+    );
+}

@@ -84,6 +84,13 @@ impl Transport for Wiretap {
     fn fetch_bundle(&self, ik: &[u8; 32], now: u64) -> Result<Option<PreKeyBundle>, String> {
         self.inner.fetch_bundle(ik, now)
     }
+    fn fetch_bundle_opk(
+        &self,
+        req: &node::node::BundleOpkRequest,
+        now: u64,
+    ) -> Result<node::node::BundleOpkResponse, String> {
+        self.inner.fetch_bundle_opk(req, now)
+    }
 }
 
 struct Fixture {
@@ -462,6 +469,13 @@ impl Transport for ScopeTap {
     fn fetch_bundle(&self, ik: &[u8; 32], now: u64) -> Result<Option<PreKeyBundle>, String> {
         self.inner.fetch_bundle(ik, now)
     }
+    fn fetch_bundle_opk(
+        &self,
+        req: &node::node::BundleOpkRequest,
+        now: u64,
+    ) -> Result<node::node::BundleOpkResponse, String> {
+        self.inner.fetch_bundle_opk(req, now)
+    }
 }
 
 fn scope_fixture() -> (Peer<ScopeTap>, Peer<ScopeTap>, Rc<RefCell<Vec<ScopeRow>>>) {
@@ -629,6 +643,13 @@ impl Transport for PublishTap {
     }
     fn fetch_bundle(&self, ik: &[u8; 32], now: u64) -> Result<Option<PreKeyBundle>, String> {
         self.inner.fetch_bundle(ik, now)
+    }
+    fn fetch_bundle_opk(
+        &self,
+        req: &node::node::BundleOpkRequest,
+        now: u64,
+    ) -> Result<node::node::BundleOpkResponse, String> {
+        self.inner.fetch_bundle_opk(req, now)
     }
 }
 

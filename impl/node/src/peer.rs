@@ -36,8 +36,9 @@ use admission::cookie::Cookie;
 use x25519_dalek::PublicKey;
 
 use crate::node::{
-    fetch_proof, payload_id, publish_proof, AckRequest, AckResponse, FetchRequest, FetchResponse,
-    Payload, PublishRequest, PublishResponse, Response, SessionEnvelope, Transport, WireMessage,
+    fetch_proof, payload_id, publish_proof, AckRequest, AckResponse, BundleOpkRequest,
+    BundleOpkResponse, FetchRequest, FetchResponse, Payload, PublishRequest, PublishResponse,
+    Response, SessionEnvelope, Transport, WireMessage,
 };
 use crate::pqxdh::{initiate_key_agreement, Account, KeyAgreement, PreKeyBundle};
 
@@ -713,14 +714,46 @@ impl<T: Transport> Peer<T> {
     /// подсунуть bundle под другим IK незаметно (подмена самого IK — внешняя
     /// стена: подлинность `peer_ik` проверяется вне канала, см. STATUS).
     pub fn connect(&mut self, peer_ik: &[u8; 32], now: u64) -> Result<ForwardSecrecy, String> {
-        let bundle = self
-            .transport
-            .fetch_bundle(peer_ik, now)?
-            .ok_or_else(|| "bundle not published".to_string())?;
+        let bundle = self.fetch_bundle_with_opk(peer_ik, now)?;
         if bundle.ik_pub != *peer_ik {
             return Err("relay returned bundle for wrong IK".into());
         }
         self.connect_with_bundle(&bundle)
+    }
+
+    /// Fetch `peer_ik`'s bundle over the ADMISSION-GATED path, so it may carry a one-time prekey.
+    ///
+    /// Deliberately no fallback to the public `fetch_bundle` when this is rejected: the public
+    /// read never carries an OPK, so falling back would turn "my capability was refused" into a
+    /// silently weaker 4-DH→3-DH agreement — the exact class of silent downgrade this whole
+    /// slice exists to remove. A rejection is an error the caller sees.
+    fn fetch_bundle_with_opk(&mut self, peer_ik: &[u8; 32], now: u64) -> Result<PreKeyBundle, String> {
+        // A fresh per-request handle, like any other admission-gated request: the relay learns
+        // "somebody wants IK X" either way, but not that it is the same somebody as last time.
+        let client_addr = self.handle(Handle::Identity);
+        let rid = self.relay_id();
+        let nonce = random32().to_vec();
+        let proof = self.capability.prove(&nonce, 0);
+        let mut req = BundleOpkRequest {
+            ik: *peer_ik,
+            client_addr: client_addr.clone(),
+            carrier_id: self.carrier_id.clone(),
+            cookie: self.cookies.get(&(rid, client_addr.clone())).copied(),
+            request_nonce: nonce,
+            capability_proof: proof,
+        };
+        for _ in 0..2 {
+            match self.transport.fetch_bundle_opk(&req, now)? {
+                BundleOpkResponse::NeedCookie(c) => {
+                    self.cookies.insert((rid, client_addr.clone()), c);
+                    req.cookie = Some(c);
+                }
+                BundleOpkResponse::Bundle(Some(b)) => return Ok(b),
+                BundleOpkResponse::Bundle(None) => return Err("bundle not published".into()),
+                BundleOpkResponse::Rejected(e) => return Err(format!("bundle fetch rejected: {e}")),
+            }
+        }
+        Err("persistent cookie challenge on bundle fetch".into())
     }
 
     /// Установить исходящую сессию по УЖЕ имеющемуся bundle (OOB-доставка / тесты).

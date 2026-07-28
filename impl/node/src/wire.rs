@@ -136,8 +136,13 @@ pub enum WireRequest {
     Ack(AckRequest),
     /// §12: опубликовать свой prekey-bundle (cookie + ownership-proof владения IK).
     PublishBundle(PublishRequest),
-    /// §12: забрать bundle по IK (публичный read).
+    /// §12: забрать bundle по IK (публичный read). NEVER carries a one-time prekey — see
+    /// `FetchBundleOpk`.
     FetchBundle([u8; 32]),
+    /// §12: забрать bundle ВМЕСТЕ с one-time prekey. Admission-gated like a send, because
+    /// handing out an OPK destroys a scarce resource the recipient cannot replace until its next
+    /// publish (R2-3). See `node::BundleOpkRequest`.
+    FetchBundleOpk(crate::node::BundleOpkRequest),
     /// §15: upload one ciphertext chunk of a large-file blob.
     BlobPut(BlobPutRequest),
     /// §15: download one ciphertext chunk of a large-file blob.

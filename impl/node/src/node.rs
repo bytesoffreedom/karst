@@ -997,13 +997,98 @@ impl RelayNode {
     /// §12 fetch bundle — ПУБЛИЧНЫЙ (bundle = публичный материал, без auth).
     /// `None` — не опубликован. Внимание: relay НЕ доверенный якорь личности —
     /// подлинность возвращённого IK проверяется вне канала (см. STATUS).
-    pub fn get_bundle(&mut self, ik: &[u8; 32]) -> Option<PreKeyBundle> {
-        let mut bundle = self.bundles.get(ik).cloned()?;
-        // Hand out (and consume) ONE one-time prekey, if any remain. Exhaustion is not an
-        // error: the fetcher falls back to the 3-DH agreement (`opk == None`) and is told so.
-        bundle.opk = self.opk_batches.get_mut(ik).and_then(|b| b.pop_front());
-        Some(bundle)
+    pub fn get_bundle(&self, ik: &[u8; 32]) -> Option<PreKeyBundle> {
+        // NEVER carries a one-time prekey. This read is unauthenticated, and handing out an OPK
+        // is destructive — that combination let anyone drain a victim's batch and push every
+        // later first contact down to 3-DH (R2-3). The OPK-bearing form is
+        // `handle_fetch_bundle_opk`, gated by the same capability a send needs.
+        self.bundles.get(ik).cloned()
     }
+
+    /// §12 fetch WITH a one-time prekey: full send-grade admission (cookie → capability → quota),
+    /// then pop one key. See [`BundleOpkRequest`] for why the destructive half is gated and the
+    /// public read is not.
+    pub fn handle_fetch_bundle_opk(
+        &mut self,
+        req: &BundleOpkRequest,
+        now: u64,
+    ) -> BundleOpkResponse {
+        self.advance_epoch(now);
+
+        let areq = Request {
+            // A fixed, small size: this request carries no payload, so charging it by a
+            // caller-supplied length would let the caller choose its own quota cost.
+            raw_len: 256,
+            client_addr: &req.client_addr,
+            carrier_id: &req.carrier_id,
+            cookie: req.cookie,
+            request_nonce: &req.request_nonce,
+            requested_scope: Scope::MessageDelivery,
+            credential: Credential::Capability(req.capability_proof),
+        };
+        let pipe = AdmissionPipeline {
+            keyring: &self.keyring,
+            capabilities: &self.capabilities,
+            token_verifier: &self.verifier,
+            issuer_ring: &self.issuer_ring,
+        };
+        let policy = self.quota_policy;
+        let outcome = pipe.process_with_policy(
+            &areq,
+            now,
+            self.epoch,
+            [0u8; 64],
+            &mut self.replay,
+            &mut self.cap_quota,
+            policy,
+        );
+        match outcome {
+            Outcome::Challenge(_) => BundleOpkResponse::NeedCookie(self.keyring.issue(
+                &req.client_addr,
+                &req.carrier_id,
+                now as u32,
+            )),
+            Outcome::Admit => {
+                let Some(mut bundle) = self.bundles.get(&req.ik).cloned() else {
+                    return BundleOpkResponse::Bundle(None);
+                };
+                // Consume AFTER admission, so a rejected request never costs the victim a key.
+                bundle.opk = self.opk_batches.get_mut(&req.ik).and_then(|b| b.pop_front());
+                BundleOpkResponse::Bundle(Some(bundle))
+            }
+            other => BundleOpkResponse::Rejected(format!("{other:?}")),
+        }
+    }
+}
+
+/// §12 fetch that ALSO consumes a one-time prekey — admission-gated exactly like a send.
+///
+/// The plain `FetchBundle` is a public read and stays one: discovery must never require a
+/// credential, or an unprovisioned client cannot reach anyone. But handing out a one-time prekey
+/// is not a read — it DESTROYS a scarce resource the recipient minted, and the recipient cannot
+/// replace it until they next publish. A public read with an irreversible side effect is how
+/// sixteen anonymous requests silently pushed every future first contact down to 3-DH (R2-3).
+///
+/// So the side effect moved behind the credential that already meters scarce relay resources.
+/// A legitimate sender pays nothing new: it needs a capability to send the very next message
+/// anyway. A drainer needs one capability per drain — proof-of-work on a public relay — and burns
+/// its own quota doing it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct BundleOpkRequest {
+    pub ik: [u8; 32],
+    pub client_addr: Vec<u8>,
+    pub carrier_id: Vec<u8>,
+    pub cookie: Option<Cookie>,
+    pub request_nonce: Vec<u8>,
+    pub capability_proof: CapabilityProof,
+}
+
+/// Answer to [`BundleOpkRequest`]. `Bundle(None)` = that IK has published nothing; a bundle with
+/// `opk: None` = published, but no one-time prekey left (genuine exhaustion).
+pub enum BundleOpkResponse {
+    NeedCookie(Cookie),
+    Bundle(Option<PreKeyBundle>),
+    Rejected(String),
 }
 
 /// Запрос §12-публикации bundle. `proof` привязывает владение приватным IK
@@ -1248,6 +1333,17 @@ pub trait Transport {
     fn fetch_bundle(&self, _ik: &[u8; 32], _now: u64) -> Result<Option<PreKeyBundle>, String> {
         Err("bundle fetch unsupported".into())
     }
+
+    /// §12 fetch WITH a one-time prekey (admission-gated — see [`BundleOpkRequest`]). Default is
+    /// unsupported rather than "fall back to the public read": a transport that cannot present a
+    /// capability must not silently obtain a weaker agreement, it must say it cannot do this.
+    fn fetch_bundle_opk(
+        &self,
+        _req: &BundleOpkRequest,
+        _now: u64,
+    ) -> Result<BundleOpkResponse, String> {
+        Err("one-time-prekey bundle fetch unsupported".into())
+    }
 }
 
 /// In-process транспорт: клиент и relay — разные объекты, общаются через этот
@@ -1278,7 +1374,14 @@ impl Transport for InMemoryTransport {
     }
     fn fetch_bundle(&self, ik: &[u8; 32], now: u64) -> Result<Option<PreKeyBundle>, String> {
         let _ = now; // публичный read, время не нужно
-        Ok(self.relay.borrow_mut().get_bundle(ik))
+        Ok(self.relay.borrow().get_bundle(ik))
+    }
+    fn fetch_bundle_opk(
+        &self,
+        req: &BundleOpkRequest,
+        now: u64,
+    ) -> Result<BundleOpkResponse, String> {
+        Ok(self.relay.borrow_mut().handle_fetch_bundle_opk(req, now))
     }
 }
 

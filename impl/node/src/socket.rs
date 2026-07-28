@@ -25,9 +25,9 @@ use snow::Builder;
 
 use crate::discovery::DiscoveryRecord;
 use crate::node::{
-    AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, FetchRequest,
-    FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayNode,
-    RelayPolicy, Response, Transport, WireMessage,
+    AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest,
+    BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse,
+    RelayDescriptor, RelayNode, RelayPolicy, Response, Transport, WireMessage,
 };
 use crate::pqxdh::PreKeyBundle;
 use crate::session::{Session, NOISE_PARAMS};
@@ -282,9 +282,20 @@ fn handle_conn(
             }
         }
         WireRequest::FetchBundle(ik) => {
-            // Публичный read; время серверу не нужно.
+            // Публичный read; время серверу не нужно — этот путь НИКОГДА не выдаёт one-time
+            // prekey, поэтому у него нет разрушающего побочного эффекта (R2-3).
             let bundle = relay.lock().expect("relay mutex").get_bundle(&ik);
             WireResponse::Bundle(bundle)
+        }
+        WireRequest::FetchBundleOpk(req) => {
+            // Consumes a one-time prekey → full admission, so it needs the real clock (cookie
+            // freshness, capability validity window, quota epoch) exactly like a send.
+            let now = (clock)();
+            match relay.lock().expect("relay mutex").handle_fetch_bundle_opk(&req, now) {
+                BundleOpkResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
+                BundleOpkResponse::Bundle(b) => WireResponse::Bundle(b),
+                BundleOpkResponse::Rejected(e) => WireResponse::Rejected(e),
+            }
         }
         WireRequest::BlobPut(breq) => {
             let now = (clock)();
@@ -677,6 +688,20 @@ impl Transport for SocketTransport {
             Ok(WireResponse::Rejected(s)) => PublishResponse::Rejected(s),
             Ok(_) => PublishResponse::Rejected("protocol: unexpected на Publish".into()),
             Err(e) => PublishResponse::Rejected(format!("transport: {e}")),
+        }
+    }
+
+    fn fetch_bundle_opk(
+        &self,
+        req: &BundleOpkRequest,
+        _now: u64,
+    ) -> Result<BundleOpkResponse, String> {
+        match self.round_trip(&WireRequest::FetchBundleOpk(req.clone())) {
+            Ok(WireResponse::NeedCookie(c)) => Ok(BundleOpkResponse::NeedCookie(c)),
+            Ok(WireResponse::Bundle(b)) => Ok(BundleOpkResponse::Bundle(b)),
+            Ok(WireResponse::Rejected(e)) => Ok(BundleOpkResponse::Rejected(e)),
+            Ok(_) => Err("protocol: unexpected на FetchBundleOpk".into()),
+            Err(e) => Err(format!("transport: {e}")),
         }
     }
 

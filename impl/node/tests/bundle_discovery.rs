@@ -250,9 +250,30 @@ fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
 
     // Everything the relay now hands out must come from the NEW batch — an old key would produce
     // an opener nobody can accept.
+    // Drained through the ADMISSION-GATED path — the public read stopped handing out one-time
+    // prekeys entirely (R2-3), so this is the only door they come out of now.
     let mut served = Vec::new();
-    while let Some(b) = relay.borrow_mut().get_bundle(&bob_ik) {
-        match b.opk {
+    loop {
+        let mut req = node::node::BundleOpkRequest {
+            ik: bob_ik,
+            client_addr: format!("drain-{}", served.len()).into_bytes(),
+            carrier_id: b"test".to_vec(),
+            cookie: None,
+            request_nonce: format!("drain-nonce-{}", served.len()).into_bytes(),
+            capability_proof: dev_cap().prove(format!("drain-nonce-{}", served.len()).as_bytes(), 0),
+        };
+        let mut got = None;
+        for _ in 0..2 {
+            match relay.borrow_mut().handle_fetch_bundle_opk(&req, NOW) {
+                node::node::BundleOpkResponse::NeedCookie(c) => req.cookie = Some(c),
+                node::node::BundleOpkResponse::Bundle(b) => {
+                    got = b;
+                    break;
+                }
+                node::node::BundleOpkResponse::Rejected(e) => panic!("gated fetch rejected: {e}"),
+            }
+        }
+        match got.and_then(|b| b.opk) {
             Some(k) => served.push(k.key),
             None => break,
         }
@@ -261,5 +282,89 @@ fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
     for k in &served {
         assert!(second.contains(k), "the relay served a prekey whose secret no longer exists");
         assert!(!first.contains(k), "a stale prekey survived the replace");
+    }
+}
+
+/// R2-3, THE carrying test. `FetchBundle` was a fully public read with an irreversible side
+/// effect: it popped a one-time prekey. Anyone who knew a victim's IK could spend sixteen
+/// anonymous fetches — no cookie, no capability, no cost — and every later first contact with
+/// that victim silently dropped from 4-DH to 3-DH until their next publish. An honest relay
+/// carried out the attack exactly as implemented.
+///
+/// Discriminating: it drains through the PUBLIC path first, then has a real capability-bearing
+/// peer connect, and requires `ForwardSecrecy::Full`. Asserting only "the anonymous fetch returns
+/// opk: None" would pass even if the gated path were broken too — the point is that the victim's
+/// keys are still THERE for the sender who is entitled to one.
+#[test]
+fn anonymous_bundle_reads_cannot_drain_a_victims_one_time_prekeys() {
+    use node::node::Transport;
+    use node::peer::ForwardSecrecy;
+
+    let (t, relay_pub) = shared();
+    let mut bob = peer(&t, relay_pub);
+    let bob_ik = bob.identity();
+
+    let opks = bob.add_opks(4);
+    assert!(matches!(bob.publish_advertising(&opks, NOW), PublishResponse::Published));
+
+    // The drain: many more anonymous reads than Bob has keys.
+    for _ in 0..32 {
+        let b = t.fetch_bundle(&bob_ik, NOW).unwrap().expect("published");
+        assert!(
+            b.opk.is_none(),
+            "an unauthenticated read handed out a one-time prekey — that is the drain"
+        );
+    }
+
+    // A legitimate sender, holding a capability, must still get one.
+    let mut alice = peer(&t, relay_pub);
+    assert_eq!(
+        alice.connect(&bob_ik, NOW).unwrap(),
+        ForwardSecrecy::Full,
+        "anonymous reads consumed the victim's one-time prekeys: the next real sender was pushed \
+         down to 3-DH without anyone noticing"
+    );
+}
+
+/// The other side of the gate: presenting no valid capability must not yield a one-time prekey
+/// either. Otherwise the "gate" would only be a different message name.
+#[test]
+fn a_bundle_opk_fetch_without_a_valid_capability_is_rejected() {
+    use node::node::{BundleOpkRequest, BundleOpkResponse, Transport};
+
+    let (t, relay_pub) = shared();
+    let mut bob = peer(&t, relay_pub);
+    let bob_ik = bob.identity();
+    let opks = bob.add_opks(2);
+    bob.publish_advertising(&opks, NOW);
+
+    // A forged capability: right shape, wrong secret.
+    let forged = Capability { secret: [0x99; 32], ..dev_cap() };
+    let nonce = b"forged-nonce".to_vec();
+    let mut req = BundleOpkRequest {
+        ik: bob_ik,
+        client_addr: b"attacker".to_vec(),
+        carrier_id: b"test".to_vec(),
+        cookie: None,
+        request_nonce: nonce.clone(),
+        capability_proof: forged.prove(&nonce, 0),
+    };
+    // First round trip is the cookie challenge; the second is the real verdict.
+    let mut verdict = None;
+    for _ in 0..2 {
+        match t.fetch_bundle_opk(&req, NOW).unwrap() {
+            BundleOpkResponse::NeedCookie(c) => req.cookie = Some(c),
+            other => {
+                verdict = Some(other);
+                break;
+            }
+        }
+    }
+    match verdict.expect("a verdict after the cookie exchange") {
+        BundleOpkResponse::Rejected(_) => {}
+        BundleOpkResponse::Bundle(_) => {
+            panic!("a forged capability was served a one-time prekey — the gate is decorative")
+        }
+        BundleOpkResponse::NeedCookie(_) => panic!("persistent cookie challenge"),
     }
 }

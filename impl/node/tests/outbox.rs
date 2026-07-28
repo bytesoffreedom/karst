@@ -64,6 +64,19 @@ impl Transport for Flaky {
             Err("transport down".into())
         }
     }
+    /// Must be delegated too, or `Peer::connect` inherits the trait's "unsupported" default and
+    /// this wrapper quietly stops exercising first contact at all.
+    fn fetch_bundle_opk(
+        &self,
+        req: &node::node::BundleOpkRequest,
+        now: u64,
+    ) -> Result<node::node::BundleOpkResponse, String> {
+        if self.up.get() {
+            self.inner.fetch_bundle_opk(req, now)
+        } else {
+            Err("transport down".into())
+        }
+    }
 }
 
 fn plaintexts(v: Vec<Option<node::peer::Received>>) -> Vec<Vec<u8>> {

@@ -48,6 +48,66 @@ fn spawn_relay() -> (SocketAddr, client::RelayId) {
 }
 
 /// The connection context for a spawned relay (single direct path, no proxy).
+/// Ask a relay for ONE one-time prekey over the admission-gated path, driving the cookie
+/// round trip by hand. The public `FetchBundle` never carries an OPK any more (R2-3), so any
+/// test that wants one has to present a capability — exactly like a real sender does.
+fn opk_request(
+    ik: &[u8; 32],
+    cookie: Option<admission::cookie::Cookie>,
+    n: u64,
+) -> node::node::BundleOpkRequest {
+    let cap = client::dev_capability();
+    let nonce = format!("opk-probe-{n}").into_bytes();
+    node::node::BundleOpkRequest {
+        ik: *ik,
+        client_addr: format!("probe-{n}").into_bytes(),
+        carrier_id: b"test".to_vec(),
+        cookie,
+        request_nonce: nonce.clone(),
+        capability_proof: cap.prove(&nonce, 0),
+    }
+}
+
+fn drain_one_opk(
+    node: &mut RelayNode,
+    ik: &[u8; 32],
+    now: u64,
+) -> Option<node::pqxdh::PreKeyBundle> {
+    use node::node::BundleOpkResponse;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut req = opk_request(ik, None, n);
+    for _ in 0..2 {
+        match node.handle_fetch_bundle_opk(&req, now) {
+            BundleOpkResponse::NeedCookie(c) => req.cookie = Some(c),
+            BundleOpkResponse::Bundle(b) => return b,
+            BundleOpkResponse::Rejected(e) => panic!("gated bundle fetch rejected: {e}"),
+        }
+    }
+    panic!("persistent cookie challenge");
+}
+
+fn fetch_opk_bundle(
+    addr: SocketAddr,
+    id: &client::RelayId,
+    ik: &[u8; 32],
+    now: u64,
+) -> Option<node::pqxdh::PreKeyBundle> {
+    use node::node::{BundleOpkResponse, Transport};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t = SocketTransport::new(addr, id.noise_pub);
+    let mut req = opk_request(ik, None, n);
+    for _ in 0..2 {
+        match t.fetch_bundle_opk(&req, now).expect("transport") {
+            BundleOpkResponse::NeedCookie(c) => req.cookie = Some(c),
+            BundleOpkResponse::Bundle(b) => return b,
+            BundleOpkResponse::Rejected(e) => panic!("gated bundle fetch rejected: {e}"),
+        }
+    }
+    panic!("persistent cookie challenge");
+}
+
 fn ctx(addr: SocketAddr, id: &client::RelayId) -> client::Relay {
     client::Relay::new(addr, *id, None)
 }
@@ -765,7 +825,9 @@ fn republishing_opks_never_hands_the_same_prekey_twice() {
     // (opk_pub == None → 3-DH fallback). A repeat means a republished duplicate is being served.
     let mut seen = std::collections::HashSet::new();
     let mut node = relay.lock().unwrap();
-    while let Some(bundle) = node.get_bundle(&b_ik) {
+    // Via the ADMISSION-GATED path: the public read never hands out a one-time prekey any more
+    // (R2-3), so draining now costs a capability — which is the point.
+    while let Some(bundle) = drain_one_opk(&mut node, &b_ik, NOW) {
         match bundle.opk {
             Some(opk) => assert!(
                 seen.insert(opk.key),
@@ -1244,14 +1306,19 @@ fn publish_all_puts_the_bundle_on_every_relay_opks_on_the_primary_only() {
     assert!(matches!(resp, PublishResponse::Published), "primary publish: {resp:?}");
 
     // Fetch Bob's bundle straight from each relay (bundle fetch is public/unauthenticated).
-    let b1 = SocketTransport::new(addr1, id1.noise_pub)
-        .fetch_bundle(&bob_ik, NOW)
-        .unwrap()
-        .expect("the primary has Bob's bundle");
-    let b2 = SocketTransport::new(addr2, id2.noise_pub)
-        .fetch_bundle(&bob_ik, NOW)
-        .unwrap()
-        .expect("the secondary has Bob's bundle"); // primary-only publish reds here
+    // The plain public read proves the bundle is THERE on both relays...
+    assert!(
+        SocketTransport::new(addr1, id1.noise_pub).fetch_bundle(&bob_ik, NOW).unwrap().is_some(),
+        "the primary has Bob's bundle"
+    );
+    assert!(
+        SocketTransport::new(addr2, id2.noise_pub).fetch_bundle(&bob_ik, NOW).unwrap().is_some(),
+        "the secondary has Bob's bundle" // primary-only publish reds here
+    );
+    // ...and the admission-gated read proves WHERE the one-time prekeys went. A public read
+    // would answer `None` on both now, which is why this half has to use the gated path.
+    let b1 = fetch_opk_bundle(addr1, &id1, &bob_ik, NOW).expect("primary bundle");
+    let b2 = fetch_opk_bundle(addr2, &id2, &bob_ik, NOW).expect("secondary bundle");
     assert!(b1.opk.is_some(), "the primary must advertise a one-time prekey");
     assert!(b2.opk.is_none(), "a secondary must NOT advertise a one-time prekey (reuse hazard)");
 

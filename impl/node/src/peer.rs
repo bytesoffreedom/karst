@@ -1186,6 +1186,18 @@ impl<T: Transport> Peer<T> {
         let ik = self.account.ik().clone();
         let payloads = self.fetch_mailbox(BoxAuth::Identity(ik), Handle::Identity, now)?;
         for p in &payloads {
+            // SEC-33: a `Ratchet` envelope is NEVER legitimately deposited here — `route_for`
+            // sends `Ratchet` only to the recipient's OWN blinded per-session box
+            // (`Handle::Box`), never to the identity mailbox. So a `Ratchet`-shaped payload
+            // landing on this PUBLIC, session-less address is always either garbage or an
+            // attacker probe; skip it WITHOUT touching a single session, rather than paying
+            // `process_ratchet`'s full sweep (bounded by `MAX_SESSIONS`, but still real DH-
+            // ratchet-step cost per session — measured at seconds of CPU for one message) for a
+            // payload that could never be legitimate.
+            if matches!(p, Payload::Session(SessionEnvelope::Ratchet(_))) {
+                out.push(None);
+                continue;
+            }
             out.push(self.process(p).map(|mut r| { r.msg_id = payload_id(p); r }));
         }
 
@@ -1207,7 +1219,13 @@ impl<T: Transport> Peer<T> {
         // ownership. Collected first: `fetch_mailbox` borrows self mutably.
         let own_m = self.account.mailbox_public();
         let account = self.account.clone();
-        let boxes: Vec<(BoxAuth, Handle)> = self
+        // The `[u8; 32]` alongside each entry is the box's OWNING peer — carried explicitly
+        // rather than re-derived from `Handle` after the fact (SEC-33's `process_for_peer`
+        // needs it, and a `match` that assumes only `Handle::Box` ever reaches here would have
+        // to panic on any other variant; carrying the value we already have here instead means
+        // there is nothing to panic on, ever, even if `Handle` grows a new variant later — loud
+        // failure belongs on attacker input, never on our own dispatch).
+        let boxes: Vec<(BoxAuth, Handle, [u8; 32])> = self
             .sessions
             .iter()
             // Also collect the peer-INITIATED (responder) sessions' inbound boxes: on a
@@ -1223,20 +1241,13 @@ impl<T: Transport> Peer<T> {
                     .filter_map(|e| {
                         let address = crate::blind::deposit_address(&own_m, &st.drop_seed, *e, dir)?;
                         let fetch_secret = account.mailbox_fetch_secret(&st.drop_seed, *e, dir);
-                        Some((BoxAuth::DropBox { address, fetch_secret }, Handle::Box(*peer_ik, *e)))
+                        Some((BoxAuth::DropBox { address, fetch_secret }, Handle::Box(*peer_ik, *e), *peer_ik))
                     })
                     .collect::<Vec<_>>()
             })
             .collect();
         let mut box_err: Option<String> = None;
-        for (auth, handle) in boxes {
-            // Which peer this SPECIFIC box belongs to — known from the handle we minted it
-            // under, before `fetch_mailbox` consumes `handle`. `process_for_peer` (SEC-33)
-            // uses it to try only that peer's session(s) instead of every session held.
-            let owner = match &handle {
-                Handle::Box(ik, _) => *ik,
-                _ => unreachable!("`boxes` is built only from Handle::Box entries above"),
-            };
+        for (auth, handle, owner) in boxes {
             match self.fetch_mailbox(auth, handle, now) {
                 Ok(payloads) => {
                     for p in &payloads {
@@ -1748,7 +1759,7 @@ mod outbox_state_tests {
 /// SEC-33: unbounded session growth as a trial-decryption DoS amplifier.
 #[cfg(test)]
 mod session_cap_tests {
-    use crate::node::{InMemoryTransport, Payload, RelayNode, SessionEnvelope};
+    use crate::node::{InMemoryTransport, Payload, RelayNode, Response, SessionEnvelope};
     use crate::pqxdh::Account;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
@@ -1934,6 +1945,56 @@ mod session_cap_tests {
             victim.decrypt_attempts_for_test(),
             1,
             "routing by the box's own peer identifies the ONLY session that could ever match — O(1), not O(sessions)"
+        );
+    }
+
+    /// SEC-33's other entry point: the identity mailbox is a PUBLIC address a stranger can
+    /// deposit to with no session, no bundle fetch, nothing — it's how first contact works.
+    /// `route_for` never sends a `Ratchet` envelope there (only `Initial`/`InitialSealed` — see
+    /// its match arms), so a `Ratchet`-shaped payload landing on it is provably never
+    /// legitimate. Drives an ACTUAL deposit through the real relay/transport (`Peer::transmit`,
+    /// bypassing `route_for` the way a hostile client would) and the real `receive()`, and
+    /// asserts it costs not one decrypt attempt, let alone one per session — the whole
+    /// generic `process_ratchet` sweep must never run for this payload shape at this address.
+    #[test]
+    fn a_garbage_ratchet_message_at_the_identity_mailbox_touches_no_session() {
+        let (transport, relay_pub) = shared();
+        let mut victim = mk_peer(&transport, relay_pub);
+        let template = dummy_session_template();
+        // This test's assertion is `== 0`, not `== N` (that comparison is the OTHER two tests'
+        // job) — a handful of sessions is enough to prove "touches none of them", and it keeps
+        // this test off `receive()`'s own pre-existing, already-documented `3 × sessions + 1`
+        // round-trip cost (see `receive`'s doc comment): that's a bandwidth/latency property,
+        // unrelated to SEC-33, and paying it at `REPRESENTATIVE_SESSION_COUNT` here would only
+        // slow the test down for no added proof.
+        for i in 0..5u64 {
+            insert_dummy(&mut victim, dummy_ik(i), &template);
+        }
+        let victim_ik = victim.identity();
+
+        let mut mallory = mk_peer(&transport, relay_pub);
+        let garbage = RatchetMessage {
+            header: Header { dh: [0x66; 32], pn: 0, n: 0, salt: [7u8; 16] },
+            ciphertext: vec![0x22; 48],
+        };
+        // Recipient = victim's identity key = victim's identity mailbox address. No PQXDH, no
+        // established session, no bundle fetch — exactly what a stranger CAN do unauthenticated.
+        assert!(
+            matches!(
+                mallory.transmit(victim_ik, super::Handle::Opener(victim_ik), SessionEnvelope::Ratchet(garbage), 0),
+                Response::Accepted
+            ),
+            "the deposit itself must succeed — admission gates senders, not payload shape"
+        );
+
+        victim.reset_decrypt_attempts_for_test();
+        let received = victim.receive(0).expect("receive succeeds even though the garbage is dropped");
+        assert!(received.iter().all(Option::is_none), "garbage at the identity mailbox must not decrypt");
+        assert_eq!(
+            victim.decrypt_attempts_for_test(),
+            0,
+            "a Ratchet-shaped payload at the identity mailbox is NEVER legitimate — it must cost \
+             ZERO decrypt attempts, not one per session held"
         );
     }
 }

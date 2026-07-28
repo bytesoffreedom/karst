@@ -340,12 +340,19 @@ pub struct KeyAgreement {
 
 /// Отправитель Alice: согласовать `root_key` с получателем по его bundle.
 /// `sender_ik` — долговременный identity Alice (её аутентификатор).
-/// Возвращает (root_key, KA-на-провод).
+/// Возвращает (root_key, KA-на-провод), либо `Err` — если bundle структурно невалиден
+/// (malformed KEM key). Никакой wire-вход не доходит до `expect`/паники.
 pub fn initiate_key_agreement(
     sender_ik: &Identity,
     sender_mailbox_pub: &[u8; 32],
     bundle: &PreKeyBundle,
-) -> ([u8; 32], KeyAgreement) {
+) -> Result<([u8; 32], KeyAgreement), String> {
+    // Parse the WIRE-derived KEM key FIRST — before any DH. `verify_prekey_sig` passing does NOT
+    // make this well-formed: a malicious contact signs its own malformed `kem_ek` with its own
+    // IK, so the signature verifies. This used to `expect()` and panic the caller (CRYPTO-08).
+    let ek = <EncapsulationKey<MlKem768> as TryKeyInit>::new_from_slice(&bundle.kem_ek)
+        .map_err(|_| "bundle KEM key is malformed".to_string())?;
+
     let ik_b = PublicKey::from(bundle.ik_pub);
     let prekey_b = PublicKey::from(bundle.prekey_pub);
     let ek_a = Identity::generate(); // эфемер отправителя
@@ -356,8 +363,6 @@ pub fn initiate_key_agreement(
     // Fourth DH against the recipient's ONE-TIME prekey, iff the bundle carried one.
     let dh4 = bundle.opk_pub.map(|opk| ek_a.dh(&PublicKey::from(opk)));
 
-    let ek = <EncapsulationKey<MlKem768> as TryKeyInit>::new_from_slice(&bundle.kem_ek)
-        .expect("valid bundle KEM key");
     let (ct, pq_shared) = ek.encapsulate();
     let kem_ct = ct.as_slice().to_vec();
 
@@ -374,10 +379,10 @@ pub fn initiate_key_agreement(
     );
     let root_key = derive_root_key(&dh1, &dh2, &dh3, dh4.as_ref(), pq_shared.as_slice(), &transcript);
 
-    (
+    Ok((
         root_key,
         KeyAgreement { ik_a_pub, ek_a_pub, kem_ct, opk_pub: bundle.opk_pub, mailbox_a_pub: *sender_mailbox_pub },
-    )
+    ))
 }
 
 /// Транскрипт: связывает ОБА долговременных ключа (IK_A, IK_B), эфемер, prekey и
@@ -503,6 +508,59 @@ mod tests {
         assert!(!tampered_mbox.verify_prekey_sig(), "a swapped mailbox point is rejected");
     }
 
+    /// A bundle carrying a MALFORMED KEM key, correctly self-signed by the attacker's own IK.
+    /// `verify_prekey_sig` passes (the signature gate is not what saves us here), so the
+    /// malformed wire value reaches the ML-KEM parse.
+    fn attacker_bundle_with_malformed_kem() -> PreKeyBundle {
+        use xeddsa::Sign;
+        let attacker = Account::generate();
+        let mut bundle = attacker.prekey_bundle();
+        bundle.kem_ek = vec![7u8; 3]; // structurally invalid ML-KEM encapsulation key
+        let sk = x25519_dalek::StaticSecret::from(attacker.ik().to_secret_bytes());
+        let signer = xeddsa::xed25519::PrivateKey::from(&sk);
+        let sig: [u8; 64] = signer.sign(
+            &prekey_sig_message(&bundle.prekey_pub, &bundle.kem_ek, &bundle.mailbox_pub),
+            rand010::rng(),
+        );
+        bundle.prekey_sig = sig.to_vec();
+        assert!(bundle.verify_prekey_sig(), "the malformed bundle is genuinely signed");
+        bundle
+    }
+
+    /// CRYPTO-08 — no wire-derived input may reach an `expect()`. A malicious CONTACT signs a
+    /// MALFORMED `kem_ek` with its OWN identity key, so `verify_prekey_sig` passes and the bundle
+    /// looks authentic; parsing it as an ML-KEM encapsulation key used to PANIC the victim's
+    /// client (remote DoS by any contact whose bundle you connect to). Discriminating: the
+    /// signature genuinely verifies (asserted in the helper), so only the explicit length/encoding
+    /// check can save us — restore the `expect()` and this test unwinds instead of returning.
+    #[test]
+    fn a_signed_but_malformed_kem_key_is_rejected_not_panicked() {
+        let bundle = attacker_bundle_with_malformed_kem();
+        let sender = Account::generate();
+        assert!(
+            initiate_key_agreement(sender.ik(), &sender.mailbox_public(), &bundle).is_err(),
+            "a malformed KEM key must fail the agreement, never panic"
+        );
+    }
+
+    /// The same malformed bundle reaching the REACHABLE path: `connect_with_bundle` must return
+    /// an error, not unwind — this is what a victim's client actually calls on a fetched bundle.
+    #[test]
+    fn connecting_to_a_malformed_bundle_errors_instead_of_panicking() {
+        let bundle = attacker_bundle_with_malformed_kem();
+        let good = Account::generate().prekey_bundle();
+        assert!(good.verify_prekey_sig(), "control: a genuine bundle is usable");
+        let sender = Account::generate();
+        assert!(
+            initiate_key_agreement(sender.ik(), &sender.mailbox_public(), &good).is_ok(),
+            "a well-formed bundle still agrees"
+        );
+        assert!(
+            initiate_key_agreement(sender.ik(), &sender.mailbox_public(), &bundle).is_err(),
+            "the malformed one is refused"
+        );
+    }
+
     /// The per-account mailbox point `M` is published in the bundle, equals `m·G`, and — like the
     /// rest of the identity — is STABLE across a re-derive from the seed bytes (so it needs no
     /// separate persistence). Backs the live blinded deposit/fetch key separation.
@@ -578,7 +636,7 @@ mod tests {
         // Согласование к восстановленному account работает (decap на seed'е).
         let alice = Identity::generate();
         let alice_m = crate::blind::MailboxSecret::generate().public();
-        let (alice_rk, ka) = initiate_key_agreement(&alice, &alice_m, &rb);
+        let (alice_rk, ka) = initiate_key_agreement(&alice, &alice_m, &rb).expect("well-formed bundle");
         assert_eq!(ka.mailbox_a_pub, alice_m, "the KA carries the sender's mailbox point");
         let (bob_rk, sender) = restored.accept_key_agreement(&ka).expect("decap");
         assert_eq!(alice_rk, bob_rk, "восстановленный account согласует ключ");

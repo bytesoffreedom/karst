@@ -18,7 +18,7 @@ fn initiator_and_recipient_agree_on_root_key() {
     let bundle = bob.prekey_bundle();
     let alice = Identity::generate();
 
-    let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle);
+    let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     let (bob_rk, sender) = bob.accept_key_agreement(&ka).expect("валидная длина KEM-ct");
     assert_eq!(alice_rk, bob_rk, "инициатор и получатель должны согласовать один root_key");
     assert_eq!(sender, alice.public.to_bytes(), "Bob узнаёт отправителя по заявленному IK");
@@ -35,7 +35,8 @@ fn cannot_impersonate_alice_without_her_identity_key() {
     let mallory = Identity::generate();
 
     // Честная установка от Mallory: обе стороны согласуют ключ, Bob видит Mallory.
-    let (mallory_rk, honest) = initiate_key_agreement(&mallory, &[7u8; 32], &bundle);
+    let (mallory_rk, honest) =
+        initiate_key_agreement(&mallory, &[7u8; 32], &bundle).expect("well-formed bundle");
     let (bob_rk, sender) = bob.accept_key_agreement(&honest).unwrap();
     assert_eq!(mallory_rk, bob_rk);
     assert_eq!(sender, mallory.public.to_bytes());
@@ -58,7 +59,7 @@ fn corrupt_kem_ciphertext_breaks_agreement() {
     let bundle = bob.prekey_bundle();
     let alice = Identity::generate();
 
-    let (alice_rk, mut ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle);
+    let (alice_rk, mut ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     ka.kem_ct[0] ^= 0x01;
     let (bob_rk, _) = bob.accept_key_agreement(&ka).expect("длина сохранена, decaps даёт значение");
     assert_ne!(alice_rk, bob_rk, "битый KEM-ct должен ломать согласование");
@@ -71,7 +72,7 @@ fn malformed_kem_ciphertext_length_rejected() {
     let bundle = bob.prekey_bundle();
     let alice = Identity::generate();
 
-    let (_alice_rk, mut ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle);
+    let (_alice_rk, mut ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     ka.kem_ct.truncate(10);
     assert!(bob.accept_key_agreement(&ka).is_none(), "KEM-ct кривой длины → None");
 }
@@ -85,7 +86,7 @@ fn wrong_recipient_derives_different_key() {
     let bundle = bob.prekey_bundle();
     let alice = Identity::generate();
 
-    let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle);
+    let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     let (bob_rk, _) = bob.accept_key_agreement(&ka).unwrap();
     let (eve_rk, _) = eve.accept_key_agreement(&ka).unwrap();
     assert_eq!(alice_rk, bob_rk, "адресат согласует тот же ключ");
@@ -106,12 +107,13 @@ fn a_one_time_prekey_is_mixed_in_and_consumed_once() {
     let bundle = bob.prekey_bundle_with_opk(opk);
 
     // Alice initiates against the OPK bundle; the KA records which OPK she used.
-    let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle);
+    let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     assert_eq!(ka.opk_pub, Some(opk), "the KA must name the OPK the sender used");
 
     // The root key differs from the SAME agreement without the OPK — proof the 4th DH is
     // load-bearing, not decorative.
-    let (alice_rk_no_opk, _) = initiate_key_agreement(&alice, &[7u8; 32], &bob.prekey_bundle());
+    let (alice_rk_no_opk, _) =
+        initiate_key_agreement(&alice, &[7u8; 32], &bob.prekey_bundle()).expect("well-formed bundle");
     assert_ne!(alice_rk, alice_rk_no_opk, "the one-time prekey did not affect the root key");
 
     // Bob accepts, derives the same key, and consumes the OPK.

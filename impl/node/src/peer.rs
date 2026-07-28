@@ -744,7 +744,10 @@ impl<T: Transport> Peer<T> {
         if !bundle.verify_prekey_sig() {
             return Err("bundle prekey signature invalid — relay tampered or unsigned bundle".into());
         }
-        let (root_key, ka) = initiate_key_agreement(self.account.ik(), &self.account.mailbox_public(), bundle);
+        // A malformed KEM key in a (validly signed) bundle fails HERE with an error instead of
+        // panicking the client — a malicious contact can sign its own garbage (CRYPTO-08).
+        let (root_key, ka) =
+            initiate_key_agreement(self.account.ik(), &self.account.mailbox_public(), bundle)?;
         // Take the drop-box seed BEFORE the ratchet starts moving: this is the one
         // moment both sides hold the same root key.
         let drop_seed = crate::drop::drop_seed(&root_key);

@@ -1887,7 +1887,12 @@ implementation. NOT feature-gated (E2E is the core of the product, unlike tring)
 - **directional authentication** Alice→Bob GIVEN an authentic IK_B (out of
   band/§12); NOT mutual. The long-lived prekey **is signed** (`prekey_sig`): XEd25519 on the
   SAME X25519 IK (Signal's XEdDSA — no second key, no safety-number change), covering
-  `prekey_pub ‖ kem_ek ‖ M`. A sender rejects a bundle whose prekey / KEM key / mailbox point a
+  `prekey_pub ‖ kem_ek ‖ M`. Each ONE-TIME prekey carries its own signature too
+  (`pqxdh::SignedOpk`, domain-separated), so a relay can neither substitute one of its own nor
+  serve an unsigned one (CRYPTO-04). It CAN still withhold them and claim exhaustion — no
+  signature distinguishes that from real exhaustion — which is why `Peer::connect` returns
+  `ForwardSecrecy::{Full, NoOneTimePrekey}` instead of proceeding quietly.
+  A sender rejects a bundle whose prekey / KEM key / mailbox point a
   relay substituted (`verify_prekey_sig`, enforced before a fetched bundle is used in
   `Peer::connect`), turning the old DoS-by-swap into fail-FAST. **Downgrade is handled:** an
   empty or wrong-length signature fails verification, so a stripped signature is REJECTED, not

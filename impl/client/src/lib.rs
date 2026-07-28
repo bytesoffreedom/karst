@@ -867,6 +867,126 @@ pub fn publish_bundle(
     peer.publish(now)
 }
 
+/// SEC-43: cap on the number of DISTINCT senders simultaneously holding an in-flight reassembly.
+/// The per-sender cap (`content::MAX_CONCURRENT_TRANSFERS`) already stops ONE busy contact from
+/// filling memory, but says nothing about the NUMBER of contacts — an IK is free to mint, so a
+/// flood of fresh sender IKs each starting one transfer would otherwise grow this map (and the
+/// worker's `HashMap<[u8; 32], Reassembler>`) without limit. 64 is generous for real use (simultaneous
+/// inbound transfers from that many distinct people at once is already an unusual amount of
+/// traffic for a P2P messenger) while bounding the map to a fixed size regardless of how many
+/// identities an attacker mints.
+pub const MAX_REASSEMBLY_SENDERS: usize = 64;
+/// SEC-43: cap on TOTAL in-flight reassembly bytes across every sender combined, checked against
+/// each manifest's DECLARED size (`content::manifest_declared_size`), NOT arrived chunk bytes — a
+/// bare manifest carries no payload, so gating on arrived bytes would let a flood of manifests
+/// with no chunks ever sent reserve every slot for free before the count ever moved. One sender's
+/// worst case alone is already ~4.5 MiB (`MAX_CONCURRENT_TRANSFERS` × the largest transfer kind, a
+/// gallery) — multiplying that by `MAX_REASSEMBLY_SENDERS` would still let a flood reach hundreds
+/// of MiB, so the cross-sender total needs its OWN bound, independent of sender count. 8 MiB
+/// comfortably covers dozens of concurrent avatar/file-sized transfers (the realistic case) while
+/// keeping a flood's worst case a small, fixed amount of committed memory.
+pub const MAX_REASSEMBLY_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Reap idle partials across EVERY sender's `Reassembler`, then drop any sender entry left
+/// holding nothing (`in_flight() == 0`) so the outer map's size reflects only senders that
+/// actually pin RAM. Called from `offer_reassembly` on every receive, and should ALSO be called
+/// on the bare poll cadence (SEC-43): the per-`Reassembler` `reap_stale` only fires when THAT
+/// SAME sender's next manifest calls `start_transfer` — a sender who starts a transfer and then
+/// goes silent would never trigger it again, pinning RAM until the account is switched or the
+/// process exits. Driving this from the ordinary receive path instead means it self-heals within
+/// `content::STALE_PARTIAL_SECS` of wall-clock time as long as the app keeps polling, with no
+/// dependence on that same sender ever sending anything again. Returns how many stale partials
+/// were dropped (diagnostic).
+pub fn reap_reassemblers(
+    reasm: &mut std::collections::HashMap<[u8; 32], content::Reassembler>,
+    now: u64,
+) -> usize {
+    let mut evicted = 0;
+    reasm.retain(|_, re| {
+        evicted += re.reap_stale(now);
+        re.in_flight() > 0
+    });
+    evicted
+}
+
+/// Sum of `Reassembler::bytes_in_flight` (ARRIVED bytes) across every sender — a diagnostic
+/// figure, NOT what the admission check below bounds (see `total_declared_reassembly_bytes`).
+pub fn total_reassembly_bytes(reasm: &std::collections::HashMap<[u8; 32], content::Reassembler>) -> usize {
+    reasm.values().map(content::Reassembler::bytes_in_flight).sum()
+}
+
+/// Sum of `Reassembler::declared_bytes_in_flight` (the sender's COMMITTED manifest size, not
+/// arrived bytes) across every sender — the quantity `MAX_REASSEMBLY_TOTAL_BYTES` actually bounds.
+pub fn total_declared_reassembly_bytes(
+    reasm: &std::collections::HashMap<[u8; 32], content::Reassembler>,
+) -> u64 {
+    reasm.values().map(|re| re.declared_bytes_in_flight() as u64).sum()
+}
+
+/// Feed one envelope into the per-sender pool, enforcing the GLOBAL bounds above before it ever
+/// reaches a per-sender `Reassembler`. Only a MANIFEST (a genuinely new transfer id, checked via
+/// `has_transfer` so an idempotent resend of an already-admitted manifest is never refused) is
+/// admission-checked — a chunk for an already-tracked transfer, or an orphan chunk that will be
+/// refused for its own reasons inside `Reassembler::offer`, never allocates a pool slot.
+///
+/// The byte cap gates on the manifest's DECLARED size (`manifest_declared_size`), never on what
+/// has arrived: a bare manifest carries zero payload, so an arrived-bytes check would let a flood
+/// of manifests with no chunks EVER sent reserve every slot for free, becoming visible only once
+/// chunks started streaming in — by which point admission had already been granted to all of
+/// them. Declared-size accounting closes that off: the sender's commitment is charged the moment
+/// the manifest is accepted, so the running total never exceeds the cap regardless of whether any
+/// chunk ever follows.
+///
+/// DELIBERATELY never evicts another sender's already-admitted (legitimate, in-progress)
+/// transfer to make room for a new one: the two callers here are equally entitled, there is no
+/// signal to prefer the newcomer, and silently destroying real progress with no error to either
+/// side is exactly the "silent loss" this must not do. Instead a new transfer that would exceed
+/// either cap is REFUSED (loud `Err`, mirroring the existing per-sender "too many concurrent
+/// transfers" rejection) — the same category as a manifest already rejected for being over a
+/// per-kind size/chunk-count limit, just enforced one level up.
+pub fn offer_reassembly(
+    reasm: &mut std::collections::HashMap<[u8; 32], content::Reassembler>,
+    sender: [u8; 32],
+    c: content::Content,
+    now: u64,
+) -> Result<Option<content::Assembled>, String> {
+    reap_reassemblers(reasm, now);
+    if let Some(id) = content::manifest_transfer_id(&c) {
+        let already_tracked = reasm.get(&sender).is_some_and(|re| re.has_transfer(id));
+        if !already_tracked {
+            let is_new_sender = !reasm.contains_key(&sender);
+            if is_new_sender && reasm.len() >= MAX_REASSEMBLY_SENDERS {
+                return Err(format!(
+                    "too many senders with in-flight transfers (cap {MAX_REASSEMBLY_SENDERS})"
+                ));
+            }
+            // This runs BEFORE `Reassembler::offer`, i.e. before the per-kind size validation
+            // that normally rejects an absurd declared size — so `declared_new` here is still the
+            // RAW attacker-declared value (a `FileManifest` can claim `size: u64::MAX`).
+            // `saturating_add` keeps the comparison meaningful instead of wrapping/panicking: any
+            // honest manifest is unaffected, and an absurd one is refused here (loud Err) rather
+            // than by luck once it reaches the per-kind check downstream.
+            let declared_new = content::manifest_declared_size(&c).unwrap_or(0);
+            let declared_total = total_declared_reassembly_bytes(reasm);
+            if declared_total.saturating_add(declared_new) > MAX_REASSEMBLY_TOTAL_BYTES as u64 {
+                return Err(format!(
+                    "in-flight reassembly memory at capacity (cap {MAX_REASSEMBLY_TOTAL_BYTES} \
+                     bytes, this manifest commits to {declared_new} more)"
+                ));
+            }
+        }
+    }
+    let entry = reasm.entry(sender).or_default();
+    let result = entry.offer(c, now);
+    if entry.in_flight() == 0 {
+        // Nothing pinned (completed, refused, or a non-manifest/non-chunk passthrough) — drop the
+        // entry now rather than waiting for the next reap, so an empty slot never counts against
+        // MAX_REASSEMBLY_SENDERS.
+        reasm.remove(&sender);
+    }
+    result
+}
+
 /// Persist the in-flight inline transfers held by a set of per-sender reassemblers.
 ///
 /// Inline chunks were reassembled ONLY in RAM while their carrier messages had already been ACKed
@@ -3153,5 +3273,201 @@ mod tests {
         assert_eq!(solo.path_count(), 1, "no routes → just the primary");
         let many = Relay::configured(addr, id, None, "127.0.0.1:9001, direct@127.0.0.1:9002");
         assert_eq!(many.path_count(), 3, "primary + one alternate endpoint + one explicit-carrier route");
+    }
+
+    /// SEC-43, the SENDER-COUNT half. The per-sender cap (`content::MAX_CONCURRENT_TRANSFERS`)
+    /// already stops one busy contact from filling memory, but nothing stopped the NUMBER of
+    /// contacts — an IK is free to mint. Discriminating: fill `MAX_REASSEMBLY_SENDERS` distinct
+    /// senders with an incomplete (never-completing) transfer each, then prove a genuinely new
+    /// sender is refused (the cap does its job) WHILE an already-admitted sender's own transfer
+    /// keeps working (the cap never touches anyone already let in).
+    #[test]
+    fn global_sender_cap_refuses_a_newcomer_but_never_disturbs_an_already_admitted_sender() {
+        let mut reasm: std::collections::HashMap<[u8; 32], content::Reassembler> =
+            std::collections::HashMap::new();
+        let now = 1_000u64;
+        let manifest = |tag: u8| content::Content::FileManifest {
+            id: [tag; 16],
+            name: "f".into(),
+            size: 20,
+            chunks: 2, // never sent in full below => stays in-flight forever
+            hash: [0; 32],
+        };
+        for i in 0..MAX_REASSEMBLY_SENDERS as u8 {
+            let sender = [i; 32];
+            assert_eq!(
+                offer_reassembly(&mut reasm, sender, manifest(i), now).unwrap(),
+                None,
+                "sender {i} must be admitted while under the cap"
+            );
+        }
+        assert_eq!(reasm.len(), MAX_REASSEMBLY_SENDERS, "control: every sender holds a slot");
+
+        // A brand-new sender: refused — every slot is held by another sender's live transfer.
+        let newcomer = [0xAA; 32];
+        assert!(
+            offer_reassembly(&mut reasm, newcomer, manifest(0xAA), now).is_err(),
+            "the sender cap must refuse a newcomer once every slot is taken"
+        );
+        assert!(!reasm.contains_key(&newcomer), "a refused newcomer must not consume a slot");
+
+        // An ALREADY-ADMITTED sender's own transfer is untouched by the cap: their earlier
+        // manifest still accepts its chunk (never evicted to make room for anyone else).
+        let existing = [0u8; 32];
+        let chunk = content::Content::FileChunk { id: [0u8; 16], index: 0, data: vec![1, 2, 3] };
+        assert_eq!(
+            offer_reassembly(&mut reasm, existing, chunk, now).unwrap(),
+            None,
+            "an existing sender's in-progress transfer must keep working at the cap"
+        );
+    }
+
+    /// SEC-43, the TOTAL-RAM half — and specifically the manifest-flood adversary: a manifest
+    /// carries NO payload, so if the cap only counted ARRIVED bytes, an attacker could send
+    /// hundreds of bare manifests (never a single chunk) and every one would be admitted for
+    /// free — the cap would only "notice" once chunks started streaming, by which point every
+    /// slot was already reserved. `MAX_REASSEMBLY_SENDERS` alone would still let that flood
+    /// reserve `senders × ~4.5 MiB` (one sender's worst case: `MAX_CONCURRENT_TRANSFERS` galleries)
+    /// — hundreds of MiB. This test sends ONLY manifests, to 20 distinct senders (well past the
+    /// ~2 that would exhaust the byte cap alone, and well under `MAX_REASSEMBLY_SENDERS` = 64), so
+    /// a pass here cannot be explained by the sender cap or by any chunk ever arriving.
+    ///
+    /// Discriminating both ways: refused well before all 160 (20 × 8) manifests are admitted, AND
+    /// a CHUNK continuing an already-admitted transfer still lands afterwards — the cap must
+    /// refuse only a transfer that has not started, never kill progress already accepted.
+    #[test]
+    fn global_byte_cap_uses_the_manifests_declared_size_so_a_bare_manifest_flood_cannot_bypass_it() {
+        let mut reasm: std::collections::HashMap<[u8; 32], content::Reassembler> =
+            std::collections::HashMap::new();
+        let now = 2_000u64;
+        let declared = content::MAX_GALLERY_BYTES as u32; // the largest single-transfer commitment
+        let mut admitted = 0usize;
+        let mut first: Option<([u8; 32], [u8; 16])> = None;
+        'outer: for sender_idx in 0u8..20 {
+            let sender = [sender_idx; 32];
+            for slot in 0u8..content::MAX_CONCURRENT_TRANSFERS as u8 {
+                let id = [sender_idx.wrapping_mul(8).wrapping_add(slot); 16];
+                let manifest = content::Content::GalleryManifest {
+                    id,
+                    size: declared,
+                    chunks: declared / 1024 + 1,
+                    hash: [0; 32],
+                };
+                match offer_reassembly(&mut reasm, sender, manifest, now) {
+                    Ok(None) => {
+                        first.get_or_insert((sender, id));
+                        admitted += 1;
+                    }
+                    Err(_) => break 'outer, // the byte cap kicked in — stop, this is what we test
+                    Ok(Some(_)) => panic!("a bare manifest cannot complete on its own"),
+                }
+                // Deliberately NO chunk is ever sent — `bytes_in_flight` (arrived) stays at 0 for
+                // every one of these. Only declared-size accounting can catch this flood.
+            }
+        }
+        assert!(
+            admitted < 160,
+            "the byte cap must refuse a bare manifest well before 160 (20 senders × 8 slots) are \
+             admitted with NO chunk ever sent; got {admitted} admitted with none refused — a \
+             manifest flood bypassed the cap"
+        );
+        assert_eq!(
+            total_reassembly_bytes(&reasm),
+            0,
+            "control: confirms this really is a bare-manifest flood — zero bytes ever arrived"
+        );
+        assert!(
+            total_declared_reassembly_bytes(&reasm) <= MAX_REASSEMBLY_TOTAL_BYTES as u64,
+            "committed declared bytes must never exceed the cap, even before any chunk arrives"
+        );
+
+        // A CHUNK continuing an already-admitted transfer still lands even with the declared
+        // budget fully committed — the cap only ever refuses a NEW transfer, never one in progress.
+        let (sender, id) = first.expect("at least one manifest must have been admitted");
+        let chunk = content::Content::AvatarChunk { id, index: 0, data: vec![7u8; 1024] };
+        assert_eq!(
+            offer_reassembly(&mut reasm, sender, chunk, now).unwrap(),
+            None,
+            "an already-admitted transfer must still be able to receive chunks at the byte cap"
+        );
+    }
+
+    /// SEC-43 overflow guard: the admission check runs BEFORE `Reassembler::offer`'s own per-kind
+    /// bound (`size > MAX_FILE_SIZE`, etc.) ever gets a chance to reject an absurd manifest, so
+    /// `manifest_declared_size` is still the RAW attacker-declared value at that point — a
+    /// `FileManifest` claiming `size: u64::MAX` must not overflow `declared_total + declared_new`.
+    /// Discriminating: swap the admission check's `saturating_add` for plain `+` and this panics
+    /// (debug builds trap on overflow) instead of returning a loud `Err`.
+    #[test]
+    fn global_byte_cap_refuses_an_absurd_declared_size_without_overflowing() {
+        let mut reasm: std::collections::HashMap<[u8; 32], content::Reassembler> =
+            std::collections::HashMap::new();
+        let now = 5_000u64;
+        // One small, honest manifest first, so `declared_total` is non-zero going into the
+        // overflow attempt — the bug is in `total + huge`, not in `huge` alone.
+        let sender_a = [1u8; 32];
+        let small = content::Content::FileManifest {
+            id: [1; 16],
+            name: "f".into(),
+            size: 10,
+            chunks: 2,
+            hash: [0; 32],
+        };
+        assert_eq!(offer_reassembly(&mut reasm, sender_a, small, now).unwrap(), None);
+
+        let sender_b = [2u8; 32];
+        let absurd = content::Content::FileManifest {
+            id: [2; 16],
+            name: "f".into(),
+            size: u64::MAX, // far past any per-kind bound `Reassembler::offer` would reject
+            chunks: 1,
+            hash: [0; 32],
+        };
+        assert!(
+            offer_reassembly(&mut reasm, sender_b, absurd, now).is_err(),
+            "an absurd declared size must be refused by the global cap, not overflow past it"
+        );
+    }
+
+    /// SEC-43, the EXPIRY half: the finding was that the 5-minute stale-partial reap was only
+    /// ever triggered by a NEW manifest from the SAME sender that is stalled — a sender who starts
+    /// a transfer and then goes silent forever would pin RAM until the account is switched or the
+    /// process exits. Discriminating: the abandoning sender sends NOTHING further; only a
+    /// DIFFERENT sender's ordinary traffic drives the receive path past the stale window, and that
+    /// alone must free the abandoning sender's slot.
+    #[test]
+    fn reap_reassemblers_frees_an_abandoned_senders_slot_via_a_different_senders_traffic() {
+        let mut reasm: std::collections::HashMap<[u8; 32], content::Reassembler> =
+            std::collections::HashMap::new();
+        let t0 = 1_000u64;
+        let abandoning = [1u8; 32];
+        let manifest = content::Content::FileManifest {
+            id: [9; 16],
+            name: "x".into(),
+            size: 10,
+            chunks: 2,
+            hash: [0; 32],
+        };
+        assert_eq!(offer_reassembly(&mut reasm, abandoning, manifest, t0).unwrap(), None);
+        assert_eq!(reasm.len(), 1, "control: the abandoning sender holds a slot");
+
+        // Past the stale window — but the abandoning sender sends nothing more. A DIFFERENT
+        // sender's manifest is the only thing driving the receive path here.
+        let later = t0 + content::STALE_PARTIAL_SECS + 1;
+        let other = [2u8; 32];
+        let other_manifest = content::Content::FileManifest {
+            id: [8; 16],
+            name: "y".into(),
+            size: 10,
+            chunks: 2,
+            hash: [0; 32],
+        };
+        assert_eq!(offer_reassembly(&mut reasm, other, other_manifest, later).unwrap(), None);
+
+        assert!(
+            !reasm.contains_key(&abandoning),
+            "a different sender's ordinary traffic must free an abandoned sender's stale slot, \
+             not only that same sender sending something new"
+        );
     }
 }

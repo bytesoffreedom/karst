@@ -13,7 +13,12 @@
 //!
 //! # Анти-DoS
 //! Манифест с абсурдным числом чанков/размером отвергается ДО аллокации
-//! (как `MAX_SKIP` в ratchet); число одновременных передач ограничено.
+//! (как `MAX_SKIP` в ratchet); число одновременных передач ограничено ПЕР ОТПРАВИТЕЛЬ
+//! (`MAX_CONCURRENT_TRANSFERS`). Это НЕ бьёт число отправителей и общий RAM всех
+//! `Reassembler` сразу (SEC-43: IK свободно генерируется) — тот бюджет считает
+//! ВЫЗЫВАЮЩИЙ (см. `client::{offer_reassembly, reap_reassemblers, MAX_REASSEMBLY_SENDERS,
+//! MAX_REASSEMBLY_TOTAL_BYTES}` в `lib.rs`), опираясь на `bytes_in_flight`/`has_transfer`
+//! отсюда.
 
 use std::collections::HashMap;
 
@@ -50,9 +55,16 @@ pub const MAX_FILENAME: usize = 48;
 /// Максимум одновременных незавершённых передач в `Reassembler` (анти-память-DoS).
 pub const MAX_CONCURRENT_TRANSFERS: usize = 8;
 /// A half-assembled transfer with no new chunk for this long is abandoned (a failed/aborted
-/// `send_file`) and gets evicted, so it cannot pin a `MAX_CONCURRENT_TRANSFERS` slot until the
-/// process restarts. Measured from the LAST chunk, so an actively-arriving transfer is never
-/// reaped. 5 minutes: generous for a real transfer's inter-chunk gap, prompt for a dead one.
+/// `send_file`) and gets evicted, so it cannot pin a `MAX_CONCURRENT_TRANSFERS` slot forever.
+/// Measured from the LAST chunk, so an actively-arriving transfer is never reaped. 5 minutes:
+/// generous for a real transfer's inter-chunk gap, prompt for a dead one.
+///
+/// SEC-43: `reap_stale` (below) only walks THIS Reassembler, and used to run ONLY from
+/// `start_transfer` — i.e. only when the SAME sender sent another manifest. A sender who starts a
+/// transfer and then goes silent forever would never trigger it again, pinning the slot (and its
+/// RAM) until the account was switched or the process exited. `client::reap_reassemblers` in
+/// `lib.rs` now also drives this from the ordinary receive path, across EVERY sender, so it fires
+/// on the next poll regardless of what the abandoning sender does.
 pub const STALE_PARTIAL_SECS: u64 = 300;
 /// Верхняя граница байтовой длины эмодзи реакции. С запасом на ZWJ/составные
 /// грапхемы (флаги, семьи), но отсекает абсурд ДО аллокации (анти-DoS на приёме).
@@ -347,6 +359,37 @@ pub fn encode(c: &Content) -> Vec<u8> {
 /// Разобрать plaintext-байты в конверт. Чужой/битый груз → ошибка (не паника).
 pub fn decode(bytes: &[u8]) -> Result<Content, String> {
     postcard::from_bytes(bytes).map_err(|e| format!("контент не разобран: {e}"))
+}
+
+/// The transfer id a MANIFEST variant would start in a `Reassembler` (`None` for a chunk or any
+/// other `Content` — those never open a new transfer slot). Lets a caller admission-check a
+/// GLOBAL cross-sender cap (SEC-43) BEFORE a manifest reaches the per-sender `Reassembler`,
+/// without re-deriving `start_transfer`'s own per-kind bounds checks.
+pub fn manifest_transfer_id(c: &Content) -> Option<[u8; 16]> {
+    match c {
+        Content::FileManifest { id, .. }
+        | Content::AvatarManifest { id, .. }
+        | Content::GalleryManifest { id, .. }
+        | Content::PostImageManifest { id, .. }
+        | Content::PostAttachmentManifest { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
+/// The byte size a MANIFEST variant declares it will assemble to (`None` for a chunk or any other
+/// `Content`) — the sender's COMMITMENT, not what has arrived. SEC-43: a bare manifest carries no
+/// payload, so a cap that only counted arrived chunk bytes would let a flood of manifests (no
+/// chunks ever sent) reserve every slot for free; the caller's admission check uses THIS instead,
+/// exactly like `Reassembler::declared_bytes_in_flight` on the already-admitted side.
+pub fn manifest_declared_size(c: &Content) -> Option<u64> {
+    match c {
+        Content::FileManifest { size, .. } => Some(*size),
+        Content::AvatarManifest { size, .. }
+        | Content::GalleryManifest { size, .. }
+        | Content::PostImageManifest { size, .. }
+        | Content::PostAttachmentManifest { size, .. } => Some(*size as u64),
+        _ => None,
+    }
 }
 
 /// Завершённая, собранная и проверенная по хэшу передача файла.
@@ -784,6 +827,34 @@ impl Reassembler {
     /// Число незавершённых передач (для тестов/диагностики).
     pub fn pending(&self) -> usize {
         self.transfers.len()
+    }
+
+    /// Total bytes currently held across all in-flight partials in THIS Reassembler (the sum of
+    /// arrived-so-far chunk payloads, not the declared manifest sizes — a transfer that is only
+    /// half-arrived pins only half its final weight). A DIAGNOSTIC figure only — the cross-sender
+    /// admission cap (SEC-43, see `declared_bytes_in_flight`) does NOT use this, because a bare
+    /// manifest carries zero payload: gating on arrived bytes would let a flood of manifests with
+    /// no chunks ever sent reserve every slot for free before this number moves at all.
+    pub fn bytes_in_flight(&self) -> usize {
+        self.transfers.values().map(|p| p.received.values().map(Vec::len).sum::<usize>()).sum()
+    }
+
+    /// Sum of DECLARED transfer sizes (the manifest's `size` field — the sender's commitment)
+    /// across all in-flight partials in THIS Reassembler. This, not `bytes_in_flight`, is what the
+    /// caller's global RAM cap (SEC-43) must admission-check a new manifest against: it bounds the
+    /// worst case the sender has already promised to make us allocate, the moment the manifest is
+    /// accepted — before a single chunk has to arrive to "prove" the cost is real.
+    pub fn declared_bytes_in_flight(&self) -> usize {
+        self.transfers.values().map(|p| p.size as usize).sum()
+    }
+
+    /// Whether transfer `id` is already tracked here. Lets the caller tell "a repeated manifest
+    /// for a transfer already admitted" (a harmless idempotent resend, per `start_transfer`) apart
+    /// from "a genuinely new transfer", WITHOUT duplicating `start_transfer`'s own bookkeeping —
+    /// needed to admission-check a new transfer against a GLOBAL cap before it reaches this
+    /// per-sender Reassembler at all.
+    pub fn has_transfer(&self, id: [u8; 16]) -> bool {
+        self.transfers.contains_key(&id)
     }
 
     fn try_complete(&mut self, id: [u8; 16]) -> Result<Option<Assembled>, String> {
@@ -1332,5 +1403,43 @@ mod tests {
             }
         }
         assert!(outcome.is_err(), "a hash mismatch must be reported, not silently assembled");
+    }
+
+    fn chunk_data_len(c: &Content) -> usize {
+        match c {
+            Content::FileChunk { data, .. } | Content::AvatarChunk { data, .. } => data.len(),
+            other => panic!("expected a chunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bytes_in_flight_counts_only_arrived_chunks_not_the_declared_final_size() {
+        // A transfer that is only PARTIALLY arrived must weigh only what actually arrived — the
+        // whole point of the accounting is to bound REAL RAM, not the sender's promised total.
+        let payload: Vec<u8> = (0..3_000u32).map(|i| (i % 251) as u8).collect(); // 3 chunks of ~1024
+        let (manifest, chunks) = chunk_file("f.bin", &payload).unwrap();
+        let mut r = Reassembler::new();
+        assert_eq!(r.bytes_in_flight(), 0, "nothing in flight yet");
+        r.offer(manifest, 0).unwrap();
+        assert_eq!(r.bytes_in_flight(), 0, "a bare manifest has received no bytes yet");
+        r.offer(chunks[0].clone(), 0).unwrap();
+        assert_eq!(r.bytes_in_flight(), chunk_data_len(&chunks[0]), "one chunk's worth only");
+        r.offer(chunks[1].clone(), 0).unwrap();
+        assert_eq!(
+            r.bytes_in_flight(),
+            chunk_data_len(&chunks[0]) + chunk_data_len(&chunks[1]),
+            "two chunks' worth, not the manifest's declared final size"
+        );
+    }
+
+    #[test]
+    fn has_transfer_and_manifest_transfer_id_agree_on_what_is_tracked() {
+        let (manifest, chunks) = chunk_file("f.bin", b"hello world").unwrap();
+        let id = manifest_transfer_id(&manifest).expect("a manifest carries an id");
+        assert_eq!(manifest_transfer_id(&chunks[0]), None, "a chunk starts nothing new");
+        let mut r = Reassembler::new();
+        assert!(!r.has_transfer(id), "not tracked before the manifest arrives");
+        r.offer(manifest, 0).unwrap();
+        assert!(r.has_transfer(id), "tracked once the manifest is admitted");
     }
 }

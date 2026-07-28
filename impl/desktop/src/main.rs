@@ -2815,28 +2815,20 @@ struct PollOut {
 /// "adding" them, and until you do you never see their self-declared name/avatar/posts. An
 /// already-known peer is left as-is (a re-DM from a confirmed contact must NOT demote them).
 fn ensure_conversation(root: &Store, ik: [u8; 32]) {
-    let Ok(mut cs) = root.load_contacts() else { return };
-    if cs.iter().any(|c| c.ik == ik) {
-        return; // already known — leave their confirmed/unconfirmed status untouched
-    }
-    // No frozen name: an EMPTY label resolves to the peer's self-declared profile name ONLY once
-    // confirmed, else a short IK, and stays renameable — you never get stuck with a hex stub.
-    cs.push(ContactRecord { name: String::new(), ik, verified: false });
-    if root.save_contacts(&cs).is_ok() {
-        let _ = root.set_unconfirmed(ik, true); // chat-only until explicitly added to contacts
-    }
+    // SEC-44: the cap (and the write-cost/log-on-refusal reasoning) lives with the persisted
+    // state in `Store::add_unconfirmed_contact`, not here — this is now a thin call site.
+    let _ = root.add_unconfirmed_contact(ik);
 }
 
 /// Ensure `ik` is a CONFIRMED contact: add the record if new AND clear any unconfirmed flag. Used
-/// when a mutual add completes (ContactAccept) or the user explicitly confirms — this is what
-/// unlocks showing their name/avatar/posts and fanning ours out to them.
+/// when a mutual add completes (ContactAccept) — this is what unlocks showing their
+/// name/avatar/posts and fanning ours out to them.
+///
+/// SEC-44: the cap lives with the persisted state in `Store::add_confirmed_contact` (this call
+/// site is driven by a REMOTE `ContactAccept`, processed automatically on receipt — the same
+/// flood surface as `ensure_conversation`), not here — this is now a thin call site.
 fn ensure_confirmed_contact(root: &Store, ik: [u8; 32]) {
-    let Ok(mut cs) = root.load_contacts() else { return };
-    if !cs.iter().any(|c| c.ik == ik) {
-        cs.push(ContactRecord { name: String::new(), ik, verified: false });
-        let _ = root.save_contacts(&cs);
-    }
-    let _ = root.set_unconfirmed(ik, false); // promote to a confirmed contact
+    let _ = root.add_confirmed_contact(ik);
 }
 
 /// Whether `ik`'s publications belong in our feed: an account we SUBSCRIBED to, OR one we live-pulled
@@ -2891,6 +2883,12 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     if proxies.is_empty() {
         proxies.push(default_proxy(&root));
     }
+    // SEC-43: reap idle in-flight reassemblies on EVERY poll tick, whether or not this pass
+    // drains any messages — the finding was that the only trigger was the SAME stalled sender
+    // sending a fresh manifest, so a sender who starts a transfer and then goes silent forever
+    // would pin RAM until the account was switched or the process exited. Cheap: the map is
+    // normally small, and this is a pure in-memory scan (no I/O).
+    client::reap_reassemblers(&mut app.reasm.lock().unwrap(), now_secs());
     // A relay counts as reachable if ANY proxy's poll reached it this pass.
     let mut reach_any = vec![false; relays.len()];
     // PROXY-IDENTITY MODEL: poll EACH proxy's mailbox (never the root). `store` below is the proxy
@@ -2974,9 +2972,11 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
             // (already listed), so without this the manifest fell through to `_` and every chunk hit
             // "chunk without manifest": inline (≤2-photo) gallery receive was silently dead.
             | Content::GalleryManifest { .. }) => {
+                // `offer_reassembly` (not a raw per-sender `entry().or_default()`) enforces the
+                // GLOBAL sender-count + RAM caps (SEC-43) before this reaches any one sender's
+                // Reassembler — a flood of fresh sender IKs must not grow this map without bound.
                 let mut reasm = app.reasm.lock().unwrap();
-                let re = reasm.entry(r.sender).or_default();
-                match re.offer(c, now_secs()) {
+                match client::offer_reassembly(&mut reasm, r.sender, c, now_secs()) {
                     Ok(Some(Assembled::File(f))) => {
                         ensure_conversation(&root, r.sender); // first-contact file: surface the sender
                         let nm = sanitize_name(&f.name);

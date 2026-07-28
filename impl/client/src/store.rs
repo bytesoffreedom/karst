@@ -1605,12 +1605,23 @@ impl Store {
     /// Encrypted at rest like every other secret file.
     pub fn load_opks(&self) -> io::Result<Vec<[u8; 32]>> {
         match std::fs::read(self.opks_path()) {
-            Ok(blob) => Ok(self
-                .key
-                .open(&blob)
-                .ok()
-                .and_then(|b| postcard::from_bytes(&b).ok())
-                .unwrap_or_default()),
+            // A file that exists but cannot be opened or decoded is an ERROR, not "no keys".
+            // Returning an empty list made the client believe it held none, mint a fresh batch and
+            // publish it — while the relay went on handing out the OLD public keys whose secrets
+            // had just been declared missing. Every initiator that received one produced an opener
+            // the recipient could no longer accept: silent, one-sided first-contact failure that
+            // looks like the network dropping messages (R2-4). Absent is still legitimately empty.
+            Ok(blob) => {
+                let plain = self
+                    .key
+                    .open(&blob)
+                    .map_err(|e| io_err(format!("one-time prekeys unreadable ({e}) — refusing to \
+                         treat a corrupt sidecar as 'no keys'; restore it or re-provision")))?;
+                postcard::from_bytes(&plain).map_err(|e| {
+                    io_err(format!("one-time prekeys malformed ({e}) — refusing to treat a corrupt \
+                         sidecar as 'no keys'"))
+                })
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }

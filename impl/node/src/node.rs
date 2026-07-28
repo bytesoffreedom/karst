@@ -949,6 +949,17 @@ impl RelayNode {
         // violates this only harms ITSELF — a re-advertised key can be handed to two of its own
         // first-contacts, and the second opener then fails closed (its OPK already consumed). Bug
         // C was exactly this: the client used to re-advertise the whole held set every publish.
+        //
+        // `replace_opks` is how a client says "forget what you are holding for me". Appending is
+        // right for a top-up, but WRONG after the client lost its secrets (a restored backup, a
+        // damaged sidecar): the relay would keep handing out public keys whose secrets no longer
+        // exist, and every initiator that got one produced an opener the recipient could not
+        // accept — until 256 stale entries filled the queue and new keys could not even be stored
+        // (R2-4). The flag is authenticated exactly like the rest of the request: it rides inside
+        // the publish proof, so only the IK's owner can clear that IK's queue.
+        if req.replace_opks {
+            self.opk_batches.remove(&ik);
+        }
         let batch = self.opk_batches.entry(ik).or_default();
         for opk in &req.opks {
             if batch.len() >= MAX_OPKS_PER_IK {
@@ -982,6 +993,10 @@ pub struct PublishRequest {
     /// OPK swap by the untrusted relay is the same DoS bucket as a prekey swap (the
     /// recipient won't hold the secret → the agreement fails), never a confidentiality loss.
     pub opks: Vec<[u8; 32]>,
+    /// Drop whatever one-time prekeys the relay still holds for this IK before storing `opks`.
+    /// Set when the client's own secrets are gone (restored backup / unreadable sidecar), so the
+    /// relay stops serving public keys nobody can answer for (R2-4).
+    pub replace_opks: bool,
     pub client_addr: Vec<u8>,
     pub carrier_id: Vec<u8>,
     pub cookie: Option<Cookie>,
@@ -1426,6 +1441,7 @@ mod tests {
         let ok = PublishRequest {
             bundle: bundle.clone(),
             opks: Vec::new(),
+            replace_opks: false,
             client_addr: addr.clone(),
             carrier_id: carrier.clone(),
             cookie: Some(cookie),
@@ -1443,6 +1459,7 @@ mod tests {
         let attack = PublishRequest {
             bundle: forged,
             opks: Vec::new(),
+            replace_opks: false,
             client_addr: addr,
             carrier_id: carrier,
             cookie: Some(cookie),
@@ -1464,6 +1481,7 @@ mod tests {
         let req = PublishRequest {
             bundle: bob.prekey_bundle(),
             opks: Vec::new(),
+            replace_opks: false,
             client_addr: bob.identity_public().to_vec(),
             carrier_id: b"c".to_vec(),
             cookie: None,

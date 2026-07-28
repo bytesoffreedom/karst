@@ -626,6 +626,18 @@ impl<T: Transport> Peer<T> {
     /// re-advertising already-published keys stockpiles duplicates and drops first-contacts.
     /// Minting/persisting the batch is the caller's job (tops up and saves before publishing).
     pub fn publish_advertising(&mut self, opks: &[[u8; 32]], now: u64) -> PublishResponse {
+        self.publish_advertising_replacing(opks, false, now)
+    }
+
+    /// As [`Peer::publish_advertising`], but first tells the relay to DROP the one-time prekeys it
+    /// still holds for this identity. Use when our own secrets are gone (restored backup, damaged
+    /// sidecar): otherwise the relay keeps serving keys nobody can answer for (R2-4).
+    pub fn publish_advertising_replacing(
+        &mut self,
+        opks: &[[u8; 32]],
+        replace: bool,
+        now: u64,
+    ) -> PublishResponse {
         let bundle = self.account.prekey_bundle();
         let shared = self.account.ik().dh(&self.relay_pub);
         // Publishing announces the bundle — and the IK inside it — so it shares the
@@ -642,6 +654,7 @@ impl<T: Transport> Peer<T> {
             let req = PublishRequest {
                 bundle: bundle.clone(),
                 opks: opks.to_vec(),
+                replace_opks: replace,
                 client_addr: client_addr.clone(),
                 carrier_id: self.carrier_id.clone(),
                 cookie,

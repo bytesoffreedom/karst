@@ -107,6 +107,7 @@ fn publish_request_fits_request_frame() {
     let req = PublishRequest {
         bundle,
         opks: Vec::new(),
+        replace_opks: false,
         client_addr: vec![0u8; 32],
         carrier_id: b"mem".to_vec(),
         cookie: None,
@@ -218,4 +219,47 @@ fn a_fetcher_still_connects_when_the_one_time_prekeys_run_out() {
 
     let got = plaintexts(bob.receive(NOW).unwrap());
     assert!(got.contains(&b"one".to_vec()) && got.contains(&b"two".to_vec()), "OPK exhaustion broke delivery");
+}
+
+/// R2-4 — a client whose own one-time-prekey secrets are gone must be able to CLEAR the relay's
+/// queue, not just append to it.
+///
+/// Publishing used to only append. So after a restored backup or a damaged sidecar the relay kept
+/// handing out the OLD public keys — whose secrets no longer existed — and every initiator that
+/// received one produced an opener the recipient could not accept: silent, one-sided first-contact
+/// failure that looks like the network losing messages. Worse, once 256 stale entries filled the
+/// queue, freshly minted keys could not even be stored.
+#[test]
+fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
+    let mut relay = RelayNode::new(NOW);
+    relay.issue_capability(dev_cap());
+    let relay_pub = relay.relay_public();
+    let relay = Rc::new(RefCell::new(relay));
+    let mut bob = Peer::new(InMemoryTransport::new(relay.clone()), Account::generate(), dev_cap(), relay_pub);
+    let bob_ik = bob.bundle().ik_pub;
+
+    // Bob publishes a batch; then his secrets are gone (restored backup / damaged sidecar) and he
+    // mints a completely new one, telling the relay to forget the old.
+    let first = bob.add_opks(2);
+    assert!(matches!(bob.publish_advertising(&first, NOW), PublishResponse::Published));
+    let second = bob.add_opks(2);
+    assert!(matches!(
+        bob.publish_advertising_replacing(&second, true, NOW),
+        PublishResponse::Published
+    ));
+
+    // Everything the relay now hands out must come from the NEW batch — an old key would produce
+    // an opener nobody can accept.
+    let mut served = Vec::new();
+    while let Some(b) = relay.borrow_mut().get_bundle(&bob_ik) {
+        match b.opk_pub {
+            Some(k) => served.push(k),
+            None => break,
+        }
+    }
+    assert!(!served.is_empty(), "the new batch is being served");
+    for k in &served {
+        assert!(second.contains(k), "the relay served a prekey whose secret no longer exists");
+        assert!(!first.contains(k), "a stale prekey survived the replace");
+    }
 }

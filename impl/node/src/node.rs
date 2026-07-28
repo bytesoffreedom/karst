@@ -39,6 +39,11 @@ pub const MAX_BUNDLES: usize = 100_000;
 pub const MAX_KNOWN_RELAYS: usize = 128;
 /// Cap on dial hints per relay descriptor (avoid a junk descriptor bloating the list).
 pub const MAX_ADDRS_PER_RELAY: usize = 4;
+/// Cap on a single dial-hint string (a real host:port / .onion / .b32.i2p is well under this).
+/// `addrs` is attacker-controlled, unsigned free-form (excluded from the binding signature),
+/// so it must be bounded in BOTH length and count before it is stored, or 4 hints × ~16 KB
+/// across the discovery map (~100 000 slots) is a multi-GB memory-growth DoS.
+pub const MAX_ADDR_LEN: usize = 256;
 /// Cap on stored one-time prekeys per IK (bounded relay state; see `PublishRequest::opks`).
 pub const MAX_OPKS_PER_IK: usize = 256;
 
@@ -482,7 +487,7 @@ impl RelayNode {
     /// limits, is a separate slice. Dedups by relay-id (unions addr hints), bounded.
     pub fn add_relay(&mut self, mut d: RelayDescriptor) {
         d.addrs.truncate(MAX_ADDRS_PER_RELAY);
-        d.addrs.retain(|a| !a.is_empty());
+        d.addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
         if d.addrs.is_empty() {
             return; // a descriptor with no dial hint is useless (and would poison the list)
         }
@@ -534,7 +539,12 @@ impl RelayNode {
         if !self.discovery.contains_key(&pseudonym) && self.discovery.len() >= MAX_BUNDLES {
             return false;
         }
-        self.discovery.insert(pseudonym, record.clone());
+        // Bound the attacker-controlled, unsigned `addrs` before storing (count + length) —
+        // mirror `add_relay`. Without this a valid-but-bloated record is a memory-growth DoS.
+        let mut record = record.clone();
+        record.location.addrs.truncate(MAX_ADDRS_PER_RELAY);
+        record.location.addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
+        self.discovery.insert(pseudonym, record);
         true
     }
 

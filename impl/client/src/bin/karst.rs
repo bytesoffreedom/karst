@@ -467,7 +467,6 @@ fn cmd_recv(args: &[String]) -> Result<(), String> {
     // Пересборка файлов — по ОТПРАВИТЕЛЮ (чанки одного отправителя не смешиваются
     // с чужими). Одноразовый recv: файл должен уместиться в один mailbox.
     let mut reasm: HashMap<[u8; 32], Reassembler> = HashMap::new();
-    let recv_dir = Store::default_dir().join("received");
     let mut shown = 0;
     for m in &msgs {
         match m {
@@ -493,8 +492,21 @@ fn cmd_recv(args: &[String]) -> Result<(), String> {
                         let re = reasm.entry(r.sender).or_default();
                         match re.offer(c, wall_clock()) {
                             Ok(Some(client::content::Assembled::File(file))) => {
-                                match save_received_file(&recv_dir, &file.name, &file.bytes) {
-                                    Ok(p) => println!("[{from}…] file: {} → {}", file.name, p),
+                                // Seal at rest + index it (mirror the desktop path). The old
+                                // plaintext `received/` write leaked cleartext to a cold disk and
+                                // left the file invisible to `karst files`.
+                                match s.save_received_file(&file.name, &file.bytes) {
+                                    Ok(id) => {
+                                        let _ = s.record_received_file(&client::store::ReceivedFile {
+                                            id: id.clone(),
+                                            name: file.name.clone(),
+                                            size: file.bytes.len() as u64,
+                                            sender: r.sender,
+                                            ts: wall_clock(),
+                                            blob_id: [0u8; 32],
+                                        });
+                                        println!("[{from}…] file: {} (sealed → id {id})", file.name);
+                                    }
                                     Err(e) => eprintln!("saving file: {e}"),
                                 }
                                 shown += 1;
@@ -594,20 +606,6 @@ fn cmd_export_file(args: &[String]) -> Result<(), String> {
     let n = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     eprintln!("exported {name} ({n} B) to {out}");
     Ok(())
-}
-
-/// Сохранить принятый файл в `dir` под БАЗОВЫМ именем (без каталогов — защита от
-/// path-traversal из чужого имени). Возвращает итоговый путь.
-fn save_received_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<String, String> {
-    let base = Path::new(name)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .unwrap_or("file");
-    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let path = dir.join(base);
-    std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    Ok(path.display().to_string())
 }
 
 // ---------- мелкий разбор аргументов (без внешних крейтов) ----------

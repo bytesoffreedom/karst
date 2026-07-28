@@ -139,20 +139,23 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[test]
 fn wss_carrier_round_trips_a_multichunk_payload() {
-    // The common case once fixed-size fetch is on: a payload larger than one Noise
-    // frame (> MAX_NOISE_PAYLOAD ~= 64 KiB), which the session splits into several
-    // chunks inside ONE WS binary frame per direction. Proves the byte-stream shim
-    // reassembles frame boundaries correctly under the real workload, not just tiny
-    // pings.
+    // The production workload: a message at the largest write_msg cap (MAX_BLOB_FRAME),
+    // which pads up to the 65 536 bucket and the session splits into two Noise chunks inside
+    // ONE WS binary frame per direction. Proves the byte-stream shim reassembles frame
+    // boundaries under the real workload, not just tiny pings. Both stay under the carrier's
+    // WS message ceiling (`ws_config`) that stops an unauthenticated peer from buffering
+    // tungstenite's default 64 MiB before the Noise handshake reads its ~50 bytes — a payload
+    // padding past that ceiling is not a production message and the carrier refuses it.
     let (client_tls, server_tls) = test_tls();
     let (relay_priv, relay_pub) = relay_keys();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    // A 200 000-byte request and a 250 000-byte reply both exceed a single frame.
-    let req: Vec<u8> = (0..200_000usize).map(|i| (i % 251) as u8).collect();
-    let reply: Vec<u8> = (0..250_000usize).map(|i| (i % 241) as u8).collect();
+    // A 64 000-byte request and a 65 000-byte reply: both ≤ MAX_BLOB_FRAME, each padded to
+    // the 65 536 bucket → two Noise chunks reassembled from one WS frame.
+    let req: Vec<u8> = (0..64_000usize).map(|i| (i % 251) as u8).collect();
+    let reply: Vec<u8> = (0..65_000usize).map(|i| (i % 241) as u8).collect();
     let req_srv = req.clone();
     let reply_srv = reply.clone();
 

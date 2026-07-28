@@ -50,6 +50,20 @@ fn ws_err(e: tungstenite::Error) -> io::Error {
     io::Error::other(e)
 }
 
+/// WebSocket message/frame ceiling for the carrier. The Noise session sends exactly one
+/// framed message per flush, ≤ `MAX_BLOB_FRAME` (~65 KB) + overhead — so 128 KiB is ~2×
+/// headroom. Without this, tungstenite's default (`max_message_size` = 64 MiB) lets an
+/// anonymous peer make the relay (or a client, from a malicious relay) buffer up to 64 MiB
+/// per connection *before* the Noise handshake reads its ~50 bytes — a memory-cost DoS that
+/// bypasses every other read cap in the system.
+const WS_MAX_FRAME: usize = 128 * 1024;
+fn ws_config() -> tungstenite::protocol::WebSocketConfig {
+    let mut c = tungstenite::protocol::WebSocketConfig::default();
+    c.max_message_size = Some(WS_MAX_FRAME);
+    c.max_frame_size = Some(WS_MAX_FRAME);
+    c
+}
+
 impl<S: Read + Write> Read for WsByteStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         while self.rpos >= self.rbuf.len() {
@@ -215,7 +229,7 @@ impl TransportAdapter for WssAdapter {
         // `Host` header; the path is the operator's secret co-hosting path (default `/`),
         // which the relay's reverse proxy uses to route this to the relay.
         let uri = format!("ws://{}{}", self.host, self.path);
-        let (ws, _resp) = tungstenite::client(uri.as_str(), tls)
+        let (ws, _resp) = tungstenite::client::client_with_config(uri.as_str(), tls, Some(ws_config()))
             .map_err(|e| io::Error::other(format!("ws upgrade: {e}")))?;
         Ok(Box::new(WsByteStream::new(ws)))
     }
@@ -230,7 +244,7 @@ pub fn accept_wss<S: Read + Write + Send + 'static>(
 ) -> io::Result<Box<dyn Channel>> {
     let conn = ServerConnection::new(config).map_err(io::Error::other)?;
     let tls = StreamOwned::new(conn, stream);
-    let ws = tungstenite::accept(tls)
+    let ws = tungstenite::accept_with_config(tls, Some(ws_config()))
         .map_err(|e| io::Error::other(format!("ws accept: {e}")))?;
     Ok(Box::new(WsByteStream::new(ws)))
 }

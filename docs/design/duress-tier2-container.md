@@ -17,7 +17,8 @@ code once it lands. Design converged with the user 2026‑07‑26.
 - The hidden compartment opens a **real, working (empty/light) account**, not a note.
 - The old "K equal partitions" scheme is replaced by a **main‑region + hidden‑tail**
   layout driven by a **three‑password policy** (below). P1 subsumes the old
-  disjoint‑partition safety; P3 adds snapshot‑diff masking the old model could not.
+  disjoint‑partition safety. (An earlier revision of this note also credited P3 with
+  snapshot‑diff *masking*. That claim was wrong and is retracted — see §5.)
 - A whole new axis the earlier note ignored entirely: **network deniability**. A
   hidden *account* leaks through the wire, not just the disk. This sets the honest
   ceiling (§5) and forces the offline/isolation controls (§6).
@@ -53,8 +54,25 @@ slot table **inside** the container (no separate `slots.dat` base file). Roles:
 - **P3 — main, BLIND.** Opens the **same** main account (same main key + a policy
   flag in the slot), allocator allowed the **whole** container → may overwrite the
   hidden tail. Two purposes: (a) it is the *cover* you reveal under duress ("just my
-  account, writes across the disk, nothing hidden"), and (b) main activity churning
-  the tail is what masks hidden writes against snapshot diffing (§5).
+  account, writes across the disk, nothing hidden").
+
+  **CORRECTION.** This note used to claim a second purpose: that main activity churning
+  the tail *masks* hidden writes against snapshot diffing. It does not, and the code
+  contradicts it in two directions (CRYPTO‑14, now pinned by tests):
+
+  - a P3 write touches the identical `(offset, length)` whether or not a hidden
+    compartment exists — so P3 activity is not cover, it is just activity;
+  - a hidden write's changed bytes fall entirely inside the hidden region — so an
+    adversary holding two snapshots separates the compartments by offset alone,
+    regardless of what P3 has been doing.
+
+  Masking and destroying are the same operation here: the only way P3 can make the tail
+  look churned is to overwrite it, which is the accepted‑risk *loss* already documented,
+  not protection. Real masking needs an O(N) rewrite of the whole container per save,
+  which defeats the ranged‑write design the container is built on. So the honest position
+  is: **the Tier‑2 container does not defend against an adversary who can diff two
+  snapshots of the file.** File size and mtime are likewise unchanged by the presence of
+  a hidden compartment, but changed‑byte *offsets* are not, and that is the leak.
 
 P1 and P3 wrap the **same** main data key, differing only by the protect/blind flag.
 Revealing P3 under coercion does not expose P1 or P2: each slot is sealed under its

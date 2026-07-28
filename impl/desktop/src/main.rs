@@ -840,7 +840,11 @@ fn container_create(app: State<App>, phrase: String, password: String, vault_dir
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     let cpath = base.join("container.dat");
     let n = size_mb.saturating_mul(1024 * 1024).max(256 * 1024);
-    let main_cap = n / 4 * 3; // reserve ~1/4 for the (future) hidden tail
+    // Reserve ~1/4 for the (future) hidden tail. NOTE the halving: a region now holds TWO copy
+    // slots so a torn save cannot brick it (CRYPTO-13), so the usable payload of a region is
+    // about half its declared capacity. The declared figure below is the region size, not what
+    // fits in it — a user asking for N MiB of container gets roughly 3N/8 of usable main account.
+    let main_cap = n / 4 * 3;
     client::container::Container::create(&cpath, n, password.as_bytes(), main_cap).map_err(|e| e.to_string())?;
     let mut cv = client::container::ContainerVault::open(&cpath, password.as_bytes(), base.join("work"))
         .map_err(|e| e.to_string())?;

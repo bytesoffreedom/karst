@@ -132,9 +132,10 @@ struct OutboxEntry {
 /// материал** (ratchet-ключи в снимках) — писать под 0600, atomic + под flock
 /// (иначе гонка процессов → keystream-reuse). Account НЕ здесь — он персистится
 /// отдельно (`account.key`).
-/// **Wire-compat note.** postcard encodes fields positionally, so this struct's layout
-/// IS its format. A state file written before the `outbox` field loads via
-/// `from_bytes_compat`; older breaks (pre-`drop_seed`) re-establish sessions.
+/// **Format note.** postcard encodes fields positionally, so this struct's layout IS its format,
+/// and there is no compatibility path: a state file from any other layout fails to decode. The
+/// version that governs that is `client::secretbox::STATE_VERSION`, which must be bumped whenever
+/// this struct changes — see `docs/design/format-versioning.md`.
 ///
 /// **Why handles and cookies persist.** A caller like the CLI/GUI runs a fresh `Peer`
 /// per poll, so anything not persisted is re-minted every cycle — and a re-minted handle
@@ -171,20 +172,15 @@ pub struct PeerState {
     /// ciphertext can be retransmitted after a transport failure instead of being lost with
     /// the advanced ratchet. Persisted IN this state so it commits atomically with the
     /// ratchet snapshots — the invariant "envelope N queued ⟺ session ratchet is at ≥ N+1"
-    /// depends on both landing in one write. Appended LAST (postcard-positional); an older
-    /// state file without it loads via `from_bytes_compat`.
-    #[serde(default)]
+    /// depends on both landing in one write.
     outbox: Vec<OutboxEntry>,
     /// Monotonic id source for outbox entries, so a caller can ask whether a specific queued
-    /// message was delivered. Appended LAST.
-    #[serde(default)]
+    /// message was delivered.
     outbox_next_id: u64,
     /// Responder sessions from simultaneous first contact (see `Peer::inbound_sessions`). A
-    /// separate top-level Vec — NOT a field on `PersistedSession` — because postcard is
-    /// positional: a new nested field would break every old state file, whereas a new trailing
-    /// top-level field is handled by the fallback chain in `from_bytes_compat`. Reuses the
-    /// `PersistedSession` shape unchanged (it already carries `peer_ik`). Appended LAST.
-    #[serde(default)]
+    /// separate top-level Vec — NOT a field on `PersistedSession`, so the responder map stays
+    /// readable on its own. Reuses the `PersistedSession` shape unchanged (it already carries
+    /// `peer_ik`).
     inbound_sessions: Vec<PersistedSession>,
 }
 
@@ -203,7 +199,6 @@ struct PersistedSession {
     drop_seed: [u8; 32],
     /// The peer's mailbox point (where I deposit outbound). Public, but persisted alongside the
     /// session because the responder only ever received it in the (consumed) key-agreement.
-    #[serde(default)]
     peer_mailbox_pub: [u8; 32],
 }
 
@@ -226,7 +221,7 @@ impl PeerState {
     }
 
     /// Deserialize a persisted state. ONE layout, strictly — see the body.
-    pub fn from_bytes_compat(bytes: &[u8]) -> Result<PeerState, postcard::Error> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<PeerState, postcard::Error> {
         // Strict decode. This used to be a CHAIN that walked back one trailing-field addition at
         // a time (PeerStatePreInbound → PeerStatePreOutbox), so state written by an older build
         // still loaded. There are no older builds with state, and the chain had a real hazard:
@@ -1381,7 +1376,7 @@ mod outbox_state_tests {
 
     /// A state file in an OLD layout must now fail LOUDLY.
     ///
-    /// `from_bytes_compat` used to walk back through PeerStatePreInbound → PeerStatePreOutbox so
+    /// `from_bytes` used to walk back through PeerStatePreInbound → PeerStatePreOutbox so
     /// state written by an earlier build still loaded. With no such state in existence that chain
     /// was pure surface, and it carried a real hazard: postcard ignores trailing bytes, so a
     /// mis-ordered attempt could silently accept an old layout for NEW data and drop the fields
@@ -1401,7 +1396,7 @@ mod outbox_state_tests {
         ))
         .unwrap();
         assert!(
-            PeerState::from_bytes_compat(&pre_outbox).is_err(),
+            PeerState::from_bytes(&pre_outbox).is_err(),
             "an old layout must be reported, not loaded with invented defaults"
         );
     }
@@ -1427,7 +1422,7 @@ mod outbox_state_tests {
             inbound_sessions: Vec::new(),
         };
         let bytes = postcard::to_stdvec(&state).unwrap();
-        let back = PeerState::from_bytes_compat(&bytes).expect("current layout loads");
+        let back = PeerState::from_bytes(&bytes).expect("current layout loads");
         assert_eq!(back.outbox.len(), 1, "queued message survived the round trip");
         assert_eq!(back.outbox[0].id, 5);
         assert_eq!(back.outbox_next_id, 6);

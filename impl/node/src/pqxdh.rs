@@ -104,6 +104,22 @@ pub struct SignedOpk {
     pub sig: Vec<u8>,
 }
 
+impl SignedOpk {
+    /// Verify this one-time prekey against the identity key that should have signed it. Separate
+    /// from [`PreKeyBundle::verify_prekey_sig`] so a relay checking a BATCH does not re-verify the
+    /// bundle's prekey signature once per key: `MAX_OPKS_PER_IK` is 256, and doing both per entry
+    /// made one publish cost 512 XEdDSA verifications plus 256 bundle clones — the same
+    /// work-amplification shape as SEC-28.
+    pub fn verify(&self, ik_pub: &[u8; 32]) -> bool {
+        use xeddsa::Verify;
+        let Ok(sig) = <[u8; 64]>::try_from(self.sig.as_slice()) else {
+            return false; // wrong length = unsigned / incompatible
+        };
+        let pk = xeddsa::xed25519::PublicKey::from(&PublicKey::from(*ik_pub));
+        pk.verify(&opk_sig_message(&self.key), &sig).is_ok()
+    }
+}
+
 /// The message an OPK signature covers: a domain tag ‖ the one-time prekey. Domain-separated from
 /// [`prekey_sig_message`] so neither signature can ever be replayed as the other.
 pub(crate) fn opk_sig_message(opk_pub: &[u8; 32]) -> Vec<u8> {
@@ -145,10 +161,7 @@ impl PreKeyBundle {
         // quietly continuing would hand the attacker exactly the downgrade they were after.
         match &self.opk {
             None => true,
-            Some(o) => match <[u8; 64]>::try_from(o.sig.as_slice()) {
-                Ok(sig) => pk.verify(&opk_sig_message(&o.key), &sig).is_ok(),
-                Err(_) => false,
-            },
+            Some(o) => o.verify(&self.ik_pub),
         }
     }
 }

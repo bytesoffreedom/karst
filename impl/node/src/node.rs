@@ -984,8 +984,9 @@ impl RelayNode {
             // Verify the publisher's signature before storing. The relay gains nothing by
             // holding a key it could never hand out usefully, and a fetcher that received one
             // would burn a first contact on it — so junk is dropped at the door, not forwarded.
-            let probe = PreKeyBundle { opk: Some(opk.clone()), ..req.bundle.clone() };
-            if !probe.verify_prekey_sig() {
+            // ONE verification per key: `SignedOpk::verify` checks only the OPK signature, where
+            // building a probe bundle would have re-checked the prekey signature 256 times over.
+            if !opk.verify(&ik) {
                 continue;
             }
             batch.push_back(opk.clone());

@@ -61,6 +61,14 @@ pub const STATE_VERSION: u16 = 1;
 ///
 /// Deliberately NOT pushed to 256 MiB+: peak RSS during unlock is real, and a profile that a
 /// low-RAM machine cannot run is a profile someone will quietly lower later.
+///
+/// HONEST LIMIT, since `STATE_VERSION` might imply otherwise: a KDF change cannot produce the
+/// loud "written by an older/newer KARST" error. That message lives INSIDE the sealed blob, and
+/// reading it needs the right key — which is exactly what a changed profile no longer derives. So
+/// raising this constant makes existing local data fail as «неверный пароль», the misleading
+/// shape we remove everywhere else. It is unavoidable here: the deniable container has no
+/// plaintext header to carry a profile id, and adding one would be a tell. Version bumps of the
+/// KDF are therefore release-note events, not self-describing ones.
 pub const KDF_M_COST: u32 = 131_072; // KiB (128 MiB)
 pub const KDF_T_COST: u32 = 3;
 pub const KDF_P_COST: u32 = 1;

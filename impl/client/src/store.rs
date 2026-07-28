@@ -1514,6 +1514,40 @@ impl Store {
     // existing name/verify-flag on disk. Migration is inherently safe — an old vault has no sidecar,
     // so the set is empty and every existing contact stays confirmed.
 
+    fn reduced_fs_path(&self) -> PathBuf {
+        self.net_file("reduced_fs.dat")
+    }
+
+    /// Peers whose session was opened WITHOUT a one-time prekey — 3-DH instead of 4-DH.
+    ///
+    /// The relay serves the one-time prekey, and while it can no longer substitute one (each is
+    /// signed — `pqxdh::SignedOpk`), it can withhold every one and claim exhaustion, which is
+    /// indistinguishable from real exhaustion. Refusing to talk would turn a downgrade into a
+    /// lockout, so the send proceeds — and lands here, so the fact is recoverable afterwards
+    /// instead of vanishing into a discarded return value. IDENTITY-scoped (`net_file`): which
+    /// proxy opened a session is not shared across proxies.
+    pub fn load_reduced_fs(&self) -> io::Result<BTreeSet<[u8; 32]>> {
+        match std::fs::read(self.reduced_fs_path()) {
+            Ok(blob) => {
+                let bytes =
+                    self.key.open(&self.label(&self.reduced_fs_path()), &blob).map_err(io_err)?;
+                postcard::from_bytes(&bytes).map_err(io_err)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record that first contact with `ik` got no one-time prekey. Idempotent.
+    pub fn mark_reduced_fs(&self, ik: [u8; 32]) -> io::Result<()> {
+        let mut set = self.load_reduced_fs()?;
+        if !set.insert(ik) {
+            return Ok(());
+        }
+        let plain = postcard::to_stdvec(&set).map_err(io_err)?;
+        self.write_sealed(&self.reduced_fs_path(), &plain)
+    }
+
     fn unconfirmed_path(&self) -> PathBuf {
         self.dir.join("unconfirmed.dat")
     }
@@ -2516,8 +2550,8 @@ impl Store {
             Ok(blob) => {
                 let bytes = self.key.open(&self.label(&self.sessions_path()), &blob).map_err(io_err)?;
                 // Tolerate a state file written before the outbox field: never brick an
-                // in-flight ratchet to add a field (see `PeerState::from_bytes_compat`).
-                PeerState::from_bytes_compat(&bytes).map_err(io_err)
+                // in-flight ratchet to add a field (see `PeerState::from_bytes`).
+                PeerState::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(PeerState::empty()),
             Err(e) => Err(e),

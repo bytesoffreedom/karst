@@ -641,6 +641,59 @@ fn a_message_between_proxies_delivers_and_the_root_ik_never_appears() {
     std::fs::remove_dir_all(&bdir).ok();
 }
 
+/// CRYPTO-04, the client half. A relay that serves NO one-time prekey downgrades first contact
+/// from 4-DH to 3-DH. `Peer::connect` reports that, but a report nobody binds is not a report —
+/// `peer.connect(..)?;` compiles fine and throws the value away, which is exactly what the client
+/// used to do. So the fact has to land somewhere durable.
+///
+/// Discriminating: the SAME send, run once against a relay holding OPKs and once against a relay
+/// that was never given any. Only the second may be recorded, so it cannot pass by marking
+/// everything (or nothing).
+#[test]
+fn a_first_contact_without_a_one_time_prekey_is_recorded_as_reduced() {
+    let (relay_addr, relay_id) = spawn_relay();
+    let adir = temp_dir("redfs-a");
+    let bdir = temp_dir("redfs-b");
+    let cdir = temp_dir("redfs-c");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    let cstore = Store::unlock(&cdir, b"pw").unwrap();
+    for st in [&astore, &bstore, &cstore] {
+        seed_provision(st);
+        st.save_capability(&client::dev_capability()).unwrap();
+    }
+    let r = ctx(relay_addr, &relay_id);
+
+    // Bob publishes WITH one-time prekeys; Carol publishes a bundle with none at all.
+    client::publish_with_opks(&bstore, &r, bstore.load_capability().unwrap(), NOW).unwrap();
+    client::publish_bundle(
+        &r,
+        cstore.load_account().unwrap(),
+        cstore.load_capability().unwrap(),
+        NOW,
+    );
+    let b_ik = bstore.load_account().unwrap().identity_public();
+    let c_ik = cstore.load_account().unwrap().identity_public();
+
+    client::send_text(&astore, &r, &b_ik, b"full strength", NOW, NOW).unwrap();
+    client::send_text(&astore, &r, &c_ik, b"reduced", NOW, NOW).unwrap();
+
+    let reduced = astore.load_reduced_fs().unwrap();
+    assert!(
+        reduced.contains(&c_ik),
+        "first contact with no one-time prekey must be recorded — otherwise the downgrade is \
+         invisible to everything above the crypto layer"
+    );
+    assert!(
+        !reduced.contains(&b_ik),
+        "a 4-DH first contact must NOT be flagged, or the flag means nothing"
+    );
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+    std::fs::remove_dir_all(&cdir).ok();
+}
+
 /// PROXY + ONE-TIME PREKEYS, the exact desktop path: Bob's proxy publishes its bundle WITH a
 /// batch of OPKs (`publish_with_opks`, as `do_publish` does), Alice's proxy sends (first contact
 /// consumes one of those OPKs → 4-DH opener), and Bob's proxy receives via `recv_session_multi`

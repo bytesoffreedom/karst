@@ -47,7 +47,7 @@ use node::node::{
     BlobGetRequest, BlobPutRequest, BlobResponse, Client, PublishResponse, Recipient, Response,
     Transport,
 };
-use node::peer::{Peer, PeerState, Received};
+use node::peer::{ForwardSecrecy, Peer, PeerState, Received};
 use node::pqxdh::Account;
 use node::seal::Identity;
 use node::socket::{BlobSession, SocketTransport};
@@ -1022,7 +1022,12 @@ pub fn send_session(
     let _lock = store.lock_sessions().map_err(|e| format!("замок сессий: {e}"))?;
     peer.import_state(store.load_sessions().map_err(|e| format!("чтение сессий: {e}"))?);
     if !peer.has_session(to_ik) {
-        peer.connect(to_ik, now)?; // §12 fetch bundle + PQXDH-инициатор
+        // The return value is the FORWARD-SECRECY strength of this first contact, and it is not
+        // allowed to be dropped: a relay that withholds every one-time prekey downgrades the
+        // agreement to 3-DH, and that fact has to survive past this line or it never existed.
+        if peer.connect(to_ik, now)? == ForwardSecrecy::NoOneTimePrekey {
+            store.mark_reduced_fs(*to_ik).map_err(|e| format!("reduced-FS record: {e}"))?;
+        }
     }
     // Crash-consistency: encrypt (advance the chain) and QUEUE the exact ciphertext, then
     // persist BEFORE it can reach the wire. The ratchet advance and the queued ciphertext
@@ -1132,8 +1137,8 @@ pub fn send_session_batch(
 
     let _lock = store.lock_sessions().map_err(|e| format!("замок сессий: {e}"))?;
     peer.import_state(store.load_sessions().map_err(|e| format!("чтение сессий: {e}"))?);
-    if !peer.has_session(to_ik) {
-        peer.connect(to_ik, now)?;
+    if !peer.has_session(to_ik) && peer.connect(to_ik, now)? == ForwardSecrecy::NoOneTimePrekey {
+        store.mark_reduced_fs(*to_ik).map_err(|e| format!("reduced-FS record: {e}"))?;
     }
     // Encrypt + enqueue EVERY payload (each advances the ratchet), then commit the advanced state
     // ONCE — same crash-consistency as `send_session` (envelope N queued ⟺ ratchet ≥ N+1), but for

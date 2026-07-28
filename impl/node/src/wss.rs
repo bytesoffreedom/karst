@@ -21,6 +21,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConnection, RootCertStore, ServerConnection, StreamOwned};
@@ -62,6 +63,67 @@ fn ws_config() -> tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(WS_MAX_FRAME),
         max_frame_size: Some(WS_MAX_FRAME),
         ..Default::default()
+    }
+}
+
+/// A10-2: wall-clock ceiling on completing the TLS handshake + WebSocket upgrade,
+/// counted from entry into `accept_wss` — the earliest point reachable from THIS
+/// file (the raw TCP accept and its per-read timeout are set in socket.rs, out of
+/// scope here; entry to `accept_wss` trails it by a handful of instructions). That
+/// per-read timeout (`CONN_READ_TIMEOUT`, 30s in socket.rs) bounds a single blocking
+/// read, not the total time to get through this carrier: a peer that sends one byte
+/// every ~29s, forever, never trips it, yet also never finishes the TLS+WS upgrade —
+/// holding the caller's `ConnLimiter` slot (`MAX_CONNECTIONS`) indefinitely for the
+/// cost of a trickle of bytes, having proven nothing. A real TLS handshake + HTTP
+/// upgrade is a handful of round trips of at most a few KB; 20s is enormous headroom
+/// even on a slow link, while staying a small fraction of socket.rs's
+/// `CONN_TOTAL_DEADLINE` (120s) for the request-serving phase that follows. Worst-case
+/// overshoot is `WSS_HANDSHAKE_DEADLINE + CONN_READ_TIMEOUT`: a read already blocked
+/// in the kernel when the deadline passes isn't interrupted, only the next attempt is.
+const WSS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Owns a stream and fails read/write with a "deadline exceeded" error once
+/// `deadline` has passed and `armed` is still true — checked BEFORE attempting the
+/// underlying I/O, so a peer trickling bytes just under socket.rs's per-read timeout
+/// still can't stall past the total deadline. `disarm` is called once the TLS+WS
+/// handshake this guards has actually completed, so the SAME deadline never applies
+/// to the ordinary traffic that follows (that budget is socket.rs's
+/// `CONN_TOTAL_DEADLINE` / `MAX_REQUESTS_PER_CONN`, separate and much longer-lived).
+struct DeadlineIo<S> {
+    inner: S,
+    deadline: Instant,
+    armed: bool,
+}
+
+impl<S> DeadlineIo<S> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self.armed && Instant::now() > self.deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "wss handshake deadline exceeded"));
+        }
+        Ok(())
+    }
+}
+
+impl<S: Read> Read for DeadlineIo<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for DeadlineIo<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check()?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.check()?;
+        self.inner.flush()
     }
 }
 
@@ -238,15 +300,33 @@ impl TransportAdapter for WssAdapter {
 
 /// Relay side: terminate TLS + WebSocket on an accepted TCP connection and return
 /// the inner byte stream, ready for `Session::accept`. The caller owns the TLS
-/// `ServerConfig` (its cert/key); this mirrors `WssAdapter::connect`.
+/// `ServerConfig` (its cert/key); this mirrors `WssAdapter::connect`. Bounded by
+/// `WSS_HANDSHAKE_DEADLINE` (A10-2) — see `accept_wss_with_deadline`, which does the
+/// real work.
 pub fn accept_wss<S: Read + Write + Send + 'static>(
     stream: S,
     config: Arc<rustls::ServerConfig>,
 ) -> io::Result<Box<dyn Channel>> {
+    accept_wss_with_deadline(stream, config, Instant::now() + WSS_HANDSHAKE_DEADLINE)
+}
+
+/// Like `accept_wss`, but with an explicit deadline instead of the production
+/// `WSS_HANDSHAKE_DEADLINE`. Production always goes through `accept_wss`; this exists
+/// so a test can inject an already-past deadline (or a short one) and prove the
+/// wiring without waiting out the real 20s budget.
+fn accept_wss_with_deadline<S: Read + Write + Send + 'static>(
+    stream: S,
+    config: Arc<rustls::ServerConfig>,
+    deadline: Instant,
+) -> io::Result<Box<dyn Channel>> {
+    let guarded = DeadlineIo { inner: stream, deadline, armed: true };
     let conn = ServerConnection::new(config).map_err(io::Error::other)?;
-    let tls = StreamOwned::new(conn, stream);
-    let ws = tungstenite::accept_with_config(tls, Some(ws_config()))
+    let tls = StreamOwned::new(conn, guarded);
+    let mut ws = tungstenite::accept_with_config(tls, Some(ws_config()))
         .map_err(|e| io::Error::other(format!("ws accept: {e}")))?;
+    // The handshake this deadline guards is done — disarm it so it never trips on
+    // the ordinary, potentially long-lived traffic that follows.
+    ws.get_mut().sock.disarm();
     Ok(Box::new(WsByteStream::new(ws)))
 }
 
@@ -284,4 +364,74 @@ pub fn server_config_from_pem_files(
     let key = rustls_pemfile::private_key(&mut &key_pem[..])?
         .ok_or_else(|| io::Error::other("no private key in key PEM"))?;
     server_config(certs, key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    /// A self-signed test cert for "localhost", as both a server config (presents
+    /// it) and a client config (trusts exactly it) — same shape as the wss carrier's
+    /// own integration tests, kept local here to avoid a cross-file test dependency.
+    fn test_tls() -> (Arc<rustls::ClientConfig>, Arc<rustls::ServerConfig>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der.clone()).unwrap();
+        let client = client_config_with_roots(roots);
+        let server = server_config(vec![cert_der], key_der).unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn a_connection_that_never_finishes_the_tls_handshake_is_dropped_on_a_deadline() {
+        let (_client_tls, server_tls) = test_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The slowloris shape: a peer that connects and then sends NOTHING — no
+        // ClientHello, nothing. A real TLS handshake read would just block on this.
+        let _silent_peer = TcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+        // Mirrors socket.rs's per-read timeout, so a NEUTERED fix fails this test via
+        // a bounded ordinary read timeout instead of hanging forever — that failure
+        // must NOT carry the "deadline exceeded" message the fixed code produces.
+        server_stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        // Deadline already in the past: `accept_wss_with_deadline` must fail on its
+        // very first read of the (nonexistent) ClientHello, without ever really
+        // blocking on the silent socket.
+        let already_past = Instant::now() - Duration::from_secs(1);
+        let err = accept_wss_with_deadline(server_stream, server_tls, already_past)
+            .err()
+            .expect("an already-past deadline must reject the handshake");
+        assert!(
+            err.to_string().contains("deadline exceeded"),
+            "must fail because of the handshake deadline specifically, not some other \
+             I/O error (e.g. an ordinary read timeout or a TLS protocol error): {err}"
+        );
+    }
+
+    #[test]
+    fn a_well_behaved_wss_handshake_still_completes_under_a_generous_deadline() {
+        // Control for the deadline test above: the mechanism must not cost a real,
+        // prompt handshake anything. Neuter it (e.g. always use the production
+        // `WSS_HANDSHAKE_DEADLINE` instead of the injected one, or drop the check
+        // entirely) and this still passes — it's the OTHER test that catches a
+        // broken/backwards check.
+        let (client_tls, server_tls) = test_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accept_wss_with_deadline(stream, server_tls, Instant::now() + Duration::from_secs(30))
+                .expect("a real, prompt TLS+WS handshake must not be rejected by a generous deadline")
+        });
+        let adapter = WssAdapter::with_config("localhost", client_tls);
+        let _channel = adapter
+            .connect(&crate::transport::Dest::from(addr))
+            .expect("client side of a real handshake");
+        server.join().unwrap();
+    }
 }

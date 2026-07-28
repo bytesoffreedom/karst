@@ -670,7 +670,10 @@ impl Container {
             f.write_all(&self.buf)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, &self.path)
+        // fsync the DIRECTORY too: without it a power loss can resurrect the old container even
+        // though the write reported success — which for `wipe()` means a "destroyed" container
+        // comes back (CRYPTO-12).
+        crate::store::rename_durable(&tmp, &self.path)
     }
 
     /// Persist ONLY `buf[off..off+len]` in place (seek + write), for the hot region-write path

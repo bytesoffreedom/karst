@@ -2336,7 +2336,7 @@ impl Store {
             f.write_all(bytes)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        rename_durable(&tmp, path)
     }
 
     // ----- §2.1 персистентные сессии (ratchet-состояние между процессами) -----
@@ -2402,7 +2402,7 @@ impl Store {
             f.write_all(&bytes)?;
             f.sync_all()?; // durability до rename
         }
-        std::fs::rename(&tmp, self.sessions_path())
+        rename_durable(&tmp, &self.sessions_path())
     }
 
     // ----- Зашифрованный append-лог истории чатов -----
@@ -3105,6 +3105,26 @@ fn fill_random(buf: &mut [u8]) {
     }
 }
 
+/// Rename `tmp` over `dest` and make the RENAME itself durable by fsyncing the directory.
+///
+/// `sync_all` on the file only promises its CONTENTS survive a power loss — POSIX does not
+/// promise the directory entry does. Without this a crash can leave the OLD file in place after a
+/// write that reported success, which is not a cosmetic loss:
+/// - for `sessions.dat` the ratchet silently rolls BACK, so the next send re-derives a message key
+///   already used, under the fixed all-zero nonce → keystream reuse (CRYPTO-01);
+/// - for the container a completed wipe can reappear (CRYPTO-12).
+///
+/// A failed directory sync is reported, not swallowed: the caller asked for a durable write.
+pub(crate) fn rename_durable(tmp: &std::path::Path, dest: &std::path::Path) -> io::Result<()> {
+    std::fs::rename(tmp, dest)?;
+    #[cfg(unix)]
+    {
+        let dir = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn write_fixed_0600(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -3112,7 +3132,7 @@ fn write_fixed_0600(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    rename_durable(&tmp, path)
 }
 
 /// Ensure `hidden.dat` exists at the fixed size, RANDOM if absent — so EVERY vault carries the region
@@ -3277,7 +3297,7 @@ fn slots_save(base: &std::path::Path, slots: &[[u8; SLOT_LEN]]) -> io::Result<()
         f.write_all(&buf)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, slots_path(base))
+    rename_durable(&tmp, &slots_path(base))
 }
 
 /// Trial-open every slot with `key`; return the first that authenticates as a valid payload.
@@ -3347,7 +3367,7 @@ fn slotdir_save(base: &std::path::Path, real_key: &MasterKey, dir: &[SlotEntry])
         f.write_all(&blob)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, slotdir_path(base))
+    rename_durable(&tmp, &slotdir_path(base))
 }
 
 /// Write (or overwrite) `target_key`'s slot with `(role, id)` and record it in the directory,
@@ -3416,7 +3436,7 @@ fn deadman_save(base: &std::path::Path, dm: &Deadman) -> io::Result<()> {
         f.write_all(&bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, deadman_path(base))
+    rename_durable(&tmp, &deadman_path(base))
 }
 
 /// Crypto-erase the whole vault: shred the salt FIRST (that alone makes every sealed file — real
@@ -4597,6 +4617,32 @@ mod tests {
         assert!(!dir.join("salt").exists(), "salt shredded");
         assert!(!dir.join("c").exists());
         assert!(Vault::open(&dir, b"realpw").is_err(), "real opens nothing post-wipe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CRYPTO-01/12 — an atomic save must make the RENAME durable, not just the file contents.
+    ///
+    /// `sync_all` on the temp file promises its bytes survive a power loss; POSIX does not
+    /// promise the directory entry does. A crash in that gap leaves the OLD file in place after a
+    /// write that reported success — for `sessions.dat` that is a silent ratchet ROLLBACK, and a
+    /// rolled-back ratchet re-derives a message key already used, under the fixed all-zero nonce.
+    ///
+    /// A unit test cannot cut the power, so this pins the reachable part: the helper completes,
+    /// the destination holds the new bytes, and no temp file is left behind. The durability
+    /// itself is asserted by construction (the directory fsync) and documented on the helper.
+    #[test]
+    fn a_durable_rename_publishes_the_new_bytes_and_leaves_no_temp() {
+        let dir = mp_dir("durable-rename");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("state.dat");
+        std::fs::write(&dest, b"old").unwrap();
+        let tmp = dir.join("state.dat.tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+
+        rename_durable(&tmp, &dest).expect("durable rename must succeed on a normal filesystem");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new", "the new bytes are published");
+        assert!(!tmp.exists(), "the temp file must be gone, not left as debris");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

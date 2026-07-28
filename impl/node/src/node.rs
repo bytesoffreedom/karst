@@ -371,6 +371,128 @@ pub struct RelayPolicy {
     pub mailbox_durability: MailboxDurability,
 }
 
+/// Required shape of `BlobPutRequest::request_nonce` — NOT freeform client-chosen bytes, unlike
+/// the live-message path's `request_nonce`. Two problems this closes at once (CRYPTO-15/#169):
+///
+/// 1. **Cross-class replay.** `Capability::prove`'s MAC is `HMAC(secret, request_nonce ||
+///    epoch_id)` — the capability's `scope` is checked separately (equality against
+///    `requested_scope`) but is NOT folded into the MAC for a stored/dev capability, so a proof
+///    minted for an ordinary message send (`Scope::MessageDelivery`, some arbitrary `"req-N"`
+///    nonce) verifies just as well if replayed onto the blob path with the SAME nonce and the
+///    same requested scope. Deriving the nonce from `(blob_id, index)` means a message-path
+///    proof's nonce essentially never has this shape, so it is rejected before the capability
+///    HMAC even runs — presenting a capability for blob storage requires a proof MINTED for
+///    that specific chunk, not a sniffed/reused one from elsewhere.
+/// 2. **Retry = same charge.** A genuine resend of the same chunk (session died mid-upload,
+///    §15) recomputes the SAME nonce and therefore the same proof, rather than minting a fresh
+///    one — so it lands as the identical (harmless, blobstore-deduped) request rather than a new
+///    quota charge with a random nonce every attempt.
+///
+/// Public and deterministic, not secret: the client must be ABLE to compute it, the relay only
+/// needs to REJECT a mismatch.
+pub fn blob_put_nonce(blob_id: &[u8; 32], index: u32) -> Vec<u8> {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(b"KARST-blob-put-nonce-v1");
+    h.update(blob_id);
+    h.update(index.to_be_bytes());
+    h.finalize().to_vec()
+}
+
+/// §7.2 admission quota for blob-upload chunks (CRYPTO-15/#169). A SEPARATE window from
+/// `POW_CAP_QUOTA` (the live-message quota): that budget is priced for a chat message — 4 MiB /
+/// 600 s buys roughly 68 requests at the blob chunk size (`blobstore::MAX_BLOB_CHUNK`, ~60 KiB
+/// ciphertext) — so a 2 GiB upload (~35_000 chunks, see `blobstore::MAX_BLOB_CHUNKS`) would need
+/// on the order of 500 windows, ~85 HOURS, to clear the message quota. Charging blob bytes
+/// against the message budget would not bound abuse, it would just make every honest large
+/// upload time out — the wrong fix for a bypass. This budget is sized to the blob store's OWN
+/// scale instead, with headroom so a full `MAX_BLOB_SIZE` transfer plus retries never trips it
+/// mid-transfer: `max_bytes`/`max_requests` are DOUBLE `blobstore::MAX_BLOB_SIZE` /
+/// `blobstore::MAX_BLOB_CHUNKS` (see `blob_cap_quota_has_headroom_over_the_blob_store_caps`,
+/// which pins this against a later change to either side). Net effect: "refill your whole
+/// storage allotment, twice over, per hour" per capability — sustaining more needs another
+/// capability (another PoW solve), the same economics `POW_CAP_QUOTA` documents.
+///
+/// **Unlinkability trade, stated plainly:** every chunk of one upload carries the SAME
+/// `capability_id` (that is what lets it be metered as one budget), so up to ~35_000 chunks of a
+/// large file are linkable to each other by whoever holds the relay — and if the same capability
+/// is also used for messaging, blob traffic links to message traffic under that capability. The
+/// blob path's `client_addr` was deliberately made a fresh per-session pseudonym for exactly the
+/// opposite reason (`Relay::pseudonym`, client/src/lib.rs) — charging a capability is in tension
+/// with that, not a free win. Accepted here because the alternative (no capability at all) is the
+/// bug this closes; a client that wants blob traffic unlinked from its messaging must hold a
+/// SEPARATE capability for uploads (mint one PoW solve per upload session) rather than reusing
+/// its messaging capability — a client-side policy choice, not something this relay enforces.
+pub const BLOB_CAP_QUOTA: Quota = Quota {
+    max_requests: 2 * crate::blobstore::MAX_BLOB_CHUNKS,
+    max_bytes: 2 * crate::blobstore::MAX_BLOB_SIZE,
+    window_secs: 3600,
+};
+
+/// Node-local per-capability meter for blob-upload bytes/requests (§7.2, CRYPTO-15/#169) —
+/// deliberately NOT `admission::capability::CapabilityQuotaTracker`. That tracker keeps a
+/// sliding-window deque of every admitted proof TAG, sized to the caller's `max_requests`: fine
+/// at message scale (`POW_CAP_QUOTA::max_requests` = 100 entries) but `BLOB_CAP_QUOTA` needs
+/// `max_requests` in the tens of thousands, and at that size its per-`consume()` replay-scan +
+/// byte-sum (both O(n) over the deque) become O(n²) across one upload — tens of thousands of
+/// chunks times a deque that has grown to tens of thousands of entries is >10^9 deque visits,
+/// and it is CHEAP to drive on purpose: resending the same already-stored index with a fresh
+/// nonce each time costs the attacker ~0 stored bytes (blobstore nets the delta) while still
+/// growing the deque. Charging blob bytes would otherwise hand back exactly the kind of
+/// amplifier this fix exists to remove.
+///
+/// A tumbling window (reset wholesale at the window boundary, not pruned entry-by-entry) is
+/// O(1) per request. The cost: it cannot single out a REPEATED exact proof for a `Replay`
+/// verdict the way the message tracker does — a captured `(nonce, mac)` pair replayed by an
+/// on-path attacker is counted as a fresh request against the SAME quota. `blob_put_nonce` keeps
+/// this from being a bypass (the replayed request can only ever name the one already-stored
+/// chunk it was minted for, so blobstore's own idempotent dedup keeps stored bytes at zero
+/// delta) — what remains is a quota-burn nuisance against whoever's capability leaked onto the
+/// wire, not a way to store bytes for free.
+#[derive(Default)]
+struct BlobQuotaTracker {
+    /// `capability_id → (window_start, bytes_used, requests_used)`.
+    windows: HashMap<[u8; 16], (u64, u64, u32)>,
+}
+
+impl BlobQuotaTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` = admitted and counted; `false` = this request would exceed `quota` for the
+    /// window `cap_id` is currently in (the window resets, rather than sliding, once
+    /// `quota.window_secs` has elapsed since it started — simpler accounting than the message
+    /// tracker's sliding window, acceptable here because `BLOB_CAP_QUOTA`'s headroom already
+    /// means a window boundary mid-transfer costs at most one extra wait, never a failure).
+    fn consume(&mut self, cap_id: [u8; 16], quota: &Quota, bytes: u64, now: u64) -> bool {
+        let entry = self.windows.entry(cap_id).or_insert((now, 0, 0));
+        if now.saturating_sub(entry.0) >= quota.window_secs as u64 {
+            *entry = (now, 0, 0);
+        }
+        if entry.2 + 1 > quota.max_requests || entry.1 + bytes > quota.max_bytes {
+            return false;
+        }
+        entry.1 += bytes;
+        entry.2 += 1;
+        true
+    }
+
+    /// Drop windows idle past `window_secs` — same hygiene as
+    /// `CapabilityQuotaTracker::reap`, and for the same reason: a Public relay mints one
+    /// `cap_id` per PoW solve, so without reaping this map grows by one permanent entry per
+    /// solve.
+    fn reap(&mut self, now: u64, window_secs: u64) {
+        self.windows.retain(|_, (start, _, _)| now.saturating_sub(*start) < window_secs);
+    }
+
+    /// Live window count — exposed (via `RelayNode::blob_cap_quota_windows_for_test`) so a test
+    /// can prove `reap` actually runs, same as `CapabilityQuotaTracker::len`.
+    fn windows_len(&self) -> usize {
+        self.windows.len()
+    }
+}
+
 /// Relay-узел: гоняет admission-конвейер (§7) на входящих capsule и, при
 /// Admit, кладёт ЗАПЕЧАТАННЫЙ (нечитаемый для узла) груз в mailbox получателя.
 /// Узел никогда не видит открытый текст — ключа у него нет.
@@ -381,6 +503,10 @@ pub struct RelayNode {
     issuer_ring: IssuerRing,
     replay: ReplayFilter,
     cap_quota: CapabilityQuotaTracker,
+    /// Blob-upload admission (CRYPTO-15/#169) — a SEPARATE budget from `cap_quota`, see
+    /// `BLOB_CAP_QUOTA`'s doc comment for why message-scale and blob-scale quotas cannot share
+    /// one tracker.
+    blob_cap_quota: BlobQuotaTracker,
     epoch: u32,
     /// Per-recipient queue of `(enqueued_at, sealed payload)`. The timestamp drives
     /// the TTL sweep (`sweep_mailboxes`) so undelivered mail for a recipient who never
@@ -453,6 +579,7 @@ impl RelayNode {
             issuer_ring: IssuerRing { issuer_pubkeys: vec![[1u8; 32]], threshold_t: 1 },
             replay: ReplayFilter::new(epoch, 4096),
             cap_quota: CapabilityQuotaTracker::new(),
+            blob_cap_quota: BlobQuotaTracker::new(),
             epoch,
             mailboxes: HashMap::new(),
             bundles: HashMap::new(),
@@ -499,8 +626,19 @@ impl RelayNode {
         }
     }
 
-    /// §15 upload: store one ciphertext chunk. Cookie-gated (DoS/freshness). The blob
-    /// store enforces ownership, in-order, immutability, and the byte caps.
+    /// §15 upload: store one ciphertext chunk. Cookie-gated (DoS/freshness) AND
+    /// capability-gated (CRYPTO-15/#169): a cookie is a stateless HMAC round-trip the requester
+    /// can mint for any address it names — a freshness proof, not a cost — so before this fix
+    /// the path that stores the LARGEST bytes on the relay was the one write that never charged
+    /// anyone's admission quota. The blob store's per-sender/global byte caps (`blobstore.rs`)
+    /// are a SEPARATE, complementary mechanism keyed to the self-declared, freely-mintable
+    /// `client_addr` — they still don't attribute cost to anything expensive to obtain. The
+    /// capability check below does: `request_nonce` must have the shape `blob_put_nonce`
+    /// requires (binds the proof to this exact chunk, see its doc comment) and
+    /// `capability_proof` must verify, and only then is the chunk's byte size metered against
+    /// `BLOB_CAP_QUOTA` — a budget sized for blob-store scale, not message scale (see that
+    /// constant's doc comment for the arithmetic on why message-scale quota would just make
+    /// every honest large upload time out instead of bounding abuse).
     pub fn handle_blob_put(&mut self, req: &BlobPutRequest, now: u64) -> BlobResponse {
         self.advance_epoch(now);
         match req.cookie {
@@ -509,6 +647,19 @@ impl RelayNode {
                 let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
                 return BlobResponse::NeedCookie(cookie);
             }
+        }
+        // Cheap, no-crypto check BEFORE the capability HMAC (stage-ordering discipline, same as
+        // the live-message pipeline): rejects a proof minted elsewhere (wrong nonce shape) at
+        // zero crypto cost, rather than paying an HMAC verify only to reject it anyway.
+        if req.request_nonce != blob_put_nonce(&req.blob_id, req.index) {
+            return BlobResponse::Rejected("bad request nonce".into());
+        }
+        let cap = match self.capabilities.verify(&req.capability_proof, &req.request_nonce, Scope::MessageDelivery, now as u32) {
+            Ok(c) => c,
+            Err(e) => return BlobResponse::Rejected(format!("capability: {e:?}")),
+        };
+        if !self.blob_cap_quota.consume(cap.capability_id, &BLOB_CAP_QUOTA, req.data.len() as u64, now) {
+            return BlobResponse::Rejected("blob quota exceeded".into());
         }
         let sender: [u8; 32] = match req.client_addr.as_slice().try_into() {
             Ok(s) => s,
@@ -525,6 +676,10 @@ impl RelayNode {
     }
 
     /// §15 download: return one ciphertext chunk (bearer-by-id). Cookie-gated for DoS.
+    /// Deliberately NOT capability-gated here (CRYPTO-15/#169 is scoped to the STORAGE cost of
+    /// `handle_blob_put`, the path that stores the largest bytes): serving a chunk back is an
+    /// EGRESS-bandwidth cost, a different resource with its own attribution question, left open
+    /// as a separate, named gap rather than folded into this fix.
     pub fn handle_blob_get(&mut self, req: &BlobGetRequest, now: u64) -> BlobResponse {
         self.advance_epoch(now);
         match req.cookie {
@@ -568,6 +723,12 @@ impl RelayNode {
     /// reap call in `advance_epoch`.
     pub fn cap_quota_windows_for_test(&self) -> usize {
         self.cap_quota.len()
+    }
+
+    /// Number of live blob-quota windows (`BlobQuotaTracker`) — the same reap-proving purpose
+    /// as `cap_quota_windows_for_test`, for the separate blob-upload tracker.
+    pub fn blob_cap_quota_windows_for_test(&self) -> usize {
+        self.blob_cap_quota.windows_len()
     }
 
     /// How many messages are queued for `recipient` — so a test can prove a re-deposit did not
@@ -866,6 +1027,10 @@ impl RelayNode {
             // other place per-cap state lived). Safe for all cap types: an active window is
             // kept, an idle one is dropped and simply re-created on the next send.
             self.cap_quota.reap(now, EPOCH_DURATION_SECS);
+            // Same reap, same reason, separate map (see `BlobQuotaTracker`'s doc comment) — a
+            // fallback window of `BLOB_CAP_QUOTA.window_secs`, used only for a cap_id never
+            // metered (mirrors `cap_quota`'s use of `EPOCH_DURATION_SECS` as ITS fallback).
+            self.blob_cap_quota.reap(now, BLOB_CAP_QUOTA.window_secs as u64);
             self.sweep_key_distribution(now);
             if let Some(blobs) = &mut self.blobs {
                 blobs.sweep(now);
@@ -1501,14 +1666,22 @@ impl RelayDescriptor {
 }
 
 /// §15 large-file upload: one ciphertext chunk of an E2E-encrypted blob. Cookie-gated
-/// (DoS/freshness, like fetch). `client_addr` is the self-declared sender used for blob
-/// ownership + best-effort per-sender caps — NOT strongly authenticated in the skeleton
-/// (see the blob-store DoS note); the per-blob / global caps + TTL are the hard bounds.
+/// (DoS/freshness, like fetch) AND capability-gated (CRYPTO-15/#169) — `capability_proof` must
+/// verify (§7.2) and `request_nonce` must equal `blob_put_nonce(blob_id, index)`, so this chunk
+/// is charged against `BLOB_CAP_QUOTA` under `capability_proof.capability_id`, the same way
+/// every other write the relay stores costs a capability's quota; see `RelayNode::
+/// handle_blob_put`. `client_addr` is still the self-declared sender used for blob ownership +
+/// the blobstore's own best-effort per-sender byte caps — NOT strongly authenticated (a fresh
+/// address is free to mint), which is exactly why those caps alone were never the fix; the
+/// capability above is.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlobPutRequest {
     pub client_addr: Vec<u8>,
     pub carrier_id: Vec<u8>,
     pub cookie: Option<Cookie>,
+    /// Must equal `blob_put_nonce(&blob_id, index)` — see that function's doc comment.
+    pub request_nonce: Vec<u8>,
+    pub capability_proof: CapabilityProof,
     pub blob_id: [u8; 32],
     pub index: u32,
     pub count: u32,
@@ -1528,7 +1701,7 @@ pub struct BlobGetRequest {
 }
 
 /// Response to a blob upload/download.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BlobResponse {
     NeedCookie(Cookie),
     /// Upload: chunk stored (more expected).
@@ -1807,6 +1980,82 @@ mod tests {
     use crate::pqxdh::Account;
 
     const NOW: u64 = 1_000_000;
+
+    /// `BlobQuotaTracker::consume` (CRYPTO-15/#169) unit-tested directly with a tiny custom
+    /// `Quota` — the real `BLOB_CAP_QUOTA` is sized in the tens-of-thousands/GiB range
+    /// specifically so an honest large upload never trips it (see that constant's doc comment),
+    /// which makes it impractical to drive to its own limit in a fast test. This exercises the
+    /// SAME code the relay calls, just parameterized small enough to hit both boundaries (byte
+    /// cap and request cap) directly.
+    #[test]
+    fn blob_quota_tracker_admits_within_budget_and_refuses_past_it() {
+        let mut t = BlobQuotaTracker::new();
+
+        // --- Byte cap binds independently of the request-count cap ---
+        let by_bytes = [1u8; 16];
+        let byte_quota = Quota { max_requests: 1000, max_bytes: 250, window_secs: 600 };
+        assert!(t.consume(by_bytes, &byte_quota, 100, NOW), "1st request: 100/250 bytes used");
+        assert!(t.consume(by_bytes, &byte_quota, 100, NOW), "2nd request: 200/250 bytes used");
+        assert!(
+            !t.consume(by_bytes, &byte_quota, 100, NOW),
+            "3rd request would total 300 > max_bytes=250: must be refused on bytes alone"
+        );
+        // A rejected consume must not have mutated the running total — a smaller request that
+        // still fits under the ORIGINAL 200-byte usage is still admitted afterwards.
+        assert!(
+            t.consume(by_bytes, &byte_quota, 40, NOW),
+            "a rejected consume must not itself have spent budget (200 + 40 = 240 <= 250)"
+        );
+
+        // --- Request-count cap binds independently of the byte cap ---
+        let by_count = [2u8; 16];
+        let count_quota = Quota { max_requests: 3, max_bytes: 1 << 20, window_secs: 600 };
+        assert!(t.consume(by_count, &count_quota, 1, NOW), "request 1/3");
+        assert!(t.consume(by_count, &count_quota, 1, NOW), "request 2/3");
+        assert!(t.consume(by_count, &count_quota, 1, NOW), "request 3/3");
+        assert!(
+            !t.consume(by_count, &count_quota, 1, NOW),
+            "4th request must be refused: over max_requests=3, even though bytes are trivial"
+        );
+
+        // --- Per-capability isolation: a DIFFERENT capability_id has its own untouched budget —
+        // a shared bucket would let one abusive capability starve every other uploader.
+        let other = [3u8; 16];
+        assert!(
+            t.consume(other, &count_quota, 1, NOW),
+            "a different capability_id must have a fresh budget, not share `by_count`'s"
+        );
+
+        // --- Tumbling window: past `window_secs`, the SAME capability_id gets a fresh budget.
+        assert!(
+            t.consume(by_count, &count_quota, 1, NOW + count_quota.window_secs as u64),
+            "a new window resets the budget for the same capability_id"
+        );
+    }
+
+    /// `reap` (idle-window hygiene, mirrors `CapabilityQuotaTracker::reap`'s reason for
+    /// existing): a Public relay mints one fresh `cap_id` per PoW solve, so without reaping this
+    /// map grows by one permanent entry per solve. Neuter `reap` to a no-op and this reddens.
+    #[test]
+    fn blob_quota_tracker_reap_drops_only_idle_windows() {
+        let mut t = BlobQuotaTracker::new();
+        let quota = Quota { max_requests: 10, max_bytes: 1000, window_secs: 100 };
+        let active = [1u8; 16];
+        let idle = [2u8; 16];
+        assert!(t.consume(active, &quota, 1, NOW));
+        assert!(t.consume(idle, &quota, 1, NOW));
+
+        t.reap(NOW + 50, 100);
+        assert_eq!(t.windows_len(), 2, "neither window is idle past 100s yet");
+
+        // `active` is touched again once its window has actually rolled over (>= window_secs
+        // since it started), which starts a FRESH window right at this instant; `idle` is never
+        // touched again, so its window never rolls over and stays exactly as stale as it was.
+        assert!(t.consume(active, &quota, 1, NOW + 150));
+
+        t.reap(NOW + 150, 100);
+        assert_eq!(t.windows_len(), 1, "idle's un-rolled-over window is reaped, active's fresh one is not");
+    }
 
     #[test]
     fn sweep_mailboxes_drops_only_entries_past_ttl() {

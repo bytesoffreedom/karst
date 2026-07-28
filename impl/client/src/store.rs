@@ -263,6 +263,17 @@ const DEDUP_RING_CAP: usize = 2048;
 
 /// Cap on the number of cached peer profiles (anti-flood from unknown IKs).
 const MAX_PEER_PROFILES: usize = 10_000;
+/// SEC-44: cap on distinct peer IKs auto-registered from RECEIVED traffic — `contacts.dat`
+/// (via `add_unconfirmed_contact`), `unconfirmed.dat`, and `contact_proxy.dat` (via
+/// `set_contact_proxy`). All three are whole-file postcard blobs rewritten IN FULL on every
+/// change (same shape as `contacts.dat`/`blocked.dat` elsewhere in this file: small lists meant
+/// for a single GUI writer, not an append log), so admitting one more entry costs O(current
+/// size) — a stream of N fresh sender IKs (free to mint; no identity cost) would otherwise cost
+/// O(N^2) total disk I/O with an unbounded ceiling on N. This does NOT cap an EXPLICIT
+/// `add_contact` from the user — only the automatic, attacker-reachable registration path.
+/// Matches `MAX_PEER_PROFILES`: the same class of "anti-flood from unknown IKs" cap already
+/// accepted for `peer_profiles.dat`.
+const MAX_CONTACTS: usize = 10_000;
 /// Cap on connection proxies in one root's registry. Generous for real use (one per contact/group
 /// over a long time) while bounding `proxies.dat` and the poll fan-out that iterates them.
 const MAX_PROXIES: usize = 10_000;
@@ -1581,8 +1592,16 @@ impl Store {
     /// Flag / unflag `ik` as unconfirmed (chat-only). `true` = a conversation that is not a contact;
     /// `false` = confirmed contact (or never was chat-only). Idempotent; empty set removes the file.
     /// Atomic (temp→fsync→rename), single GUI writer, like `blocked`/`contacts`.
+    ///
+    /// Bounded by `MAX_CONTACTS` (SEC-44) as defense in depth: the only caller that FLAGS a new ik
+    /// (`add_unconfirmed_contact`) already gates on the same cap before ever reaching here, but a
+    /// future caller must not be able to reopen the flood by forgetting to check first.
     pub fn set_unconfirmed(&self, ik: [u8; 32], unconfirmed: bool) -> io::Result<()> {
         let mut set = self.load_unconfirmed()?;
+        if unconfirmed && !set.contains(&ik) && set.len() >= MAX_CONTACTS {
+            eprintln!("warning: unconfirmed-peers set at cap ({MAX_CONTACTS}) — not flagging a new sender IK");
+            return Ok(());
+        }
         let changed = if unconfirmed { set.insert(ik) } else { set.remove(&ik) };
         if !changed {
             return Ok(());
@@ -1609,6 +1628,37 @@ impl Store {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, self.unconfirmed_path())
+    }
+
+    /// Auto-register `ik` as a CHAT-ONLY (unconfirmed) conversation on first contact, so an
+    /// unknown sender's message is never decrypted-and-invisible (the receive path surfaces it
+    /// this way instead of silently dropping it from the UI — see the desktop poll loop).
+    /// Idempotent: an already-known `ik` is returned as-is, confirmed/unconfirmed status
+    /// untouched either way.
+    ///
+    /// Bounded by `MAX_CONTACTS` (SEC-44): past the cap a stream of fresh sender IKs (free to
+    /// mint) stops growing `contacts.dat`/`unconfirmed.dat` — logged, not silently swallowed, but
+    /// with no user-facing error (there is no channel to report "ignored" through on a receive
+    /// path with no ack protocol). This is ONLY the automatic registration path; an EXPLICIT
+    /// `add_contact` from the user is a different call and is never capped by this.
+    ///
+    /// Returns whether a new entry was added (false: already known, or refused at the cap).
+    pub fn add_unconfirmed_contact(&self, ik: [u8; 32]) -> io::Result<bool> {
+        let mut cs = self.load_contacts()?;
+        if cs.iter().any(|c| c.ik == ik) {
+            return Ok(false); // already known — leave confirmed/unconfirmed status untouched
+        }
+        if cs.len() >= MAX_CONTACTS {
+            eprintln!("warning: contacts at cap ({MAX_CONTACTS}) — ignoring a new sender IK");
+            return Ok(false);
+        }
+        // No frozen name: an EMPTY label resolves to the peer's self-declared profile name ONLY
+        // once confirmed, else a short IK, and stays renameable — you never get stuck with a hex
+        // stub.
+        cs.push(ContactRecord { name: String::new(), ik, verified: false });
+        self.save_contacts(&cs)?;
+        self.set_unconfirmed(ik, true)?; // chat-only until explicitly added to contacts
+        Ok(true)
     }
 
     /// Whether `ik` is a CONFIRMED contact: present in `contacts.dat` and NOT flagged unconfirmed.
@@ -2499,10 +2549,22 @@ impl Store {
         Ok(true)
     }
 
-    /// Tag which proxy reaches a contact (the channel they know you through).
+    /// Tag which proxy reaches a contact (the channel they know you through). Called on EVERY
+    /// inbound message (before the `Content` is even decoded — a proxy tag is about which channel
+    /// carried the bytes, not what they mean), so SEC-44 applies here even harder than to
+    /// `contacts.dat`: a flood of fresh sender IKs costs one full read+rewrite of this map PER
+    /// distinct new IK, with no cardinality bound.
+    ///
+    /// Bounded by `MAX_CONTACTS`: past the cap a brand-new sender simply isn't tagged to a proxy —
+    /// replies to them fall back to the default proxy (a routing nicety), never lost message
+    /// content, since the message itself was already accepted independent of this tag.
     pub fn set_contact_proxy(&self, ik: [u8; 32], index: u32) -> io::Result<()> {
         let mut map = self.load_contact_proxy();
         if map.get(&ik) == Some(&index) {
+            return Ok(());
+        }
+        if !map.contains_key(&ik) && map.len() >= MAX_CONTACTS {
+            eprintln!("warning: contact→proxy map at cap ({MAX_CONTACTS}) — not tagging a new sender IK");
             return Ok(());
         }
         map.insert(ik, index);
@@ -4764,6 +4826,93 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(!list[0].active && list[1].active, "p0 burned, p1 active");
         assert_eq!(s2.contact_proxy(&[9u8; 32]), Some(1), "contact tagged to its proxy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-44: `add_unconfirmed_contact` is what the RECEIVE path calls for every first-contact
+    /// message (a remote sender drives it, not the user), so it must not grow `contacts.dat` /
+    /// `unconfirmed.dat` without bound. Built via a SINGLE bulk write of an already-at-cap
+    /// `contacts.dat` (not `MAX_CONTACTS` individual calls) so the test exercises the cap
+    /// boundary itself, not an O(n) fsync loop. Discriminating: drop the `cs.len() >= MAX_CONTACTS`
+    /// check and the newcomer gets added, reddening both size assertions below.
+    #[test]
+    fn add_unconfirmed_contact_refuses_a_new_sender_ik_once_contacts_are_at_cap() {
+        let dir = std::env::temp_dir().join(format!("karst-store-contactcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let full: Vec<ContactRecord> = (0..MAX_CONTACTS)
+            .map(|i| {
+                let mut ik = [0u8; 32];
+                ik[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                ContactRecord { name: String::new(), ik, verified: false }
+            })
+            .collect();
+        s.save_contacts(&full).unwrap();
+
+        let newcomer = [0xAAu8; 32];
+        assert!(
+            !s.add_unconfirmed_contact(newcomer).unwrap(),
+            "a brand-new sender ik must be refused once contacts.dat is at the cap"
+        );
+        assert_eq!(
+            s.load_contacts().unwrap().len(),
+            MAX_CONTACTS,
+            "contacts.dat must not grow past the cap"
+        );
+        assert!(
+            !s.load_unconfirmed().unwrap().contains(&newcomer),
+            "a refused ik must not be flagged unconfirmed either"
+        );
+
+        // Control: an ALREADY-KNOWN ik is a no-op regardless of the cap — this is not a "new
+        // sender flood" case, so the cap must never get in the way of it.
+        let known = full[0].ik;
+        assert!(
+            !s.add_unconfirmed_contact(known).unwrap(),
+            "an already-known ik returns false (no-op), same as before any cap existed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-44: `set_contact_proxy` runs on EVERY inbound message (before the `Content` is even
+    /// decoded), so its cap matters even more than `contacts.dat`'s. Same bulk-write construction
+    /// as above to hit the cap boundary without an O(n) fsync loop.
+    #[test]
+    fn set_contact_proxy_refuses_a_new_sender_ik_once_the_map_is_at_cap() {
+        let dir = std::env::temp_dir().join(format!("karst-store-proxycap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let full: BTreeMap<[u8; 32], u32> = (0..MAX_CONTACTS)
+            .map(|i| {
+                let mut ik = [0u8; 32];
+                ik[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                (ik, 0u32)
+            })
+            .collect();
+        let plain = postcard::to_stdvec(&full).unwrap();
+        s.write_sealed(&s.contact_proxy_path(), &plain).unwrap();
+
+        let newcomer = [0xBBu8; 32];
+        s.set_contact_proxy(newcomer, 3).unwrap();
+        assert_eq!(
+            s.contact_proxy(&newcomer),
+            None,
+            "a brand-new sender ik must not be tagged once contact_proxy.dat is at the cap"
+        );
+
+        // Control: an already-tagged ik can still be RE-tagged (moved to a different proxy) — the
+        // cap only refuses a genuinely NEW key, never an update to one already present.
+        let known = *full.keys().next().unwrap();
+        s.set_contact_proxy(known, 7).unwrap();
+        assert_eq!(
+            s.contact_proxy(&known),
+            Some(7),
+            "re-tagging an already-known ik must still work at the cap"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -23,7 +23,7 @@
 //! that one), and TTL-swept. This does mean the relay now holds (opaque, capped, TTL-swept)
 //! ciphertext across restarts — the deliberate fat-relay tradeoff, bounded as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -40,8 +40,11 @@ const META_HEADER_LEN: usize = 4 + 32 + 4 + 8;
 pub const MAX_BLOB_CHUNK: usize = 64 * 1024;
 /// Per-blob size ceiling.
 pub const MAX_BLOB_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-/// Per-blob chunk-count ceiling (rejects an absurd manifest before it allocates index
-/// state). 2 GiB / ~60 KiB chunks ≈ 35k, so 40k leaves headroom.
+/// Per-blob chunk-count ceiling. The per-blob index is now sized to what actually ARRIVED, not
+/// to this declared count (#209), so this bound isn't guarding an allocation any more — it caps
+/// the declared range itself: `index`/`count` fields, the resume watermark, and a legitimate
+/// blob's chunk arithmetic all stay in sane `u32` territory. 2 GiB / ~60 KiB chunks ≈ 35k, so
+/// 40k leaves headroom.
 pub const MAX_BLOB_CHUNKS: u32 = 40_000;
 /// Per-sender total stored bytes (across their in-flight + complete blobs).
 pub const MAX_SENDER_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
@@ -63,31 +66,41 @@ pub enum BlobPut {
 
 /// In-memory metadata for one blob. Each chunk's ciphertext lives in its OWN file
 /// (`<id>.c<index>`), so chunks may arrive OUT OF ORDER (the relay pipelines) without any
-/// offset math or truncation hazard: `lengths[i]` is `Some(len)` once chunk `i` is on disk.
+/// offset math or truncation hazard: `lengths[i]` is present once chunk `i` is on disk.
 struct Meta {
     sender: [u8; 32],
     count: u32,
-    /// Per-index ciphertext length; `Some` iff that chunk file is stored. `len == count`.
-    lengths: Vec<Option<u32>>,
+    /// Per-index ciphertext length, keyed by the ARRIVED index. A `HashMap`, not a
+    /// `Vec<Option<u32>>` sized to `count`: #209 — an uploader declares a huge `count` (up to
+    /// `MAX_BLOB_CHUNKS`) and sends only a couple of chunks at extreme indices. A count-sized
+    /// `Vec` allocated on first sight would cost the relay a 40_000-slot structure for that,
+    /// and every scan over it (`size`, `received`, the old `next`) would be O(count) on every
+    /// put/stat/sweep/recover regardless of how little actually arrived. Keyed by what's
+    /// present, this struct costs O(received), which the sender actually paid for.
+    lengths: HashMap<u32, u32>,
     created_at: u64,
     complete: bool,
+    /// First index NOT yet stored — the contiguous watermark a sequential resumable upload
+    /// continues from. Maintained INCREMENTALLY (advanced in `put_chunk` only when a fresh
+    /// arrival closes the gap at the current watermark) instead of recomputed by scanning:
+    /// `stat()` is an unauthenticated-cost read (no bytes required, no cap crossed) that a
+    /// client can call as often as it likes, so it must not be allowed to cost O(count).
+    contiguous: u32,
 }
 
 impl Meta {
     /// Actual stored bytes (sum of received chunk lengths) — NOT a slot extent, so the byte
-    /// caps stay honest under out-of-order arrival.
+    /// caps stay honest under out-of-order arrival. O(received), not O(count).
     fn size(&self) -> u64 {
-        self.lengths.iter().filter_map(|l| l.map(u64::from)).sum()
+        self.lengths.values().map(|&l| u64::from(l)).sum()
     }
-    /// How many chunks are stored (completion = all `count`).
+    /// How many chunks are stored (completion = all `count`). O(1) — the map's own length.
     fn received(&self) -> u32 {
-        self.lengths.iter().filter(|l| l.is_some()).count() as u32
+        self.lengths.len() as u32
     }
-    /// First index NOT yet stored — the contiguous watermark a sequential resumable upload
-    /// continues from (re-sending an already-present later chunk is idempotent, so a resumer
-    /// with gaps still converges).
+    /// First index NOT yet stored (see `contiguous` above) — O(1).
     fn next(&self) -> u32 {
-        self.lengths.iter().position(|l| l.is_none()).map(|i| i as u32).unwrap_or(self.count)
+        self.contiguous
     }
 }
 
@@ -170,7 +183,7 @@ impl BlobStore {
             if m.count != count {
                 return BlobPut::Rejected("chunk count changed mid-transfer".into());
             }
-            m.lengths[index as usize] // Some(old_len) if this index is a re-send (idempotent)
+            m.lengths.get(&index).copied() // Some(old_len) if this index is a re-send (idempotent)
         } else {
             None
         };
@@ -207,11 +220,18 @@ impl BlobStore {
         let m = self.blobs.entry(id).or_insert_with(|| Meta {
             sender,
             count,
-            lengths: vec![None; count as usize],
+            lengths: HashMap::new(),
             created_at: now,
             complete: false,
+            contiguous: 0,
         });
-        m.lengths[index as usize] = Some(add as u32);
+        m.lengths.insert(index, add as u32);
+        // Advance the watermark past whatever is now contiguously present. Each index can only
+        // be stepped over once in the life of this blob, so this is amortized O(1) per put —
+        // never a rescan of the whole (possibly count-sized) range.
+        while m.lengths.contains_key(&m.contiguous) {
+            m.contiguous += 1;
+        }
         self.total_bytes += delta;
         if m.received() == m.count {
             m.complete = true;
@@ -256,7 +276,7 @@ impl BlobStore {
     pub fn get_chunk(&self, id: &[u8; 32], index: u32) -> Option<Vec<u8>> {
         let m = self.blobs.get(id)?;
         // Only a stored chunk (its length is known) is readable — even before the blob completes.
-        m.lengths.get(index as usize).copied().flatten()?;
+        m.lengths.get(&index)?;
         std::fs::read(self.chunk_path(id, index)).ok()
     }
 
@@ -283,8 +303,11 @@ impl BlobStore {
             let keep = now.saturating_sub(m.created_at) <= BLOB_TTL_SECS;
             if !keep {
                 freed += m.size();
-                for i in 0..m.count {
-                    let _ = std::fs::remove_file(dir.join(format!("{}.c{i}", hex::encode(id))));
+                // Only the indices that actually ARRIVED (#209) — not `0..m.count`, which for a
+                // sparse blob would turn every sweep pass into `count` mostly-ENOENT removes for
+                // a blob that only ever held a couple of real chunks.
+                for &index in m.lengths.keys() {
+                    let _ = std::fs::remove_file(dir.join(format!("{}.c{index}", hex::encode(id))));
                 }
                 let _ = std::fs::remove_file(dir.join(format!("{}.meta", hex::encode(id))));
             }
@@ -294,102 +317,129 @@ impl BlobStore {
     }
 
     /// Rebuild the in-memory index from the on-disk sidecars. Called by [`open`](Self::open).
-    /// Sidecar-driven: each `<id>.meta` names a blob; its chunk files (`<id>.c<i>`) are scanned to
-    /// see which chunks survived. Files not belonging to a recovered blob (orphan chunks, `.tmp`
-    /// leftovers, old `KBM1` single-data files) are swept.
+    ///
+    /// A SINGLE `read_dir` pass classifies every file by name (sidecar, chunk, `.tmp`, or junk)
+    /// and only then reconciles each blob against exactly the chunk files it actually has. This
+    /// used to be two directory passes, and the per-blob reconciliation inside them looped
+    /// `0..count` — a stat call (plus a `.tmp` unlink attempt) per DECLARED index (#209). A
+    /// sparse blob (a huge declared `count`, a couple of real chunks at extreme indices) made
+    /// that loop cost the same regardless of how little actually arrived, so restart cost scaled
+    /// with what senders *claimed*, not what they *sent* — parking a handful of such blobs could
+    /// make every future relay restart do tens of thousands of pointless syscalls per blob.
+    /// Building straight from the directory listing instead makes recovery cost proportional to
+    /// the files really on disk.
     fn recover(&mut self, now: u64) -> io::Result<()> {
         let dir = self.dir.clone();
+        let mut meta_bytes: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let mut chunks: HashMap<[u8; 32], Vec<(u32, u64)>> = HashMap::new();
+        let mut doomed: Vec<PathBuf> = Vec::new(); // `.tmp` leftovers + unrecognized junk
+
         for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            let Some(id) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".meta"))
-                .and_then(parse_blob_id)
-            else {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
                 continue;
             };
-            match self.recover_one(&id, now) {
-                Ok(Some((meta, size))) => {
-                    self.total_bytes += size;
-                    self.blobs.insert(id, meta);
+            if let Some(id_str) = name.strip_suffix(".meta") {
+                if let Some(blob_id) = parse_blob_id(id_str) {
+                    meta_bytes.insert(blob_id, std::fs::read(&path).unwrap_or_default());
+                    continue;
                 }
-                // Junk (bad/old-format sidecar, TTL-expired, or no chunks survived): drop it all.
-                Ok(None) | Err(_) => self.drop_blob_files(&id),
+            }
+            let Some(blob_id) = leading_blob_id(&name) else { continue };
+            let rest = &name[64..];
+            let mut recognized = false;
+            if let Some(chunk_part) = rest.strip_prefix(".c") {
+                if let Some(idx_str) = chunk_part.strip_suffix(".tmp") {
+                    if idx_str.parse::<u32>().is_ok() {
+                        doomed.push(path.clone());
+                        recognized = true;
+                    }
+                } else if let Ok(index) = chunk_part.parse::<u32>() {
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    chunks.entry(blob_id).or_default().push((index, len));
+                    recognized = true;
+                }
+            }
+            if !recognized {
+                // Recognized id, unrecognized suffix (e.g. an old KBM1 bare `<id>` single-data
+                // file) — always junk.
+                doomed.push(path);
             }
         }
-        // Sweep stray files that belong to no recovered blob: orphan chunk/tmp files and old-format
-        // single-data files (`<id>` with no suffix). Their leading 64-hex names the blob.
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-            if let Some(id) = leading_blob_id(name) {
-                if !self.blobs.contains_key(&id) {
-                    let _ = std::fs::remove_file(&path);
+        for path in doomed {
+            let _ = std::fs::remove_file(path);
+        }
+
+        // Reconcile every id that showed up as EITHER a sidecar or a chunk file — an orphan
+        // chunk with no sidecar is handled the same loop, just with `meta_bytes.get` coming back
+        // empty.
+        let ids: HashSet<[u8; 32]> = meta_bytes.keys().chain(chunks.keys()).copied().collect();
+        for blob_id in ids {
+            let header = meta_bytes.get(&blob_id).and_then(|raw| parse_meta_header(raw, now));
+            let Some((sender, count, created_at)) = header else {
+                self.drop_recovered(&blob_id, chunks.get(&blob_id));
+                continue;
+            };
+            // Only chunk files inside the declared range and with a sane on-disk length count —
+            // this loop is bounded by how many real chunk FILES were found for this id, not by
+            // `count`.
+            let mut lengths = HashMap::new();
+            let mut acc = 0u64;
+            if let Some(list) = chunks.get(&blob_id) {
+                for &(index, len) in list {
+                    if index < count && len > 0 && len <= MAX_BLOB_CHUNK as u64 {
+                        lengths.insert(index, len as u32);
+                        acc += len;
+                    }
                 }
             }
+            if lengths.is_empty() {
+                self.drop_recovered(&blob_id, chunks.get(&blob_id)); // header only — re-upload recreates it
+                continue;
+            }
+            let complete = lengths.len() as u32 == count;
+            let mut contiguous = 0u32;
+            while lengths.contains_key(&contiguous) {
+                contiguous += 1;
+            }
+            self.total_bytes += acc;
+            self.blobs.insert(blob_id, Meta { sender, count, lengths, created_at, complete, contiguous });
         }
         Ok(())
     }
 
-    /// Reconstruct one blob's `Meta` from its sidecar header + the chunk files present on disk.
-    /// `Ok(None)` = drop it (bad/old-format header, TTL-expired, or no chunks survived).
-    fn recover_one(&self, id: &[u8; 32], now: u64) -> io::Result<Option<(Meta, u64)>> {
-        let meta_bytes = match std::fs::read(self.meta_path(id)) {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        if meta_bytes.len() < META_HEADER_LEN || &meta_bytes[..4] != META_MAGIC {
-            return Ok(None); // absent, short, or an older format (KBM1) — discard
-        }
-        let mut sender = [0u8; 32];
-        sender.copy_from_slice(&meta_bytes[4..36]);
-        let count = u32::from_le_bytes(meta_bytes[36..40].try_into().unwrap());
-        let created_at = u64::from_le_bytes(meta_bytes[40..48].try_into().unwrap());
-        if count == 0 || count > MAX_BLOB_CHUNKS {
-            return Ok(None);
-        }
-        // TTL: an expired blob is dropped rather than recovered.
-        if now.saturating_sub(created_at) > BLOB_TTL_SECS {
-            return Ok(None);
-        }
-
-        // Scan which chunk files survived (atomic rename → each is whole or absent, never torn).
-        // Also clear any `.tmp` leftover from a crash mid-write.
-        let mut lengths = vec![None; count as usize];
-        let mut acc = 0u64;
-        let mut received = 0u32;
-        for i in 0..count {
-            let _ = std::fs::remove_file(self.dir.join(format!("{}.c{i}.tmp", hex::encode(id))));
-            if let Ok(meta) = std::fs::metadata(self.chunk_path(id, i)) {
-                let len = meta.len();
-                if len > 0 && len <= MAX_BLOB_CHUNK as u64 {
-                    lengths[i as usize] = Some(len as u32);
-                    acc += len;
-                    received += 1;
-                }
-            }
-        }
-        if received == 0 {
-            return Ok(None); // header only, no chunks — a fresh re-upload will recreate it
-        }
-
-        let complete = received == count;
-        Ok(Some((Meta { sender, count, lengths, created_at, complete }, acc)))
-    }
-
-    /// Delete every on-disk file for a blob: its sidecar and all its chunk (+ `.tmp`) files.
-    fn drop_blob_files(&self, id: &[u8; 32]) {
-        let hex = hex::encode(id);
+    /// Delete a blob's sidecar plus exactly the chunk files THIS recovery pass found for it — not
+    /// `0..count` (a blob that never earns a kept `Meta` doesn't get to cost `count` probes on
+    /// the way out either).
+    fn drop_recovered(&self, id: &[u8; 32], chunks: Option<&Vec<(u32, u64)>>) {
         let _ = std::fs::remove_file(self.meta_path(id));
-        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&hex) && name != format!("{hex}.meta") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+        if let Some(list) = chunks {
+            for &(index, _) in list {
+                let _ = std::fs::remove_file(self.chunk_path(id, index));
             }
         }
     }
+}
+
+/// Parse + validate a sidecar header's raw bytes (magic, count sanity, TTL). `None` means the
+/// whole blob is unrecoverable: absent/short/old-format header, an insane `count`, or expiry.
+fn parse_meta_header(bytes: &[u8], now: u64) -> Option<([u8; 32], u32, u64)> {
+    if bytes.len() < META_HEADER_LEN || &bytes[..4] != META_MAGIC {
+        return None; // absent, short, or an older format (KBM1) — discard
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[4..36]);
+    let count = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+    let created_at = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    if count == 0 || count > MAX_BLOB_CHUNKS {
+        return None;
+    }
+    // TTL: an expired blob is dropped rather than recovered.
+    if now.saturating_sub(created_at) > BLOB_TTL_SECS {
+        return None;
+    }
+    Some((sender, count, created_at))
 }
 
 /// Parse a 64-hex blob-store filename back into a blob id, or `None` if it is not one.
@@ -554,9 +604,17 @@ mod tests {
         assert_eq!(s.get_chunk(&b, 2).as_deref(), Some(&b"cccc"[..]));
         assert!(!dir.join(format!("{}.c1.tmp", hex::encode(b))).exists(), "the .tmp leftover is cleaned");
         assert_eq!(s.total_bytes, 3 + 4, "only whole chunks are counted");
+        // The watermark has TWO writers now: `recover` computes it from scratch on open, and
+        // `put_chunk` advances it incrementally afterwards. They must agree, or a resumer would
+        // get told the wrong next index after a restart. Chunk 0 is present but 1 is the gap, so
+        // the watermark must stop at 1 (NOT jump to 2, which is also present but not contiguous).
+        assert_eq!(s.stat(&b), Some((1, 3, false)), "recovery computed the watermark, stopped at the gap");
         // The sender fills the gap and the blob completes.
         assert_eq!(s.put_chunk(a, b, 1, 3, b"bb", 0), BlobPut::Complete);
         assert_eq!(s.get_chunk(&b, 1).as_deref(), Some(&b"bb"[..]));
+        // put_chunk's incremental advance must pick up cleanly from the recovery-computed
+        // watermark and walk it all the way to `count` now that the gap is filled.
+        assert_eq!(s.stat(&b), Some((3, 3, true)), "put_chunk's watermark advance agrees with recovery's");
     }
 
     #[test]
@@ -613,5 +671,119 @@ mod tests {
         let s2 = BlobStore::open(dir, 0).unwrap();
         assert_eq!(s2.meta(&b), Some((3, false)));
         assert_eq!(s2.get_chunk(&b, 0).as_deref(), Some(&b"aaa"[..]));
+    }
+
+    #[test]
+    fn a_sparse_blob_does_not_cost_the_relay_its_declared_size() {
+        // #209: an uploader declares MAX_BLOB_CHUNKS but sends only two chunks, at the extreme
+        // ends of the range. Before the fix, `Meta.lengths` was a `Vec<Option<u32>>` allocated to
+        // `count` on first sight, and `received()`/`next()` (driving `put_chunk`'s completion
+        // check and `stat()`'s watermark) each did a full O(count) scan over it. So a handful of
+        // real bytes forced a 40_000-slot allocation, and every later put/stat on that one blob
+        // rescanned all 40_000 slots. Timing is the only externally observable signature of that:
+        // if the scan is back, 20_000 put/stat round trips on this blob take seconds; if the
+        // structure and the watermark are both proportional to what arrived, they take
+        // milliseconds.
+        let mut s = BlobStore::new(tmp().join("sparse-cost")).unwrap();
+        let a = sender(9);
+        let b = id(9);
+        assert_eq!(s.put_chunk(a, b, 0, MAX_BLOB_CHUNKS, b"first", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(a, b, MAX_BLOB_CHUNKS - 1, MAX_BLOB_CHUNKS, b"last", 0), BlobPut::Ok);
+        assert_eq!(s.stat(&b), Some((1, MAX_BLOB_CHUNKS, false)), "only index 0 is contiguous");
+
+        let started = std::time::Instant::now();
+        for _ in 0..20_000 {
+            // A re-send (idempotent, net-zero byte delta) exercises put_chunk's completion check;
+            // stat() exercises the watermark. Neither adds a chunk, so any cost here is pure
+            // per-declared-count overhead, not real upload work.
+            assert_eq!(s.put_chunk(a, b, 0, MAX_BLOB_CHUNKS, b"first", 0), BlobPut::Ok);
+            assert_eq!(s.stat(&b), Some((1, MAX_BLOB_CHUNKS, false)));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "20_000 ops on a sparse {MAX_BLOB_CHUNKS}-count blob (2 real chunks) took {elapsed:?} \
+             — looks like an O(count) scan is back on the put/stat hot path"
+        );
+    }
+
+    #[test]
+    fn a_sweep_of_many_sparse_blobs_does_not_walk_their_declared_size() {
+        // #209, the "sweep" cost named in the finding: before the fix, sweeping an expiring blob
+        // deleted `0..m.count` chunk files — a `remove_file` syscall (almost always ENOENT) per
+        // DECLARED index. A handful of near-empty, MAX_BLOB_CHUNKS-declared blobs would turn one
+        // sweep pass into millions of pointless syscalls. Deleting only the indices that actually
+        // arrived makes sweep cost proportional to real chunks on disk, not declared ones.
+        let mut s = BlobStore::new(tmp().join("sweep-cost")).unwrap();
+        for n in 0..30u8 {
+            assert_eq!(s.put_chunk(sender(n), id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
+        }
+        let started = std::time::Instant::now();
+        s.sweep(BLOB_TTL_SECS + 1); // every blob above was created_at = 0, now past TTL
+        let elapsed = started.elapsed();
+        assert_eq!(s.total_bytes, 0, "all 30 sparse blobs were swept");
+        // Neutered (0..count remove_file loop), this took 2.3s; fixed, it's low milliseconds — 2s
+        // leaves an order of magnitude of headroom for a loaded/slow-disk CI box while still
+        // sitting far under the neutered number.
+        assert!(
+            elapsed < std::time::Duration::from_millis(2000),
+            "sweeping 30 sparse {MAX_BLOB_CHUNKS}-count blobs (1 real chunk each) took {elapsed:?} \
+             — looks like sweep is walking 0..count again"
+        );
+    }
+
+    #[test]
+    fn a_restart_does_not_walk_the_declared_size_of_many_sparse_parked_blobs() {
+        // #209, the "recover" cost: before the fix, rebuilding the index from disk looped
+        // `0..count` per blob (a `stat` plus a `.tmp`-unlink attempt per DECLARED index) to see
+        // which chunks survived. Many sparse, near-empty blobs parked at MAX_BLOB_CHUNKS would
+        // make every relay restart cost millions of syscalls for chunks that were never written.
+        // Rebuilding from a single directory listing instead makes restart cost proportional to
+        // files actually on disk.
+        let dir = tmp().join("recover-cost");
+        {
+            let mut s = BlobStore::new(dir.clone()).unwrap();
+            for n in 0..30u8 {
+                assert_eq!(s.put_chunk(sender(n), id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
+            }
+        }
+        let started = std::time::Instant::now();
+        let s = BlobStore::open(dir, 0).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(s.meta(&id(0)), Some((MAX_BLOB_CHUNKS, false)), "a parked sparse blob still recovers");
+        // Neutered (0..count stat+tmp-unlink loop), this took 4.8s; fixed, it's low milliseconds —
+        // 2s leaves headroom for a loaded/slow-disk CI box while staying far under the neutered
+        // number.
+        assert!(
+            elapsed < std::time::Duration::from_millis(2000),
+            "recovering 30 sparse {MAX_BLOB_CHUNKS}-count blobs (1 real chunk each) took {elapsed:?} \
+             — looks like recover is walking 0..count again"
+        );
+    }
+
+    #[test]
+    fn a_dense_legitimate_blob_still_completes_and_reads_back_correctly() {
+        // Control for the fix above: a real, densely-filled upload (every index actually sent, in
+        // order) must still complete and read back correctly under the new HashMap-backed index
+        // and the incrementally-maintained watermark.
+        let mut s = BlobStore::new(tmp().join("dense-control")).unwrap();
+        let a = sender(10);
+        let b = id(10);
+        let count = 500u32;
+        for i in 0..count {
+            let data = vec![(i % 251) as u8; 10];
+            let want = if i + 1 == count { BlobPut::Complete } else { BlobPut::Ok };
+            assert_eq!(s.put_chunk(a, b, i, count, &data, 0), want);
+            assert_eq!(s.stat(&b), Some((i + 1, count, i + 1 == count)), "watermark tracks every chunk");
+        }
+        assert_eq!(s.meta(&b), Some((count, true)));
+        for i in 0..count {
+            let want = vec![(i % 251) as u8; 10];
+            assert_eq!(s.get_chunk(&b, i), Some(want), "chunk {i} reads back correctly");
+        }
+        // Survives a restart too, since the recovery path was also rewritten.
+        let s2 = BlobStore::open(s.dir.clone(), 0).unwrap();
+        assert_eq!(s2.meta(&b), Some((count, true)));
+        assert_eq!(s2.get_chunk(&b, 499).as_deref(), Some(&[(499u32 % 251) as u8; 10][..]));
     }
 }

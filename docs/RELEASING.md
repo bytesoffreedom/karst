@@ -89,3 +89,18 @@ signature:
 git checkout v0.1.0
 impl/scripts/build-reproducible.sh   # prints the same sha256s as SHA256SUMS
 ```
+
+## Release gate (SEC-32)
+
+The `release` job runs in the **`release` GitHub Environment**, not on a bare tag push:
+
+- **required reviewer** — a run must be approved before it can touch the signing key;
+- **deployment branch policy** — only refs matching `v*` (tags) may deploy to it;
+- **third-party actions are pinned to full commit SHAs**, not tags. A tag like `@v4` is
+  mutable: whoever controls it can change what executes in the job that holds the key.
+
+Why: previously the workflow signed and published for ANY pushed `v*` tag, with the signing
+key available as a plain repo secret. Anyone able to create such a tag — or to move one of
+those action tags — could obtain a signed, published artefact without touching a line of
+source. Keep the signing secret scoped to this environment; do not re-add it as a repo-wide
+secret.

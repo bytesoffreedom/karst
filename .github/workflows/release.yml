@@ -17,9 +17,16 @@ jobs:
   release:
     name: signed reproducible release
     runs-on: ubuntu-latest
+    # The signing key lives in this ENVIRONMENT, not in plain repo secrets, so reaching it
+    # requires whatever protection rules the environment carries (reviewers / branch+tag rules).
+    # Without it, the job ran for ANY pushed `v*` tag: anyone able to create such a tag got a
+    # signed, published artefact without touching a line of source (SEC-32).
+    environment: release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.0
+      # Third-party actions are pinned to full commit SHAs. A tag like `@v4` is MUTABLE — whoever
+      # controls it can change what runs in a job that holds the signing key.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
 
       # The SAME script a verifier runs — so the published binaries are byte-for-byte what
       # anyone rebuilding from this tag produces.

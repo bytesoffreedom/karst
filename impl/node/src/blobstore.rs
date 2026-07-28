@@ -718,17 +718,36 @@ mod tests {
         for n in 0..30u8 {
             assert_eq!(s.put_chunk(sender(n), id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
         }
-        let started = std::time::Instant::now();
-        s.sweep(BLOB_TTL_SECS + 1); // every blob above was created_at = 0, now past TTL
-        let elapsed = started.elapsed();
+        let sparse = {
+            let started = std::time::Instant::now();
+            s.sweep(BLOB_TTL_SECS + 1); // every blob above was created_at = 0, now past TTL
+            started.elapsed()
+        };
         assert_eq!(s.total_bytes, 0, "all 30 sparse blobs were swept");
-        // Neutered (0..count remove_file loop), this took 2.3s; fixed, it's low milliseconds — 2s
-        // leaves an order of magnitude of headroom for a loaded/slow-disk CI box while still
-        // sitting far under the neutered number.
+
+        // The BASELINE: the same 30 blobs, the same one real chunk each, but declaring a tiny
+        // count. If sweep cost tracks what ARRIVED, the two are within noise; if it tracks what
+        // was DECLARED, the first is 10_000x the second.
+        //
+        // Measured against a same-machine baseline on purpose. An absolute millisecond threshold
+        // is a test that lies on a loaded or slow box — in both directions: the fixed path can
+        // exceed it under load, and the broken path can slip under it on a fast one. A ratio
+        // calibrates itself to whatever machine it lands on.
+        let mut small = BlobStore::new(tmp().join("sweep-cost-baseline")).unwrap();
+        for n in 0..30u8 {
+            assert_eq!(small.put_chunk(sender(n), id(n), 0, 4, b"x", 0), BlobPut::Ok);
+        }
+        let dense = {
+            let started = std::time::Instant::now();
+            small.sweep(BLOB_TTL_SECS + 1);
+            started.elapsed()
+        };
+
+        let floor = std::time::Duration::from_millis(1); // timer noise on a fast box
         assert!(
-            elapsed < std::time::Duration::from_millis(2000),
-            "sweeping 30 sparse {MAX_BLOB_CHUNKS}-count blobs (1 real chunk each) took {elapsed:?} \
-             — looks like sweep is walking 0..count again"
+            sparse < dense.max(floor) * 50,
+            "sweeping 30 blobs that DECLARED {MAX_BLOB_CHUNKS} chunks took {sparse:?} against \
+             {dense:?} for the same real data declaring 4 — sweep is walking 0..count again"
         );
     }
 
@@ -747,17 +766,39 @@ mod tests {
                 assert_eq!(s.put_chunk(sender(n), id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
             }
         }
-        let started = std::time::Instant::now();
-        let s = BlobStore::open(dir, 0).unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(s.meta(&id(0)), Some((MAX_BLOB_CHUNKS, false)), "a parked sparse blob still recovers");
-        // Neutered (0..count stat+tmp-unlink loop), this took 4.8s; fixed, it's low milliseconds —
-        // 2s leaves headroom for a loaded/slow-disk CI box while staying far under the neutered
-        // number.
+        let sparse = {
+            let started = std::time::Instant::now();
+            let s = BlobStore::open(dir, 0).unwrap();
+            let e = started.elapsed();
+            assert_eq!(
+                s.meta(&id(0)),
+                Some((MAX_BLOB_CHUNKS, false)),
+                "a parked sparse blob still recovers"
+            );
+            e
+        };
+
+        // Baseline on the SAME machine: identical data, tiny declared count. See the sibling
+        // sweep test for why this is a ratio and not a millisecond threshold — an absolute bound
+        // is a test that lies on a loaded box, and lies in the direction of passing.
+        let small_dir = tmp().join("recover-cost-baseline");
+        {
+            let mut s = BlobStore::new(small_dir.clone()).unwrap();
+            for n in 0..30u8 {
+                assert_eq!(s.put_chunk(sender(n), id(n), 0, 4, b"x", 0), BlobPut::Ok);
+            }
+        }
+        let dense = {
+            let started = std::time::Instant::now();
+            let _ = BlobStore::open(small_dir, 0).unwrap();
+            started.elapsed()
+        };
+
+        let floor = std::time::Duration::from_millis(1);
         assert!(
-            elapsed < std::time::Duration::from_millis(2000),
-            "recovering 30 sparse {MAX_BLOB_CHUNKS}-count blobs (1 real chunk each) took {elapsed:?} \
-             — looks like recover is walking 0..count again"
+            sparse < dense.max(floor) * 50,
+            "recovering 30 blobs that DECLARED {MAX_BLOB_CHUNKS} chunks took {sparse:?} against \
+             {dense:?} for the same real data declaring 4 — recover is walking 0..count again"
         );
     }
 

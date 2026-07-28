@@ -334,5 +334,10 @@ fn a_relay_declared_difficulty_above_the_ceiling_is_refused() {
         msg.contains(&hex::encode(fetch_pub)),
         "the refusal must name the offending relay: {msg}"
     );
-    assert!(msg.contains("64"), "the refusal must state the declared difficulty: {msg}");
+    // The FULL phrase, not a bare "64": the relay id is 64 hex characters, so a substring
+    // search for "64" alone would very likely hit the id itself and pass for the wrong reason.
+    assert!(
+        msg.contains("difficulty 64 bits"),
+        "the refusal must state the declared difficulty: {msg}"
+    );
 }

@@ -57,6 +57,13 @@ pub const MAX_ACK_IDS: usize = crate::wire::MAX_FETCH_SEALS;
 /// Cap on stored one-time prekeys per IK (bounded relay state; see `PublishRequest::opks`).
 pub const MAX_OPKS_PER_IK: usize = 256;
 
+/// Fixed wire size of an ML-KEM-768 encapsulation key (FIPS 203) — `PreKeyBundle::kem_ek`.
+/// Mirrors the same literal `wire::PREKEY_BUNDLE_WIRE` already hardcodes for its frame-size
+/// estimate (see its doc comment); enforced here as an actual check, not just an estimate.
+const ML_KEM_768_EK_LEN: usize = 1184;
+/// Fixed size of an XEdDSA signature (`PreKeyBundle::prekey_sig`, `SignedOpk::sig`).
+const XEDDSA_SIG_LEN: usize = 64;
+
 /// How long an undelivered sealed message lives in a mailbox before the TTL sweep
 /// drops it (7 days). A recipient who never comes back otherwise pins memory
 /// forever. Generous enough for ordinary offline delivery; swept lazily when the
@@ -272,7 +279,14 @@ pub struct WireMessage {
 pub enum Response {
     /// Первый контакт: relay выдал cookie, клиент повторяет с ним.
     NeedCookie(Cookie),
-    /// Допущено, запечатанный груз положен в mailbox получателя.
+    /// Admitted, and the sealed payload is sitting in the recipient's mailbox — **in this
+    /// process's memory only** (R2-5, #161). `mailboxes` (see `RelayNode`) is never written to
+    /// disk, so a crash or restart between this reply and the recipient's fetch loses the message
+    /// with NO resend signal to the sender: there is no queued-vs-durable distinction here to
+    /// report, because there is no durable side at all yet. A sender that retires its outbox
+    /// entry the moment it sees `Accepted` is trusting a guarantee this relay does not make —
+    /// `RelayPolicy::mailbox_durability` is the machine-readable form of this same fact, fetched
+    /// once via `GetPolicy` rather than assumed.
     Accepted,
     /// Отклонено конвейером допуска (текст исхода).
     Rejected(String),
@@ -308,6 +322,22 @@ pub enum BlobPersistence {
     Ephemeral,
 }
 
+/// Whether a message sitting in a mailbox survives this relay restarting (R2-5, #161).
+///
+/// Unlike `BlobPersistence`, this is not yet an operator CHOICE — there is no durable variant to
+/// choose. `RelayNode::mailboxes` (and `bundles`/`opk_batches` alongside it) live only in this
+/// process's memory; nothing here writes them to disk or reads them back on startup, so
+/// `Volatile` is the only value there is to report. The type exists (rather than a bare `bool`)
+/// so a future durable mode is an additive variant, not a wire break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MailboxDurability {
+    /// In-memory only. A crash or restart between `Accepted` and the recipient's fetch loses the
+    /// message, and the sender is never told — its outbox already retired the entry on
+    /// `Accepted` (see that variant's doc comment). Advertised so a client can, at minimum, know
+    /// not to trust the guarantee `Accepted` does not make.
+    Volatile,
+}
+
 /// A relay's advertised policy — the operator-configured knobs a client can inspect (`GetPolicy`)
 /// to understand what it's connecting to and to prefer relays matching its preferences. Every
 /// field is **operator-declared**; they differ in how far a client can check them:
@@ -317,6 +347,8 @@ pub enum BlobPersistence {
 ///     but `Ephemeral` is a CLAIM no one can check remotely (you cannot prove a server deleted /
 ///     did not copy data). Trust ephemeral only as far as the operator; accountability for the
 ///     unverifiable claims will come from the future reputation layer, not from crypto.
+///   * `mailbox_durability` — not operator-configurable at all yet (see `MailboxDurability`); this
+///     relay always reports `Volatile` because that is the only thing it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RelayPolicy {
     /// Blob-store restart posture (`None` = large-file blobs disabled on this relay).
@@ -328,6 +360,9 @@ pub struct RelayPolicy {
     /// Door policy: `None` = not issuing (Private/Dev), `Some(0)` = open (no PoW),
     /// `Some(n)` = n-bit PoW required to earn a capability.
     pub pow_bits: Option<u32>,
+    /// Whether an `Accepted` message survives this relay restarting (R2-5, #161). Always
+    /// `Volatile` today — see `MailboxDurability`.
+    pub mailbox_durability: MailboxDurability,
 }
 
 /// Relay-узел: гоняет admission-конвейер (§7) на входящих capsule и, при
@@ -452,6 +487,9 @@ impl RelayNode {
             blob_ttl_secs: if self.blobs.is_some() { crate::blobstore::BLOB_TTL_SECS } else { 0 },
             max_blob_size: if self.blobs.is_some() { crate::blobstore::MAX_BLOB_SIZE } else { 0 },
             pow_bits: self.pow_issue,
+            // Not a config read — there is no knob. `mailboxes` has no disk path at all (R2-5,
+            // #161), so this is always true, for every relay, until that changes.
+            mailbox_durability: MailboxDurability::Volatile,
         }
     }
 
@@ -1058,8 +1096,9 @@ impl RelayNode {
         AckResponse::Acked
     }
 
-    /// §12 публикация bundle. Cookie-gate (DoS/свежесть, как fetch) + ownership-
-    /// proof владения IK. `bundle.ik_pub` — ключ хранения. Перезапись своего —
+    /// §12 публикация bundle. Cookie-gate (DoS/свежесть, как fetch) + fixed-length check on
+    /// `kem_ek`/`prekey_sig` (A10-1, #231 — both are stored verbatim, never parsed, here) +
+    /// ownership-proof владения IK. `bundle.ik_pub` — ключ хранения. Перезапись своего —
     /// всегда; новый IK при полном хранилище → отказ (не тихий сброс).
     pub fn handle_publish(&mut self, req: &PublishRequest, now: u64) -> PublishResponse {
         self.advance_epoch(now);
@@ -1071,6 +1110,19 @@ impl RelayNode {
                 return PublishResponse::NeedCookie(cookie);
             }
         };
+
+        // A10-1 (#231): `kem_ek`/`prekey_sig` are never PARSED here — this relay only ever
+        // stores-and-forwards them (a sender parses the KEM key in
+        // `pqxdh::initiate_key_agreement`, not us) — so nothing else in this path would catch
+        // either field being shaped to some other length. Unchecked, the flat `raw_len: 2048`
+        // charged below (sized for "a bundle is ~1.3 KiB", see its comment) would be undercharging
+        // an arbitrarily larger bundle by construction, not just in the untested worst case — and
+        // because `get_bundle` serves the stored bundle back to ANY caller with no cookie and no
+        // capability, a write metered once would then read out for free, at its real size, on
+        // every future lookup. Rejected loudly, before the (cheap but non-zero) DH below.
+        if req.bundle.kem_ek.len() != ML_KEM_768_EK_LEN || req.bundle.prekey_sig.len() != XEDDSA_SIG_LEN {
+            return PublishResponse::Rejected("malformed bundle field length".into());
+        }
 
         let ik = req.bundle.ik_pub;
         let shared = self.relay_identity.dh(&PublicKey::from(ik));
@@ -1869,6 +1921,67 @@ mod tests {
         assert_eq!(relay.get_bundle(&bundle.ik_pub).unwrap().prekey_pub, bundle.prekey_pub);
     }
 
+    /// A10-1 (#231): `kem_ek`/`prekey_sig` are stored VERBATIM — this relay never parses either
+    /// (a sender parses the KEM key, in `pqxdh::initiate_key_agreement`; this relay's job here is
+    /// pure storage-and-forward) — so a wrong-length field would slip past every other check and
+    /// make the flat `raw_len: 2048` charge below (sized for "a bundle is ~1.3 KiB") undercount an
+    /// arbitrarily larger stored bundle, which `get_bundle` then serves back to ANY caller for
+    /// free, repeatedly, at its real (inflated) size. Neuter the length check in `handle_publish`
+    /// and the two malformed cases below flip from `Rejected` to `Published` — reddens.
+    #[test]
+    fn publish_rejects_a_bundle_whose_kem_ek_or_prekey_sig_is_the_wrong_length() {
+        let mut relay = RelayNode::new(NOW);
+        let relay_pub = relay.relay_public();
+        let bob = Account::generate();
+        let cap = publish_cap();
+        relay.issue_capability(cap.clone());
+        let addr = bob.identity_public().to_vec();
+        let carrier = b"c".to_vec();
+
+        let publish = |relay: &mut RelayNode, bundle: PreKeyBundle, nonce: &[u8]| -> PublishResponse {
+            let cookie = relay.keyring.issue(&addr, &carrier, NOW as u32);
+            let proof = publish_proof(&bob.ik().dh(&relay_pub), &cookie.mac, &bundle);
+            let req = PublishRequest {
+                bundle,
+                opks: Vec::new(),
+                replace_opks: false,
+                client_addr: addr.clone(),
+                carrier_id: carrier.clone(),
+                cookie: Some(cookie),
+                request_nonce: nonce.to_vec(),
+                capability_proof: cap.prove(nonce, 0),
+                proof,
+            };
+            relay.handle_publish(&req, NOW)
+        };
+
+        // Oversized kem_ek: within the wire frame's ceiling, but not the real ML-KEM-768 key size.
+        let mut bad_kem = bob.prekey_bundle();
+        bad_kem.kem_ek = vec![7u8; ML_KEM_768_EK_LEN + 1];
+        assert!(
+            matches!(publish(&mut relay, bad_kem, b"n-kem"), PublishResponse::Rejected(_)),
+            "an oversized kem_ek must be rejected, not stored at the flat 2048-byte charge"
+        );
+        assert!(relay.get_bundle(&bob.identity_public()).is_none(), "malformed bundle not stored");
+
+        // Undersized prekey_sig.
+        let mut bad_sig = bob.prekey_bundle();
+        bad_sig.prekey_sig = vec![7u8; XEDDSA_SIG_LEN - 1];
+        assert!(
+            matches!(publish(&mut relay, bad_sig, b"n-sig"), PublishResponse::Rejected(_)),
+            "a wrong-length prekey_sig must be rejected"
+        );
+        assert!(relay.get_bundle(&bob.identity_public()).is_none(), "malformed bundle not stored");
+
+        // Control: the SAME account's untouched bundle (real, correctly-sized fields) still
+        // publishes — the check rejects a malformed LENGTH specifically, not publishing itself.
+        assert!(
+            matches!(publish(&mut relay, bob.prekey_bundle(), b"n-ok"), PublishResponse::Published),
+            "a correctly-shaped bundle from the same account must still publish"
+        );
+        assert!(relay.get_bundle(&bob.identity_public()).is_some());
+    }
+
     /// Публикация без cookie → challenge (DoS-gate, как fetch).
     #[test]
     fn publish_without_cookie_is_challenged() {
@@ -2105,5 +2218,53 @@ mod tests {
         // ...yet the sweep at deposit + TTL still removes it, lease notwithstanding.
         relay.sweep_mailboxes(NOW + MAILBOX_TTL_SECS + 1);
         assert!(!boxed(&relay, &bob), "deposit-time TTL reaps a never-acked lease");
+    }
+
+    /// R2-5 (#161): `RelayPolicy` must not let a client believe a queued message is any more
+    /// durable than it is. `policy()` reports `Volatile` because nothing writes `mailboxes` to
+    /// disk — see `MailboxDurability` for what changes this assertion (an additive variant, the
+    /// day a durable mode actually exists).
+    #[test]
+    fn advertised_policy_reports_mailboxes_as_volatile() {
+        let relay = RelayNode::new(NOW);
+        assert_eq!(
+            relay.policy().mailbox_durability,
+            MailboxDurability::Volatile,
+            "mailboxes have no disk path (see RelayNode::mailboxes) — the policy must say so"
+        );
+    }
+
+    /// R2-5 (#161) — CHARACTERIZATION, not a fix. `mailboxes` lives only in `RelayNode`'s own
+    /// memory (see its field doc), so there is nothing to "neuter" here to turn this red: it pins
+    /// today's real behavior — an `Accepted` message is gone the moment the process holding it
+    /// is gone — so a future persistence layer has a red test to turn green, instead of an
+    /// unverified claim. `karst-relay` restarts with the SAME node identity (`load_or_create_keys`
+    /// persists it to `relay.key`); `with_identity` + a cloned `Identity` reproduces exactly that
+    /// continuity, so this is not a strawman "different relay" — same identity, empty mailboxes.
+    #[test]
+    fn an_accepted_message_does_not_survive_a_relay_restart() {
+        let identity = Identity::generate();
+        let relay = Rc::new(RefCell::new(RelayNode::with_identity(NOW, identity.clone())));
+        let cap = publish_cap();
+        relay.borrow_mut().issue_capability(cap.clone());
+        let transport = InMemoryTransport::new(relay.clone());
+        let mut sender = Client::new(transport, cap, b"sender");
+
+        let recipient = PublicKey::from([0x42u8; 32]);
+        let resp = sender.send(&recipient, b"hello", NOW);
+        assert!(matches!(resp, Response::Accepted), "precondition: the relay actually admitted it");
+        assert_eq!(
+            relay.borrow().mailbox_len_for_test(&recipient.to_bytes()),
+            1,
+            "precondition: it is really sitting in the mailbox before the 'restart'"
+        );
+
+        // The "restart": a fresh RelayNode, same persisted identity, nothing carried over.
+        let restarted = RelayNode::with_identity(NOW, identity);
+        assert_eq!(
+            restarted.mailbox_len_for_test(&recipient.to_bytes()),
+            0,
+            "an Accepted message does not survive a restart, and the sender is never told (R2-5)"
+        );
     }
 }

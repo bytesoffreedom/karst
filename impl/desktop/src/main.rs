@@ -90,6 +90,95 @@ fn now_secs() -> u64 {
 const STORY_TTL_SECS: u64 = 24 * 60 * 60;
 /// Most public posts we serve to a single live-pull visitor (bounds the reply to a profile view).
 const POSTS_PULL_LIMIT: usize = 30;
+/// Window the global live-pull reply budget refills over. Matched to the admission capability's own
+/// quota window (`admission::capability`, 600 s), because the scarce thing being rationed is
+/// ultimately that quota: a request unit spent answering a stranger's profile view is a request unit
+/// this account cannot spend sending a message.
+const POSTS_REPLY_WINDOW_SECS: u64 = 600;
+/// Publication sends this client will spend answering `PostsRequest` per window — in TOTAL, across
+/// every peer. A typical Public capability allows 100 requests per 600 s, so capping live-pull at 30
+/// reserves the rest for chat: answering profile views can no longer deny the user their own sends.
+const POSTS_REPLY_BUDGET: usize = 30;
+/// Reply jobs allowed to run CONCURRENTLY. Each is one OS thread doing serialisation, sealing and
+/// relay round trips, so this is the difference between a bounded responder and a thread flood.
+const POSTS_REPLY_MAX_ACTIVE: usize = 2;
+
+/// Global admission for `PostsRequest` replies (SEC-30). One inbound control message used to load
+/// the whole feed, spawn an OS thread and fire up to `POSTS_PULL_LIMIT` separate sends, with no
+/// cooldown, no dedup and no ceiling — a 1→30 amplifier any stranger could pull, repeatedly.
+///
+/// The bound is deliberately GLOBAL rather than per-peer. Per-peer cooldown is the obvious remedy
+/// and it does not hold here: the requester is authenticated only as "some session", and a
+/// `PostsRequest` needs no contact status, so an attacker mints a fresh identity key per request and
+/// walks straight past any per-peer state. Worse, per-peer state keyed by an attacker-chosen IK is
+/// itself unbounded memory. What survives fresh identities is a budget that does not care who is
+/// asking.
+///
+/// The cost of that choice, stated plainly: a flood can exhaust the window's budget and make this
+/// client stop answering live pulls until it refills — the feature is deniable. That is the right
+/// trade, because the alternative it replaces is a flood exhausting the account's REQUEST QUOTA and
+/// denying the user their own messages, plus unbounded threads. Losing "strangers can peek at my
+/// public posts right now" is recoverable; losing "I can send" is not.
+#[derive(Default)]
+struct PostsReplyBudget {
+    /// Start of the current window (0 until the first admission).
+    window_start: u64,
+    /// Sends reserved in this window.
+    spent: usize,
+    /// Reply jobs currently running.
+    active: usize,
+}
+
+impl PostsReplyBudget {
+    /// Reserve up to `want` sends for one reply job. Returns how many are granted (0 = refuse, and
+    /// the caller must do NOTHING — not even read the feed, which is itself per-request work an
+    /// attacker would otherwise get for free). On a non-zero grant the caller owns one active slot
+    /// and must release it via `PostsReplySlot`.
+    fn admit(&mut self, now: u64, want: usize) -> usize {
+        if now.saturating_sub(self.window_start) >= POSTS_REPLY_WINDOW_SECS {
+            self.window_start = now;
+            self.spent = 0;
+        }
+        if self.active >= POSTS_REPLY_MAX_ACTIVE {
+            return 0;
+        }
+        let granted = want.min(POSTS_REPLY_BUDGET.saturating_sub(self.spent));
+        if granted == 0 {
+            return 0;
+        }
+        self.spent += granted;
+        self.active += 1;
+        granted
+    }
+
+    /// Hand back sends that were reserved but not needed (we have fewer public posts than the
+    /// grant). Without this a client with three public posts would burn a 30-send reservation per
+    /// visitor and refuse honest visitors ten times too early.
+    ///
+    /// The caller must always leave at least ONE unit charged per admitted request — see the floor
+    /// at the call site. Answering costs more than the sends: the feed and public-post sets are
+    /// sealed files, so deciding there is nothing to reply with is already a full read and AEAD
+    /// open per request. A client with no public posts at all — a new account, or one whose posts
+    /// are all narrow-audience — is the common case, and refunding its whole reservation would
+    /// leave the window permanently empty and the rate unbounded, with only the concurrency cap
+    /// standing between a mailbox burst and one feed decrypt per message.
+    fn refund(&mut self, n: usize) {
+        self.spent = self.spent.saturating_sub(n);
+    }
+}
+
+/// RAII release of an active reply slot — a `Drop` impl rather than a call at the end of the thread
+/// body, so a panic in the reply loop cannot permanently consume one of the `POSTS_REPLY_MAX_ACTIVE`
+/// slots and quietly kill live pull for the rest of the process's life.
+struct PostsReplySlot(Arc<Mutex<PostsReplyBudget>>);
+
+impl Drop for PostsReplySlot {
+    fn drop(&mut self) {
+        if let Ok(mut b) = self.0.lock() {
+            b.active = b.active.saturating_sub(1);
+        }
+    }
+}
 /// Max fetch pages a single poll drains per proxy (≈ pages × page-size messages). Bounds one poll's
 /// work so a flooded mailbox can't wedge it, while still emptying a normal image post in one pass.
 const MAX_DRAIN_PAGES: usize = 80;
@@ -167,6 +256,10 @@ struct App {
     /// emitted (SEC-45: without this, `set_net_offline(true)` could return success while one of
     /// these was still mid-flight on a relay handle captured before the flip).
     net_active: Arc<AtomicU64>,
+    /// SEC-30 — the global ceiling on work an inbound `PostsRequest` may cause. `Arc` for the same
+    /// reason `offline` is one: the reply job runs on its own thread and has to release its slot
+    /// there, with no `State<App>` in hand.
+    posts_reply: Arc<Mutex<PostsReplyBudget>>,
 }
 
 impl App {
@@ -3010,8 +3103,28 @@ fn ensure_confirmed_contact(root: &Store, ik: [u8; 32]) {
 /// Whether `ik`'s publications belong in our feed: an account we SUBSCRIBED to, OR one we live-pulled
 /// from (visited their profile). Posts are decoupled from contacts — you subscribe to follow, or pull
 /// to peek; a pulled author's reply posts land in their profile view.
+///
+/// The rule itself moved to `Store` (SEC-31): the client receive path has to apply the SAME gate to
+/// a `PostAttachmentRef` before it commits the work, and two copies of a consent rule is how they
+/// drift apart. This stays as the local spelling every feed call site already reads.
 fn is_feed_source(store: &Store, ik: &[u8; 32]) -> bool {
-    store.load_channel_peers().contains(ik) || store.load_pulled().is_ok_and(|s| s.contains(ik))
+    store.is_feed_source(ik)
+}
+
+/// Whether an inline transfer MANIFEST from `sender` may open a reassembly slot (SEC-31, the inline
+/// half). Post media reaches us two ways — a blob pointer, gated in `recv_session_multi`, or these
+/// inline chunk transfers — and a gate on only one of them is not a gate. Files, avatars and
+/// galleries are unaffected: they are addressed to the CONVERSATION, which anyone may open, and
+/// carry their own caps. Only the two post-media manifests need the feed gate, because only they
+/// claim to decorate a post.
+///
+/// A predicate rather than an inline condition so the decision is testable on its own; the poll
+/// dispatch it guards is not.
+fn inline_transfer_admitted(store: &Store, sender: &[u8; 32], c: &Content) -> bool {
+    if matches!(c, Content::PostImageManifest { .. } | Content::PostAttachmentManifest { .. }) {
+        return is_feed_source(store, sender);
+    }
+    true
 }
 
 /// COVER-TRAFFIC tick (Loopix-style, opt-in): emit ONE dummy deposit through the exact real send
@@ -3202,6 +3315,12 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
             // (already listed), so without this the manifest fell through to `_` and every chunk hit
             // "chunk without manifest": inline (≤2-photo) gallery receive was silently dead.
             | Content::GalleryManifest { .. }) => {
+                // SEC-31, inline half. Refusing the MANIFEST (not the assembled result) means the
+                // transfer never opens, so its chunks are dropped by the reassembler's own "chunk
+                // without manifest" rule instead of accumulating in RAM until the reaper takes them.
+                if !inline_transfer_admitted(&store, &r.sender, &c) {
+                    continue;
+                }
                 // `offer_reassembly` (not a raw per-sender `entry().or_default()`) enforces the
                 // GLOBAL sender-count + RAM caps (SEC-43) before this reaches any one sender's
                 // Reassembler — a flood of fresh sender IKs must not grow this map without bound.
@@ -3394,6 +3513,16 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
             // subscribing. Best-effort, off-thread; only public ids in `public_posts` qualify.
             Content::PostsRequest => {
                 if let Some(relay) = relays.first().cloned() {
+                    // SEC-30: admit BEFORE doing anything, because everything below is work an
+                    // unsolicited message would otherwise buy for free — the feed and public-post
+                    // sets are sealed files, so even "load, find nothing, send nothing" is a full
+                    // decrypt per request. Reserve the worst case (`POSTS_PULL_LIMIT`) and hand
+                    // back what we turn out not to need.
+                    let granted = app.posts_reply.lock().unwrap().admit(now_secs(), POSTS_PULL_LIMIT);
+                    if granted == 0 {
+                        continue;
+                    }
+                    let slot = PostsReplySlot(app.posts_reply.clone());
                     let public = store.load_public_posts().unwrap_or_default();
                     let own = store.load_account().ok().map(|a| a.identity_public()).unwrap_or([0u8; 32]);
                     let mut posts: Vec<_> = store
@@ -3403,7 +3532,15 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
                         .filter(|f| f.author == own && f.expire_at.is_none() && public.contains(&f.id))
                         .collect();
                     posts.sort_by_key(|f| std::cmp::Reverse(f.ts));
-                    posts.truncate(POSTS_PULL_LIMIT);
+                    posts.truncate(granted); // `granted` ≤ POSTS_PULL_LIMIT and may be smaller
+                    // Charge for the sends we will actually make, but never less than one: the two
+                    // sealed reads above happened whatever the answer turns out to be, so a client
+                    // with nothing public to serve must still pay for having been asked. Without
+                    // the floor its whole reservation comes back and the window never fills.
+                    app.posts_reply.lock().unwrap().refund(granted - posts.len().max(1));
+                    if posts.is_empty() {
+                        continue; // nothing to say — don't spend a thread saying it
+                    }
                     let ps = store.as_proxy(proxy_for_contact(&store, &r.sender));
                     let to = r.sender;
                     // SEC-45: this loop can run long past `poll`'s own return (a visitor with a
@@ -3414,6 +3551,7 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
                     let guard = NetGuard::enter(&app.net_active);
                     std::thread::spawn(move || {
                         let _guard = guard;
+                        let _slot = slot; // released here, however this thread ends (SEC-30)
                         let now = now_secs();
                         for f in posts {
                             // Checked between posts, not mid-post: each `send_publication` is its
@@ -3469,6 +3607,26 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
             // A contact MOVED to a new channel — authenticated by arriving on our session with
             // their OLD address (r.sender). Re-point them to new_ik; the safety number changed, so
             // surface it for a re-verify. Future mail to/from them uses the new address.
+            //
+            // DELIBERATELY NOT behind SEC-29's outstanding-request ledger, and the reason is a
+            // category difference, not an oversight. That ledger answers one question — "did WE
+            // ask for this?" — and it works for `ContactAccept`/`JoinAccept` because each is the
+            // second half of a request this client sent and recorded. A migration has no first
+            // half: it is a contact telling us something about themselves, unprompted, exactly
+            // like `Profile` or `RetractPublication`. Requiring a consumed ledger entry would mean
+            // requiring an entry that can never exist, which is not a gate but a deletion of the
+            // feature. What DOES stand in for consent here is `migrate_contact_ik`'s own
+            // precondition: `r.sender` must already be a contact, so a stranger cannot reach this
+            // path at all, and it refuses a `new_ik` that already belongs to a DIFFERENT contact
+            // (SEC-36's collision half).
+            //
+            // The residual is real and is NOT the ledger: nothing proves the sender holds
+            // `new_ik`, and the re-point is applied before the user sees it, so a compromised or
+            // malicious contact can silently redirect our future mail to a third party's key.
+            // `verified` is cleared (the UI prompts a re-verify) but the redirect has already
+            // happened. Closing that needs a staged migration — persist as PENDING, apply only on
+            // an explicit user action — which is SEC-36's auto-redirect half, tracked separately;
+            // see `docs/STATUS.md`. Bolting a wrong-shaped gate on here would have hidden it.
             Content::ChannelMigrate { new_ik } => {
                 if new_ik != r.sender {
                     match root.migrate_contact_ik(r.sender, new_ik) {
@@ -3915,10 +4073,14 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_chunk, transfer_finish, App, TransferState, MAX_STREAM_BYTES};
+    use super::{
+        append_chunk, transfer_finish, App, PostsReplyBudget, PostsReplySlot, TransferState,
+        MAX_STREAM_BYTES, POSTS_PULL_LIMIT, POSTS_REPLY_BUDGET, POSTS_REPLY_MAX_ACTIVE,
+        POSTS_REPLY_WINDOW_SECS,
+    };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// A minimal `TransferState` for tests that only care about the cancel/state machinery, not
     /// the transfer's own bookkeeping fields.
@@ -4244,5 +4406,154 @@ mod tests {
         );
         // Pre-per-process names carry no owner and cannot belong to a live session of this build.
         assert!(super::hidden_dir_owner_is_gone("karst-hid-abc"), "unowned legacy name is collectable");
+    }
+
+    /// SEC-30 — one unsolicited `PostsRequest` used to buy a feed load, an OS thread and up to
+    /// `POSTS_PULL_LIMIT` outgoing publication sends, with nothing bounding how often. This pins
+    /// the property that replaces it: however many requests arrive, from however many DISTINCT
+    /// senders, the sends they can cause in one window are capped and the threads are capped.
+    ///
+    /// Every peer here is a fresh identity key, which is the point — an attacker gets a new one
+    /// per request for free, so anything keyed per-peer would report success while the flood went
+    /// through. Counting, no clock: `now` is passed in, so the window is exercised without ever
+    /// measuring elapsed time.
+    #[test]
+    fn a_flood_of_posts_requests_cannot_exceed_the_windows_reply_budget() {
+        let b = Arc::new(Mutex::new(PostsReplyBudget::default()));
+        let now = 1_000_000;
+
+        let mut granted_total = 0usize;
+        let mut slots: Vec<PostsReplySlot> = Vec::new();
+        let mut peak_active = 0usize;
+        for _ in 0..500 {
+            // Each iteration stands for a request from a brand-new sender.
+            let granted = b.lock().unwrap().admit(now, POSTS_PULL_LIMIT);
+            if granted > 0 {
+                granted_total += granted;
+                slots.push(PostsReplySlot(b.clone()));
+                peak_active = peak_active.max(b.lock().unwrap().active);
+            }
+        }
+        assert!(
+            granted_total <= POSTS_REPLY_BUDGET,
+            "500 requests were allowed {granted_total} sends; the window's ceiling is \
+             {POSTS_REPLY_BUDGET}"
+        );
+        assert!(
+            peak_active <= POSTS_REPLY_MAX_ACTIVE,
+            "{peak_active} reply jobs ran at once; the ceiling is {POSTS_REPLY_MAX_ACTIVE}"
+        );
+
+        // Slots are returned when the jobs end, but the SPENT budget is not — otherwise the
+        // concurrency cap alone would let a serial flood spend without limit.
+        drop(slots);
+        assert_eq!(b.lock().unwrap().active, 0, "finished jobs must release their slot");
+        assert_eq!(
+            b.lock().unwrap().admit(now, POSTS_PULL_LIMIT),
+            0,
+            "the window's budget must stay spent after its jobs finish"
+        );
+
+        // ...and the next window refills, so this is a bound on rate, not a permanent shutdown.
+        assert!(
+            b.lock().unwrap().admit(now + POSTS_REPLY_WINDOW_SECS, POSTS_PULL_LIMIT) > 0,
+            "the budget must refill — a live pull that never recovers is a broken feature"
+        );
+    }
+
+    /// SEC-31, the inline half. The blob-pointer path is gated in the client; the inline chunk path
+    /// reaches the same feed sidecar and had no gate at all, so a stranger could still stream post
+    /// media at a client that would never show their posts.
+    ///
+    /// Discriminating in three directions, because two of them are ways to get this wrong: the
+    /// stranger's post manifests are refused, a subscribed channel's identical manifests are
+    /// admitted, and a FILE manifest from the same stranger is still admitted — chats are open to
+    /// anyone, and a gate that also closed those would break ordinary first-contact file sending.
+    #[test]
+    fn only_a_feed_source_may_open_an_inline_post_media_transfer() {
+        use client::content::Content;
+        let dir = std::env::temp_dir().join(format!("karst-inline-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = client::store::Store::unlock(&dir, b"pw").unwrap();
+        let stranger = [0x41u8; 32];
+        let channel = [0x42u8; 32];
+        store.set_channel_peer(channel, true).unwrap();
+
+        let post_img =
+            Content::PostImageManifest { post_id: [1; 16], id: [2; 16], size: 10, chunks: 1, hash: [3; 32] };
+        let post_att = Content::PostAttachmentManifest {
+            post_id: [1; 16],
+            index: 0,
+            kind: 0,
+            name: String::new(),
+            id: [4; 16],
+            size: 10,
+            chunks: 1,
+            hash: [3; 32],
+        };
+        let file = Content::FileManifest { id: [5; 16], name: "n".into(), size: 10, chunks: 1, hash: [3; 32] };
+
+        assert!(!super::inline_transfer_admitted(&store, &stranger, &post_img));
+        assert!(!super::inline_transfer_admitted(&store, &stranger, &post_att));
+        assert!(super::inline_transfer_admitted(&store, &channel, &post_img));
+        assert!(super::inline_transfer_admitted(&store, &channel, &post_att));
+        assert!(
+            super::inline_transfer_admitted(&store, &stranger, &file),
+            "an ordinary file from a stranger is a CONVERSATION, not feed content — still allowed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: an ordinary client with a handful of public posts must not burn a
+    /// full `POSTS_PULL_LIMIT` reservation per visitor. Reserving the worst case is what lets the
+    /// admission decision happen BEFORE the feed is read (the read is itself per-request work),
+    /// so the unused remainder has to come back.
+    #[test]
+    fn an_unused_reply_reservation_is_returned_to_the_window() {
+        let mut b = PostsReplyBudget::default();
+        let now = 2_000_000;
+        // An account with three public posts. Without the refund the FIRST visitor would reserve
+        // all 30 and the second would already be turned away; with it, the window pays only for
+        // sends actually made, so the budget stretches to `POSTS_REPLY_BUDGET / 3` visitors.
+        let visitors = POSTS_REPLY_BUDGET / 3;
+        for i in 0..visitors {
+            let granted = b.admit(now, POSTS_PULL_LIMIT);
+            assert!(granted >= 3, "visitor {i} was refused while the window still had budget");
+            b.refund(granted - 3);
+            b.active -= 1; // the job finished
+        }
+        assert_eq!(b.spent, visitors * 3, "the window must be charged for sends made, not reserved");
+    }
+
+    /// The refund's own failure mode, and the common one: a client with NO public posts. Every
+    /// request still costs two sealed-file reads to discover there is nothing to answer with, so
+    /// if the reservation comes back in full the window never fills and the rate is unbounded —
+    /// `POSTS_REPLY_MAX_ACTIVE` would bound threads at any instant but nothing would bound how
+    /// many requests a mailbox burst could put through the feed decrypt. The floor of one unit per
+    /// admitted request is what closes that.
+    ///
+    /// Discriminating: neutering the floor back to `refund(granted - posts.len())` lets this run
+    /// forever without ever being refused.
+    #[test]
+    fn answering_nothing_still_costs_the_window_a_unit() {
+        let mut b = PostsReplyBudget::default();
+        let now = 3_000_000;
+        let mut admitted = 0usize;
+        for _ in 0..500 {
+            let granted = b.admit(now, POSTS_PULL_LIMIT);
+            if granted == 0 {
+                break;
+            }
+            admitted += 1;
+            let posts = 0usize; // nothing public to serve
+            b.refund(granted - posts.max(1)); // the floor
+            b.active -= 1;
+        }
+        assert_eq!(
+            admitted, POSTS_REPLY_BUDGET,
+            "a client with no public posts must still be able to refuse: {admitted} empty replies \
+             were admitted against a budget of {POSTS_REPLY_BUDGET}"
+        );
     }
 }

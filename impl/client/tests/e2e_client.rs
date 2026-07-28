@@ -2973,6 +2973,11 @@ fn post_attachment_blob_round_trips_into_the_feed_sidecar() {
         PublishResponse::Published
     ));
 
+    // Bob SUBSCRIBED to Alice — the same consent the feed itself requires of a publication. SEC-31:
+    // without this the refs are refused at the door, which is the point of the gate; a post
+    // attachment is only ever fetched for an author whose posts we would display.
+    bstore.set_channel_peer(alice_ik, true).unwrap();
+
     // The ACTUAL failing scenario: FOUR multi-chunk images on ONE post. On the inline path this was
     // ~360 seals into a 256-cap mailbox → the later images bounced off MailboxFull ("one of four
     // published, the rest didn't"). On the blob path it's four tiny refs + four per-recipient blobs.
@@ -3036,6 +3041,20 @@ fn post_attachment_blob_round_trips_into_the_feed_sidecar() {
         bstore.feed_attachments(alice_ik, post_id).len() as u32,
         N,
         "a redelivered/re-driven ref stays idempotent (no extra slot)"
+    );
+
+    // SEC-31 over the real socket: Bob unsubscribes, so Alice is no longer a feed source. The very
+    // same send that worked four times above must now leave NOTHING queued — the ref is refused
+    // before it can occupy a durable fetch slot, even though the session and the blob are fine.
+    bstore.set_channel_peer(alice_ik, false).unwrap();
+    client::send_post_attachment_blob(&astore, &r, &bob_ik, post_id, N, 0, "", &images[0], NOW)
+        .expect("the SEND side is unchanged — the gate is the recipient's");
+    for _ in 0..4 {
+        let _ = client::recv_session(&bstore, &r, NOW).unwrap();
+    }
+    assert!(
+        bstore.list_pending_post_attachments().unwrap().is_empty(),
+        "an attachment from an author we no longer follow must not become queued work"
     );
 }
 

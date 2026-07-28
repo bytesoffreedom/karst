@@ -3,8 +3,8 @@
 //! `not_after`. Несущий тест — `captured_proof_replay_caught_across_epoch`.
 
 use admission::capability::{
-    Capability, CapabilityProof, CapabilityQuotaTracker, CapabilityTable, Quota, QuotaDecision,
-    Scope,
+    pow_cap_id, pow_cap_secret, Capability, CapabilityProof, CapabilityQuotaTracker,
+    CapabilityTable, Quota, QuotaDecision, Scope, POW_CAP_QUOTA,
 };
 use admission::cookie::CookieKeyring;
 use admission::params::EPOCH_DURATION_SECS;
@@ -236,4 +236,124 @@ fn cookie_mac_binds_address_and_carrier_unambiguously() {
     let c2 = kr.issue(b"ab", b"c", NOW as u32);
     assert!(kr.verify(&c2, b"ab", b"c", NOW).is_ok());
     assert!(kr.verify(&c2, b"a", b"bc", NOW).is_err());
+}
+
+/// #214 (A4-7) — a stored (dev/invite) capability and a stateless PoW-derived one (§7 slice 4a)
+/// verify through the same `CapabilityTable::verify`, and BOTH results flow into the same
+/// `process_with_policy` clamp (`cap.quota.clamped_by(&policy)`, pipeline.rs). There is no second
+/// place that has to be kept in sync — but that is a structural fact about the current code, not
+/// something this crate previously PROVED: neither the stored-cap quota tests above nor the
+/// stateless-cap tests in `pow_cap.rs` ever exercised `quota_policy` at all. This pins it: an
+/// operator ceiling far below the capability's OWN quota must reject the second request on
+/// EITHER kind of capability, and (control) the very same capability must still admit that
+/// second request when no ceiling is set — so the rejection is attributable to the ceiling, not
+/// to some unrelated always-reject bug.
+#[test]
+fn an_operator_quota_ceiling_binds_a_stateless_capability_too() {
+    let (kr, ring) = pipeline_env();
+    let verifier = MockRingVerifier;
+    let client = b"203.0.113.40:9000";
+    let carrier = b"c";
+    let cookie = kr.issue(client, carrier, NOW as u32);
+
+    // Far tighter than either the stored cap's own quota (100) or POW_CAP_QUOTA's own 100 —
+    // if a request survives past #1, the ceiling did not reach that capability's kind.
+    let policy = Quota { max_requests: 1, max_bytes: 1 << 30, window_secs: 600 };
+
+    // --- Stored (dev/invite) capability ---
+    let stored = cap_with(100, 1 << 20, 600);
+    let mut stored_caps = CapabilityTable::new();
+    stored_caps.insert(stored.clone());
+    let pipe_stored = AdmissionPipeline {
+        keyring: &kr,
+        capabilities: &stored_caps,
+        token_verifier: &verifier,
+        issuer_ring: &ring,
+    };
+    let mut replay = ReplayFilter::new(0, 1024);
+    let mut cq = CapabilityQuotaTracker::new();
+    let p1 = stored.prove(b"stored-nonce-1", 0);
+    assert_eq!(
+        pipe_stored.process_with_policy(
+            &mk_req(client, carrier, cookie, b"stored-nonce-1", p1), NOW, 0, [0; 64], &mut replay, &mut cq, Some(policy),
+        ),
+        Outcome::Admit,
+        "control: first request under the ceiling is admitted"
+    );
+    let p2 = stored.prove(b"stored-nonce-2", 0);
+    assert_eq!(
+        pipe_stored.process_with_policy(
+            &mk_req(client, carrier, cookie, b"stored-nonce-2", p2), NOW, 0, [0; 64], &mut replay, &mut cq, Some(policy),
+        ),
+        Outcome::Reject(RejectReason::CapabilityQuota),
+        "a stored capability's own quota (100) must not save it from the operator's tighter ceiling (1)"
+    );
+
+    // --- Stateless PoW capability (§7 slice 4a): NOT stored, recomputed from the issuer key ---
+    let issuer = [7u8; 32];
+    let relay_id = [3u8; 32];
+    let pow_id = pow_cap_id(&issuer, &relay_id, 42, &[1u8; 32], 9);
+    let not_after = u32::MAX;
+    let pow_secret = pow_cap_secret(&issuer, &pow_id, not_after, Scope::MessageDelivery);
+    let pow_cap = Capability {
+        capability_id: pow_id,
+        scope: Scope::MessageDelivery,
+        quota: POW_CAP_QUOTA,
+        not_before: 0,
+        not_after,
+        secret: pow_secret,
+    };
+    let mut pow_table = CapabilityTable::new();
+    pow_table.set_pow_issuer(issuer);
+    let pipe_pow = AdmissionPipeline {
+        keyring: &kr,
+        capabilities: &pow_table,
+        token_verifier: &verifier,
+        issuer_ring: &ring,
+    };
+    let mut replay2 = ReplayFilter::new(0, 1024);
+    let mut cq2 = CapabilityQuotaTracker::new();
+    let q1 = pow_cap.prove(b"pow-nonce-1", 0);
+    assert_eq!(
+        pipe_pow.process_with_policy(
+            &mk_req(client, carrier, cookie, b"pow-nonce-1", q1), NOW, 0, [0; 64], &mut replay2, &mut cq2, Some(policy),
+        ),
+        Outcome::Admit,
+        "control: first stateless request under the ceiling is admitted"
+    );
+    let q2 = pow_cap.prove(b"pow-nonce-2", 0);
+    assert_eq!(
+        pipe_pow.process_with_policy(
+            &mk_req(client, carrier, cookie, b"pow-nonce-2", q2), NOW, 0, [0; 64], &mut replay2, &mut cq2, Some(policy),
+        ),
+        Outcome::Reject(RejectReason::CapabilityQuota),
+        "the SAME ceiling must bind a stateless PoW capability too — POW_CAP_QUOTA's own 100 must not save it"
+    );
+
+    // --- Control: the identical stateless capability, no ceiling — its OWN quota (100) admits #2 ---
+    let mut pow_table_nopolicy = CapabilityTable::new();
+    pow_table_nopolicy.set_pow_issuer(issuer);
+    let pipe_pow_free = AdmissionPipeline {
+        keyring: &kr,
+        capabilities: &pow_table_nopolicy,
+        token_verifier: &verifier,
+        issuer_ring: &ring,
+    };
+    let mut replay3 = ReplayFilter::new(0, 1024);
+    let mut cq3 = CapabilityQuotaTracker::new();
+    let r1 = pow_cap.prove(b"free-nonce-1", 0);
+    assert_eq!(
+        pipe_pow_free.process_with_policy(
+            &mk_req(client, carrier, cookie, b"free-nonce-1", r1), NOW, 0, [0; 64], &mut replay3, &mut cq3, None,
+        ),
+        Outcome::Admit
+    );
+    let r2 = pow_cap.prove(b"free-nonce-2", 0);
+    assert_eq!(
+        pipe_pow_free.process_with_policy(
+            &mk_req(client, carrier, cookie, b"free-nonce-2", r2), NOW, 0, [0; 64], &mut replay3, &mut cq3, None,
+        ),
+        Outcome::Admit,
+        "control: un-lowered case still admits — proves the ceiling (not some other bug) caused the rejection above"
+    );
 }

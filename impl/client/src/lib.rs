@@ -1123,6 +1123,13 @@ pub fn publish_with_opks(store: &Store, relay: &Relay, cap: Capability, now: u64
     // contacts fall back to 3-DH. Bounded and self-healing; correctness beats that efficiency.
     // Persist BEFORE publishing: the relay must never advertise an OPK whose secret we have not
     // durably stored, or an opener using it could not be accepted.
+    //
+    // Under the sessions flock: the prekey secrets share the session file (CRYPTO-26), so
+    // topping them up is a read-modify-write that a concurrent send/receive would otherwise
+    // interleave with — one of the two writes would drop the other's half. Publish is not on a
+    // hot path, and no caller of this function holds the lock already (checked: nothing between
+    // `publish_all` and the desktop/CLI entry points takes it).
+    let _lock = store.lock_sessions().map_err(|e| format!("session lock: {e}"))?;
     peer.load_opks(&store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?);
     let fresh = if peer.opk_count() < OPK_TARGET {
         peer.add_opks(OPK_TARGET - peer.opk_count())
@@ -2988,16 +2995,18 @@ pub fn recv_session(
     // deletes the used ones, and we persist the remainder so they are never reused.
     peer.load_opks(&store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?);
     let msgs = peer.receive(now)?;
-    // PLAINTEXT-FIRST: persist the decrypted text to history BEFORE burning OPKs, saving the
-    // ratchet, or acking. This closes both former loss windows — `[save_opks → save_sessions]`
-    // (burned OPK, unsaved session: a redelivered opener can't re-derive the 4th DH) and
-    // `[save_sessions → history]` (advanced ratchet, unpersisted plaintext) — because the
-    // plaintext is now durable before either commit. A crash here just redelivers; the dedup
-    // (or the ratchet's fail-closed on an already-advanced session) prevents a double. The
-    // whole op runs under the sessions flock, so no concurrent receive can interleave.
+    // PLAINTEXT-FIRST: persist the decrypted text to history BEFORE the state commit or the ACK,
+    // so a crash between them cannot lose the message (`[save_sessions → history]`: advanced
+    // ratchet, unpersisted plaintext). A crash here just redelivers; the dedup (or the ratchet's
+    // fail-closed on an already-advanced session) prevents a double. The whole op runs under the
+    // sessions flock, so no concurrent receive can interleave.
     persist_incoming_history(store, &msgs, now)?;
-    store.save_opks(&peer.export_opks()).map_err(|e| format!("saving one-time prekeys: {e}"))?;
-    store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий: {e}"))?;
+    // The burnt one-time prekey and the session derived from it commit TOGETHER (CRYPTO-26):
+    // two writes here meant a crash could leave the prekey gone with no session to show for it,
+    // and the redelivered opener then had nothing left to re-derive the 4th DH term from.
+    store
+        .save_receive_commit(&peer.export_state(), &peer.export_opks())
+        .map_err(|e| format!("saving the receive commit: {e}"))?;
     // Plaintext + ratchet + OPKs durable ⇒ safe to delete the leased messages from the relay.
     peer.ack_all(now);
     Ok(msgs)
@@ -3224,12 +3233,14 @@ pub fn recv_session_multi(store: &Store, relays: &[Relay], now: u64) -> Result<M
     let opks = store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?;
     let out = receive_threaded(account, state, opks, &pairs, now);
     // PLAINTEXT-FIRST (same discipline as `recv_session`, all under the sessions flock):
-    // persist decrypted text to history BEFORE saving OPKs/sessions and BEFORE the ACKs, so a
+    // persist decrypted text to history BEFORE the state commit and BEFORE the ACKs, so a
     // crash between the commit and the plaintext write cannot lose the message. Deduped by
-    // `payload_id`.
+    // `payload_id`. The prekeys and the ratchet then commit as ONE write (CRYPTO-26) — see
+    // `Store::save_receive_commit`.
     persist_incoming_history(store, &out.messages, now)?;
-    store.save_opks(&out.opks).map_err(|e| format!("saving one-time prekeys: {e}"))?;
-    store.save_sessions(&out.state).map_err(|e| format!("saving sessions: {e}"))?;
+    store
+        .save_receive_commit(&out.state, &out.opks)
+        .map_err(|e| format!("saving the receive commit: {e}"))?;
     // Plaintext + state are durable IN THIS STORE — which is the whole story for a file-tree
     // account and only half of it for a container-backed one (SEC-34). So the leases are handed
     // back instead of acked here: each receipt carries the transport of the relay that leased it

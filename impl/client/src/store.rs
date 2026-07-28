@@ -1888,14 +1888,6 @@ impl Store {
         self.dir.join("peer_profiles.dat")
     }
 
-    fn opks_path(&self) -> PathBuf {
-        self.net_file("opks.dat")
-    }
-
-    /// Load persisted one-time prekey SECRETS (see `pqxdh::Account::export_opk_secrets`).
-    /// A sidecar, deliberately SEPARATE from `account.key`: the long-lived identity is
-    /// never touched, so there is no migration risk. Absent → empty (backward compatible).
-    /// Encrypted at rest like every other secret file.
     /// Path of the sealed in-flight inline-transfer state (see `content::Reassembler::export`).
     fn partials_path(&self) -> PathBuf {
         self.net_file("partials.dat")
@@ -1920,35 +1912,35 @@ impl Store {
         }
     }
 
+    /// Load the persisted one-time prekey SECRETS (see `pqxdh::Account::export_opk_secrets`).
+    ///
+    /// They live INSIDE the session state file — see `save_receive_commit` for why — so a
+    /// file that exists but cannot be opened or decoded is an ERROR here, not "no keys".
+    /// Returning an empty list made the client believe it held none, mint a fresh batch and
+    /// publish it — while the relay went on handing out the OLD public keys whose secrets had
+    /// just been declared missing. Every initiator that received one produced an opener the
+    /// recipient could no longer accept: silent, one-sided first-contact failure that looks like
+    /// the network dropping messages (R2-4). Absent is still legitimately empty.
     pub fn load_opks(&self) -> io::Result<Vec<[u8; 32]>> {
-        match std::fs::read(self.opks_path()) {
-            // A file that exists but cannot be opened or decoded is an ERROR, not "no keys".
-            // Returning an empty list made the client believe it held none, mint a fresh batch and
-            // publish it — while the relay went on handing out the OLD public keys whose secrets
-            // had just been declared missing. Every initiator that received one produced an opener
-            // the recipient could no longer accept: silent, one-sided first-contact failure that
-            // looks like the network dropping messages (R2-4). Absent is still legitimately empty.
-            Ok(blob) => {
-                let plain = self
-                    .key
-                    .open(&self.label(&self.opks_path()), &blob)
-                    .map_err(|e| io_err(format!("one-time prekeys unreadable ({e}) — refusing to \
-                         treat a corrupt sidecar as 'no keys'; restore it or re-provision")))?;
-                postcard::from_bytes(&plain).map_err(|e| {
-                    io_err(format!("one-time prekeys malformed ({e}) — refusing to treat a corrupt \
-                         sidecar as 'no keys'"))
-                })
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
-        }
+        Ok(self.read_session_file()?.map(|(_, _, opks)| opks).unwrap_or_default())
     }
 
-    /// Atomically persist the one-time prekey secrets (full rewrite; the set is small and
-    /// changes as a whole on top-up/consumption). **Private keys in the clear** — 0600.
+    /// Persist the one-time prekey secrets alone, keeping the session state that shares their
+    /// file. For the PUBLISH side (mint a batch, store the secrets, then advertise the public
+    /// halves); the RECEIVE side must use `save_receive_commit` instead, because there the two
+    /// halves change together. **Private keys in the clear** — 0600.
+    ///
+    /// Read-modify-write of a shared file: the caller must hold `lock_sessions`, or a concurrent
+    /// send/receive can interleave and one of the two writes loses the other's half.
     pub fn save_opks(&self, opks: &[[u8; 32]]) -> io::Result<()> {
-        let plain = postcard::to_stdvec(opks).map_err(io_err)?;
-        self.write_sealed(&self.opks_path(), &plain)
+        // Carry the session bytes across OPAQUELY (never decode → re-encode): a state this call
+        // cannot parse is still a state the ratchet may need, and re-encoding would make every
+        // OPK top-up a chance to rewrite it.
+        let state = match self.read_session_file()? {
+            Some((_, state, _)) => state,
+            None => postcard::to_stdvec(&PeerState::empty()).map_err(io_err)?,
+        };
+        self.write_session_file(&state, opks)
     }
 
     fn extra_relays_path(&self) -> PathBuf {
@@ -2666,7 +2658,8 @@ impl Store {
         for path in [
             victim.net_file("discovery.key"),
             victim.net_file("reduced_fs.dat"),
-            victim.net_file("opks.dat"),
+            // No `opks.dat`: the one-time prekey secrets live INSIDE `sessions.dat` now
+            // (CRYPTO-26), so removing that file takes them with it.
             victim.net_file("partials.dat"),
             victim.net_file("sessions.dat"),
             victim.net_file("sessions.lock"),
@@ -2921,35 +2914,35 @@ impl Store {
         postcard::from_bytes(&plain).unwrap_or(0)
     }
 
-    pub fn load_sessions(&self) -> io::Result<PeerState> {
-        match std::fs::read(self.sessions_path()) {
-            Ok(blob) => {
-                let bytes = self.key.open(&self.label(&self.sessions_path()), &blob).map_err(io_err)?;
-                let (generation, state): (u64, Vec<u8>) =
-                    postcard::from_bytes(&bytes).map_err(io_err)?;
-                let anchor = self.load_sessions_anchor();
-                if generation < anchor {
-                    return Err(io_err(format!(
-                        "session state rolled back: on disk is generation {generation}, but this                          account has already written {anchor}. Something restored sessions.dat                          from an older copy. Message keys are not reused (each message derives                          its own), but replies may be undecryptable until the session is                          re-established — reconnect the affected chats."
-                    )));
-                }
-                PeerState::from_bytes(&state).map_err(io_err)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(PeerState::empty()),
-            Err(e) => Err(e),
-        }
+    /// Read the session file as it sits on disk: `(generation, opaque state bytes, OPK secrets)`,
+    /// or `None` if this account has never written one. An existing-but-unreadable file is an
+    /// ERROR — every caller here holds secrets whose loss is silent (a ratchet position, a burnt
+    /// prekey), so "unreadable" must never collapse into "empty".
+    fn read_session_file(&self) -> io::Result<Option<(u64, Vec<u8>, Vec<[u8; 32]>)>> {
+        let blob = match std::fs::read(self.sessions_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let plain = self.key.open(&self.label(&self.sessions_path()), &blob).map_err(|e| {
+            io_err(format!("session state unreadable ({e}) — refusing to treat it as absent"))
+        })?;
+        let (generation, state, opks): (u64, Vec<u8>, Vec<[u8; 32]>) =
+            postcard::from_bytes(&plain).map_err(|e| {
+                io_err(format!("session state malformed ({e}) — refusing to treat it as absent"))
+            })?;
+        Ok(Some((generation, state, opks)))
     }
 
-    /// АТОМАРНО сохранить состояние сессий: шифруем в памяти → temp (0600) →
-    /// fsync → rename поверх. Крах на середине записи не оставит усечённый/битый
-    /// файл (иначе — wedge/потеря позиции). temp в том же каталоге (rename атомарен
-    /// в пределах ФС). Ratchet-ключи шифруются at-rest перед записью.
-    pub fn save_sessions(&self, state: &PeerState) -> io::Result<()> {
+    /// ATOMICALLY write the session file: seal in memory → temp (0600) → fsync → rename over.
+    /// A crash mid-write leaves no truncated/torn file (which would wedge the account or lose a
+    /// ratchet position); the temp sits in the same directory, so the rename is atomic within the
+    /// filesystem. Ratchet keys and prekey secrets are encrypted at rest before the write.
+    fn write_session_file(&self, state: &[u8], opks: &[[u8; 32]]) -> io::Result<()> {
         // One past the highest generation EITHER file knows about, so a rolled-back state file
         // cannot lower the mark by being written over.
         let generation = self.load_sessions_anchor().max(self.sessions_generation()) + 1;
-        let inner = postcard::to_stdvec(state).map_err(io_err)?;
-        let plain = postcard::to_stdvec(&(generation, inner)).map_err(io_err)?;
+        let plain = postcard::to_stdvec(&(generation, state, opks)).map_err(io_err)?;
         let bytes = self.key.seal(&self.label(&self.sessions_path()), &plain);
         let tmp = self.net_file("sessions.dat.tmp");
         {
@@ -2970,12 +2963,52 @@ impl Store {
         self.write_sealed(&self.sessions_anchor_path(), &postcard::to_stdvec(&generation).map_err(io_err)?)
     }
 
+    pub fn load_sessions(&self) -> io::Result<PeerState> {
+        let Some((generation, state, _)) = self.read_session_file()? else {
+            return Ok(PeerState::empty());
+        };
+        let anchor = self.load_sessions_anchor();
+        if generation < anchor {
+            return Err(io_err(format!(
+                "session state rolled back: on disk is generation {generation}, but this                  account has already written {anchor}. Something restored sessions.dat                  from an older copy. Message keys are not reused (each message derives                  its own), but replies may be undecryptable until the session is                  re-established — reconnect the affected chats."
+            )));
+        }
+        PeerState::from_bytes(&state).map_err(io_err)
+    }
+
+    /// Persist the ratchet state alone, keeping the one-time prekeys that share its file.
+    /// For the SEND side, which never touches prekeys; the receive side commits both together
+    /// (`save_receive_commit`).
+    ///
+    /// Read-modify-write of a shared file: hold `lock_sessions` across load → mutate → save, as
+    /// every caller already does to keep two processes off the same ratchet position.
+    pub fn save_sessions(&self, state: &PeerState) -> io::Result<()> {
+        let opks = self.read_session_file()?.map(|(_, _, opks)| opks).unwrap_or_default();
+        self.write_session_file(&postcard::to_stdvec(state).map_err(io_err)?, &opks)
+    }
+
+    /// Commit BOTH halves of a receive — the remaining one-time prekeys and the ratchet state
+    /// derived from the one that was just consumed — in a single durable write.
+    ///
+    /// CRYPTO-26. These used to be two files and two atomic renames (`save_opks` then
+    /// `save_sessions`). Each rename was atomic on its own, but the PAIR was not: a crash or an
+    /// I/O error in between left "OPK burnt, no session on disk", which is unrecoverable rather
+    /// than merely stale. The ACK had not been sent, so the relay redelivered the opener — and
+    /// `accept_key_agreement` could no longer find the prekey secret to re-derive the root key,
+    /// while the sender, holding a perfectly good session, kept ratcheting into a mailbox the
+    /// recipient could never open again. Swapping the order does not fix it either: session
+    /// first, prekey still on disk, is a reuse window for a secret that is one-time by contract.
+    ///
+    /// One file, one rename, so the reachable crash states are only "both old" (the opener
+    /// redelivers and re-opens) or "both new" (done) — never "neither".
+    pub fn save_receive_commit(&self, state: &PeerState, opks: &[[u8; 32]]) -> io::Result<()> {
+        self.write_session_file(&postcard::to_stdvec(state).map_err(io_err)?, opks)
+    }
+
     /// The generation recorded INSIDE the current session file (0 if absent/unreadable — a
     /// corrupt state file is reported by `load_sessions`, not silently by this helper).
     fn sessions_generation(&self) -> u64 {
-        let Ok(blob) = std::fs::read(self.sessions_path()) else { return 0 };
-        let Ok(plain) = self.key.open(&self.label(&self.sessions_path()), &blob) else { return 0 };
-        postcard::from_bytes::<(u64, Vec<u8>)>(&plain).map(|(g, _)| g).unwrap_or(0)
+        self.read_session_file().ok().flatten().map(|(g, _, _)| g).unwrap_or(0)
     }
 
     // ----- Зашифрованный append-лог истории чатов -----

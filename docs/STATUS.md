@@ -625,9 +625,19 @@ else, and we either refused it (an authority, a token) or could not verify it
   delayed, not lost); the ratchet's transactional decrypt fails closed on an already-consumed
   duplicate, so redelivery is effectively-once with no dedup store. The two former residual loss windows
   are now **closed** by persisting plaintext-first: `recv_session`/`recv_session_multi` write the
-  decrypted text to history BEFORE burning OPKs, saving the ratchet, or acking (all under the sessions
-  flock). So a crash in `[OPK burned → session saved]` or `[session saved → history]` no longer loses
-  the message — the plaintext is already durable, and a redelivered copy is skipped by a **payload_id**
+  decrypted text to history BEFORE the state commit or the ack (all under the sessions flock), and the
+  burnt one-time prekey and the session derived from it commit **together, in one durable write**
+  (`Store::save_receive_commit`, CRYPTO-26 — the prekey secrets now live INSIDE `sessions.dat`, so one
+  rename commits the pair; `opks.dat` is gone and `STATE_VERSION` is 5). That last one was never a
+  plaintext-loss window but an unrecoverable state one: two files meant a crash between them left
+  "prekey burnt, no session", the unacked opener redelivered into an `accept_key_agreement` that no
+  longer had the secret for the 4th DH term, and the sender kept ratcheting into a mailbox its contact
+  could never open — manual forget/reconnect was the only way out. Swapping the write order would have
+  traded it for a reuse window on a one-time secret, so the pair had to become one commit rather than a
+  better order. Pinned by `a_crash_before_the_session_commit_leaves_the_prekey_to_reopen_the_contact`
+  (drops the lease receipts, rolls the session file back, drives the relay clock past the lease, and
+  requires the redelivered opener to still open). So a crash in `[session saved → history]` no longer
+  loses the message — the plaintext is already durable, and a redelivered copy is skipped by a **payload_id**
   dedup over the recent history tail (collision-free, unlike a content hash, which would eat a genuine
   double-tap of the same text in the same second). Both single-homed (`recv_session`, CLI) and
   multi-homed (`recv_session_multi`, desktop/GUI) carry lease/ACK; the multi-homed path acks each leased
@@ -2104,9 +2114,12 @@ implementation. NOT feature-gated (E2E is the core of the product, unlike tring)
   increments: (1) the key-agreement mechanism (`dh4` mixed in + bound in the transcript,
   the OPK consumed on accept); (2) the relay stores a published batch and hands out ONE
   distinct OPK per fetch (`opk_batches`, capped, exhaustion → 3-DH fallback); (3) the
-  client persists the OPK secrets in a **sidecar** (`opks.dat`, deliberately out of
-  `account.key` so the identity is never at migration risk) — `publish_with_opks` tops up
-  and persists before publishing, `recv_session` reloads to accept and saves the remainder.
+  client persists the OPK secrets **inside the session state file** (`sessions.dat`,
+  deliberately out of `account.key` so the identity is never at migration risk; they were a
+  separate `opks.dat` sidecar until CRYPTO-26 needed the burn and the session it produces to
+  commit in ONE rename) — `publish_with_opks` tops up and persists before publishing (under
+  the sessions flock, since the file is now shared), `recv_session` reloads to accept and
+  commits the remainder together with the new session.
   Pinned at every layer: `a_one_time_prekey_is_mixed_in_and_consumed_once`,
   `dh4_one_time_prekey_secret_is_load_bearing_in_root_key`,
   `the_relay_hands_a_distinct_one_time_prekey_to_each_fetcher`,

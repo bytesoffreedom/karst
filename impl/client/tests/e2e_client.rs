@@ -3613,3 +3613,100 @@ fn clearing_a_chat_wipes_it_from_disk_across_a_reload() {
     std::fs::remove_dir_all(&adir).ok();
     std::fs::remove_dir_all(&bdir).ok();
 }
+
+/// Copy every file in `dir` (flat — the account's network files all live at the top level) so a
+/// later `restore_files` can put chosen ones back exactly as they were.
+fn snapshot_files(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+        .collect()
+}
+
+/// Put back exactly the named files from a snapshot — the simulation of a crash in which those
+/// writes never landed while every other write did.
+fn restore_files(snap: &[(PathBuf, Vec<u8>)], names: &[&str]) {
+    for (path, bytes) in snap {
+        if names.contains(&path.file_name().unwrap().to_str().unwrap()) {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
+/// CRYPTO-26 — a crash between burning a one-time prekey and saving the session it produced
+/// must not strand the contact permanently.
+///
+/// The receive path used to write the two halves as two files and two renames: prekeys first,
+/// ratchet second. Each rename was atomic alone, the PAIR was not, and a crash (or an I/O error)
+/// in between left the prekey burnt with no session to show for it. Nothing was acked, so the
+/// relay redelivered the exact opener — and there was no longer a prekey secret to re-derive the
+/// 4th DH term with, while the sender kept ratcheting into a mailbox its contact could never
+/// open again. Recovery needed a manual forget/reconnect.
+///
+/// The crash is simulated the only way that keeps it honest: the poll's lease receipts are
+/// DROPPED (so the relay still holds the ciphertext, exactly as a crash before the ACK leaves
+/// it) and the file(s) carrying the session half are restored to their pre-receive bytes. Then
+/// the lease expires on the relay's own clock (driven, never slept on) and the opener comes back.
+#[test]
+fn a_crash_before_the_session_commit_leaves_the_prekey_to_reopen_the_contact() {
+    let (relay_addr, relay_id, _handle, clock) = spawn_relay_handle_clock();
+    let adir = temp_dir("crash26-a");
+    let bdir = temp_dir("crash26-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    for s in [&astore, &bstore] {
+        seed_provision(s);
+        s.save_capability(&client::dev_capability()).unwrap();
+    }
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+    let r = ctx(relay_addr, &relay_id);
+
+    // Bob publishes one-time prekeys, so Alice's first contact really consumes one (4-DH).
+    client::publish_with_opks(&bstore, &r, client::dev_capability(), NOW).unwrap();
+    let opks_before = bstore.load_opks().unwrap();
+    assert!(!opks_before.is_empty(), "the batch must be persisted for this test to mean anything");
+    client::send_text(&astore, &r, &bob_ik, b"first contact", NOW, NOW).unwrap();
+
+    // The disk as it looked BEFORE the receive.
+    let snapshot = snapshot_files(&bdir);
+
+    // Bob receives — and crashes before acking: the receipts are dropped, never committed, so
+    // the ciphertext stays leased on the relay.
+    let poll = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+    assert_eq!(poll.messages.iter().flatten().count(), 1, "the opener must decrypt the first time");
+    assert!(!poll.acks.is_empty(), "the poll must have taken a lease to drop");
+    drop(poll);
+
+    // The crash: the session write never reached the disk. Everything else did.
+    restore_files(&snapshot, &["sessions.dat", "sessions.anchor"]);
+
+    // The invariant the pair commit exists for: never "prekey burnt AND no session". With the
+    // session rolled back, the prekey set must be rolled back with it.
+    assert!(
+        bstore.load_sessions().unwrap().debug_peers().0.is_empty(),
+        "test setup: the session half is supposed to be rolled back here"
+    );
+    let (mut back, mut before) = (bstore.load_opks().unwrap(), opks_before.clone());
+    back.sort_unstable();
+    before.sort_unstable();
+    assert_eq!(
+        back, before,
+        "the prekey was burnt but its session did not survive — the contact can never be reopened"
+    );
+
+    // And operationally: the lease expires, the relay redelivers the exact opener, and it still
+    // opens — the state that redelivery is supposed to recover from.
+    let later = NOW + node::node::LEASE_SECS + 1;
+    clock.store(later, AtomicOrdering::SeqCst);
+    let again = recv_multi(&bstore, std::slice::from_ref(&r), later).unwrap();
+    let texts = poll_texts(&again.messages);
+    assert!(
+        texts.contains(&b"first contact".to_vec()),
+        "the redelivered opener no longer opens — the contact is stranded"
+    );
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}

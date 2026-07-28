@@ -63,6 +63,35 @@ pub const MAX_OPKS_PER_IK: usize = 256;
 /// epoch advances (`advance_epoch` → `sweep_mailboxes`), never on a background thread.
 pub const MAILBOX_TTL_SECS: u64 = 7 * 24 * 3600;
 
+/// Ceiling on DISTINCT mailbox keys (recipients holding at least one queued message),
+/// independent of `MAILBOX_TTL_SECS` and of the per-mailbox `MAX_FETCH_SEALS` cap. `recipient`
+/// in `WireMessage` is any 32 bytes the SENDER picks — never checked against a published
+/// bundle or any other proof the address belongs to someone — so an admitted sender can deposit
+/// one message to a fresh fabricated address every send, and admission (capability + quota)
+/// throttles the RATE new keys appear, never their total COUNT.
+///
+/// This is NOT a one-entry-per-identity table like `bundles` — do not size it that way.
+/// `drop.rs`'s rotating drop-boxes mean one ACTIVE session alone can hold up to `2` (directions,
+/// `drop::direction`) `× (TTL_EPOCHS + 2)` distinct live keys — `TTL_EPOCHS =
+/// MAILBOX_TTL_SECS / DROP_EPOCH_SECS = 7`, so up to 18 keys for a single busy two-way
+/// conversation, on top of one long-term identity-key mailbox per user (polled for a stranger's
+/// first contact). Honest organic churn for a `MAX_BUNDLES`-sized population with even a modest
+/// number of concurrently-active conversations per user reaches the high hundreds of thousands
+/// to low millions — nowhere near `MAX_BUNDLES` itself. Set well above that (this is a rough
+/// calibration pending real telemetry, not a derived exact bound; pre-alpha makes raising it
+/// free).
+///
+/// Mitigating fact that makes a flat cap tenable at all: a mailbox drained by `handle_fetch`
+/// (delete-on-fetch) or `handle_ack` is removed from the table IMMEDIATELY, not just at the TTL
+/// sweep — so a key only occupies a table slot for mail that is genuinely UNDELIVERED, not for
+/// every key a conversation has ever used.
+///
+/// Honest residual (same shape as `BundleSlot`'s CRYPTO-18 note): once the table is completely
+/// full, first-contact delivery to a BRAND-NEW recipient is refused until TTL reclaims a slot —
+/// this cap cannot distinguish a hostile flood from a legitimate surge of new correspondents. An
+/// already-known recipient (already a key in the table) is never affected.
+pub const MAX_MAILBOXES: usize = 2_000_000;
+
 /// How long a leased (fetched-but-unacked) message stays invisible to a subsequent
 /// fetch before it becomes deliverable again. A client that fetches with
 /// `FetchRequest::ack` promises to ACK once the message is durably persisted; if it
@@ -862,17 +891,28 @@ impl RelayNode {
                 Response::NeedCookie(cookie)
             }
             Outcome::Admit => {
-                // Cap на ВСТАВКЕ держит инвариант «mailbox всегда влезает в один
-                // кадр ответа» по построению → fetch никогда не упрётся в
-                // FrameTooLarge ПОСЛЕ drain'а (иначе — тихая потеря всей очереди
-                // офлайн-получателя). Полный ящик = backpressure отправителю, не
-                // молчаливый сброс. В духе admission-троттлинга.
-                let mbox = self.mailboxes.entry(msg.recipient).or_default();
-                if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
-                    Response::Rejected("MailboxFull".into())
+                // Table-wide cap on NEW keys (see `MAX_MAILBOXES`): a fabricated recipient the
+                // relay has never seen costs a whole HashMap entry that then sits until
+                // `MAILBOX_TTL_SECS` sweeps it, and admission does not bound how many distinct
+                // addresses one capability can address mail to — only how fast. Checked before
+                // `entry()` would itself allocate the new slot; an EXISTING recipient (already
+                // in the table) is never blocked by this, only a brand-new one once the table is
+                // full.
+                if !self.mailboxes.contains_key(&msg.recipient) && self.mailboxes.len() >= MAX_MAILBOXES {
+                    Response::Rejected("MailboxTableFull".into())
                 } else {
-                    mbox.push(MailboxEntry { enqueued_at: now, leased_until: 0, payload: msg.payload.clone() });
-                    Response::Accepted
+                    // Cap на ВСТАВКЕ держит инвариант «mailbox всегда влезает в один
+                    // кадр ответа» по построению → fetch никогда не упрётся в
+                    // FrameTooLarge ПОСЛЕ drain'а (иначе — тихая потеря всей очереди
+                    // офлайн-получателя). Полный ящик = backpressure отправителю, не
+                    // молчаливый сброс. В духе admission-троттлинга.
+                    let mbox = self.mailboxes.entry(msg.recipient).or_default();
+                    if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
+                        Response::Rejected("MailboxFull".into())
+                    } else {
+                        mbox.push(MailboxEntry { enqueued_at: now, leased_until: 0, payload: msg.payload.clone() });
+                        Response::Accepted
+                    }
                 }
             }
             other => Response::Rejected(format!("{:?}", other)),
@@ -1692,6 +1732,55 @@ mod tests {
 
         relay.sweep_mailboxes(NOW + MAILBOX_TTL_SECS + 1);
         assert!(!relay.mailboxes.contains_key(&ik), "stale entry swept, empty mailbox gone");
+    }
+
+    /// Finding #2 (backlog #162, R2-8/9): `recipient` is any 32 bytes the SENDER picks — never
+    /// checked against a published bundle or any other proof of ownership — so an admitted
+    /// sender can deposit one message to a fresh fabricated address every send. Before
+    /// `MAX_MAILBOXES`, nothing bounded how many distinct keys the table could hold short of
+    /// `MAILBOX_TTL_SECS` (7 days) passing. The table is pre-filled directly (as
+    /// `sweep_mailboxes_drops_only_entries_past_ttl` above does) so the test stays fast — only
+    /// `handle`'s cap check is under test here, not the admission pipeline.
+    #[test]
+    fn a_flood_of_fabricated_recipients_cannot_grow_the_mailbox_table_without_bound() {
+        let relay = Rc::new(RefCell::new(RelayNode::new(NOW)));
+        {
+            let mut r = relay.borrow_mut();
+            for n in 0..MAX_MAILBOXES as u64 {
+                let mut recipient = [0u8; 32];
+                recipient[..8].copy_from_slice(&n.to_le_bytes());
+                r.mailboxes.insert(
+                    recipient,
+                    vec![MailboxEntry { enqueued_at: NOW, leased_until: 0, payload: test_seal(1) }],
+                );
+            }
+            assert_eq!(r.mailboxes.len(), MAX_MAILBOXES, "table filled to the cap");
+        }
+
+        let cap = publish_cap();
+        relay.borrow_mut().issue_capability(cap.clone());
+        let transport = InMemoryTransport::new(relay.clone());
+        let mut attacker = Client::new(transport, cap, b"attacker");
+
+        // A FRESH fabricated recipient, once the table is already full, must be rejected loudly
+        // — never a silent drop of the send.
+        let fresh = PublicKey::from([0xFEu8; 32]);
+        let resp = attacker.send(&fresh, b"hello", NOW);
+        assert!(
+            matches!(resp, Response::Rejected(_)),
+            "a brand-new recipient must be rejected once the mailbox table is at MAX_MAILBOXES, got {resp:?}"
+        );
+        assert_eq!(relay.borrow().mailboxes.len(), MAX_MAILBOXES, "the table did not grow past the cap");
+
+        // Control: an ALREADY-PRESENT recipient (one of the pre-filled ones) still receives mail
+        // — the cap throttles brand-new keys, never delivery to an existing correspondent.
+        let mut known = [0u8; 32];
+        known[..8].copy_from_slice(&0u64.to_le_bytes());
+        let resp2 = attacker.send(&PublicKey::from(known), b"hi", NOW);
+        assert!(
+            matches!(resp2, Response::Accepted),
+            "legitimate delivery to an EXISTING mailbox must still work while the table is full, got {resp2:?}"
+        );
     }
 
     /// §12 write-side auth: опубликовать bundle под чужим IK нельзя. Владелец

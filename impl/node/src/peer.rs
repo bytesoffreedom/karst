@@ -744,6 +744,13 @@ impl<T: Transport> Peer<T> {
         if !bundle.verify_prekey_sig() {
             return Err("bundle prekey signature invalid — relay tampered or unsigned bundle".into());
         }
+        // A degenerate mailbox point is signed by its owner but still unusable: the all-zero
+        // encoding is the Ristretto identity, so `h·M` is the identity for every epoch — every
+        // sender derives the same box and nobody can prove ownership of it. Refuse it here rather
+        // than storing it and failing at the first send.
+        if bundle.mailbox_pub == [0u8; 32] {
+            return Err("bundle carries a degenerate mailbox point — refusing".into());
+        }
         // A malformed KEM key in a (validly signed) bundle fails HERE with an error instead of
         // panicking the client — a malicious contact can sign its own garbage (CRYPTO-08).
         let (root_key, ka) =

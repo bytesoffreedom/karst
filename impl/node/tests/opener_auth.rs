@@ -135,3 +135,38 @@ fn an_unsealed_opener_is_refused_but_the_sealed_form_of_it_works() {
     assert_eq!(got.plaintext, b"first contact");
     assert_eq!(got.sender, alice.public.to_bytes());
 }
+
+/// A degenerate mailbox point must not enter a session — from either direction.
+///
+/// The all-zero encoding is the Ristretto IDENTITY point, and `h·identity == identity` for every
+/// blinding factor, so every sender would derive the SAME "drop box" and nobody could prove
+/// ownership of it. It used to be the `serde(default)` for pre-mailbox bundles, which is why a
+/// downstream guard had to catch it at SEND time — after it had already been stored in a session.
+/// Its owner can sign it perfectly well, so the signature check does not cover this.
+#[test]
+fn a_degenerate_mailbox_point_is_refused_on_both_sides() {
+    // ACCEPT side: an opener whose sender advertises the identity point.
+    let mut bob = bob_peer();
+    let bundle = bob.bundle();
+    let alice = Identity::generate();
+    let (root, mut ka) =
+        initiate_key_agreement(&alice, &[0u8; 32], &bundle).expect("well-formed bundle");
+    assert_eq!(ka.mailbox_a_pub, [0u8; 32], "the sender advertised the degenerate point");
+    let mut sender = Session::init_sender(root, bundle.prekey_pub);
+    let msg = sender.encrypt(b"hello");
+    let sealed = sealed_to(bundle.ik_pub, &ka, msg);
+    assert!(bob.open_for_test(&sealed).is_none(), "a degenerate sender mailbox must be refused");
+    assert!(!bob.has_session(&alice.public.to_bytes()), "and must leave no session");
+
+    // Control: the same opener with a real mailbox point is accepted, so the refusal is about
+    // the degenerate value and not about the opener.
+    let alice_m = node::blind::MailboxSecret::generate().public();
+    let (root2, ka2) =
+        initiate_key_agreement(&alice, &alice_m, &bundle).expect("well-formed bundle");
+    ka.mailbox_a_pub = alice_m;
+    let _ = &ka2;
+    let mut sender2 = Session::init_sender(root2, bundle.prekey_pub);
+    let msg2 = sender2.encrypt(b"hello again");
+    let sealed2 = sealed_to(bundle.ik_pub, &ka2, msg2);
+    assert!(bob.open_for_test(&sealed2).is_some(), "a real mailbox point still works");
+}

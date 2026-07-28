@@ -59,14 +59,22 @@ pub struct PreKeyBundle {
     /// (`prekey_pub ‖ kem_ek`) — the §2.1 "signed prekey". Lets the sender REJECT a bundle
     /// whose prekey / KEM key a relay substituted, instead of only failing closed later in the
     /// DH agreement. Signed with the SAME X25519 identity key (Signal's XEdDSA), so no second
-    /// key and no safety-number change. The one-time prekey is NOT signed. Appended last.
-    #[serde(default)]
+    /// key and no safety-number change. The one-time prekey is NOT signed.
+    ///
+    /// MANDATORY. It used to be `serde(default)` so a pre-signature bundle would still decode as
+    /// "unsigned" — tolerance for clients that do not exist. A missing signature now fails to
+    /// decode instead of arriving as an empty Vec that only a later check happens to catch.
     pub prekey_sig: Vec<u8>,
     /// The account's public mailbox point `M = m·G` for blinded deposit/fetch key separation
     /// (`crate::blind`). Bound by `prekey_sig` (a relay cannot swap it undetected). The live
     /// drop-box path derives the blinded deposit address from it for established sessions
-    /// (`peer.rs` → `blind::deposit_address`). Appended last.
-    #[serde(default)]
+    /// (`peer.rs` → `blind::deposit_address`).
+    ///
+    /// MANDATORY, and never the all-zero encoding: that is the Ristretto IDENTITY point, for
+    /// which `h·M` is the identity for every blinding factor — so every sender would compute the
+    /// same "address" and nobody could prove ownership of it. It used to default to `[0;32]` for
+    /// pre-mailbox bundles, which is why a downstream guard had to catch the degenerate value at
+    /// SEND time; it is now rejected where it would enter a session.
     pub mailbox_pub: [u8; 32],
 }
 
@@ -304,6 +312,13 @@ impl Account {
     /// взяв публичный bundle, заставит получателя сохранить мёртвую сессию под чужим IK.
     /// Возвращает (root_key, заявленный identity отправителя).
     pub fn prepare_key_agreement(&self, ka: &KeyAgreement) -> Option<([u8; 32], [u8; 32])> {
+        // The sender's mailbox point becomes where we deposit our replies, so a degenerate one
+        // must never enter a session: the all-zero encoding is the Ristretto IDENTITY, and
+        // `h·identity == identity` for every blinding factor, so the "address" is the same for
+        // everyone and nobody can prove they own it.
+        if ka.mailbox_a_pub == [0u8; 32] {
+            return None;
+        }
         let ik_a = PublicKey::from(ka.ik_a_pub);
         let ek_a = PublicKey::from(ka.ek_a_pub);
         // Зеркало DH отправителя (симметрия static-static X25519).

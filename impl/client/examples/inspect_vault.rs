@@ -80,6 +80,10 @@ fn main() {
             let ps = root.as_proxy(p.index);
             match client::recv_session_multi(&ps, std::slice::from_ref(&relay), now) {
                 Ok(poll) => {
+                    // This inspector opens a FILE-TREE vault, so the store writes `recv_session_multi`
+                    // just made are the authority — the barrier is a no-op, and the leases are acked
+                    // so the inspected mailbox drains exactly as the real client would drain it.
+                    let _ = poll.acks.commit_then_send(now, || Ok(()));
                     let msgs: Vec<_> = poll.messages.into_iter().flatten().collect();
                     println!("proxy #{}: {} message(s), failed relays {:?}", p.index, msgs.len(), poll.failed);
                     for m in &msgs {

@@ -739,6 +739,11 @@ fn build_relays(store: &Store) -> Vec<Relay> {
             }
         }
     }
+    // Seeding lives HERE, in the one function that decides what this account's relay set IS,
+    // rather than at each of the callers that change it (unlock, set-relay, add/remove backup) —
+    // a new caller would otherwise leave its relay with no credential and no obvious symptom
+    // beyond "publish silently skipped it".
+    seed_dev_capabilities(store, &relays);
     relays
 }
 
@@ -854,9 +859,6 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
     app.offline.store(offline, Ordering::SeqCst);
     let store = vault.account(&id);
     let relays = build_relays(&store);
-    // Seed/refresh the DEV capability for each configured relay (see `seed_dev_capabilities`) —
-    // an account made on an older build picks up quota changes here too.
-    seed_dev_capabilities(&store, &relays);
     // Pick up any inline transfer that was mid-flight when the process last stopped. Its carrier
     // messages were already acked, so the relay will not resend them — without this the chunks
     // were simply gone (Bug E).

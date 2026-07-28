@@ -76,7 +76,7 @@ The commands are printed by `karst-up.sh`; in brief (`$R` = `--relay ...
 ```sh
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst init          # → prints the PHRASE + IK
 # restore on another device: karst restore word1 … word12  (into an empty $KARST_HOME)
-KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst dev-cap
+KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst dev-cap $R    # a credential is per RELAY, so name it
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst publish $R
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst send $R --to <recipient's IK> "text"
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst send-file $R --to <IK> --file ./pic.jpg
@@ -107,6 +107,22 @@ the reference for what it configures.
 | `dev` | a known, public capability (local testing only — never expose) | the one-machine demo above |
 
 An **unknown** mode value refuses to start (no silent default).
+
+> **Known limit of the private door (CRYPTO-25, open).** A private relay mints exactly ONE
+> capability and `invite.json` is that one credential, handed to everybody. So all your invitees
+> share one `capability_id` — and the quota tracker meters by `capability_id`, which means they
+> share **one quota bucket** too. Consequences to plan around: one noisy or compromised invitee can
+> exhaust the bucket and everyone else's messages start coming back `CapabilityQuota`; you cannot
+> revoke or rate-limit ONE person; you cannot tell whose traffic is whose; and rotating
+> `capability.key` cuts off every user at once. A capability is a bearer token either way (any
+> holder can pass it on voluntarily), so per-invite credentials would not stop sharing — but they
+> would isolate quota, allow a targeted revoke, and keep one compromised client from becoming a
+> denial of service for the whole group. Until that lands, size a private relay to people you would
+> trust with each other's availability.
+
+Since a capability belongs to ONE relay, the client always names the relay an invite is for:
+`karst import-cap invite.json --relay HOST:PORT --relay-id <hex>` (the invite file itself carries
+no relay-id — the relay writes the bare credential).
 
 ### Proof-of-work on a public door — and toggling it live
 

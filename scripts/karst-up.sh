@@ -47,7 +47,7 @@ relay-id: $RID
   export R="--relay $ADDR --relay-id $RID"
   # Alice:
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI init
-  KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI dev-cap
+  KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI dev-cap \$R
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI publish \$R
   # Bob (in another window) — same, then find each other's IK:
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI account   # → Alice's IK

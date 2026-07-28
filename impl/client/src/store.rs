@@ -384,6 +384,20 @@ fn clamp_str(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
+/// What `sessions.dat` holds, as it sits on disk (see `Store::read_session_file`).
+///
+/// The ratchet state stays OPAQUE here on purpose: a writer that only needs to carry the other
+/// half across (an OPK top-up, say) must never decode and re-encode a state it has no business
+/// touching — that would turn every unrelated write into a chance to rewrite it.
+struct SessionFile {
+    /// Monotonic rollback marker, checked against `sessions.anchor`.
+    generation: u64,
+    /// The serialized `PeerState`, untouched.
+    state: Vec<u8>,
+    /// The one-time prekey secrets, which commit in the SAME write as the state (CRYPTO-26).
+    opks: Vec<[u8; 32]>,
+}
+
 /// Clone is a cheap handle (a path + the derived key), so an off-loop transfer thread
 /// can seal straight into the vault instead of staging plaintext on disk.
 #[derive(Clone)]
@@ -1962,7 +1976,7 @@ impl Store {
     /// recipient could no longer accept: silent, one-sided first-contact failure that looks like
     /// the network dropping messages (R2-4). Absent is still legitimately empty.
     pub fn load_opks(&self) -> io::Result<Vec<[u8; 32]>> {
-        Ok(self.read_session_file()?.map(|(_, _, opks)| opks).unwrap_or_default())
+        Ok(self.read_session_file()?.map(|f| f.opks).unwrap_or_default())
     }
 
     /// Persist the one-time prekey secrets alone, keeping the session state that shares their
@@ -1977,7 +1991,7 @@ impl Store {
         // cannot parse is still a state the ratchet may need, and re-encoding would make every
         // OPK top-up a chance to rewrite it.
         let state = match self.read_session_file()? {
-            Some((_, state, _)) => state,
+            Some(f) => f.state,
             None => postcard::to_stdvec(&PeerState::empty()).map_err(io_err)?,
         };
         self.write_session_file(&state, opks)
@@ -2958,7 +2972,7 @@ impl Store {
     /// or `None` if this account has never written one. An existing-but-unreadable file is an
     /// ERROR — every caller here holds secrets whose loss is silent (a ratchet position, a burnt
     /// prekey), so "unreadable" must never collapse into "empty".
-    fn read_session_file(&self) -> io::Result<Option<(u64, Vec<u8>, Vec<[u8; 32]>)>> {
+    fn read_session_file(&self) -> io::Result<Option<SessionFile>> {
         let blob = match std::fs::read(self.sessions_path()) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2967,11 +2981,10 @@ impl Store {
         let plain = self.key.open(&self.label(&self.sessions_path()), &blob).map_err(|e| {
             io_err(format!("session state unreadable ({e}) — refusing to treat it as absent"))
         })?;
-        let (generation, state, opks): (u64, Vec<u8>, Vec<[u8; 32]>) =
-            postcard::from_bytes(&plain).map_err(|e| {
-                io_err(format!("session state malformed ({e}) — refusing to treat it as absent"))
-            })?;
-        Ok(Some((generation, state, opks)))
+        let (generation, state, opks) = postcard::from_bytes(&plain).map_err(|e| {
+            io_err(format!("session state malformed ({e}) — refusing to treat it as absent"))
+        })?;
+        Ok(Some(SessionFile { generation, state, opks }))
     }
 
     /// ATOMICALLY write the session file: seal in memory → temp (0600) → fsync → rename over.
@@ -3004,9 +3017,10 @@ impl Store {
     }
 
     pub fn load_sessions(&self) -> io::Result<PeerState> {
-        let Some((generation, state, _)) = self.read_session_file()? else {
+        let Some(f) = self.read_session_file()? else {
             return Ok(PeerState::empty());
         };
+        let (generation, state) = (f.generation, f.state);
         let anchor = self.load_sessions_anchor();
         if generation < anchor {
             return Err(io_err(format!(
@@ -3023,7 +3037,7 @@ impl Store {
     /// Read-modify-write of a shared file: hold `lock_sessions` across load → mutate → save, as
     /// every caller already does to keep two processes off the same ratchet position.
     pub fn save_sessions(&self, state: &PeerState) -> io::Result<()> {
-        let opks = self.read_session_file()?.map(|(_, _, opks)| opks).unwrap_or_default();
+        let opks = self.read_session_file()?.map(|f| f.opks).unwrap_or_default();
         self.write_session_file(&postcard::to_stdvec(state).map_err(io_err)?, &opks)
     }
 
@@ -3048,7 +3062,7 @@ impl Store {
     /// The generation recorded INSIDE the current session file (0 if absent/unreadable — a
     /// corrupt state file is reported by `load_sessions`, not silently by this helper).
     fn sessions_generation(&self) -> u64 {
-        self.read_session_file().ok().flatten().map(|(g, _, _)| g).unwrap_or(0)
+        self.read_session_file().ok().flatten().map(|f| f.generation).unwrap_or(0)
     }
 
     // ----- Зашифрованный append-лог истории чатов -----

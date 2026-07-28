@@ -358,7 +358,9 @@ echo "  config:    $ENVFILE"
 # shell only has the default, so prefix the hint when this relay uses a custom home.
 POWPFX="" ; [ "$RHOME" != "$HOME/.config/karst-relay" ] && POWPFX="KARST_RELAY_HOME=$RHOME "
 if [ "$MODE" = private ]; then
-  echo "  invite:    $RHOME/invite.json  (a peer joins with: karst import-cap <that file>)"
+  echo "  invite:    $RHOME/invite.json  (a peer joins with: karst import-cap <that file> --relay $PEER_ADDR --relay-id $RELAY_ID)"
+  echo "             NOTE: one invite = one shared credential and ONE shared quota bucket for"
+  echo "             everyone you hand it to — see docs/RUNNING.md (CRYPTO-25)."
 elif [ "$MODE" = public ]; then
   if [ "${POW_BITS:-20}" = 0 ]; then
     echo "  door:      OPEN (no PoW) — peers join with: karst join --relay $PEER_ADDR --relay-id $RELAY_ID"

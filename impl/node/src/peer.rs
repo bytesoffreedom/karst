@@ -297,8 +297,14 @@ pub struct Peer<T: Transport> {
     carrier_id: Vec<u8>,
     nonce_ctr: u64,
     /// **Per-purpose pseudonyms** used as `client_addr` — the value the relay binds a
-    /// cookie to. Fresh random bytes per `Handle`, NEVER persisted and NEVER derived
-    /// from the identity key.
+    /// cookie to. Fresh random bytes per `Handle`, NEVER derived from the identity key.
+    ///
+    /// They ARE persisted, and deliberately so — the "never persisted" this comment used to
+    /// claim contradicted both `PeerState::handles` and the reasoning at the top of this file
+    /// (A5-8). A caller runs a fresh `Peer` per poll, so an in-memory-only handle would be
+    /// re-minted every cycle, and a new pseudonym on every poll is itself a pattern the relay can
+    /// watch. Persisting costs nothing here because `Box` handles are keyed BY EPOCH, so they
+    /// still rotate on the schedule the drop-boxes do.
     ///
     /// `client_addr` was once the IK, which handed the relay a plaintext social graph:
     /// on a deposit the sender's IK sat right next to `recipient`. Nothing needs it —

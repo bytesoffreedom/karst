@@ -2358,21 +2358,37 @@ pub fn download_blob(
     // prefix). A mismatch means a bad partial — discard it and re-download from scratch.
     let got: [u8; 32] = hasher.finalize().into();
     if got == pd.hash {
-        let _ = store.record_received_file(&store::ReceivedFile {
+        // The commit steps used to be `let _ = ...` and `Done` was returned regardless, so a
+        // download could be reported COMPLETE while the file was not indexed — bytes on disk that
+        // nothing points at, and a user told a file arrived that they cannot find (A8-10). The
+        // three steps do not carry equal weight, so they are handled separately rather than all
+        // being swallowed:
+        if let Err(e) = store.record_received_file(&store::ReceivedFile {
             id: fid.clone(),
             name: pd.name.clone(),
             size: pd.size,
             sender: pd.sender,
             ts: pd.ts,
             blob_id: pd.blob_id,
-        });
-        let _ = store.append_history(&store::HistoryRecord {
+        }) {
+            // Load-bearing: without the record the file is unreachable. Keep the pending entry so
+            // the next pass retries (the blob lives on the relay until its TTL).
+            return DownloadOutcome::Retry(format!("recording the received file: {e}"));
+        }
+        // Not load-bearing — the file IS saved and indexed — but it must not be silent, or a
+        // chat that stopped showing arrivals looks like nothing was sent.
+        if let Err(e) = store.append_history(&store::HistoryRecord {
             from_me: false,
             peer_ik: pd.sender,
             text: format!("📎 {}", pd.name).into_bytes(),
             ts: pd.ts,
-        });
-        let _ = store.remove_pending_download(&pd.blob_id);
+        }) {
+            eprintln!("warning: file saved, but its history line failed: {e}");
+        }
+        if let Err(e) = store.remove_pending_download(&pd.blob_id) {
+            // Harmless (the retry is idempotent by blob_id) but worth knowing about.
+            eprintln!("warning: could not clear the pending download entry: {e}");
+        }
         DownloadOutcome::Done(fid)
     } else {
         let _ = store.remove_received_file(&fid);

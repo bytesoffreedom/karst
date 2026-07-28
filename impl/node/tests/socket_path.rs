@@ -299,3 +299,40 @@ fn earn_a_capability_over_the_socket_then_send() {
     let msgs: Vec<_> = bob.receive(NOW).unwrap().into_iter().flatten().collect();
     assert_eq!(msgs, vec![b"hello via earned cap".to_vec()]);
 }
+
+/// SEC-41 (#226): nothing server-side bounds what a relay may put in `PowRequired`'s
+/// `difficulty_bits` — the relay declares it and, before this fix, `join()` just went and
+/// solved it. A hostile or misconfigured relay could declare an absurd difficulty and the
+/// client would burn unbounded CPU earning a capability while the relay spent nothing to
+/// issue the challenge. 64 bits is chosen because it is not merely "slow" but computationally
+/// infeasible: if the client-side ceiling check is ever neutered, this test does not just get
+/// slower, it HANGS — so the join runs on a worker thread behind a bounded `recv_timeout`,
+/// which turns "the fix regressed" into a clean, fast failure instead of a stuck suite.
+#[test]
+fn a_relay_declared_difficulty_above_the_ceiling_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut relay = node::node::RelayNode::with_identity(NOW, Identity::generate());
+    relay.enable_pow_issue(64); // far past any reasonable ceiling; infeasible to solve
+    let fetch_pub = relay.relay_public().to_bytes();
+    let server = RelayServer::new(relay, Arc::new(move || NOW));
+    let noise_pub = server.noise_public();
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(SocketTransport::new(addr, noise_pub).join());
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a ceiling-respecting client refuses immediately instead of grinding forever");
+    let err = result.expect_err("an absurd relay-declared difficulty must be refused, never solved");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&hex::encode(fetch_pub)),
+        "the refusal must name the offending relay: {msg}"
+    );
+    assert!(msg.contains("64"), "the refusal must state the declared difficulty: {msg}");
+}

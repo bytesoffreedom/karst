@@ -181,7 +181,7 @@ fn the_relay_hands_a_distinct_one_time_prekey_to_each_fetcher() {
     let mut bob = peer(&t, relay_pub);
     let bob_ik = bob.identity();
 
-    assert_eq!(bob.add_opks(2), 2, "Bob holds two one-time prekeys");
+    assert_eq!(bob.add_opks(2).len(), 2, "Bob holds two one-time prekeys");
     assert!(matches!(bob.publish(NOW), PublishResponse::Published));
 
     let mut alice1 = peer(&t, relay_pub);

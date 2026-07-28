@@ -685,6 +685,52 @@ fn a_proxy_message_via_a_published_opk_delivers() {
     std::fs::remove_dir_all(&bdir).ok();
 }
 
+/// BUG C — OPK republish must not stockpile duplicates. `publish_with_opks` used to advertise the
+/// WHOLE unconsumed batch every call, and the relay appends a publish's OPKs with no dedup — so a
+/// second publish (a keepalive republish, no consumption between) left the relay holding two copies
+/// of every key. `get_bundle` pops one per fetch, so past the number of DISTINCT keys it hands a
+/// key out AGAIN — and two first-contacts binding the same OPK lose whichever the recipient accepts
+/// second (its OPK secret was consumed by the first accept → `accept_key_agreement` returns None).
+/// Discriminating: drain every OPK the relay will hand out and require each to be DISTINCT. Neuter
+/// the fix (advertise the full set again) and the (OPK_TARGET+1)-th fetch repeats a key → RED.
+#[test]
+fn republishing_opks_never_hands_the_same_prekey_twice() {
+    let (relay_addr, relay_id, relay) = spawn_relay_handle();
+    let bdir = temp_dir("opkrepub-b");
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    seed_provision(&bstore);
+    bstore.save_capability(&client::dev_capability()).unwrap();
+    let b = bstore.as_proxy(0);
+    let b_ik = b.load_account().unwrap().identity_public();
+    let r = ctx(relay_addr, &relay_id);
+
+    // Publish a full OPK batch, then REPUBLISH it unchanged (no consumption between).
+    client::publish_with_opks(&b, &r, b.load_capability().unwrap(), NOW).unwrap();
+    client::publish_with_opks(&b, &r, b.load_capability().unwrap(), NOW).unwrap();
+
+    // Drain every OPK the relay will hand out; each must be distinct, then the batch exhausts
+    // (opk_pub == None → 3-DH fallback). A repeat means a republished duplicate is being served.
+    let mut seen = std::collections::HashSet::new();
+    let mut node = relay.lock().unwrap();
+    while let Some(bundle) = node.get_bundle(&b_ik) {
+        match bundle.opk_pub {
+            Some(opk) => assert!(
+                seen.insert(opk),
+                "the relay handed out the same OPK twice after a republish (Bug C)"
+            ),
+            None => break,
+        }
+    }
+    drop(node);
+    assert_eq!(
+        seen.len(),
+        client::OPK_TARGET,
+        "one full distinct batch should be available (no duplicates, none dropped)"
+    );
+
+    std::fs::remove_dir_all(&bdir).ok();
+}
+
 /// STORY, two-party: an ephemeral publication delivers over the relay carrying its self-destruct
 /// time, so the recipient can drop it when dead and show a countdown while live.
 #[test]

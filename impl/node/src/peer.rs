@@ -628,14 +628,12 @@ impl<T: Transport> Peer<T> {
         self.account.identity_public()
     }
 
-    /// Top up this peer's one-time prekeys by `n` before publishing, and report how many
-    /// are now held. The next `publish` advertises them; the relay hands one out per fetch
-    /// and each is consumed on `receive`.
-    pub fn add_opks(&mut self, n: usize) -> usize {
-        for _ in 0..n {
-            self.account.add_opk();
-        }
-        self.account.opk_count()
+    /// Mint `n` fresh one-time prekeys and return THEIR public keys — the only ones a publish
+    /// should advertise (re-advertising already-published keys stockpiles duplicates on the
+    /// relay; see [`Peer::publish`], Bug C). The secrets are held in the account for the caller
+    /// to persist; each is consumed on `receive`.
+    pub fn add_opks(&mut self, n: usize) -> Vec<[u8; 32]> {
+        (0..n).map(|_| self.account.add_opk()).collect()
     }
 
     /// Load persisted one-time prekey secrets into this peer's account (before receiving,
@@ -668,12 +666,22 @@ impl<T: Transport> Peer<T> {
     /// §12: опубликовать СВОЙ bundle у relay, чтобы другие могли инициировать к
     /// нам. Cookie-refresh + ownership-proof (владение приватным IK).
     pub fn publish(&mut self, now: u64) -> PublishResponse {
-        let bundle = self.account.prekey_bundle();
-        // Advertise the account's CURRENT unconsumed one-time prekeys; the relay hands one
-        // out per fetch. Minting/persisting the batch is the CALLER's job (the client tops
-        // it up and saves the secrets before publishing) — a `Peer` over a fresh account
-        // with no OPKs simply publishes an empty batch, and fetchers fall back to 3-DH.
+        // Advertise the account's currently-held one-time prekeys. Fine for a ONE-SHOT publish
+        // (a fresh account with no OPKs publishes an empty batch). For a PERSISTENT batch that is
+        // re-published over time, use [`Peer::publish_advertising`] with only freshly minted keys:
+        // the relay appends a publish's OPKs with no dedup, so re-advertising the whole held set
+        // stockpiles duplicates and later hands the SAME key to two first-contacts (Bug C — see
+        // the client `publish_with_opks`).
         let opks = self.account.opk_pubs();
+        self.publish_advertising(&opks, now)
+    }
+
+    /// Publish the bundle advertising EXACTLY `opks`. The caller passes only FRESHLY minted
+    /// one-time prekeys (`add_opks`), never the whole held set — see [`Peer::publish`] for why
+    /// re-advertising already-published keys stockpiles duplicates and drops first-contacts.
+    /// Minting/persisting the batch is the caller's job (tops up and saves before publishing).
+    pub fn publish_advertising(&mut self, opks: &[[u8; 32]], now: u64) -> PublishResponse {
+        let bundle = self.account.prekey_bundle();
         let shared = self.account.ik().dh(&self.relay_pub);
         // Publishing announces the bundle — and the IK inside it — so it shares the
         // handle with the identity-mailbox poll, which names us just as loudly. It must
@@ -688,7 +696,7 @@ impl<T: Transport> Peer<T> {
             };
             let req = PublishRequest {
                 bundle: bundle.clone(),
-                opks: opks.clone(),
+                opks: opks.to_vec(),
                 client_addr: client_addr.clone(),
                 carrier_id: self.carrier_id.clone(),
                 cookie,

@@ -829,6 +829,7 @@ pub fn publish_bundle(
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
+    // A plain bundle publish advertises NO one-time prekeys (fresh account has none anyway).
     peer.publish(now)
 }
 
@@ -846,15 +847,23 @@ pub fn publish_with_opks(store: &Store, relay: &Relay, cap: Capability, now: u64
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
 
-    // Restore the unconsumed OPKs, then top up to the target so a fresh publish always
-    // offers a full batch. Persist BEFORE publishing: the relay must never advertise an OPK
-    // whose secret we have not durably stored, or an opener using it could not be accepted.
+    // Restore the unconsumed OPKs, then top up to the target by minting the DEFICIT. Advertise
+    // ONLY the freshly minted keys, never the whole held set: the relay appends a publish's
+    // OPKs with no dedup, so re-advertising already-published-but-unconsumed keys stockpiles
+    // duplicates and later hands the SAME OPK to two first-contacts (Bug C). Trade-off: after a
+    // relay restart the relay loses the batch and this client, still holding those secrets,
+    // won't re-offer them until consumption drops it below the target — meanwhile first
+    // contacts fall back to 3-DH. Bounded and self-healing; correctness beats that efficiency.
+    // Persist BEFORE publishing: the relay must never advertise an OPK whose secret we have not
+    // durably stored, or an opener using it could not be accepted.
     peer.load_opks(&store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?);
-    if peer.opk_count() < OPK_TARGET {
-        peer.add_opks(OPK_TARGET - peer.opk_count());
-    }
+    let fresh = if peer.opk_count() < OPK_TARGET {
+        peer.add_opks(OPK_TARGET - peer.opk_count())
+    } else {
+        Vec::new()
+    };
     store.save_opks(&peer.export_opks()).map_err(|e| format!("saving one-time prekeys: {e}"))?;
-    Ok(peer.publish(now))
+    Ok(peer.publish_advertising(&fresh, now))
 }
 
 /// Publish this account's bundle to EVERY relay in the set (multi-homing): the primary

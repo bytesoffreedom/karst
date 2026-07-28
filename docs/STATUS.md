@@ -1908,6 +1908,8 @@ implementation. NOT feature-gated (E2E is the core of the product, unlike tring)
   Pinned at every layer: `a_one_time_prekey_is_mixed_in_and_consumed_once`,
   `dh4_one_time_prekey_secret_is_load_bearing_in_root_key`,
   `the_relay_hands_a_distinct_one_time_prekey_to_each_fetcher`,
+  `republishing_opks_never_hands_the_same_prekey_twice` (a keepalive republish must not
+  stockpile duplicate OPKs on the relay — the client advertises only freshly minted keys),
   `one_time_prekeys_work_and_persist_across_the_process_per_call_client`;
 - **no low-order/contributory check** of the three X25519 DHs — an audit item on
   this reference (not exploitable for the claimed property), the same guard as in

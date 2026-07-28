@@ -917,7 +917,12 @@ impl RelayNode {
         // opt-in (`PublishDiscovery`) so that merely being reachable never leaks fact-of-partici-
         // pation into a lookup-able directory. See `handle_publish_discovery`.
         // Top up the one-time-prekey batch, capped so a client cannot make the relay hold
-        // unbounded state. Deduped implicitly by the client minting fresh keys each time.
+        // unbounded state. The relay does NOT dedup: it relies on the client advertising ONLY
+        // freshly minted keys per publish (client `publish_with_opks` → `Peer::publish`), so each
+        // key is appended at most once and a fetch hands out a distinct one. A client that
+        // violates this only harms ITSELF — a re-advertised key can be handed to two of its own
+        // first-contacts, and the second opener then fails closed (its OPK already consumed). Bug
+        // C was exactly this: the client used to re-advertise the whole held set every publish.
         let batch = self.opk_batches.entry(ik).or_default();
         for opk in &req.opks {
             if batch.len() >= MAX_OPKS_PER_IK {

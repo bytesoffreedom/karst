@@ -40,7 +40,7 @@ use crate::node::{
     Payload, PublishRequest, PublishResponse, Response, SessionEnvelope, Transport, WireMessage,
 };
 use crate::pqxdh::{initiate_key_agreement, Account, KeyAgreement, PreKeyBundle};
-use crate::ratchet::{Session, SessionSnapshot};
+use crate::ratchet::{RatchetMessage, Session, SessionSnapshot};
 use crate::seal::Identity;
 
 /// 32 fresh random bytes from the OS CSPRNG (pseudonyms, request nonces).
@@ -1255,9 +1255,24 @@ impl<T: Transport> Peer<T> {
             Payload::Session(SessionEnvelope::InitialSealed { sealed_ka, msg }) => {
                 let plain = sealed_ka.open(self.account.ik())?;
                 let ka: KeyAgreement = postcard::from_bytes(&plain).ok()?;
-                self.process(&Payload::Session(SessionEnvelope::Initial { ka, msg: msg.clone() }))
+                self.process_opener(&ka, msg)
             }
-            Payload::Session(SessionEnvelope::Initial { ka, msg }) => {
+            // An UNSEALED opener is REFUSED. It carries the sender's identity key in the clear,
+            // so the relay can read the social-graph edge straight off it — the exact leak
+            // `InitialSealed` exists to close. The variant was kept only so an in-flight capsule
+            // from an older client would still open; there are no older clients, and accepting it
+            // let any peer silently downgrade a conversation's metadata privacy by sending the
+            // legacy form. We only ever SEND sealed, so nothing legitimate produces this.
+            Payload::Session(SessionEnvelope::Initial { .. }) => None,
+            Payload::Session(SessionEnvelope::Ratchet(msg)) => self.process_ratchet(msg),
+        }
+    }
+
+    /// Handle a first-contact opener (already unsealed). Split out of `process` so the sealed
+    /// path does not have to round-trip through the legacy wire variant to reach it.
+    fn process_opener(&mut self, ka: &KeyAgreement, msg: &RatchetMessage) -> Option<Received> {
+        {
+            {
                 // accept_key_agreement FIRST — it CONSUMES the one-time prekey, and that
                 // consumption IS the at-most-once dedup: a re-delivered Initial whose OPK we
                 // already consumed (and durably saved) returns None here and is NOT re-processed
@@ -1318,24 +1333,24 @@ impl<T: Transport> Peer<T> {
                 }
                 Some(Received { sender: sender_ik, plaintext: pt, msg_id: [0u8; 32] })
             }
-            Payload::Session(SessionEnvelope::Ratchet(msg)) => {
-                // Нет sender-хинта → trial-decryption. Безопасно: decrypt
-                // транзакционен, промах не двигает чужую сессию. Отправитель = ключ
-                // сессии, которая сошлась. Both maps: a peer's ongoing stream after a
-                // simultaneous first contact rides `inbound_sessions`.
-                for (ik, st) in self.sessions.iter_mut() {
-                    if let Ok(pt) = st.session.decrypt(msg) {
-                        return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
-                    }
-                }
-                for (ik, st) in self.inbound_sessions.iter_mut() {
-                    if let Ok(pt) = st.session.decrypt(msg) {
-                        return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
-                    }
-                }
-                None
+        }
+    }
+
+    /// An ongoing ratchet message: no sender hint, so trial-decrypt. Safe because `decrypt` is
+    /// transactional — a miss does not move anyone else's session. Both maps: a peer's stream
+    /// after a simultaneous first contact rides `inbound_sessions`.
+    fn process_ratchet(&mut self, msg: &RatchetMessage) -> Option<Received> {
+        for (ik, st) in self.sessions.iter_mut() {
+            if let Ok(pt) = st.session.decrypt(msg) {
+                return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
             }
         }
+        for (ik, st) in self.inbound_sessions.iter_mut() {
+            if let Ok(pt) = st.session.decrypt(msg) {
+                return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
+            }
+        }
+        None
     }
 }
 

@@ -19,6 +19,7 @@ use node::peer::Peer;
 use node::pqxdh::{initiate_key_agreement, Account};
 use node::ratchet::{Header, RatchetMessage, Session};
 use node::seal::Identity;
+use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;
 
@@ -36,6 +37,12 @@ fn dev_cap() -> Capability {
 /// A `Peer` for Bob over an in-memory relay — this test never sends over the wire, it feeds
 /// payloads straight into `process` (via `open_for_test`), which is exactly the code path a
 /// fetched envelope takes.
+fn sealed_to(recipient_ik: [u8; 32], ka: &node::pqxdh::KeyAgreement, msg: RatchetMessage) -> Payload {
+    let plain = postcard::to_stdvec(ka).unwrap();
+    let sealed_ka = node::seal::SkeletonSeal::seal(&PublicKey::from(recipient_ik), &plain);
+    Payload::Session(SessionEnvelope::InitialSealed { sealed_ka, msg })
+}
+
 fn bob_peer() -> Peer<InMemoryTransport> {
     let relay = Rc::new(RefCell::new(RelayNode::new(NOW)));
     relay.borrow_mut().issue_capability(dev_cap());
@@ -64,7 +71,9 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
         header: Header { dh: [1u8; 32], pn: 0, n: 0 },
         ciphertext: vec![7u8; 48],
     };
-    let forged = Payload::Session(SessionEnvelope::Initial { ka, msg: garbage });
+    // SEALED, so the refusal below is about authentication — not about the envelope form.
+    let bob_ik = bob.bundle().ik_pub;
+    let forged = sealed_to(bob_ik, &ka, garbage);
 
     assert!(bob.open_for_test(&forged).is_none(), "a bogus opener delivers nothing");
     assert!(
@@ -85,10 +94,44 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
         initiate_key_agreement(&real_sender, &[3u8; 32], &bundle).expect("well-formed bundle");
     let mut sender = Session::init_sender(root, bundle.prekey_pub);
     let msg = sender.encrypt(b"genuine first contact");
-    let honest = Payload::Session(SessionEnvelope::Initial { ka: ka2, msg });
+    let honest = sealed_to(bob_ik, &ka2, msg);
 
     let got = bob.open_for_test(&honest).expect("the genuine opener must still be acceptable");
     assert_eq!(got.plaintext, b"genuine first contact");
     assert_eq!(got.sender, real_sender.public.to_bytes(), "attributed to the real sender");
     assert_eq!(bob.opk_count(), 0, "the genuine acceptance consumes the one-time prekey");
+}
+
+/// The UNSEALED opener is refused on the wire.
+///
+/// `SessionEnvelope::Initial` carries the sender's identity key in the clear, so a relay can read
+/// the social-graph edge straight off it — the exact leak `InitialSealed` was introduced to close.
+/// The variant was kept only so an in-flight capsule from an older client would still open; with
+/// no older clients that tolerance is pure downside, because ANY peer could send the legacy form
+/// and silently downgrade a conversation's metadata privacy without the recipient noticing.
+///
+/// Discriminating: the very same agreement is accepted when SEALED, so this pins the refusal to
+/// the envelope form rather than to a broken opener.
+#[test]
+fn an_unsealed_opener_is_refused_but_the_sealed_form_of_it_works() {
+    let mut bob = bob_peer();
+    let opk = bob.add_opks(1)[0];
+    let mut bundle = bob.bundle();
+    bundle.opk_pub = Some(opk);
+
+    let alice = Identity::generate();
+    let (root, ka) = initiate_key_agreement(&alice, &[5u8; 32], &bundle).expect("well-formed bundle");
+    let mut sender = Session::init_sender(root, bundle.prekey_pub);
+    let msg = sender.encrypt(b"first contact");
+
+    // Legacy form: identical contents, unsealed → refused, and nothing is consumed.
+    let legacy = Payload::Session(SessionEnvelope::Initial { ka: ka.clone(), msg: msg.clone() });
+    assert!(bob.open_for_test(&legacy).is_none(), "an unsealed opener must not be accepted");
+    assert_eq!(bob.opk_count(), 1, "a refused envelope must not consume the one-time prekey");
+
+    // Sealed form of the SAME agreement: accepted.
+    let sealed = sealed_to(bob.bundle().ik_pub, &ka, msg);
+    let got = bob.open_for_test(&sealed).expect("the sealed form of the same opener must work");
+    assert_eq!(got.plaintext, b"first contact");
+    assert_eq!(got.sender, alice.public.to_bytes());
 }

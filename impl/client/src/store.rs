@@ -4016,10 +4016,13 @@ impl Vault {
         format!("vault/{}", parts.join("/"))
     }
 
-    /// Открыть vault под паролем устройства. `salt`/`verify` на уровне базы. При
-    /// первом мультиаккаунтном запуске мигрирует legacy одиночный аккаунт (файлы
-    /// прямо в базе) в `accounts/<ik>/` — БЕЗ перешифрования (соль та же → ключ
-    /// тот же → файлы читаются как есть).
+    /// Открыть vault под паролем устройства. `salt`/`verify` на уровне базы.
+    ///
+    /// NO migration of a legacy single-account directory. That path was removed with format v2:
+    /// at-rest keys are derived per (account, file), so relocating a file into an account
+    /// directory changes its key by construction and a migration would have to re-seal
+    /// everything. A bare pre-vault directory stays a standalone `Store` that still opens; a
+    /// vault provisioned over it starts empty and leaves those files alone.
     /// COMPAT entry point — "open the compartment this password belongs to, or provision a fresh
     /// real one". A brand-new vault (nothing on disk) is created as the real compartment bound to
     /// this password; an existing vault is routed by [`Vault::open`] (real or decoy). A wipe
@@ -4083,9 +4086,10 @@ impl Vault {
     }
 
     /// Open an EXISTING vault, routing by which compartment (real/decoy) the password unlocks — or
-    /// executing a wipe if it is the duress password. Runs the transparent migrations (legacy
-    /// single-account → `accounts/<ik>/`, then pre-multipassword root → `c/<id>/`) under the
-    /// correct key. A password that opens nothing is a wrong password.
+    /// executing a wipe if it is the duress password. Runs the ONE surviving migration
+    /// (pre-multipassword root → `c/<id>/`, which only MOVES a directory and so keeps every
+    /// at-rest label intact) under the correct key. A password that opens nothing is a wrong
+    /// password.
     pub fn open(base: impl Into<PathBuf>, passphrase: &[u8]) -> io::Result<Opened> {
         let base = base.into();
         std::fs::create_dir_all(&base)?;

@@ -51,9 +51,37 @@ pub const STATE_VERSION: u16 = 1;
 
 /// The pinned Argon2id cost parameters (see [`MasterKey::derive`]). Owned by KARST, not by the
 /// `argon2` crate's defaults, so a dependency bump cannot silently change key derivation.
-pub const KDF_M_COST: u32 = 19_456; // KiB
-pub const KDF_T_COST: u32 = 2;
+///
+/// Raised in format v2 from 19 MiB / t=2 (CRYPTO-34). That was OWASP's *floor*, published as the
+/// minimum for a memory-constrained environment — and this is a desktop application deriving ONE
+/// key per unlock, which is the opposite of memory-constrained. Against an offline attacker
+/// grinding the passphrase, the cost per guess is what buys time, and 19 MiB buys little from a
+/// GPU. 128 MiB / t=3 is ~10x the memory-time product; measured ~0.2 s per derive in release on
+/// this machine, i.e. still well inside "press unlock, see the app".
+///
+/// Deliberately NOT pushed to 256 MiB+: peak RSS during unlock is real, and a profile that a
+/// low-RAM machine cannot run is a profile someone will quietly lower later.
+pub const KDF_M_COST: u32 = 131_072; // KiB (128 MiB)
+pub const KDF_T_COST: u32 = 3;
 pub const KDF_P_COST: u32 = 1;
+
+/// TEST-ONLY escape hatch, compiled out of release builds entirely.
+///
+/// A conservative KDF is expensive by construction, and the suite derives keys ~150 times in
+/// tests that are not about the KDF at all — at the production profile that is minutes of CI per
+/// run, which is how profiles end up quietly lowered "just for now". So `debug` builds honour
+/// `KARST_INSECURE_FAST_KDF=1` and derive with Argon2's minimum cost instead.
+///
+/// The guarantee is structural, and deliberately NOT expressed as a test: a test would have to
+/// mutate the process environment, which in a parallel test binary changes the KDF under every
+/// other thread. `cfg(debug_assertions)` is checked by the compiler on every release build,
+/// which is stronger than an assertion anyway. The branch sits behind it,
+/// so a release binary does not contain it and no environment variable can reach it. When it IS
+/// taken it says so on stderr every time, so a vault created under it can never be mistaken for
+/// a real one. The production profile itself is still exercised — see
+/// `the_production_kdf_profile_is_what_we_think_it_is`.
+#[cfg(debug_assertions)]
+const FAST_KDF_ENV: &str = "KARST_INSECURE_FAST_KDF";
 const NONCE_LEN: usize = 24;
 /// `MAGIC(4) ‖ state_version(2) ‖ nonce(24)`.
 const HEADER_LEN: usize = 4 + 2 + NONCE_LEN;
@@ -91,13 +119,31 @@ impl MasterKey {
         Ok(MasterKey(key))
     }
 
-    /// The pinned KARST KDF profile: Argon2**id**, version 0x13, m=19456 KiB, t=2, p=1, 32-byte
+    /// The pinned KARST KDF profile: Argon2**id**, version 0x13, m=131072 KiB, t=3, p=1, 32-byte
     /// output. The container has no plaintext header to carry a profile id (that would be a tell
     /// for deniability), so the profile is normative per format version rather than stored.
     fn kdf() -> Result<Argon2<'static>, String> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os(FAST_KDF_ENV).is_some() {
+            eprintln!(
+                "KARST: {FAST_KDF_ENV} is set — deriving keys with Argon2's MINIMUM cost. \
+                 This is for the test suite. Anything created now is not protected at rest."
+            );
+            let params = argon2::Params::new(argon2::Params::MIN_M_COST, 1, 1, Some(32))
+                .map_err(|e| format!("argon2 params: {e}"))?;
+            return Ok(Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params));
+        }
         let params = argon2::Params::new(KDF_M_COST, KDF_T_COST, KDF_P_COST, Some(32))
             .map_err(|e| format!("argon2 params: {e}"))?;
         Ok(Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params))
+    }
+
+    /// The PRODUCTION Argon2 instance, ignoring the debug fast-KDF hatch. Exists so one test can
+    /// verify the shipped profile even when the suite runs with the hatch on.
+    #[cfg(test)]
+    fn kdf_production_only_for_tests() -> Argon2<'static> {
+        let params = argon2::Params::new(KDF_M_COST, KDF_T_COST, KDF_P_COST, Some(32)).unwrap();
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
     }
 
     /// Wrap raw 32 bytes as a key (for keys carried INSIDE a sealed slot, e.g. the Tier-2
@@ -217,28 +263,45 @@ impl MasterKey {
 
 #[cfg(test)]
 mod tests {
-    /// CRYPTO-16 — the KDF profile must be OURS, and pinning it must not have moved any existing
-    /// key. Asserts byte-for-byte equality with what `Argon2::default()` derives today, so:
-    /// (a) pinning was a no-op on disk — no vault or container became unopenable; and
-    /// (b) if a future `argon2` bump changes its defaults, THIS test goes red and tells us the
-    ///     library moved, instead of users discovering it as "wrong password" on their own data.
+    /// CRYPTO-16/34 — the KDF profile must be OURS and must be the one we think it is.
+    ///
+    /// This used to assert equality with `Argon2::default()`, which was right while the pinned
+    /// values WERE the old default: it proved pinning moved nobody's key. Format v2 raised the
+    /// profile deliberately, so that assertion is gone by design (and the raise is exactly what
+    /// makes existing local vaults unopenable — stated in the commit, not discovered here).
+    ///
+    /// What it pins now: a derive under the PRODUCTION profile equals a derive under the literal
+    /// constants. So an `argon2` bump that changes how those constants are interpreted still goes
+    /// red here — the library can never move key derivation under us silently. This is also the
+    /// one test that pays the real KDF cost, so the production path stays covered even when the
+    /// rest of the suite runs with the fast-KDF escape hatch.
     #[test]
-    fn the_pinned_kdf_profile_is_byte_identical_to_the_old_default() {
+    fn the_production_kdf_profile_is_what_we_think_it_is() {
         use argon2::Argon2;
         let (pw, salt) = (b"correct horse battery staple".as_slice(), b"0123456789abcdef".as_slice());
 
-        let pinned = super::MasterKey::derive(pw, salt).unwrap();
+        let params = argon2::Params::new(super::KDF_M_COST, super::KDF_T_COST, super::KDF_P_COST, Some(32))
+            .unwrap();
+        let mut expected = [0u8; 32];
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(pw, salt, &mut expected)
+            .unwrap();
 
-        let mut legacy = [0u8; 32];
-        Argon2::default().hash_password_into(pw, salt, &mut legacy).unwrap();
+        // Bypasses `MasterKey::derive` on purpose: that one honours the debug fast-KDF hatch, and
+        // this test must measure the profile the shipped binary actually uses.
+        let profiled = super::MasterKey::kdf_production_only_for_tests();
+        let mut got = [0u8; 32];
+        profiled.hash_password_into(pw, salt, &mut got).unwrap();
 
         assert_eq!(
-            pinned.0, legacy,
-            "pinning the KDF profile changed the derived key — that would brick every existing \
-             vault and container; if the argon2 crate moved its defaults, decide the migration \
-             deliberately instead of adjusting this test"
+            got, expected,
+            "the derived key no longer matches the pinned Argon2id profile (m={}, t={}, p={}) — \
+             if the argon2 crate moved, decide the migration deliberately instead of adjusting \
+             this test",
+            super::KDF_M_COST, super::KDF_T_COST, super::KDF_P_COST
         );
     }
+
 
     use super::*;
 
@@ -296,3 +359,4 @@ mod tests {
         assert_ne!(a, b, "шифртекст не должен повторяться при одинаковом plaintext");
     }
 }
+

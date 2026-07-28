@@ -38,8 +38,16 @@ jobs:
       # The unaudited-crypto feature is a real build variant (tring); gate it too.
       - name: clippy (unaudited-crypto)
         run: cargo clippy --all-targets --features unaudited-crypto -- -D warnings
+      # KARST_INSECURE_FAST_KDF drops Argon2id to its minimum cost for the test runs ONLY.
+      # The production profile is 128 MiB / t=3 (CRYPTO-34) and the suite derives keys ~150
+      # times in tests that are not about the KDF — at full cost that is minutes of CI per
+      # run, which is how a conservative profile ends up quietly lowered later. The hatch is
+      # behind `cfg(debug_assertions)`, so the release job below cannot be affected by it,
+      # and one test still exercises the real profile end to end.
       - name: test (default)
         run: cargo test
+        env:
+          KARST_INSECURE_FAST_KDF: "1"
       # `unaudited-crypto` is defined and #[cfg]-gated ONLY in the admission crate (tring
       # + token + lib); no other crate reads or enables it. Running the WHOLE workspace
       # under the feature re-ran the slow gui/node integration suites for zero added

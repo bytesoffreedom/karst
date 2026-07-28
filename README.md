@@ -129,8 +129,8 @@ release binary into `~/.local/bin` and are safe to re-run after a `git pull` to
 update.
 
 ```sh
-git clone https://github.com/bytesoffreedom/karst-messenger
-cd karst-messenger
+git clone https://github.com/bytesoffreedom/karst
+cd karst
 
 scripts/install-karst.sh         # the messenger: CLI `karst` + desktop `karst-desktop`
 #                                  (add --no-gui on a headless box)
@@ -150,7 +150,7 @@ crypto is unaudited reference).
 ### 2b. Build manually
 
 ```sh
-cd karst-messenger/impl
+cd karst/impl
 cargo build --release            # builds relay + CLI + the desktop client
 # binaries land in impl/target/release/: karst-relay, karst, karst-desktop
 

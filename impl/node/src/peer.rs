@@ -166,35 +166,6 @@ pub struct PeerState {
     inbound_sessions: Vec<PersistedSession>,
 }
 
-/// The post-outbox / pre-`inbound_sessions` `PeerState` layout — the middle rung of the
-/// backward-compat chain. postcard errors on the missing trailing `inbound_sessions`, so
-/// `from_bytes_compat` falls back here before dropping all the way to `PeerStatePreOutbox`.
-#[derive(serde::Deserialize)]
-struct PeerStatePreInbound {
-    sessions: Vec<PersistedSession>,
-    nonce_ctr: u64,
-    handles: Vec<([u8; 32], Handle, [u8; 32])>,
-    cookies: Vec<([u8; 32], Vec<u8>, Cookie)>,
-    last_sweep: u64,
-    outbox: Vec<OutboxEntry>,
-    outbox_next_id: u64,
-}
-
-/// The pre-outbox `PeerState` layout, for loading a state file written before the outbox
-/// field existed. postcard is positional and errors on a missing trailing field, so
-/// [`PeerState::from_bytes_compat`] tries the current layout first and falls back to this —
-/// never bricking an in-flight ratchet just to add a field (backlog #6, versioning, in the
-/// small). Nested types (`PersistedSession`, `Handle`, `Cookie`) are unchanged, so only the
-/// top-level struct needs a mirror.
-#[derive(serde::Deserialize)]
-struct PeerStatePreOutbox {
-    sessions: Vec<PersistedSession>,
-    nonce_ctr: u64,
-    handles: Vec<([u8; 32], Handle, [u8; 32])>,
-    cookies: Vec<([u8; 32], Vec<u8>, Cookie)>,
-    last_sweep: u64,
-}
-
 /// (peer_ik, drop_seed) — a session's peer and the seed its drop-boxes derive from. For diagnostics.
 pub type PeerSeed = ([u8; 32], [u8; 32]);
 
@@ -232,40 +203,14 @@ impl PeerState {
         }
     }
 
-    /// Deserialize a persisted state, tolerating the pre-outbox layout. Tries the current
-    /// format FIRST (new data parses cleanly; old data errors with `UnexpectedEnd` because
-    /// the trailing outbox fields are absent) and falls back to [`PeerStatePreOutbox`] with
-    /// an empty outbox. Order matters: postcard ignores trailing bytes, so trying the old
-    /// layout first would silently drop the outbox from new data.
+    /// Deserialize a persisted state. ONE layout, strictly — see the body.
     pub fn from_bytes_compat(bytes: &[u8]) -> Result<PeerState, postcard::Error> {
-        // Newest layout first (it parses new data cleanly; older data errors with UnexpectedEnd
-        // on the absent trailing field), then walk BACK one trailing-field addition at a time.
-        if let Ok(s) = postcard::from_bytes::<PeerState>(bytes) {
-            return Ok(s);
-        }
-        if let Ok(mid) = postcard::from_bytes::<PeerStatePreInbound>(bytes) {
-            return Ok(PeerState {
-                sessions: mid.sessions,
-                nonce_ctr: mid.nonce_ctr,
-                handles: mid.handles,
-                cookies: mid.cookies,
-                last_sweep: mid.last_sweep,
-                outbox: mid.outbox,
-                outbox_next_id: mid.outbox_next_id,
-                inbound_sessions: Vec::new(),
-            });
-        }
-        let old: PeerStatePreOutbox = postcard::from_bytes(bytes)?;
-        Ok(PeerState {
-            sessions: old.sessions,
-            nonce_ctr: old.nonce_ctr,
-            handles: old.handles,
-            cookies: old.cookies,
-            last_sweep: old.last_sweep,
-            outbox: Vec::new(),
-            outbox_next_id: 0,
-            inbound_sessions: Vec::new(),
-        })
+        // Strict decode. This used to be a CHAIN that walked back one trailing-field addition at
+        // a time (PeerStatePreInbound → PeerStatePreOutbox), so state written by an older build
+        // still loaded. There are no older builds with state, and the chain had a real hazard:
+        // postcard ignores trailing bytes, so a mis-ordered attempt could silently drop fields
+        // that were actually present. One layout, one decode, loud failure (no-users sweep).
+        postcard::from_bytes::<PeerState>(bytes)
     }
 
     /// How many messages are queued in the outbox awaiting delivery to a relay (for a UI
@@ -1363,7 +1308,7 @@ impl<T: Transport> Peer<T> {
 
 #[cfg(test)]
 mod outbox_state_tests {
-    use super::{Handle, OutboxEntry, PeerState, PersistedSession};
+    use super::{OutboxEntry, PeerState, PersistedSession};
     use crate::node::SessionEnvelope;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::cookie::Cookie;
@@ -1375,12 +1320,20 @@ mod outbox_state_tests {
         })
     }
 
-    /// A state file written BEFORE the outbox field loads with an empty outbox, rather than
-    /// failing (which would brick the ratchet). The old on-disk bytes are exactly a postcard
-    /// tuple of the five pre-outbox fields (positional == struct), so we build them that way.
+    /// A state file in an OLD layout must now fail LOUDLY.
+    ///
+    /// `from_bytes_compat` used to walk back through PeerStatePreInbound → PeerStatePreOutbox so
+    /// state written by an earlier build still loaded. With no such state in existence that chain
+    /// was pure surface, and it carried a real hazard: postcard ignores trailing bytes, so a
+    /// mis-ordered attempt could silently accept an old layout for NEW data and drop the fields
+    /// that were actually there. One layout, one decode — and an unreadable file is an error the
+    /// caller sees, not silent defaults substituted for a live ratchet's outbox.
+    ///
+    /// (This replaces two tests that pinned the removed fallback. They were deleted deliberately
+    /// because the behaviour they described is gone, not to make a red run go green.)
     #[test]
-    fn pre_outbox_state_loads_with_an_empty_outbox() {
-        let old = postcard::to_stdvec(&(
+    fn an_old_layout_state_file_is_rejected_rather_than_silently_defaulted() {
+        let pre_outbox = postcard::to_stdvec(&(
             Vec::<super::PersistedSession>::new(),
             7u64, // nonce_ctr
             Vec::<([u8; 32], super::Handle, [u8; 32])>::new(),
@@ -1388,12 +1341,10 @@ mod outbox_state_tests {
             42u64, // last_sweep
         ))
         .unwrap();
-
-        let s = PeerState::from_bytes_compat(&old).expect("old layout still loads");
-        assert_eq!(s.nonce_ctr, 7);
-        assert_eq!(s.last_sweep, 42);
-        assert!(s.outbox.is_empty(), "outbox defaults empty on migration");
-        assert_eq!(s.outbox_next_id, 0);
+        assert!(
+            PeerState::from_bytes_compat(&pre_outbox).is_err(),
+            "an old layout must be reported, not loaded with invented defaults"
+        );
     }
 
     /// The current layout round-trips a NON-empty outbox: try-new-first must win so the
@@ -1422,41 +1373,6 @@ mod outbox_state_tests {
         assert_eq!(back.outbox[0].id, 5);
         assert_eq!(back.outbox_next_id, 6);
         assert_eq!(back.nonce_ctr, 3);
-    }
-
-    /// A state file written by a binary BEFORE `inbound_sessions` existed (old PeerState = these 7
-    /// fields, no trailing inbound_sessions Vec). `from_bytes_compat` MUST load it via the MIDDLE
-    /// fallback rung with the session ratchets intact — otherwise upgrading the binary silently
-    /// drops every existing account's sessions and ALL messaging stops.
-    #[test]
-    #[allow(clippy::type_complexity)] // the positional mirror of the on-disk layout is the point
-    fn pre_inbound_state_migrates_with_sessions_intact() {
-        let sess = PersistedSession {
-            peer_ik: [9u8; 32],
-            snapshot: Session::init_sender([1u8; 32], [2u8; 32]).snapshot(),
-            pending_initial: None,
-            drop_seed: [3u8; 32],
-            peer_mailbox_pub: [4u8; 32],
-        };
-        // Positional mirror of the pre-inbound layout (postcard encodes a tuple exactly like the
-        // struct whose fields it mirrors, in order).
-        let old: (
-            Vec<PersistedSession>,
-            u64,
-            Vec<([u8; 32], Handle, [u8; 32])>,
-            Vec<([u8; 32], Vec<u8>, Cookie)>,
-            u64,
-            Vec<OutboxEntry>,
-            u64,
-        ) = (vec![sess], 11, Vec::new(), Vec::new(), 42, Vec::new(), 0);
-        let bytes = postcard::to_stdvec(&old).unwrap();
-        let back = PeerState::from_bytes_compat(&bytes).expect("pre-inbound state loads");
-        assert_eq!(back.sessions.len(), 1, "the session survived the upgrade");
-        assert_eq!(back.sessions[0].peer_ik, [9u8; 32]);
-        assert_eq!(back.sessions[0].drop_seed, [3u8; 32]);
-        assert_eq!(back.nonce_ctr, 11);
-        assert_eq!(back.last_sweep, 42);
-        assert!(back.inbound_sessions.is_empty(), "an old file has no inbound sessions");
     }
 
     /// `forget_peer` clears BOTH session halves (outbound + inbound) and any queued outbox for one

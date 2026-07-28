@@ -181,6 +181,16 @@ fn base32_decode(s: &str) -> Option<Vec<u8>> {
             out.push((buf >> bits) as u8);
         }
     }
+    // CANONICAL only: the payload is not a whole number of 5-bit groups, so the last character
+    // carries a few PADDING bits. The encoder writes them as zero; accepting anything else made
+    // eight different strings decode to the same key and pass the same checksum, so one identity
+    // had eight valid contact codes / QR images. That is not a key-substitution risk, but it
+    // breaks the assumption that the string form identifies a record — which logs, manual
+    // comparison, dedup and any future signature over the string all rely on (CRYPTO-17).
+    let leftover = buf & ((1u32 << bits) - 1);
+    if leftover != 0 {
+        return None;
+    }
     Some(out)
 }
 
@@ -296,5 +306,38 @@ mod tests {
         assert!(verify(&dpub, &m, &sign(&dsecret, &m)));
         // A different key cannot authorise a write to this slot.
         assert!(!verify(&dpub, &m, &sign(&[23u8; 32], &m)));
+    }
+
+    /// CRYPTO-17 — a contact code must have exactly ONE canonical spelling.
+    ///
+    /// The payload is not a whole number of 5-bit groups, so the final character carries padding
+    /// bits. The encoder zeroes them, but the decoder used to ignore whatever was there — so all
+    /// eight variants of that last character decoded to the same key and passed the same
+    /// checksum, giving one identity eight valid codes and eight different QR images. No key
+    /// substitution, but the string stops identifying the record, which logs, manual comparison,
+    /// dedup and any future signature over the string form all depend on.
+    #[test]
+    fn a_contact_code_has_exactly_one_canonical_spelling() {
+        let code = encode_code(&public_of(&[7u8; 32]));
+        assert!(decode_code(&code).is_some(), "control: the canonical code decodes");
+
+        // Walk the last data character through the whole alphabet. Every spelling other than the
+        // canonical one must be REFUSED, not silently accepted as the same key.
+        let mut chars: Vec<char> = code.chars().collect();
+        let last = chars.len() - 1;
+        let original = chars[last];
+        let mut accepted = 0usize;
+        for &c in CROCKFORD.iter() {
+            chars[last] = c as char;
+            let variant: String = chars.iter().collect();
+            if decode_code(&variant).is_some() {
+                accepted += 1;
+                assert_eq!(
+                    variant.chars().last(), Some(original),
+                    "a non-canonical spelling was accepted: {variant}"
+                );
+            }
+        }
+        assert_eq!(accepted, 1, "exactly one spelling of the final character may decode");
     }
 }

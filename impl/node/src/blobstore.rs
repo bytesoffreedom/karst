@@ -53,6 +53,22 @@ pub const MAX_STORE_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 /// Blob time-to-live; swept like the mailbox.
 pub const BLOB_TTL_SECS: u64 = 7 * 24 * 3600;
 
+/// Per-sender ceiling on DISTINCT blob ids (in-flight or complete), independent of
+/// `MAX_SENDER_BYTES`. A blob that declares `count=1` and sends one zero- or few-byte chunk
+/// completes immediately, paying (almost) nothing toward the byte caps while still costing the
+/// relay a full `Meta` entry plus its `.meta`/`.c0` sidecar files on disk — so the byte caps
+/// alone never bound how many ids one sender can mint. A legitimate sender's concurrent
+/// transfers (a multi-attachment post, a handful of open chats each mid-upload) is a small
+/// number; 1_000 is generous headroom above that while still making the per-blob bookkeeping
+/// this attack grows bounded rather than open-ended.
+pub const MAX_BLOBS_PER_SENDER: usize = 1_000;
+/// Global ceiling on distinct blob ids, for the same reason `MAX_BLOBS_PER_SENDER` is
+/// independent of `MAX_SENDER_BYTES`: many senders each parking a handful of near-empty blobs
+/// still adds up. Same order of magnitude as `MAX_BUNDLES` in `node.rs` — this project's other
+/// "one entry per identity" table — which is the scale already accepted here as a sane
+/// population ceiling for a single relay.
+pub const MAX_BLOBS_TOTAL: usize = 100_000;
+
 /// Outcome of a `put_chunk`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlobPut {
@@ -148,6 +164,13 @@ impl BlobStore {
         self.blobs.values().filter(|m| &m.sender == sender).map(Meta::size).sum()
     }
 
+    /// How many DISTINCT blob ids this sender currently owns (in-flight or complete). Backs
+    /// `MAX_BLOBS_PER_SENDER` — a count-based cap the byte caps cannot substitute for (see that
+    /// constant's doc).
+    fn sender_blob_count(&self, sender: &[u8; 32]) -> usize {
+        self.blobs.values().filter(|m| &m.sender == sender).count()
+    }
+
     /// Append one ciphertext chunk. Enforces (in order): per-chunk size, ownership
     /// (first sender owns the id), immutability (a complete blob is frozen), in-order
     /// index, count sanity, and the per-blob / per-sender / global byte caps. Streams
@@ -187,6 +210,20 @@ impl BlobStore {
         } else {
             None
         };
+
+        // Count caps (per-sender, global): checked ONLY when this chunk would CREATE a new blob
+        // id — a later chunk on an already-known blob never re-pays this. These exist because a
+        // zero- or near-zero-byte blob (declare `count=1`, send one tiny chunk) completes and
+        // costs a full `Meta` + sidecar entry while adding (almost) nothing to the byte caps
+        // below, so byte totals alone cannot stop an id-minting flood.
+        if !self.blobs.contains_key(&id) {
+            if self.blobs.len() >= MAX_BLOBS_TOTAL {
+                return BlobPut::Rejected("blob store at capacity".into());
+            }
+            if self.sender_blob_count(&sender) >= MAX_BLOBS_PER_SENDER {
+                return BlobPut::Rejected("sender has too many blobs".into());
+            }
+        }
 
         // Byte caps (per-blob, per-sender, global) on the DELTA this put adds — a re-send of the
         // same index nets its length change (usually zero). Reject when full — never evict.
@@ -826,5 +863,75 @@ mod tests {
         let s2 = BlobStore::open(s.dir.clone(), 0).unwrap();
         assert_eq!(s2.meta(&b), Some((count, true)));
         assert_eq!(s2.get_chunk(&b, 499).as_deref(), Some(&[(499u32 % 251) as u8; 10][..]));
+    }
+
+    /// A synthetic, all-zero-bytes `Meta` for pre-filling the table in bulk without paying real
+    /// disk I/O — only `put_chunk`'s in-memory count check is under test here, not recovery or
+    /// sweep, so the entries don't need real chunk files backing them.
+    fn synthetic_meta(sender: [u8; 32]) -> Meta {
+        Meta { sender, count: 1, lengths: HashMap::new(), created_at: 0, complete: true, contiguous: 1 }
+    }
+
+    #[test]
+    fn a_flood_of_near_empty_blobs_from_one_sender_cannot_grow_its_own_share_without_bound() {
+        // Finding #1 (backlog #162, R2-2): a blob that declares `count=1` and sends one
+        // near-empty chunk completes immediately, paying (almost) nothing toward
+        // MAX_SENDER_BYTES/MAX_STORE_BYTES while still costing a full Meta + sidecar entry.
+        // Before MAX_BLOBS_PER_SENDER, nothing stopped one sender from minting an unbounded
+        // number of such ids.
+        let mut s = BlobStore::new(tmp().join("per-sender-cap")).unwrap();
+        let attacker = sender(0xAB);
+        for n in 0..MAX_BLOBS_PER_SENDER as u32 {
+            let mut bid = [0u8; 32];
+            bid[4..8].copy_from_slice(&n.to_le_bytes());
+            s.blobs.insert(bid, synthetic_meta(attacker));
+        }
+        assert_eq!(s.sender_blob_count(&attacker), MAX_BLOBS_PER_SENDER, "table filled to this sender's cap");
+        assert_eq!(s.total_bytes, 0, "the whole flood so far paid ZERO real bytes");
+
+        // One more zero-byte blob from the SAME sender: the per-sender count cap must reject it
+        // — nothing here would trip the (still-empty) byte caps.
+        let one_more = [0x01u8; 32];
+        assert!(
+            matches!(s.put_chunk(attacker, one_more, 0, 1, b"", 0), BlobPut::Rejected(_)),
+            "per-sender blob-count cap must reject this sender's next fabricated id"
+        );
+        assert_eq!(s.sender_blob_count(&attacker), MAX_BLOBS_PER_SENDER, "the sender's share did not grow past the cap");
+
+        // Control: a DIFFERENT sender, with a REAL (non-empty) chunk, is unaffected — the cap is
+        // per-sender, not a global lockout triggered by someone else's flood.
+        let other = sender(0xCD);
+        assert_eq!(
+            s.put_chunk(other, [0x02u8; 32], 0, 1, b"real", 0),
+            BlobPut::Complete,
+            "an unrelated sender's legitimate upload still succeeds while this one is capped"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_near_empty_blobs_across_many_senders_cannot_grow_the_global_table_past_its_cap() {
+        // Finding #1's global axis: many DIFFERENT senders, each well under their own
+        // MAX_BLOBS_PER_SENDER share, can still add up past any per-sender bound — so the store
+        // needs an independent GLOBAL count ceiling too.
+        let mut s = BlobStore::new(tmp().join("global-cap")).unwrap();
+        for n in 0..MAX_BLOBS_TOTAL as u32 {
+            let mut bid = [0u8; 32];
+            bid[..4].copy_from_slice(&n.to_le_bytes());
+            let mut snd = [0u8; 32];
+            snd[4..8].copy_from_slice(&n.to_le_bytes()); // a DISTINCT sender per blob
+            s.blobs.insert(bid, synthetic_meta(snd));
+        }
+        assert_eq!(s.blobs.len(), MAX_BLOBS_TOTAL, "table filled to the global cap");
+        assert_eq!(s.total_bytes, 0, "the whole flood so far paid ZERO real bytes");
+
+        // A FRESH sender's first (near-empty) blob is rejected purely because the TABLE is full
+        // — this sender has zero blobs of their own, so the per-sender cap cannot be what fires.
+        let fresh_sender = [0xEEu8; 32];
+        let fresh_id = [0xFFu8; 32];
+        assert!(
+            matches!(s.put_chunk(fresh_sender, fresh_id, 0, 1, b"", 0), BlobPut::Rejected(_)),
+            "global blob-count cap must reject a brand-new id once the table is full"
+        );
+        assert_eq!(s.blobs.len(), MAX_BLOBS_TOTAL, "the table did not grow past the global cap");
     }
 }

@@ -147,12 +147,25 @@ const OUTBOX_TTL_SECS: u64 = crate::node::MAILBOX_TTL_SECS;
 /// One message encrypted and durably queued, awaiting delivery to the relay. Holds the
 /// EXACT ciphertext (`envelope`) so a failed transmit retries the identical bytes rather
 /// than re-encrypting position N under a new plaintext (which would reuse the message key).
+///
+/// `drop_seed`/`peer_mailbox_pub` are a ROUTING SNAPSHOT taken at `queue` time (A6-1). Routing
+/// a `Ratchet` envelope used to re-derive its deposit address from `sessions[peer_ik]`'s
+/// CURRENT state at flush time — harmless as long as that state cannot change between queue
+/// and flush, which held right up until `converge_split_session` started SWAPPING a peer's
+/// `sessions[peer_ik]` entry out from under it (simultaneous-first-contact convergence, see
+/// `Peer::converge_split_session`). Without this snapshot, a message queued under the LOSING
+/// session and flushed AFTER its own convergence swap would be deposited at the WINNER's box —
+/// an address the recipient's copy of the losing session never watches — and vanish silently.
+/// Baking the routing in at queue time makes delivery of an already-encrypted envelope
+/// independent of whatever `sessions[peer_ik]` holds by the time it is actually sent.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OutboxEntry {
     id: u64,
     peer_ik: [u8; 32],
     envelope: SessionEnvelope,
     queued_at: u64,
+    drop_seed: [u8; 32],
+    peer_mailbox_pub: [u8; 32],
 }
 
 /// Персистентное состояние peer'а (для CLI: процесс-на-вызов возобновляет сессии
@@ -928,8 +941,30 @@ impl<T: Transport> Peer<T> {
     /// Передать уже зашифрованный конверт (cookie-retry). На `Accepted` снимает
     /// `pending_initial` (дальше только Ratchet). Отдельно от `encrypt_next`,
     /// чтобы вызывающий вставил durable-save между ними (см. `encrypt_next`).
+    ///
+    /// Routes with LIVE session state (`sessions[peer_ik]` as it is right now) — correct here
+    /// because this is the immediate `send()` path: `encrypt_next` and this call are
+    /// synchronous and back-to-back, so nothing can have swapped the session in between. A
+    /// QUEUED envelope flushed later needs the routing it was encrypted under instead — see
+    /// [`Peer::transmit_envelope_routed`], which this delegates to with no override.
     pub fn transmit_envelope(&mut self, peer_ik: &[u8; 32], envelope: SessionEnvelope, now: u64) -> Response {
-        let (recipient, handle) = match self.route_for(peer_ik, &envelope, now) {
+        self.transmit_envelope_routed(peer_ik, envelope, None, now)
+    }
+
+    /// As [`Peer::transmit_envelope`], but for a QUEUED (already-encrypted) envelope: `routing`
+    /// carries the `(drop_seed, peer_mailbox_pub)` snapshot taken at `queue` time. Without it,
+    /// a `Ratchet` envelope flushed after its own peer's `sessions[peer_ik]` entry was SWAPPED
+    /// by `converge_split_session` would be routed by the NEW (winning) session's box address
+    /// instead of the one it was actually encrypted for — silently stranding it (A6-1). `None`
+    /// falls back to whatever `sessions[peer_ik]` holds right now, for the immediate-send path.
+    fn transmit_envelope_routed(
+        &mut self,
+        peer_ik: &[u8; 32],
+        envelope: SessionEnvelope,
+        routing: Option<([u8; 32], [u8; 32])>,
+        now: u64,
+    ) -> Response {
+        let (recipient, handle) = match self.route_for(peer_ik, &envelope, routing, now) {
             Ok(r) => r,
             Err(e) => return Response::Rejected(e),
         };
@@ -949,10 +984,28 @@ impl<T: Transport> Peer<T> {
     /// consumed with its ciphertext lost — the retransmit gap this closes. Delivery (and
     /// retry after a transport failure) is [`Peer::flush_outbox`].
     pub fn queue(&mut self, peer_ik: &[u8; 32], plaintext: &[u8], now: u64) -> Result<u64, String> {
+        // Snapshot THIS session's routing BEFORE encrypting — see `OutboxEntry`'s doc for why
+        // flush must not re-derive this from `sessions[peer_ik]` later (a convergence swap may
+        // have relocated it by then). Looked up first, not after `encrypt_next`, so a missing
+        // session surfaces as the SAME ordinary `Err` `encrypt_next` would give — never a
+        // panic on our own dispatch (a session cannot legitimately disappear between these two
+        // lines: nothing else runs in between).
+        let (drop_seed, peer_mailbox_pub) = self
+            .sessions
+            .get(peer_ik)
+            .map(|st| (st.drop_seed, st.peer_mailbox_pub))
+            .ok_or("no session (call connect first)")?;
         let envelope = self.encrypt_next(peer_ik, plaintext)?;
         let id = self.outbox_next_id;
         self.outbox_next_id = self.outbox_next_id.wrapping_add(1);
-        self.outbox.push(OutboxEntry { id, peer_ik: *peer_ik, envelope, queued_at: now });
+        self.outbox.push(OutboxEntry {
+            id,
+            peer_ik: *peer_ik,
+            envelope,
+            queued_at: now,
+            drop_seed,
+            peer_mailbox_pub,
+        });
         // Bound the queue against a permanently-unreachable relay: drop the oldest beyond the
         // cap (least likely still decryptable, see the DH-step bound below).
         while self.outbox.len() > MAX_OUTBOX {
@@ -983,7 +1036,10 @@ impl<T: Transport> Peer<T> {
             if now.saturating_sub(entry.queued_at) > OUTBOX_TTL_SECS {
                 continue; // expired: drop (the recipient's mailbox would be gone anyway)
             }
-            match self.transmit_envelope(&entry.peer_ik, entry.envelope.clone(), now) {
+            // Route with the SNAPSHOT taken at queue time, not whatever `sessions[peer_ik]`
+            // holds now — see `OutboxEntry`'s doc (A6-1 convergence can have swapped it since).
+            let routing = Some((entry.drop_seed, entry.peer_mailbox_pub));
+            match self.transmit_envelope_routed(&entry.peer_ik, entry.envelope.clone(), routing, now) {
                 Response::Accepted => delivered.push(entry.id),
                 _ => self.outbox.push(entry), // keep for retry — identical bytes next time
             }
@@ -1082,10 +1138,15 @@ impl<T: Transport> Peer<T> {
     /// has no session yet, so it cannot derive a drop-box, and a stranger's first knock
     /// needs one stable address to arrive at. That is the honest residual of this slice
     /// — everything AFTER the first message rotates.
+    /// `routing`, if given, OVERRIDES the live `sessions[peer_ik]` lookup for a `Ratchet`
+    /// envelope — the snapshot a queued entry was encrypted under (see
+    /// [`Peer::transmit_envelope_routed`]). `None` uses the CURRENT session, correct only when
+    /// nothing could have mutated it since encryption (the immediate-send path).
     fn route_for(
         &self,
         peer_ik: &[u8; 32],
         envelope: &SessionEnvelope,
+        routing: Option<([u8; 32], [u8; 32])>,
         now: u64,
     ) -> Result<([u8; 32], Handle), String> {
         match envelope {
@@ -1093,7 +1154,13 @@ impl<T: Transport> Peer<T> {
                 Ok((*peer_ik, Handle::Opener(*peer_ik)))
             }
             SessionEnvelope::Ratchet(_) => {
-                let st = self.sessions.get(peer_ik).ok_or("no session (call connect first)")?;
+                let (drop_seed, peer_mailbox_pub) = match routing {
+                    Some(r) => r,
+                    None => {
+                        let st = self.sessions.get(peer_ik).ok_or("no session (call connect first)")?;
+                        (st.drop_seed, st.peer_mailbox_pub)
+                    }
+                };
                 let epoch = crate::drop::epoch_of(now);
                 // Deposit into the OUTBOUND box (me → peer): the peer's mailbox point blinded for
                 // this session/epoch. The peer fetches the same address with its own fetch secret;
@@ -1104,10 +1171,10 @@ impl<T: Transport> Peer<T> {
                 // `deposit_address` would return `Some(identity)` and silently deposit into a box
                 // no one fetches (a real `M = m·G` is a hash-derived scalar times the basepoint,
                 // never the identity, so this never false-rejects a live session).
-                if st.peer_mailbox_pub == [0u8; 32] {
+                if peer_mailbox_pub == [0u8; 32] {
                     return Err("session predates blinded mailboxes — re-establish it (connect anew)".into());
                 }
-                let address = crate::blind::deposit_address(&st.peer_mailbox_pub, &st.drop_seed, epoch, dir)
+                let address = crate::blind::deposit_address(&peer_mailbox_pub, &drop_seed, epoch, dir)
                     .ok_or("peer mailbox point is not a valid curve point")?;
                 Ok((address, Handle::Box(*peer_ik, epoch)))
             }
@@ -1178,6 +1245,16 @@ impl<T: Transport> Peer<T> {
     /// under ONE `client_addr` would relink them and undo the slice.
     pub fn receive(&mut self, now: u64) -> Result<Vec<Option<Received>>, String> {
         self.prune_handles(now);
+        // A6-1: converge any split held from BEFORE this cycle — state `import_state`d from an
+        // older build, or from a peer this side hasn't polled since the other half landed.
+        // `process_opener` already converges a split the MOMENT it forms; this sweep is the
+        // same idempotent check for one that formed some OTHER way (only `inbound_sessions`
+        // can ever hold a split half — `inbound implies outbound`, see its field doc — so this
+        // is bounded by the number of peers actually split, not by session count generally).
+        let split_peers: Vec<[u8; 32]> = self.inbound_sessions.keys().copied().collect();
+        for peer_ik in split_peers {
+            self.converge_split_session(&peer_ik);
+        }
         let mut out = Vec::new();
 
         // The identity mailbox: openers from strangers. It names us — the DH ownership
@@ -1522,13 +1599,80 @@ impl<T: Transport> Peer<T> {
                 // Not `entry`: the check ROUTES between two different maps (inbound vs primary),
                 // it is not an insert-if-absent into one.
                 #[allow(clippy::map_entry)]
-                if self.sessions.contains_key(&sender_ik) {
+                let just_split = if self.sessions.contains_key(&sender_ik) {
                     self.inbound_sessions.insert(sender_ik, new_state);
+                    true
                 } else {
                     self.sessions.insert(sender_ik, new_state);
+                    false
+                };
+                // A6-1: the moment BOTH halves of a simultaneous first contact exist locally is
+                // exactly the moment convergence becomes possible — no need to wait for anything
+                // else to happen first (see `converge_split_session`).
+                if just_split {
+                    self.converge_split_session(&sender_ik);
                 }
                 Some(Received { sender: sender_ik, plaintext: pt, msg_id: [0u8; 32] })
             }
+        }
+    }
+
+    /// A6-1: heal a simultaneous-first-contact split by converging its two one-way chains onto
+    /// ONE bidirectional session, deterministically and with no wire message.
+    ///
+    /// **Why the split stops healing.** `sessions[peer_ik]` only ever ENCRYPTS (it is what
+    /// `send`/`queue` use) and `inbound_sessions[peer_ik]` only ever DECRYPTS (nothing calls
+    /// `encrypt` on it) — see their field docs. A reply from the peer therefore never reaches
+    /// the chain we send on: it lands on the OTHER one-way chain instead, where nobody replies
+    /// back. `Session::dh_ratchet` only fires when a NEW header key arrives on a chain that is
+    /// ALSO used to answer — which never happens here — so post-compromise healing is
+    /// permanently stalled on both halves, not just delayed.
+    ///
+    /// **Why no wire message is needed.** `drop_seed` is a pure function of a session's root
+    /// key (`crate::drop::drop_seed`), and that root key was ALREADY agreed identically by both
+    /// sides at PQXDH time — nothing about it depends on which side happened to send or
+    /// receive first. So both peers hold the exact same two `drop_seed` values (their own
+    /// outbound's and the other's, now sitting in `inbound_sessions`) and can compare them with
+    /// a fixed, symmetric rule — smaller byte string wins — and land on the SAME winner with no
+    /// negotiation. A rule beats a handshake here specifically because it cannot be
+    /// interrupted half-done: there is no message to lose, so there is no half-converged state
+    /// to fall into. (Equality is not a real case: it would mean two independent PQXDH
+    /// agreements, run with fresh ephemerals on each side, produced the same root key.)
+    ///
+    /// **What actually converges.** If our OWN outbound already IS the winner, there is nothing
+    /// to do — we were already sending on the surviving chain, and the peer converges toward us
+    /// the next time THEY run this check. Otherwise the two entries are SWAPPED:
+    /// `inbound_sessions[peer_ik]` (the peer's session, which — per `process_opener` — already
+    /// forced a DH-ratchet step on its very first decrypt and so already holds a working
+    /// sending chain) is promoted into `sessions[peer_ik]`, and our losing outbound is demoted
+    /// into `inbound_sessions[peer_ik]`.
+    ///
+    /// **Why the swap loses nothing.** Nothing is deleted, only relocated — and both maps are
+    /// treated identically everywhere that matters: `receive`'s box collection polls the
+    /// INBOUND box of every session in EITHER map the same way (by that session's own
+    /// `drop_seed`, regardless of which map holds it), and `process_for_peer`/`process_ratchet`
+    /// try both maps to decrypt. So the demoted loser keeps being polled and keeps decrypting
+    /// exactly as it did before the swap — any reply the peer already sent on it, or sends
+    /// before THEY converge too, still arrives. The one thing that changes is which chain FUTURE
+    /// `send`/`queue` calls encrypt on. Already-queued ciphertext under the old (now demoted)
+    /// chain is unaffected by the swap for the same reason: `OutboxEntry` carries its OWN
+    /// routing snapshot from `queue` time, not a live lookup — see its doc.
+    fn converge_split_session(&mut self, peer_ik: &[u8; 32]) {
+        let (Some(out_seed), Some(in_seed)) = (
+            self.sessions.get(peer_ik).map(|st| st.drop_seed),
+            self.inbound_sessions.get(peer_ik).map(|st| st.drop_seed),
+        ) else {
+            return; // no split held for this peer (yet) — nothing to converge
+        };
+        if in_seed < out_seed {
+            // Swap, don't drop: see the doc above for why both halves stay fully usable either
+            // way, just under the other map.
+            let winner = self.inbound_sessions.remove(peer_ik).expect("checked Some above");
+            let loser = self
+                .sessions
+                .insert(*peer_ik, winner)
+                .expect("checked Some above");
+            self.inbound_sessions.insert(*peer_ik, loser);
         }
     }
 
@@ -1623,6 +1767,8 @@ mod outbox_state_tests {
                 peer_ik: [2u8; 32],
                 envelope: a_ratchet_envelope(),
                 queued_at: 100,
+                drop_seed: [3u8; 32],
+                peer_mailbox_pub: [4u8; 32],
             }],
             outbox_next_id: 6,
             inbound_sessions: Vec::new(),
@@ -1995,6 +2141,229 @@ mod session_cap_tests {
             0,
             "a Ratchet-shaped payload at the identity mailbox is NEVER legitimate — it must cost \
              ZERO decrypt attempts, not one per session held"
+        );
+    }
+}
+
+/// A6-1: simultaneous-first-contact convergence. `session_convergence.rs` (integration test,
+/// full PQXDH + relay) proves both sides independently pick the same session and that a
+/// straggler queued before an END-TO-END split still arrives. These are UNIT-level tests that
+/// isolate two narrower claims the e2e path cannot cleanly isolate on its own:
+///
+/// - `route_for`'s SNAPSHOT actually changes where a queued envelope lands (the e2e path masks
+///   a broken snapshot: `receive()` always drains the identity mailbox — creating the peer's
+///   second session — before it polls drop-boxes IN THE SAME call, and `process_for_peer`
+///   trial-decrypts a peer's traffic against BOTH of that peer's held sessions regardless of
+///   which box it arrived on. Together these recover an address computed from the wrong
+///   session in every ordering this test file's own harness can produce — so proving the
+///   snapshot's effect requires inspecting the computed ADDRESS directly, not observing
+///   receive() end to end);
+/// - the DH ratchet actually RESUMES stepping once convergence makes a session bidirectional
+///   again (the ticket's actual subject — "the DH ratchet stops healing" — which a plaintext
+///   round-trip alone does not distinguish from the pre-fix split, since BOTH one-way chains
+///   already deliver plaintext correctly; only the ratchet-pubkey changing on reply is
+///   specific to healing).
+#[cfg(test)]
+mod convergence_route_tests {
+    use super::{SessionEnvelope, SessionState};
+    use crate::node::{InMemoryTransport, RelayNode, Response};
+    use crate::pqxdh::Account;
+    use crate::ratchet::{Header, RatchetMessage, Session};
+    use admission::capability::{Capability, Quota, Scope};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use x25519_dalek::PublicKey;
+
+    const NOW: u64 = 1_000_000;
+
+    fn dev_cap() -> Capability {
+        Capability {
+            capability_id: [0xCE; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 100, max_bytes: 1 << 20, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x36; 32],
+        }
+    }
+
+    /// A relay + transport shared by TWO peers, so they can actually reach each other — the
+    /// routing test below needs neither (it never touches the network), but the healing and
+    /// disk-reload tests do.
+    fn shared() -> (InMemoryTransport, PublicKey) {
+        let mut relay = RelayNode::new(NOW);
+        relay.issue_capability(dev_cap());
+        let relay_pub = relay.relay_public();
+        (InMemoryTransport::new(Rc::new(RefCell::new(relay))), relay_pub)
+    }
+
+    fn mk_peer(transport: &InMemoryTransport, relay_pub: PublicKey) -> super::Peer<InMemoryTransport> {
+        super::Peer::new(transport.clone(), Account::generate(), dev_cap(), relay_pub)
+    }
+
+    /// A standalone peer with its OWN relay — for the routing test, which never sends or
+    /// receives anything over the network (it calls `route_for` directly).
+    fn mk_lone_peer() -> super::Peer<InMemoryTransport> {
+        let (transport, relay_pub) = shared();
+        mk_peer(&transport, relay_pub)
+    }
+
+    /// THE routing claim, isolated: a `Ratchet` envelope encrypted under one session
+    /// (`pre_swap_seed`) must deposit at the address THAT session derives — even after
+    /// `sessions[peer_ik]` has since been replaced (exactly what `converge_split_session`
+    /// does) — when routed with the snapshot `queue` captured. Without the snapshot, routing
+    /// drifts to whatever CURRENTLY occupies `sessions[peer_ik]`, landing at a DIFFERENT
+    /// address than the one actually encrypted for.
+    #[test]
+    fn a_queued_envelope_routes_by_its_own_snapshot_not_by_whatever_session_is_current() {
+        let mut peer = mk_lone_peer();
+        let peer_ik = [9u8; 32];
+        let mailbox_pub = crate::blind::MailboxSecret::generate().public();
+        let pre_swap_seed = [1u8; 32];
+        let post_swap_seed = [2u8; 32];
+        let mk_state = |drop_seed: [u8; 32]| SessionState {
+            session: Session::init_sender([7u8; 32], [8u8; 32]),
+            pending_initial: None,
+            drop_seed,
+            peer_mailbox_pub: mailbox_pub,
+        };
+
+        // The session this message is ACTUALLY encrypted under.
+        peer.sessions.insert(peer_ik, mk_state(pre_swap_seed));
+        let envelope = SessionEnvelope::Ratchet(RatchetMessage {
+            header: Header { dh: [3u8; 32], pn: 0, n: 0, salt: [4u8; 16] },
+            ciphertext: vec![5u8; 32],
+        });
+        let dir = crate::drop::direction(&peer.identity(), &peer_ik);
+        let epoch = crate::drop::epoch_of(NOW);
+        let correct_address =
+            crate::blind::deposit_address(&mailbox_pub, &pre_swap_seed, epoch, dir)
+                .expect("valid curve point");
+
+        // The convergence swap: some OTHER session now occupies `sessions[peer_ik]` — the
+        // message above was already encrypted before this happened.
+        peer.sessions.insert(peer_ik, mk_state(post_swap_seed));
+
+        let (snapshot_addr, _) = peer
+            .route_for(&peer_ik, &envelope, Some((pre_swap_seed, mailbox_pub)), NOW)
+            .expect("routes with the snapshot");
+        assert_eq!(
+            snapshot_addr, correct_address,
+            "routed WITH the queue-time snapshot: lands where it was actually encrypted for"
+        );
+
+        let (live_addr, _) =
+            peer.route_for(&peer_ik, &envelope, None, NOW).expect("routes without an override");
+        assert_ne!(
+            live_addr, correct_address,
+            "routed WITHOUT the snapshot: drifts to whatever `sessions[peer_ik]` holds NOW — \
+             exactly the hazard `OutboxEntry`'s snapshot exists to close"
+        );
+    }
+
+    /// The ticket's actual subject: after convergence, BOTH sides' ratchet-pubkeys keep
+    /// changing across several further rounds — not merely once.
+    ///
+    /// A single round is NOT discriminating on its own: `process_opener` already forces one
+    /// free `dh_ratchet` step on the very FIRST decrypt of ANY new session, split or not (see
+    /// its doc) — so whichever side happens to win the tie-break may see its NEXT one or two
+    /// replies land on a chain whose peer-key hasn't moved YET (the winning side's own long-held
+    /// session never decrypted anything before convergence, so it takes one full round to catch
+    /// up). What a split can NEVER do, and convergence exists to restore, is CONTINUE
+    /// ratcheting on message after message — a one-way chain gets its one first-contact freebie
+    /// and then nothing, forever. So this drives several rounds and compares the FIRST key each
+    /// side held against the LAST — proof of ongoing, not one-shot, healing.
+    #[test]
+    fn the_converged_session_keeps_dh_ratcheting_across_several_further_rounds() {
+        let (transport, relay_pub) = shared();
+        let mut alice = mk_peer(&transport, relay_pub);
+        let mut bob = mk_peer(&transport, relay_pub);
+        let (alice_ik, bob_ik) = (alice.identity(), bob.identity());
+
+        alice.connect_with_bundle(&bob.bundle()).unwrap();
+        bob.connect_with_bundle(&alice.bundle()).unwrap();
+        assert!(matches!(alice.send(&bob_ik, b"a0", NOW), Response::Accepted));
+        assert!(matches!(bob.send(&alice_ik, b"b0", NOW), Response::Accepted));
+        bob.receive(NOW).unwrap();
+        alice.receive(NOW).unwrap();
+
+        // Precondition: converged (see `session_convergence.rs` for the dedicated test of this
+        // property) — both now hold the SAME session for each other.
+        let alice_seed = alice.sessions.get(&bob_ik).unwrap().drop_seed;
+        let bob_seed = bob.sessions.get(&alice_ik).unwrap().drop_seed;
+        assert_eq!(alice_seed, bob_seed, "precondition: converged before checking healing");
+
+        let alice_key0 = alice.sessions.get(&bob_ik).unwrap().session.ratchet_public();
+        let bob_key0 = bob.sessions.get(&alice_ik).unwrap().session.ratchet_public();
+
+        for i in 0..3u8 {
+            assert!(matches!(bob.send(&alice_ik, &[b'B', i], NOW), Response::Accepted));
+            let got: Vec<_> = alice.receive(NOW).unwrap().into_iter().flatten().collect();
+            assert_eq!(got.len(), 1, "round {i}: alice gets bob's message");
+
+            assert!(matches!(alice.send(&bob_ik, &[b'A', i], NOW), Response::Accepted));
+            let got: Vec<_> = bob.receive(NOW).unwrap().into_iter().flatten().collect();
+            assert_eq!(got.len(), 1, "round {i}: bob gets alice's message");
+        }
+
+        let alice_key_last = alice.sessions.get(&bob_ik).unwrap().session.ratchet_public();
+        let bob_key_last = bob.sessions.get(&alice_ik).unwrap().session.ratchet_public();
+        assert_ne!(
+            alice_key0, alice_key_last,
+            "alice's ratchet key must have moved after several further rounds — a split \
+             session gets ONE free DH-ratchet at first contact and then never another; \
+             seeing it move AGAIN is what 'healing resumed' actually means"
+        );
+        assert_ne!(
+            bob_key0, bob_key_last,
+            "same for bob's side — BOTH directions must keep healing, not just one"
+        );
+    }
+
+    /// A6-1's other entry point: a split that formed and was PERSISTED before this fix (or one
+    /// this side hasn't touched since the peer's half landed) must also converge — via the
+    /// sweep at the top of `receive()` — not just a split detected fresh inside
+    /// `process_opener` in the SAME process. Builds the split BY HAND (the same shape
+    /// `process_opener` would have produced on an OLDER build, before convergence existed —
+    /// same technique `session_cap_tests::insert_dummy` uses to avoid paying for a real PQXDH
+    /// agreement when only the MAP SHAPE is under test) and hands it to a fresh `Peer` purely
+    /// via `import_state` — `process_opener` never runs in this process at all, so the ONLY
+    /// thing that can converge it is the sweep.
+    #[test]
+    fn a_split_present_only_because_it_was_just_loaded_from_disk_converges_on_the_next_receive() {
+        let mut peer = mk_lone_peer();
+        let peer_ik = [9u8; 32];
+        let mailbox_pub = crate::blind::MailboxSecret::generate().public();
+        let mk_state = |drop_seed: [u8; 32]| SessionState {
+            session: Session::init_sender([7u8; 32], [8u8; 32]),
+            pending_initial: None,
+            drop_seed,
+            peer_mailbox_pub: mailbox_pub,
+        };
+        // `sessions[peer]` (the outbound map — what `send`/`queue` use) starts with the LARGER
+        // seed on purpose: convergence must actually SWAP for the assertion below to hold. If
+        // it started with the smaller seed already, a completely inert (no-op) sweep would
+        // pass this check by doing nothing — the exact "passes by deleting/skipping state"
+        // trap the project's testing rule warns against.
+        peer.sessions.insert(peer_ik, mk_state([2u8; 32]));
+        peer.inbound_sessions.insert(peer_ik, mk_state([1u8; 32]));
+
+        let state = peer.export_state();
+        let mut reloaded = mk_lone_peer();
+        reloaded.import_state(state);
+
+        // No mailbox traffic to fetch — this exercises ONLY the sweep at the top of
+        // `receive()`, never `process_opener` (nothing arrives for it to process).
+        reloaded.receive(NOW).unwrap();
+
+        let out_seed = reloaded.sessions.get(&peer_ik).unwrap().drop_seed;
+        let in_seed = reloaded.inbound_sessions.get(&peer_ik).unwrap().drop_seed;
+        assert!(
+            out_seed < in_seed,
+            "the sweep must converge onto the SMALLER seed just as `process_opener`'s own \
+             check would — `sessions[peer]` (what `send`/`queue` actually use) must end up \
+             holding it regardless of which map the winner started in, and regardless of \
+             whether the split was detected fresh or reloaded from disk"
         );
     }
 }

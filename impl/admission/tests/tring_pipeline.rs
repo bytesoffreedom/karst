@@ -87,6 +87,7 @@ fn real_threshold_token_admitted_through_pipeline() {
     let mut replay = ReplayFilter::new(0, 1024);
     let req = admission::pipeline::Request {
         raw_len: 400,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -126,6 +127,7 @@ fn real_below_threshold_token_rejected_through_pipeline() {
     let mut replay = ReplayFilter::new(0, 1024);
     let req = admission::pipeline::Request {
         raw_len: 400,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),

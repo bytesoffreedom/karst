@@ -33,6 +33,12 @@ use crate::seal::{Identity, SkeletonSeal};
 /// Перезапись СВОЕГО bundle всегда разрешена (не считается новым).
 pub const MAX_BUNDLES: usize = 100_000;
 
+/// What one signed one-time prekey costs the relay, for quota purposes: the 32-byte key, its
+/// 64-byte signature, and the postcard framing around them. Deliberately the STORED size rather
+/// than the wire size — the relay holds it until a fetcher takes it, and that is the resource
+/// the byte budget exists to bound.
+const SIGNED_OPK_COST: usize = 32 + 64 + 8;
+
 /// How long a published bundle survives without being republished. 30 days: a client republishes
 /// on launch and on announce, so an account in ANY use stays live, while an abandoned or
 /// Sybil-minted slot returns its capacity instead of holding it until the process restarts.
@@ -905,6 +911,7 @@ impl RelayNode {
         let raw_len = msg.payload.approx_len() + 128;
         let req = Request {
             raw_len,
+            max_raw_len: admission::params::MAX_PACKET_SIZE,
             client_addr: &msg.client_addr,
             carrier_id: &msg.carrier_id,
             cookie: msg.cookie,
@@ -1154,7 +1161,15 @@ impl RelayNode {
         // that must present a capability and be charged for it.
         if is_new_slot {
             let areq = Request {
-                raw_len: 2048, // a bundle is ~1.3 KiB; a fixed figure, not caller-chosen
+                // The REAL cost of this request, not a stand-in: the bundle AND the one-time
+                // prekey batch riding with it. It used to be a flat 2048 covering the bundle
+                // alone, so up to `MAX_OPKS_PER_IK` signed keys — tens of kilobytes the relay
+                // then stores and serves — were free (A10-1). They were free for a structural
+                // reason: stage 0 applied the live-path MTU to EVERY request class, so charging
+                // the truth here would have rejected every honest full-batch publish. Each class
+                // carries its own ceiling now, which is what makes the honest figure affordable.
+                raw_len: 2048 + req.opks.len() * SIGNED_OPK_COST,
+                max_raw_len: 2048 + MAX_OPKS_PER_IK * SIGNED_OPK_COST + 512,
                 client_addr: &req.client_addr,
                 carrier_id: &req.carrier_id,
                 cookie: req.cookie,
@@ -1253,6 +1268,7 @@ impl RelayNode {
             // A fixed, small size: this request carries no payload, so charging it by a
             // caller-supplied length would let the caller choose its own quota cost.
             raw_len: 256,
+            max_raw_len: admission::params::MAX_PACKET_SIZE,
             client_addr: &req.client_addr,
             carrier_id: &req.carrier_id,
             cookie: req.cookie,

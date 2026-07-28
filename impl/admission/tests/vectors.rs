@@ -178,6 +178,7 @@ fn pipeline_first_contact_gets_challenge() {
 
     let req = admission::pipeline::Request {
         raw_len: 200,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: b"203.0.113.5:5000",
         carrier_id: b"c",
         cookie: None, // первый контакт
@@ -214,6 +215,7 @@ fn pipeline_capability_admits_then_replay_rejects() {
 
     let mk = || admission::pipeline::Request {
         raw_len: 300,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -253,6 +255,7 @@ fn pipeline_token_threshold_enforced() {
     let mut replay = ReplayFilter::new(0, 1024);
     let req_good = admission::pipeline::Request {
         raw_len: 300,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -267,6 +270,7 @@ fn pipeline_token_threshold_enforced() {
     let mut replay2 = ReplayFilter::new(0, 1024);
     let req_weak = admission::pipeline::Request {
         raw_len: 300,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -295,7 +299,8 @@ fn pipeline_oversize_dropped_silently() {
     };
     let mut replay = ReplayFilter::new(0, 1024);
     let req = admission::pipeline::Request {
-        raw_len: 5000, // > MAX_PACKET_SIZE
+        raw_len: 5000,
+        max_raw_len: admission::params::MAX_PACKET_SIZE, // > MAX_PACKET_SIZE
         client_addr: b"x",
         carrier_id: b"c",
         cookie: None,

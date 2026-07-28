@@ -99,6 +99,7 @@ fn mk_req<'a>(
 ) -> Request<'a> {
     Request {
         raw_len: 300,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),

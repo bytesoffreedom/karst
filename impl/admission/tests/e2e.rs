@@ -61,6 +61,7 @@ fn live_session_journey() {
     // 1. Первый контакт без cookie → Challenge.
     let first = Request {
         raw_len: 200,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: None,
@@ -78,6 +79,7 @@ fn live_session_journey() {
     let proof1 = cap.prove(b"nonce-1", 0);
     let admitted = Request {
         raw_len: 200,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -97,6 +99,7 @@ fn live_session_journey() {
     let proof2 = cap.prove(b"nonce-2", 0);
     let admitted2 = Request {
         raw_len: 200,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -271,6 +274,7 @@ fn rln_layer_works_but_pipeline_branch_not_implemented() {
     let cookie = kr.issue(client, carrier, NOW as u32);
     let req = Request {
         raw_len: 200,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -335,6 +339,7 @@ fn live_real_ring_token_journey() {
     let mut replay = ReplayFilter::new(0, 1024);
     let req = Request {
         raw_len: 400,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -352,6 +357,7 @@ fn live_real_ring_token_journey() {
     let mut replay2 = ReplayFilter::new(0, 1024);
     let req_bad = Request {
         raw_len: 400,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),
@@ -416,6 +422,7 @@ fn an_invalid_capability_does_not_consume_replay_capacity() {
         junk.mac = [i; 16]; // fails the HMAC check at Stage 4
         let req = Request {
             raw_len: 200,
+            max_raw_len: admission::params::MAX_PACKET_SIZE,
             client_addr: client,
             carrier_id: carrier,
             cookie: Some(cookie),
@@ -436,6 +443,7 @@ fn an_invalid_capability_does_not_consume_replay_capacity() {
     // reached the filter.
     let good = Request {
         raw_len: 200,
+        max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: client,
         carrier_id: carrier,
         cookie: Some(cookie),

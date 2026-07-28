@@ -21,7 +21,7 @@ use crate::dtn::{
     DtnCapError, DtnCapabilityProof, DtnCapabilityTable, ReplayCheck, RollingReplayWindow,
     MAX_DTN_CAPSULE_SIZE,
 };
-use crate::params::{COOKIE_CHALLENGE_SIZE, MAX_PACKET_SIZE};
+use crate::params::COOKIE_CHALLENGE_SIZE;
 use crate::token::{AdmissionToken, AdmissionTokenVerifier, IssuerRing, TokenError};
 
 /// Предъявляемый credential (§7.5, Ступень 4). RLN здесь не отдельный
@@ -39,6 +39,18 @@ pub enum Credential {
 pub struct Request<'a> {
     /// Длина сырого пакета до разбора (для Ступени 0).
     pub raw_len: usize,
+    /// Stage-0 ceiling for THIS request's CLASS, supplied by the caller.
+    ///
+    /// It used to be a single hardcoded `MAX_PACKET_SIZE` for every kind of request, which forced
+    /// a choice between two wrong answers wherever a class legitimately costs more: charge the
+    /// real cost and have stage 0 reject every honest request, or charge a fiction and leave the
+    /// difference unmetered. A bundle publish carrying a full one-time-prekey batch is ~28 KiB
+    /// against a 2560-byte ceiling, so it took the second — the batch was free (A10-1).
+    ///
+    /// The caller declares the ceiling because only it knows the class; `wire::max_frame_for`
+    /// already does exactly this one layer up, and the asymmetry between the two was the defect.
+    /// Use [`crate::params::MAX_PACKET_SIZE`] for the ordinary live path.
+    pub max_raw_len: usize,
     pub client_addr: &'a [u8],
     pub carrier_id: &'a [u8],
     /// Cookie, если клиент уже прошёл первый round-trip; None — первый контакт.
@@ -252,7 +264,7 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         // --- Ступени 0–1 ---
         if let Some(out) = self.precheck(
             req.raw_len,
-            MAX_PACKET_SIZE, // live-MTU
+            req.max_raw_len,
             req.client_addr,
             req.carrier_id,
             &req.cookie,

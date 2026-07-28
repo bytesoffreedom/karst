@@ -297,3 +297,55 @@ fn an_issued_pow_capability_advertises_the_quota_enforcement_will_actually_grant
     assert_eq!(cap.quota.max_requests, 3, "a tighter operator ceiling must bind the issued quota");
     assert_eq!(cap.quota.max_bytes, 4096);
 }
+
+/// A10-1. Stage 0 of admission applied ONE ceiling — the live-path MTU — to every request class.
+/// A bundle publish carrying a full one-time-prekey batch is an order of magnitude larger than
+/// that, so charging its real cost would have rejected every honest publish; the code charged a
+/// flat figure covering the bundle alone instead, and the batch (up to 256 keys the relay then
+/// stores and serves) rode along free.
+///
+/// Discriminating: a capability whose byte budget is smaller than a full batch must be exhausted
+/// by publishing one, while the SAME budget comfortably admits a publish carrying no keys. A
+/// relay that still charged a flat figure would admit both; one that rejected both would fail the
+/// control.
+#[test]
+fn a_one_time_prekey_batch_is_charged_against_the_publishers_byte_budget() {
+    use admission::capability::{Capability, Quota, Scope};
+    use node::node::{InMemoryTransport, RelayNode};
+    use node::peer::Peer;
+    use node::pqxdh::Account;
+
+    let cap = |max_bytes: u64| Capability {
+        capability_id: [0xB1; 16],
+        scope: Scope::MessageDelivery,
+        quota: Quota { max_requests: 100, max_bytes, window_secs: 600 },
+        not_before: 0,
+        not_after: u32::MAX,
+        secret: [0x44; 32],
+    };
+
+    // Budget deliberately between "a bundle" and "a bundle plus a full batch".
+    let budget = 8_000;
+
+    let mut relay = RelayNode::new(NOW);
+    relay.issue_capability(cap(budget));
+    let relay_pub = relay.relay_public();
+    let t = InMemoryTransport::new(Rc::new(RefCell::new(relay)));
+
+    // Control: a publish with NO one-time prekeys fits the same budget.
+    let mut lean = Peer::new(t.clone(), Account::generate(), cap(budget), relay_pub);
+    assert!(
+        matches!(lean.publish_advertising(&[], NOW), node::node::PublishResponse::Published),
+        "control: a bundle alone must fit a budget this size"
+    );
+
+    // The same budget must NOT also cover a bundle plus a full batch.
+    let mut heavy = Peer::new(t, Account::generate(), cap(budget), relay_pub);
+    let opks = heavy.add_opks(128);
+    let resp = heavy.publish_advertising(&opks, NOW);
+    assert!(
+        !matches!(resp, node::node::PublishResponse::Published),
+        "128 one-time prekeys rode along without being charged — the byte budget does not bound \
+         what a publisher can make the relay store: {resp:?}"
+    );
+}

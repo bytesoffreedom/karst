@@ -178,8 +178,38 @@ build; clippy clean.**
   account, both open with their own password, container size unchanged. **Honest ceiling (say it):
   deniable at rest on disk + while offline; NOT deniable against an adversary with relay/network logs
   once the hidden account goes online** (circuit isolation + timing settings deferred — see #123).
-  14 container tests. Desktop: `container_create/unlock/flush/active/hidden/add_hidden`,
+  32 container tests. Desktop: `container_create/unlock/flush/active/hidden/add_hidden`,
   `net_offline/set_net_offline`, `Vault::adopt`.
+  **Container is the authority for the work dir (A3-3, fixed).** Opening a compartment now makes the
+  work dir EQUAL its snapshot — `restore_dir` clears the directory first instead of overlaying the
+  snapshot onto whatever was left there. A visible account's work dir (`<vault>/work`) survives
+  between sessions, so the overlay let deleted contacts/settings/sidecars come back and be
+  re-snapshotted (permanent resurrection), and could mix two generations of state file-by-file with
+  nothing reporting it. A blob that fails to decode is refused *before* anything is removed. **Named
+  cost:** work that never reached a `save()` is discarded cleanly at the next open rather than left
+  behind torn — safe for received mail (ACKs are deferred behind the commit, so it redelivers), a real
+  loss for a queued `flush_outbox` send or an in-progress download, which have no relay copy. Test:
+  `reopening_a_compartment_replaces_the_work_dir_instead_of_merging_into_it`.
+  **One writer per container (A3-8, fixed — UNIX only).** `Container` holds an exclusive `flock` on
+  `container.dat` for its lifetime, so a second window (or a second instance in one process) is
+  refused rather than racing. Two writers previously shared one `<container>.tmp` and could rename an
+  interleaved mixture over the file — losing EVERY compartment, not just the loser's changes — while
+  `load` could unlink another process's in-flight save. **No equivalent on non-UNIX platforms**: a
+  lock *file* is not available to us, because a hidden account's directory must hold `container.dat`
+  and nothing else. A lock conflict (and an over-ceiling container) is reported with a distinct
+  `io::ErrorKind` so `container_unlock` does not fold it into the opaque "wrong password" it must
+  return for a genuine open failure — a user with a correct password should never be told otherwise.
+  `wipe` deliberately does NOT re-take the lock: a wipe that lost the relock race would report
+  failure for a container it had just erased. Test:
+  `a_second_live_container_over_one_file_is_refused_until_the_first_is_dropped`.
+  **Container size is a RAM budget, capped at 1 GiB (A3-9, fixed).** The whole file lives in a
+  `Vec<u8>`, and the desktop passed `size_mb` from the frontend through unchecked;
+  `client::container::MAX_CONTAINER_BYTES` now refuses an oversized container at `create` (before the
+  allocation) and at `load` (by `stat`, before the read). Memory-mapping would not lift this: format
+  (b) stores one sealed blob per compartment, so a save buffers the whole snapshot and its whole
+  ciphertext regardless — peak ≈ 2× the container size, of which only the file term is mmap-able.
+  1 GiB ⇒ ~384 MiB of usable account. Test:
+  `a_container_over_the_ram_ceiling_is_refused_at_both_create_and_load`.
   **Receive durability (SEC-34, fixed).** A container-backed session's `Store` is a materialized
   working copy; the authority is the container, written by a separate later `save()`. Receiving used
   to ack the relay — telling it to delete its only copy — as soon as that working copy was written,
@@ -192,17 +222,22 @@ build; clippy clean.**
   container, relay-clock lease expiry), plus `a_control_only_batch_still_carries_a_commit_barrier`.
   **Named limits.** (a) "Redeliverable" means *after a relock/restart*: within the same session the
   work dir still holds the advanced ratchet, so a redelivery fails closed and shows as nothing — no
-  loss, but no in-session recovery either. A failed commit DROPS its receipts rather than deferring
-  them to the next successful save, so those messages occupy relay mailbox slots until the deposit
-  TTL sweeps them (bounded, never lossy — the copy that matters is the container's). (b) The
-  **ratchet rollback itself is not fixed**: a stale
-  container snapshot can still overwrite a newer work dir on reopen (the audit's generation-marker
-  item), and a rollback deeper than `MAX_SKIP` can still wedge a conversation. Deferring the ack
-  removes the message LOSS, not the rollback. (c) Only the receive path is gated. Other writers of a
-  container-backed work dir — `flush_outbox`, the spawned download/attachment threads — are still
-  durable only at the next container save; nothing is deleted from a relay on their behalf, so this
-  costs redundant work after a rollback, not mail. (d) The quarantine/replay log is **not** a
-  mitigation here: it lives in the work dir, so it rolls back with everything else.
+  loss, but no in-session recovery either. (Since A3-3 the relock/restart half is cleaner than it
+  was: the reopen resets the work dir to the container's snapshot outright, so the ratchet really
+  does return to the last committed state instead of being partly overlaid by leftovers.) A failed
+  commit DROPS its receipts rather than deferring them to the next successful save, so those messages
+  occupy relay mailbox slots until the deposit TTL sweeps them (bounded, never lossy — the copy that
+  matters is the container's). (b) The **ratchet rollback itself is not fixed**: reopening a
+  compartment restores the container's snapshot over the work dir — now a full replace rather than a
+  merge, so a stale snapshot rolls the account back wholesale — and a rollback deeper than `MAX_SKIP`
+  can still wedge a conversation. Deferring the ack removes the message LOSS, not the rollback.
+  (c) Only the receive path is gated. Other writers of a container-backed work dir — `flush_outbox`,
+  the spawned download/attachment threads — are still durable only at the next container save, and
+  since A3-3 their un-saved work is *discarded* at the next open rather than surviving in the
+  directory. Nothing is deleted from a relay on their behalf, so a rollback costs a redundant resend
+  or re-download, not mail — but the queued item itself does not survive the reopen. (d) The
+  quarantine/replay log is **not** a mitigation here: it lives in the work dir, so it rolls back with
+  everything else.
 - **Public-node admission door (`impl/admission`, `impl/node`).** A stateless proof-of-work → a
   short-lived capability, so a public relay admits strangers without an invite and without keeping
   per-client state at the door.

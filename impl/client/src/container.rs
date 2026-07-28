@@ -238,17 +238,63 @@ pub fn snapshot_dir(dir: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     postcard::to_stdvec(&files).map_err(io_err)
 }
 
-/// Rebuild an account directory from a `snapshot_dir` blob. Recreates every file (and parent
-/// dirs) under `dir`. Rejects unsafe relative paths (absolute or `..`) defensively.
+/// Rebuild an account directory from a `snapshot_dir` blob: afterwards `dir` holds EXACTLY the
+/// files the snapshot names and nothing else. Rejects unsafe relative paths (absolute or `..`)
+/// defensively.
+///
+/// **`dir` is DELETED and recreated — pass a work dir, never a vault base.** Every caller today
+/// passes a subdirectory (`<vault>/work`, `/dev/shm/karst-hid-*`), which is what keeps
+/// `container.dat` — the sibling this restores FROM — out of the blast radius. A caller that ever
+/// handed this the vault base itself would erase the container along with the work dir.
+///
+/// **A3-3 — this used to OVERLAY the snapshot onto whatever was already in `dir`.** It created and
+/// overwrote the snapshot's own files but never removed anything else, and both callers
+/// (`ContainerVault::open`, `open_container`) run it over a work dir that SURVIVES between sessions
+/// (the desktop's is `<vault>/work`). So a file the user had deleted — a contact, a settings file,
+/// an attachment sidecar — came back the moment its (older, or merely different) snapshot was
+/// restored over a directory that still held it, and the next `save()` snapshotted the resurrected
+/// merge back INTO the container, making the resurrection permanent. Two generations of state could
+/// also be mixed file-by-file with nothing anywhere reporting it. The container is the authority for
+/// what an account contains, so restoring now means "make the directory equal the snapshot":
+/// everything under `dir` is removed first, then the snapshot is laid down fresh.
+///
+/// **Ordering, deliberately: decode and validate the WHOLE blob before removing anything.** A blob
+/// that fails to decode, or that names an unsafe path, must leave the work dir exactly as it was —
+/// otherwise a corrupt read would destroy the one materialized copy on its way to reporting the
+/// error.
+///
+/// **What this DISCARDS, said plainly (rule: no overclaiming).** Anything written into the work dir
+/// that never made it into a `save()` is gone at the next open — it is not merged and it is not
+/// recovered. For received mail that is safe and already load-bearing: `recv_session_multi` defers
+/// its relay ACKs behind a successful container commit, so unsaved messages are still leased on the
+/// relay and redeliver. It is NOT safe for the writers that have no relay copy — a queued
+/// `flush_outbox` send and an in-progress download/attachment thread are, per `docs/STATUS.md`,
+/// durable only at the next container save; a crash before that save now loses them cleanly instead
+/// of leaving them behind torn. That is the intended trade (the container cannot be the authority
+/// AND defer to leftovers in the directory it authorizes), not an oversight.
 pub fn restore_dir(dir: &Path, blob: &[u8]) -> io::Result<()> {
-    if blob.is_empty() {
-        return Ok(()); // a freshly-created, empty compartment — nothing to restore
-    }
-    let files: Vec<(String, Vec<u8>)> = postcard::from_bytes(blob).map_err(io_err)?;
-    for (rel, bytes) in files {
+    // Decode + validate FIRST: nothing below may destroy the live work dir on a blob we then
+    // turn out to be unable to restore.
+    let files: Vec<(String, Vec<u8>)> = if blob.is_empty() {
+        Vec::new() // a freshly-created, empty compartment — it holds no files, so neither may `dir`
+    } else {
+        postcard::from_bytes(blob).map_err(io_err)?
+    };
+    for (rel, _) in &files {
         if rel.starts_with('/') || rel.split('/').any(|p| p == ".." || p.is_empty()) {
             return Err(io_err("unsafe path in snapshot"));
         }
+    }
+    // Clear, then lay down. A crash between the two is never OBSERVED: the container still holds
+    // the authoritative blob, restore always precedes use, and it is idempotent — the next open
+    // simply redoes it. That is why this needs no staging directory (which would litter the vault
+    // base with a second container-shaped artifact after a crash — see the zero-external-artifacts
+    // test) and no rollback.
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    for (rel, bytes) in files {
         let path = dir.join(&rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -373,18 +419,47 @@ pub enum Opened {
     Wipe,
 }
 
-/// The whole container file, held in memory (fixed size, so bounded). Every mutation is
-/// persisted by a crash-safe temp-swap that preserves untouched regions byte-for-byte.
+/// The largest container this implementation will create or open.
+///
+/// **A3-9 — the container is a whole-file-in-RAM design, so its size IS a memory budget.** `load`
+/// reads the entire file into `buf` and `create` allocates and randomises all of it, while the
+/// desktop's `container_create` takes a `size_mb` straight from the frontend and multiplies. A user
+/// (or a buggy UI) asking for 10 GB got a 10 GB allocation and, with two windows open, two of them.
+///
+/// Memory-mapping or a block-oriented store would fix the `buf` term and NOT the problem, which is
+/// the reason this cap is the right shape of fix rather than a band-aid over a missing rewrite:
+/// format (b) stores **one sealed blob per compartment**, so a save necessarily builds the whole
+/// account snapshot in RAM (`snapshot_dir` → `Vec<u8>`) and then its whole sealed ciphertext, and an
+/// open necessarily decrypts the whole blob. Peak RAM is therefore about `C` (the file) + `0.375·C`
+/// (the snapshot — a main compartment's usable payload is ~3/8 of the file, see `container_create`'s
+/// geometry) + as much again for the ciphertext, i.e. **≈2×C, of which only the first term is what
+/// mmap would remove**. A container the machine cannot hold in RAM twice over is unusable by design,
+/// not by implementation, so the honest fix is to refuse it at the library boundary — where every
+/// caller is covered — instead of validating `size_mb` in one UI. 1 GiB ⇒ ~2 GiB peak and ~384 MiB
+/// of usable account.
+pub const MAX_CONTAINER_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The whole container file, held in memory (fixed size and bounded by [`MAX_CONTAINER_BYTES`]).
+/// Every mutation is persisted by a crash-safe temp-swap that preserves untouched regions
+/// byte-for-byte.
 pub struct Container {
     path: PathBuf,
     buf: Vec<u8>,
+    /// A held-open descriptor carrying an exclusive advisory lock on the container file (A3-8).
+    /// `None` only on a platform where we cannot take one — see [`Container::lock_file`].
+    /// Dropping the `Container` closes it, which releases the lock.
+    lock: Option<std::fs::File>,
+}
+
+fn fill_random(dst: &mut [u8]) {
+    use chacha20poly1305::aead::rand_core::RngCore;
+    use chacha20poly1305::aead::OsRng;
+    OsRng.fill_bytes(dst);
 }
 
 fn random_bytes(n: usize) -> Vec<u8> {
-    use chacha20poly1305::aead::rand_core::RngCore;
-    use chacha20poly1305::aead::OsRng;
     let mut v = vec![0u8; n];
-    OsRng.fill_bytes(&mut v);
+    fill_random(&mut v);
     v
 }
 
@@ -414,11 +489,85 @@ impl Container {
         &self.buf[..SALT_LEN]
     }
 
+    /// Take the exclusive advisory lock on an EXISTING container file, and hand back the descriptor
+    /// that holds it (closing it releases the lock, so a `Container` keeps it for its whole life).
+    ///
+    /// **A3-8 — nothing used to stop two writers over one container, and the damage was worse than
+    /// "one of them loses its changes".** Every `Container::load` takes its own full copy of the
+    /// file with no lock, generation number or compare-and-swap, so: (a) both `persist` paths used
+    /// the SAME `<container>.tmp` name, and two concurrent full saves could interleave their bytes
+    /// into that one file before one of them renamed the mixture over `container.dat` — salt and
+    /// slot table included, i.e. EVERY compartment gone, not just the losing writer's; (b) `load`
+    /// unconditionally deleted `<container>.tmp`, so merely OPENING a container could unlink another
+    /// process's save mid-flight; (c) a stale in-memory image persisted later silently reverted
+    /// regions its holder never touched; (d) in-place `persist_range` writes from two processes
+    /// could interleave inside one region. A file lock is what closes all four at once: with it, (a)
+    /// and (b) cannot arise because the tmp file is provably ours while we hold the lock, and (c)
+    /// and (d) cannot arise because no second image exists.
+    ///
+    /// `flock` is per open-file-description, so this also refuses a second `Container` in the SAME
+    /// process — the "one held instance" convention the old comments relied on is now enforced
+    /// rather than assumed.
+    ///
+    /// **Honest limits.** (1) UNIX ONLY. On other platforms this returns `None` and the container is
+    /// unprotected exactly as before — stated here and in `docs/STATUS.md` rather than papered over;
+    /// the desktop's only supported container platform today is Linux. (2) The lock is on the
+    /// container's INODE, and `persist` replaces that inode by rename, so `persist` re-takes the lock
+    /// on the new file immediately afterwards; a second process that opens the container inside that
+    /// microsecond window can win it, in which case our re-lock fails LOUDLY (see `persist`) rather
+    /// than letting two writers proceed. (3) It is advisory: a different program that ignores locks
+    /// is not stopped by it.
+    fn lock_file(path: &Path) -> io::Result<Option<std::fs::File>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            // SAFETY: `f` is a live descriptor for the duration of the call.
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                // `WouldBlock` deliberately: `LOCK_NB` returns EWOULDBLOCK, and a caller needs to
+                // tell this apart from "wrong password". The desktop maps an ordinary open failure
+                // to a single opaque "wrong password" — which is the point, since "no such
+                // compartment" and "wrong password" must be the same answer — but doing that to a
+                // LOCK conflict would report the most misleading string possible for a condition
+                // that has nothing to do with the password.
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "this container is already open in another session ({}) — close it there \
+                         first; two writers over one container can destroy every compartment in it",
+                        io::Error::last_os_error()
+                    ),
+                ));
+            }
+            Ok(Some(f))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
     /// Create a fresh container of exactly `total` bytes, entirely random, with the main
     /// account's P1 (protect) password installed. `main_cap` (bytes, the "A" reserve) is
     /// the protect-mode write ceiling for the main region. The tail after the main region
     /// is reserved for a future hidden compartment (indistinguishable random until then).
     pub fn create(path: &Path, total: u64, main_password: &[u8], main_cap: u64) -> io::Result<Self> {
+        // A3-9: refuse BEFORE the allocation, so an absurd size costs nothing rather than OOMing
+        // on the way to finding out. Checked on `u64` — casting first would wrap on 32-bit.
+        if total > MAX_CONTAINER_BYTES {
+            // `OutOfMemory` for the same reason the lock uses `WouldBlock`: this is not a password
+            // failure and must not be reported as one.
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "container size {total} bytes exceeds the {MAX_CONTAINER_BYTES}-byte maximum — \
+                     the whole file is held in RAM and a save buffers the compartment's snapshot \
+                     and ciphertext on top of it (peak ≈ 2× the container size)"
+                ),
+            ));
+        }
         let total = total as usize;
         if total < DATA_OFF + MIN_REGION_CAP {
             return Err(io_err("container size too small"));
@@ -433,20 +582,42 @@ impl Container {
         let mut c = Container {
             path: path.to_path_buf(),
             buf: std::mem::take(&mut buf),
+            lock: None,
         };
         // Seal an empty payload so a fresh main region reads back as empty (not garbage).
         Self::write_region_at(&mut c.buf, main_off, main_cap, main_cap, &region_key, &[])?;
         c.seal_slot(0, Role::Main, Policy::Protect, main_password, main_off as u64, main_cap as u64, &region_key)?;
         let mgmt = c.key_for(main_password)?;
         c.write_dir(&mgmt, &[0])?; // slot 0 is the management/main slot
+        // `persist` takes the lock on the file it just laid down (A3-8): there is nothing to lock
+        // before that, since the file does not exist yet. Two processes racing to CREATE the same
+        // path is therefore still last-writer-wins — an unavoidable window at this one call, and a
+        // harmless one: neither container has any account in it yet.
         c.persist()?;
         Ok(c)
     }
 
-    /// Load an existing container file into memory.
+    /// Load an existing container file into memory, taking the exclusive lock first (A3-8).
     pub fn load(path: &Path) -> io::Result<Self> {
-        // A crash mid-persist can leave a full-size `.tmp` copy (harmless — also random —
-        // but tidy it so there aren't two container-shaped blobs lying around).
+        // Lock BEFORE touching anything: the stale-tmp cleanup below is only safe once we know no
+        // other session is mid-save, and the read below is only meaningful if nobody can rewrite
+        // the file under us afterwards.
+        let lock = Self::lock_file(path)?;
+        // A3-9: stat, don't read, to find out a file is too big — the point is to refuse without
+        // ever allocating for it.
+        let len = std::fs::metadata(path)?.len();
+        if len > MAX_CONTAINER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "container file is {len} bytes, over the {MAX_CONTAINER_BYTES}-byte maximum \
+                     this build will hold in memory — refusing to read it"
+                ),
+            ));
+        }
+        // A crash mid-persist can leave a full-size `.tmp` copy (harmless — also random — but tidy
+        // it so there aren't two container-shaped blobs lying around). Safe to delete only because
+        // we hold the lock: without it this was deleting other processes' in-flight saves (A3-8).
         let _ = std::fs::remove_file(path.with_extension("tmp"));
         let buf = std::fs::read(path)?;
         if buf.len() < HEADER_LEN + LEN_HDR {
@@ -455,6 +626,7 @@ impl Container {
         Ok(Container {
             path: path.to_path_buf(),
             buf,
+            lock,
         })
     }
 
@@ -1012,7 +1184,33 @@ impl Container {
     /// Crash-safe persist: write the whole buffer to a temp file, fsync, atomically rename.
     /// Untouched regions (e.g. the hidden tail during a Protect-mode main write) are copied
     /// byte-for-byte, so this never perturbs another compartment.
-    fn persist(&self) -> io::Result<()> {
+    ///
+    /// **A3-8 — the rename replaces the inode our lock is on, so the lock is re-taken here.** The
+    /// alternative (writing the whole buffer in place, keeping one inode and one lock forever) would
+    /// hold the lock without a gap but would give up the crash-atomicity that this path exists for:
+    /// `add_hidden`/`add_blind_main`/`add_wipe` change the slot table and directory, and a torn
+    /// in-place write over those would corrupt bytes the ping-pong copy slots do not protect. So the
+    /// swap stays, and the microsecond between `rename` and re-locking is a real, named window: if
+    /// another process takes the lock inside it, the re-lock FAILS and this call reports an error
+    /// even though the bytes are safely on disk — deliberately, because continuing would mean two
+    /// live images of one container, which is the whole class this lock exists to kill. The caller's
+    /// correct response is to reopen, not to retry the save.
+    fn persist(&mut self) -> io::Result<()> {
+        self.persist_bytes()?;
+        // Drop the old inode's lock BEFORE asking for the new one: `flock` is per open-file
+        // description, so holding both is harmless, but releasing first keeps "how many locks does
+        // this Container hold" answerable as exactly one.
+        self.lock = None;
+        self.lock = Self::lock_file(&self.path)?;
+        Ok(())
+    }
+
+    /// The bytes half of `persist`, without re-taking the lock. Split out for `wipe`, which must
+    /// NOT be able to report failure after it has already succeeded: a wipe that lost the relock
+    /// race would return `Err` for a container it had just crypto-erased, and the desktop renders
+    /// that as "wrong password" — telling a user under duress that their wipe password did not
+    /// work, when it did.
+    fn persist_bytes(&self) -> io::Result<()> {
         let tmp = self.path.with_extension("tmp");
         {
             use std::io::Write;
@@ -1108,8 +1306,16 @@ impl Container {
         let fresh_salt = random_bytes(SALT_LEN);
         self.buf[..SALT_LEN].copy_from_slice(&fresh_salt);
         self.persist_range(0, SALT_LEN)?;
-        self.buf = random_bytes(self.buf.len());
-        self.persist()
+        // Randomise the buffer we already hold rather than allocating a second one of the same
+        // size: this used to be `self.buf = random_bytes(len)`, which peaked at TWICE the container
+        // size — on the one path most likely to be run under duress, in a hurry (A3-9).
+        fill_random(&mut self.buf);
+        self.persist_bytes()?;
+        // Release the lock instead of re-taking it (`persist_bytes`, not `persist`): there is
+        // nothing left in this file to protect from a second writer, and a failed relock must never
+        // turn a COMPLETED wipe into an error the caller reports as failure.
+        self.lock = None;
+        Ok(())
     }
 }
 
@@ -1137,7 +1343,8 @@ impl ContainerVault {
         let container = Container::load(container_path)?;
         match container.open(password)? {
             Opened::Compartment { role, policy, payload, region_key } => {
-                std::fs::create_dir_all(&work_dir)?;
+                // `restore_dir` owns the work dir end to end now (it CLEARS it first — A3-3), so
+                // creating it here would be undone a line later; it creates what it needs.
                 restore_dir(&work_dir, &payload)?;
                 Ok(ContainerVault { container, password: password.to_vec(), region_key, work_dir, role, policy })
             }
@@ -1300,7 +1507,7 @@ pub fn open_container(
             } else {
                 main_work
             };
-            std::fs::create_dir_all(&work_dir)?;
+            // As in `ContainerVault::open`: `restore_dir` clears and recreates the work dir itself.
             restore_dir(&work_dir, &payload)?;
             Ok(Unlocked::Account(ContainerVault {
                 container,
@@ -1788,6 +1995,7 @@ mod tests {
         assert_eq!(before, after, "main writes must not alter the hidden region's bytes on disk");
 
         // Everything still reads back correctly after in-place writes + reload.
+        drop(c); // A3-8: one writer at a time — the exclusive lock is released with the instance.
         let c = Container::load(&p).unwrap();
         match c.open(b"realpw").unwrap() {
             Opened::Compartment { payload, .. } => assert_eq!(payload, b"main state v4"),
@@ -2020,6 +2228,7 @@ mod tests {
         let c = Container::load(&cpath).unwrap();
         assert!(c.read_dir(&c.key_for(b"coverpw").unwrap()).is_err(), "cover password must not expose the slot directory");
         assert!(c.read_dir(&c.key_for(b"mainpw").unwrap()).is_ok(), "the main password manages slots");
+        drop(c); // A3-8: release the exclusive lock before opening the container again.
         // Wipe erases the whole container.
         assert!(matches!(open_container(&cpath, b"burnpw", root.join("mw3"), Some(root.join("hw3"))).unwrap(), Unlocked::Wiped));
         assert!(open_container(&cpath, b"mainpw", root.join("mw4"), Some(root.join("hw4"))).is_err());
@@ -2438,6 +2647,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
             _ => panic!(),
         }
         c.wipe().unwrap();
+        drop(c); // A3-8: release the exclusive lock before reloading.
         let c = Container::load(&p).unwrap();
         assert!(c.open(b"realpw").is_err(), "wipe erased the real compartment");
         let _ = std::fs::remove_file(&p);
@@ -2481,5 +2691,150 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
              even though every slot/region byte is completely untouched"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// **A3-3 — reopening a compartment must make the work dir EQUAL its snapshot, not merge into
+    /// it.** The work dir survives between sessions (`<vault>/work`), so the old overlay behaviour
+    /// let anything left in it outlive the snapshot that was supposed to replace it — deleted files
+    /// came back and were then re-snapshotted, making the resurrection permanent.
+    ///
+    /// DISCRIMINATING by construction: the stray file is one the snapshot NEVER contained, so the
+    /// obvious version of this test ("delete a contact, save, reopen, still gone") would pass under
+    /// the overlay too — a delete removes it from the work dir, hence from the snapshot. Only a file
+    /// that exists in the directory and not in the blob separates the two behaviours. Neuter by
+    /// deleting the `remove_dir_all` in `restore_dir` and the stray survives → RED.
+    ///
+    /// The second half pins the ORDER: a blob that fails to decode must leave the work dir intact.
+    /// Neuter by moving the clear above the decode and the live account is destroyed by a bad
+    /// read → RED.
+    #[test]
+    fn reopening_a_compartment_replaces_the_work_dir_instead_of_merging_into_it() {
+        let root = tmp("restore-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cpath = root.join("container.dat");
+        let work = root.join("work");
+        Container::create(&cpath, 256 * 1024, b"realpw", 96 * 1024).unwrap();
+
+        {
+            let mut cv = ContainerVault::open(&cpath, b"realpw", work.clone()).unwrap();
+            std::fs::write(work.join("kept.txt"), b"in the snapshot").unwrap();
+            std::fs::create_dir_all(work.join("sub")).unwrap();
+            std::fs::write(work.join("sub/kept2.txt"), b"also in the snapshot").unwrap();
+            cv.save().unwrap();
+        }
+
+        // Files that were never saved — what a crash (or a failed save) leaves behind.
+        std::fs::write(work.join("stray.txt"), b"never reached the container").unwrap();
+        std::fs::create_dir_all(work.join("ghost")).unwrap();
+        std::fs::write(work.join("ghost/deleted-contact"), b"resurrected under the old overlay").unwrap();
+
+        let cv = ContainerVault::open(&cpath, b"realpw", work.clone()).unwrap();
+        assert_eq!(std::fs::read(work.join("kept.txt")).unwrap(), b"in the snapshot");
+        assert_eq!(std::fs::read(work.join("sub/kept2.txt")).unwrap(), b"also in the snapshot");
+        assert!(
+            !work.join("stray.txt").exists(),
+            "a file the snapshot does not contain must not survive a reopen — the container is the \
+             authority for what the account holds"
+        );
+        assert!(!work.join("ghost").exists(), "and neither must a whole directory it does not contain");
+        drop(cv);
+
+        // Ordering: an undecodable blob must not destroy the materialized account on its way to
+        // reporting the error.
+        assert!(restore_dir(&work, &[0xffu8; 8]).is_err(), "a corrupt snapshot blob must be refused");
+        assert_eq!(
+            std::fs::read(work.join("kept.txt")).unwrap(),
+            b"in the snapshot",
+            "a blob that fails to decode must leave the work dir exactly as it was"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A3-8 — one live `Container` per file, enforced rather than assumed.** Two writers over one
+    /// container could interleave into the shared `<container>.tmp` and rename the mixture over
+    /// `container.dat` (destroying every compartment), delete each other's in-flight saves, or
+    /// silently revert regions they never touched. `flock` is per open-file-description, so this
+    /// also covers two instances inside ONE process — which is what this test uses, since that is
+    /// the strictly harder case and needs no second process to demonstrate.
+    ///
+    /// Neuter by making `lock_file` return `Ok(None)` without calling `flock` and the second load
+    /// succeeds → RED.
+    #[test]
+    #[cfg(unix)]
+    fn a_second_live_container_over_one_file_is_refused_until_the_first_is_dropped() {
+        let root = tmp("one-writer");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cpath = root.join("container.dat");
+        let mut first = Container::create(&cpath, 128 * 1024, b"realpw", 60 * 1024).unwrap();
+        first.write(b"realpw", b"the first session's state").unwrap();
+
+        let err = Container::load(&cpath)
+            .err()
+            .expect("a second image of a container someone is already writing must be refused");
+        // The KIND matters as much as the refusal: the desktop collapses an ordinary open failure
+        // to an opaque "wrong password" (deliberately — see `container_unlock`), so a lock conflict
+        // that is not distinguishable by kind gets reported as a password failure to a user whose
+        // password is fine.
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::WouldBlock,
+            "a lock conflict must be distinguishable from a wrong password, got: {err}"
+        );
+        assert!(
+            ContainerVault::open(&cpath, b"realpw", root.join("work")).is_err(),
+            "and the vault path must be refused for the same reason, not just the raw loader"
+        );
+
+        // The lock lives exactly as long as the instance: dropping it frees the container.
+        drop(first);
+        let reopened = Container::load(&cpath).unwrap();
+        match reopened.open(b"realpw").unwrap() {
+            Opened::Compartment { payload, .. } => assert_eq!(payload, b"the first session's state"),
+            _ => panic!("the main compartment must still open"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A3-9 — a container bigger than we will hold in RAM is refused, not attempted.** The whole
+    /// file lives in a `Vec<u8>`, so `size_mb` from the frontend was an unbounded allocation
+    /// request; peak is about twice that again while a save buffers the snapshot and its ciphertext.
+    ///
+    /// Asserts the REFUSAL (a state), never a measured allocation — a memory-threshold assertion
+    /// would be a wall-clock-style flake in a different costume. The create half additionally pins
+    /// that the file is not left behind, which is what proves the check happens BEFORE the work.
+    ///
+    /// Neuter by removing either bound and the corresponding half succeeds → RED.
+    #[test]
+    fn a_container_over_the_ram_ceiling_is_refused_at_both_create_and_load() {
+        let root = tmp("ram-ceiling");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cpath = root.join("container.dat");
+
+        let err = Container::create(&cpath, MAX_CONTAINER_BYTES + 1, b"realpw", 60 * 1024)
+            .err()
+            .expect("a container over the ceiling must be refused")
+            .to_string();
+        assert!(err.contains("exceeds"), "the error must name the ceiling, got: {err}");
+        assert!(!cpath.exists(), "nothing may be created for a size we refuse — the check precedes the work");
+
+        // Control: the same call at a sane size succeeds, so the refusal is about the size and not
+        // about the path or arguments.
+        drop(Container::create(&cpath, 128 * 1024, b"realpw", 60 * 1024).unwrap());
+
+        // The load half: a SPARSE file (no blocks allocated) that merely reports an over-ceiling
+        // length must be refused by the stat, before `read` turns its length into an allocation.
+        let big = root.join("big.dat");
+        std::fs::File::create(&big).unwrap().set_len(MAX_CONTAINER_BYTES + 1).unwrap();
+        let err = Container::load(&big).err().expect("an over-ceiling file must be refused");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::OutOfMemory,
+            "an over-ceiling container must not be reportable as a wrong password, got: {err}"
+        );
+        assert!(err.to_string().contains("maximum"), "the error must name the ceiling, got: {err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -69,6 +69,14 @@
 //! nothing it was actually providing, and a Blind save is crash-atomic for the first time (it can
 //! no longer reach `write_region_at`'s non-atomic spill path via the public API at all).
 //!
+//! **Scope of the fix — `region_cap` (hence the ceiling) is `main_cap`, a value the user chooses
+//! per container at creation (§7's A/B slider), so it remains inferable the same way `N` (total
+//! container size) already is per §8 — that leak is accepted and unchanged. What CRYPTO-10 closes
+//! is narrower and specific: the divergence BETWEEN P1 and P3 *within one container*. A coercer
+//! who has only ever seen this ONE password can no longer learn "this password behaves
+//! differently from what this container's real password would" — they learn nothing they
+//! couldn't already learn from the file's size.**
+//!
 //! **Honest residual — management OPERATIONS still betray a second password, only READING an
 //! account never does.** `add_hidden`/`add_blind_main`/`add_wipe` all require reading the
 //! management directory (`read_dir`), which only the P1 key can open — that is what makes P3 safe
@@ -1567,9 +1575,22 @@ mod tests {
     /// container) must be refused under the cover password exactly like it would be under an
     /// ordinary Protect password.
     ///
+    /// **Scope of the claim (do not overread this test).** A and B are given the IDENTICAL
+    /// `total`/`main_cap` on purpose — the parity this test pins is "same policy behaviour given
+    /// the same region geometry," not "the ceiling is geometry-independent." `region_cap` (hence
+    /// the ceiling) is `main_cap`, a value the user picks per container at creation time (§7's A/B
+    /// slider) — so the write ceiling remains a finer-grained version of the SAME leak §8 already
+    /// concedes for `N` (container size): both are user-chosen, both are visible to whoever can
+    /// stress-test the write path. What CRYPTO-10 closes is the divergence BETWEEN P1 and P3
+    /// *within one container* (a coercer who only ever sees one password can no longer learn "this
+    /// password behaves differently from what this container's real password would"), not the
+    /// separate, already-accepted fact that `main_cap` itself is inferable the same way `N` is.
+    ///
     /// Neutered by re-introducing the old `Policy::Blind => (wide, wide)` arm in `write_limits`:
     /// `max_payload_len` on B then reports a number far larger than A's, and the oversized write
-    /// below SUCCEEDS instead of erroring — RED. Restoring the collapsed ceiling turns it GREEN.
+    /// below SUCCEEDS instead of erroring — RED (verified by hand with BOTH a 2x stand-in ceiling
+    /// and the true historical `buf_len - region_off` value). Restoring the collapsed ceiling
+    /// turns it GREEN.
     #[test]
     fn the_cover_password_write_ceiling_is_identical_to_an_ordinary_accounts() {
         let vanilla = tmp("crypto10-vanilla");

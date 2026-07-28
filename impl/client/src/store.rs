@@ -2863,6 +2863,20 @@ impl Store {
         Ok(out)
     }
 
+    /// Drop the quarantine log once its contents have been re-applied.
+    ///
+    /// Called AFTER the handlers have run, never before: that ordering is what makes the replay
+    /// at-least-once. A crash midway simply replays the same items on the next launch, and the
+    /// handlers are the same ones ordinary delivery uses, so a repeat is the duplicate they
+    /// already tolerate — whereas clearing first would recreate the loss this log exists to stop.
+    pub fn clear_quarantine(&self) -> io::Result<()> {
+        match std::fs::remove_file(self.quarantine_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     fn history_path(&self) -> PathBuf {
         self.dir.join("history.dat")
     }
@@ -4439,6 +4453,38 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-40 / A6-6, the RECOVERY half. Parking an unappliable message before the ack stopped it
+    /// being lost; it did not put it back. This pins the contract the desktop replay depends on:
+    /// what was parked comes back intact, and clearing is a separate step — so a crash between
+    /// reading and clearing replays rather than loses.
+    ///
+    /// Discriminating: it asserts the parked bytes and sender survive a reload (a write that
+    /// dropped either would fail), and that clearing is what empties the log — not reading it.
+    #[test]
+    fn a_parked_message_survives_a_reload_and_is_only_gone_once_cleared() {
+        let dir = std::env::temp_dir().join(format!("karst-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        s.quarantine_incoming([0x77; 32], b"an unapplied profile update", 500).unwrap();
+        s.quarantine_incoming([0x88; 32], b"a publication nobody committed", 501).unwrap();
+
+        // Reading must not consume: the handlers have not run yet.
+        assert_eq!(s.load_quarantine().unwrap().len(), 2, "reading must not consume the log");
+
+        let parked = s.load_quarantine().unwrap();
+        assert_eq!(parked[0].sender, [0x77; 32]);
+        assert_eq!(parked[0].plaintext, b"an unapplied profile update");
+        assert_eq!(parked[0].received_at, 500);
+        assert_eq!(parked[1].sender, [0x88; 32]);
+
+        s.clear_quarantine().unwrap();
+        assert!(s.load_quarantine().unwrap().is_empty(), "clearing is what empties it");
+        s.clear_quarantine().expect("clearing an already-empty log is not an error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// SEC-29, the ledger half. An "accept" writes the sender's profile into our contacts and
     /// marks them confirmed. Nothing recorded what WE had asked for, so a stranger's unsolicited

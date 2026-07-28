@@ -2926,6 +2926,23 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
                 break; // empty page → mailbox drained this pass
             }
         }
+        // SEC-40 / A6-6: re-apply anything a previous run parked because no handler had committed
+        // it before the ack. The relay deleted its copy, so this log is the only remaining source;
+        // running the items through the SAME dispatch below is what turns "recoverable" into
+        // "recovered". Loaded (not cleared) here — the clear happens after the loop, so a crash
+        // midway replays rather than loses.
+        let parked = root.load_quarantine().unwrap_or_default();
+        let replayed = !parked.is_empty();
+        let drained: Vec<_> = parked
+            .into_iter()
+            .map(|q| node::peer::Received {
+                sender: q.sender,
+                plaintext: q.plaintext,
+                msg_id: [0u8; 32], // replayed, not freshly leased: nothing to ack
+            })
+            .chain(drained)
+            .collect();
+
         for r in drained {
             // They reached us via THIS proxy — tag the contact so replies go out the same channel.
             let _ = root.set_contact_proxy(r.sender, pidx);
@@ -3236,6 +3253,14 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
         // decrypted + stored but never rendered — see `ensure_contact`).
         ensure_conversation(&root, r.sender);
         out.push(Incoming::text(r.sender, String::from_utf8_lossy(&text).into_owned(), ts, expire_at));
+        }
+        // Clear the parked log only now, AFTER every handler above has run. Clearing first would
+        // recreate exactly the loss the log exists to prevent; clearing after makes the replay
+        // at-least-once, and a repeat is the same duplicate ordinary delivery already tolerates.
+        if replayed {
+            if let Err(e) = root.clear_quarantine() {
+                eprintln!("KARST: clearing the replayed message log: {e}");
+            }
         }
     }
     // Crash-safe large-file downloads: driven once with the ROOT store (downloads + the relay

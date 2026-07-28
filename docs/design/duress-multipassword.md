@@ -149,7 +149,16 @@ user giving the decoy password does not keep the real data alive).
 
 ## Wipe semantics
 
-`wipe()` = crypto-erase: remove `salt`, `slots.dat`, `deadman.dat`, and
+**Tier-2 container caveat (CRYPTO-12), stated before the Tier-1 description below:**
+`Container::wipe()` randomises the buffer and persists it — but `persist` writes a NEW
+file and renames over the old name, so the previous inode (keyslots, wrapped region
+keys, ciphertext) is UNLINKED, not overwritten. Those blocks can survive in free space,
+the journal, a CoW snapshot, the SSD FTL or a backup, and reopen if a P1/P2 password is
+later obtained — even for an adversary who imaged the disk only *after* the wipe.
+In-place overwriting would not fix it either. Call it best-effort; a real guarantee needs
+an independently erasable KEK (OS/hardware keystore) that wipe destroys.
+
+`wipe()` (Tier 1) = crypto-erase: remove `salt`, `slots.dat`, `deadman.dat`, and
 `accounts/` (real and decoy dirs). Because every sealed file's key is
 `Argon2id(pw, salt)`, deleting `salt` alone already makes *all* ciphertext
 permanently unopenable even with the correct password. We still unlink the

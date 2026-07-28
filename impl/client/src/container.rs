@@ -689,8 +689,20 @@ impl Container {
         f.sync_all()
     }
 
-    /// Crypto-erase: overwrite the whole file with fresh random (destroys every region and
-    /// slot at once — the wipe password's effect). After this, opening any password fails.
+    /// The wipe password's effect: replace the whole buffer with fresh random, so every region and
+    /// slot becomes unopenable and no password works afterwards.
+    ///
+    /// **Best-effort, NOT a guaranteed crypto-erase — say it plainly (CRYPTO-12).** This does not
+    /// overwrite the existing file: `persist` writes a NEW file and renames over the old name, so
+    /// the previous inode — holding the keyslots, wrapped region keys and ciphertext — is
+    /// UNLINKED, not destroyed. Its blocks can survive in free space, the filesystem journal, a
+    /// CoW/filesystem snapshot, the SSD's flash translation layer, or backup history, and become
+    /// openable again if a P1/P2 password is later obtained — even for an adversary who imaged the
+    /// disk only AFTER the wipe. In-place overwriting would not fix this either (CoW, wear
+    /// levelling and snapshots all keep old blocks).
+    ///
+    /// A real guarantee needs an independently erasable root: keep an extra random KEK in an OS or
+    /// hardware keystore, encrypt the region keys under it, and destroy THAT on wipe.
     pub fn wipe(&mut self) -> io::Result<()> {
         self.buf = random_bytes(self.buf.len());
         self.persist()

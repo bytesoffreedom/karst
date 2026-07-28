@@ -56,8 +56,7 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
 
     // Bob publishes a bundle carrying ONE one-time prekey.
     let opk = bob.add_opks(1)[0];
-    let mut bundle = bob.bundle();
-    bundle.opk_pub = Some(opk);
+    let bundle = bob.bundle_with_opk(opk);
     assert_eq!(bob.opk_count(), 1, "control: Bob holds exactly one one-time prekey");
 
     // An attacker builds a well-formed agreement against that bundle, then claims to be a
@@ -116,8 +115,7 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
 fn an_unsealed_opener_is_refused_but_the_sealed_form_of_it_works() {
     let mut bob = bob_peer();
     let opk = bob.add_opks(1)[0];
-    let mut bundle = bob.bundle();
-    bundle.opk_pub = Some(opk);
+    let bundle = bob.bundle_with_opk(opk);
 
     let alice = Identity::generate();
     let (root, ka) = initiate_key_agreement(&alice, &[5u8; 32], &bundle).expect("well-formed bundle");
@@ -169,4 +167,71 @@ fn a_degenerate_mailbox_point_is_refused_on_both_sides() {
     let msg2 = sender2.encrypt(b"hello again");
     let sealed2 = sealed_to(bundle.ik_pub, &ka2, msg2);
     assert!(bob.open_for_test(&sealed2).is_some(), "a real mailbox point still works");
+}
+
+/// CRYPTO-04, THE carrying test. A one-time prekey used to ride unsigned while everything else in
+/// the bundle was covered by `prekey_sig`, so a malicious relay could hand the sender an OPK of
+/// its OWN making. The sender folded `EK_A × OPK_relay` into the root key believing the fourth DH
+/// bought forward secrecy against a later compromise of the long-lived prekey — while the relay
+/// knew that DH all along.
+///
+/// Discriminating: the substituted OPK is a perfectly well-formed X25519 key, correctly signed BY
+/// THE RELAY. Only the identity binding tells the two apart, so this cannot pass by rejecting
+/// malformed input, and the control below proves a genuine signed OPK still works.
+#[test]
+fn a_relay_substituted_one_time_prekey_is_refused() {
+    let mut bob = bob_peer();
+    let opk = bob.add_opks(1)[0];
+    let genuine = bob.bundle_with_opk(opk);
+
+    // The relay mints its own one-time prekey and signs it with its own identity — everything a
+    // relay can do on its own.
+    let mut relay_account = Account::generate();
+    let relay_opk = relay_account.add_opk();
+    let forged_opk = node::pqxdh::SignedOpk {
+        key: relay_opk,
+        sig: relay_account.sign_opk(&relay_opk),
+    };
+    let substituted = node::pqxdh::PreKeyBundle { opk: Some(forged_opk), ..genuine.clone() };
+
+    let mut alice = bob_peer();
+    assert!(
+        alice.connect_with_bundle(&substituted).is_err(),
+        "a one-time prekey signed by the RELAY was accepted as the recipient's — the fourth DH \
+         would then be a value the relay knows, and the forward secrecy it buys is fiction"
+    );
+
+    let mut alice2 = bob_peer();
+    assert!(
+        alice2.connect_with_bundle(&genuine).is_ok(),
+        "control: the recipient's OWN signed one-time prekey is still accepted"
+    );
+}
+
+/// The other half of CRYPTO-04: a relay can still WITHHOLD every one-time prekey and claim
+/// exhaustion, which no signature can distinguish from real exhaustion. Refusing to talk would
+/// turn a downgrade into a lockout (and exhaustion is attacker-inducible today, #159), so the
+/// agreement proceeds — but it must SAY so rather than quietly return the same `Ok(())` as a
+/// full-strength one.
+#[test]
+fn a_bundle_with_no_one_time_prekey_reports_reduced_forward_secrecy() {
+    use node::peer::ForwardSecrecy;
+
+    let mut bob = bob_peer();
+    let opk = bob.add_opks(1)[0];
+
+    let mut alice = bob_peer();
+    assert_eq!(
+        alice.connect_with_bundle(&bob.bundle_with_opk(opk)).unwrap(),
+        ForwardSecrecy::Full,
+        "a bundle carrying a one-time prekey is the 4-DH case"
+    );
+
+    // Same bundle, OPK stripped — exactly what a withholding relay serves.
+    let mut alice2 = bob_peer();
+    assert_eq!(
+        alice2.connect_with_bundle(&bob.bundle()).unwrap(),
+        ForwardSecrecy::NoOneTimePrekey,
+        "a stripped bundle must be reported as reduced, not silently accepted as equivalent"
+    );
 }

@@ -305,7 +305,7 @@ pub struct RelayNode {
     /// `MAX_BUNDLES` (отказ при полноте, не тихий сброс).
     bundles: HashMap<[u8; 32], PreKeyBundle>,
     /// One-time prekey batches per IK; a fetch pops one (see `PublishRequest::opks`).
-    opk_batches: HashMap<[u8; 32], VecDeque<[u8; 32]>>,
+    opk_batches: HashMap<[u8; 32], VecDeque<crate::pqxdh::SignedOpk>>,
     /// Rotating start offset for `node_list`, so advertisement is fair rather than always
     /// favouring whoever was learned first (A3-13). `Cell` because serving a list is a READ.
     gossip_cursor: std::cell::Cell<usize>,
@@ -981,7 +981,14 @@ impl RelayNode {
             if batch.len() >= MAX_OPKS_PER_IK {
                 break;
             }
-            batch.push_back(*opk);
+            // Verify the publisher's signature before storing. The relay gains nothing by
+            // holding a key it could never hand out usefully, and a fetcher that received one
+            // would burn a first contact on it — so junk is dropped at the door, not forwarded.
+            let probe = PreKeyBundle { opk: Some(opk.clone()), ..req.bundle.clone() };
+            if !probe.verify_prekey_sig() {
+                continue;
+            }
+            batch.push_back(opk.clone());
         }
         PublishResponse::Published
     }
@@ -992,8 +999,8 @@ impl RelayNode {
     pub fn get_bundle(&mut self, ik: &[u8; 32]) -> Option<PreKeyBundle> {
         let mut bundle = self.bundles.get(ik).cloned()?;
         // Hand out (and consume) ONE one-time prekey, if any remain. Exhaustion is not an
-        // error: the fetcher falls back to the 3-DH agreement (`opk_pub == None`).
-        bundle.opk_pub = self.opk_batches.get_mut(ik).and_then(|b| b.pop_front());
+        // error: the fetcher falls back to the 3-DH agreement (`opk == None`) and is told so.
+        bundle.opk = self.opk_batches.get_mut(ik).and_then(|b| b.pop_front());
         Some(bundle)
     }
 }
@@ -1003,12 +1010,18 @@ impl RelayNode {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublishRequest {
     pub bundle: PreKeyBundle,
-    /// A batch of ONE-TIME prekey public keys (see `pqxdh`). The relay hands out one per
-    /// bundle fetch and never twice, so each contact gets a DISTINCT prekey. Empty = none
-    /// (fetchers fall back to the 3-DH agreement). Not covered by the ownership proof — an
-    /// OPK swap by the untrusted relay is the same DoS bucket as a prekey swap (the
-    /// recipient won't hold the secret → the agreement fails), never a confidentiality loss.
-    pub opks: Vec<[u8; 32]>,
+    /// A batch of ONE-TIME prekeys, each SIGNED by the publisher's identity key (see
+    /// `pqxdh::SignedOpk`). The relay hands out one per bundle fetch and never twice, so each
+    /// contact gets a DISTINCT prekey.
+    ///
+    /// They used to be bare public keys, and the note here said an OPK swap was "the same DoS
+    /// bucket as a prekey swap, never a confidentiality loss". That was wrong in the way that
+    /// matters: a swapped OPK does break the agreement, but only AFTER the sender has already
+    /// derived a root key believing the fourth DH gave it forward secrecy against a later
+    /// compromise of the long-lived prekey — a property the relay had quietly removed
+    /// (CRYPTO-04). Signed now, and the relay verifies at publish so it cannot even store junk
+    /// that would waste a fetcher's first contact.
+    pub opks: Vec<crate::pqxdh::SignedOpk>,
     /// Drop whatever one-time prekeys the relay still holds for this IK before storing `opks`.
     /// Set when the client's own secrets are gone (restored backup / unreadable sidecar), so the
     /// relay stops serving public keys nobody can answer for (R2-4).

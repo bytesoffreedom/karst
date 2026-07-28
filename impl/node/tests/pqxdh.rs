@@ -100,8 +100,9 @@ fn a_small_order_prekey_in_a_bundle_is_refused() {
         "a small-order prekey must be refused"
     );
 
-    let mut degenerate_opk = good.clone();
-    degenerate_opk.opk_pub = Some([0u8; 32]);
+    // Signed BY ITS OWNER and still small-order: "signed" says nothing about group order, which
+    // is exactly why the contributory check is separate from the signature check.
+    let degenerate_opk = bob.prekey_bundle_with_opk([0u8; 32]);
     assert!(
         initiate_key_agreement(&alice, &[7u8; 32], &degenerate_opk).is_err(),
         "a small-order one-time prekey must be refused too"

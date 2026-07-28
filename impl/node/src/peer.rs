@@ -40,6 +40,28 @@ use crate::node::{
     Payload, PublishRequest, PublishResponse, Response, SessionEnvelope, Transport, WireMessage,
 };
 use crate::pqxdh::{initiate_key_agreement, Account, KeyAgreement, PreKeyBundle};
+
+/// How much forward secrecy the FIRST message of a new session actually got.
+///
+/// A relay can no longer SUBSTITUTE a one-time prekey — each is signed by its owner
+/// (`pqxdh::SignedOpk`). But it can still hand out none and claim exhaustion, which is
+/// indistinguishable from genuine exhaustion. Refusing to talk in that case would turn a
+/// downgrade into a lockout, and exhaustion is attacker-inducible today (an unauthenticated
+/// bundle fetch consumes one, #159).
+///
+/// So the agreement proceeds and SAYS SO. Returning this from `connect` forces the caller to
+/// acknowledge the difference instead of inheriting it silently — the project's "no silent
+/// fallback" rule, applied to cryptographic strength rather than to transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardSecrecy {
+    /// 4-DH: a one-time prekey was used, so the first message stays secret even if the peer's
+    /// long-lived signed prekey secret is compromised later.
+    Full,
+    /// 3-DH: the bundle carried no one-time prekey. The session is still end-to-end encrypted and
+    /// heals on the first DH ratchet step; what is lost is forward secrecy for the FIRST message
+    /// against a later compromise of the long-lived prekey.
+    NoOneTimePrekey,
+}
 use crate::ratchet::{RatchetMessage, Session, SessionSnapshot};
 use crate::seal::Identity;
 
@@ -614,6 +636,13 @@ impl<T: Transport> Peer<T> {
         self.account.prekey_bundle()
     }
 
+    /// This peer's bundle carrying one of ITS OWN one-time prekeys, signed. The only way to build
+    /// such a bundle from outside `pqxdh`: an OPK cannot be attached without the identity key that
+    /// signs it, so nothing can accidentally produce the unsigned form the relay used to serve.
+    pub fn bundle_with_opk(&self, opk_pub: [u8; 32]) -> PreKeyBundle {
+        self.account.prekey_bundle_with_opk(opk_pub)
+    }
+
     /// §12: опубликовать СВОЙ bundle у relay, чтобы другие могли инициировать к
     /// нам. Cookie-refresh + ownership-proof (владение приватным IK).
     pub fn publish(&mut self, now: u64) -> PublishResponse {
@@ -645,6 +674,10 @@ impl<T: Transport> Peer<T> {
         now: u64,
     ) -> PublishResponse {
         let bundle = self.account.prekey_bundle();
+        let signed_opks: Vec<crate::pqxdh::SignedOpk> = opks
+            .iter()
+            .map(|k| crate::pqxdh::SignedOpk { key: *k, sig: self.account.sign_opk(k) })
+            .collect();
         let shared = self.account.ik().dh(&self.relay_pub);
         // Publishing announces the bundle — and the IK inside it — so it shares the
         // handle with the identity-mailbox poll, which names us just as loudly. It must
@@ -659,7 +692,10 @@ impl<T: Transport> Peer<T> {
             };
             let req = PublishRequest {
                 bundle: bundle.clone(),
-                opks: opks.to_vec(),
+                // Sign each one-time prekey here, at the only place that holds the identity
+                // secret. The relay stores opaque signed pairs and can hand one out, but cannot
+                // mint a substitute (CRYPTO-04).
+                opks: signed_opks.clone(),
                 replace_opks: replace,
                 client_addr: client_addr.clone(),
                 carrier_id: self.carrier_id.clone(),
@@ -681,7 +717,7 @@ impl<T: Transport> Peer<T> {
     /// Проверяет, что отданный bundle заявляет ЗАПРОШЕННЫЙ IK — relay не может
     /// подсунуть bundle под другим IK незаметно (подмена самого IK — внешняя
     /// стена: подлинность `peer_ik` проверяется вне канала, см. STATUS).
-    pub fn connect(&mut self, peer_ik: &[u8; 32], now: u64) -> Result<(), String> {
+    pub fn connect(&mut self, peer_ik: &[u8; 32], now: u64) -> Result<ForwardSecrecy, String> {
         let bundle = self
             .transport
             .fetch_bundle(peer_ik, now)?
@@ -697,7 +733,7 @@ impl<T: Transport> Peer<T> {
     /// доверенный якорь личности). НЕ перезатирает живую сессию: повторный
     /// `connect` к известному пиру → `Err` (иначе новый root_key молча убил бы
     /// работающую сессию в обе стороны — тот же класс silent-loss).
-    pub fn connect_with_bundle(&mut self, bundle: &PreKeyBundle) -> Result<(), String> {
+    pub fn connect_with_bundle(&mut self, bundle: &PreKeyBundle) -> Result<ForwardSecrecy, String> {
         if self.sessions.contains_key(&bundle.ik_pub) {
             return Err("session already established with this peer".into());
         }
@@ -725,11 +761,15 @@ impl<T: Transport> Peer<T> {
         let session = Session::init_sender(root_key, bundle.prekey_pub);
         // The PEER's mailbox point (from its signed bundle) — where I deposit my outbound box.
         let peer_mailbox_pub = bundle.mailbox_pub;
+        let fs = match ka.opk_pub {
+            Some(_) => ForwardSecrecy::Full,
+            None => ForwardSecrecy::NoOneTimePrekey,
+        };
         self.sessions.insert(
             bundle.ik_pub,
             SessionState { session, pending_initial: Some(ka), drop_seed, peer_mailbox_pub },
         );
-        Ok(())
+        Ok(fs)
     }
 
     /// Отправить `plaintext` пиру `peer_ik` по установленной сессии.

@@ -49,12 +49,12 @@ pub struct PreKeyBundle {
     pub prekey_pub: [u8; 32],
     /// ML-KEM-768 encapsulation key (~1184 Б).
     pub kem_ek: Vec<u8>,
-    /// Optional ONE-TIME prekey for this contact (X25519). When present it adds a fourth
-    /// DH term `EK_A × OPK_B` to the root key and is CONSUMED by the recipient, giving the
-    /// first message forward secrecy against a later compromise of the long-lived prekey
-    /// secret. `None` falls back to the 3-DH agreement unchanged. Appended last (postcard
-    /// is positional).
-    pub opk_pub: Option<[u8; 32]>,
+    /// Optional ONE-TIME prekey for this contact, WITH its owner's signature. When present it
+    /// adds a fourth DH term `EK_A × OPK_B` to the root key and is CONSUMED by the recipient,
+    /// giving the first message forward secrecy against a later compromise of the long-lived
+    /// prekey secret. `None` means the 3-DH agreement — see [`SignedOpk`] for why that case is
+    /// reported to the caller rather than taken silently.
+    pub opk: Option<SignedOpk>,
     /// XEdDSA signature (by the identity key `ik_pub`) over the long-lived prekey material
     /// (`prekey_pub ‖ kem_ek`) — the §2.1 "signed prekey". Lets the sender REJECT a bundle
     /// whose prekey / KEM key a relay substituted, instead of only failing closed later in the
@@ -76,6 +76,41 @@ pub struct PreKeyBundle {
     /// pre-mailbox bundles, which is why a downstream guard had to catch the degenerate value at
     /// SEND time; it is now rejected where it would enter a session.
     pub mailbox_pub: [u8; 32],
+}
+
+/// A one-time prekey as it travels: the public key together with its owner's signature over it.
+///
+/// The two are ONE value on purpose. The OPK used to ride as a bare `[u8; 32]`, unsigned, while
+/// everything else in the bundle was covered by `prekey_sig` — so a relay could hand the sender
+/// an OPK of its OWN choosing (CRYPTO-04). The sender would fold `EK_A × OPK_relay` into the root
+/// key believing it had gained forward secrecy, when the fourth DH was a value the relay knew.
+/// The recipient would then fail to decrypt, but the damage is not decryption failure: it is that
+/// the extra-forward-secrecy property is silently fake.
+///
+/// Signing each OPK individually rather than committing to the batch keeps the relay's job pure
+/// storage-and-forward: it holds opaque signed values, hands one out, and cannot mint another.
+///
+/// STILL POSSIBLE, and deliberately not "fixed" here: the relay can WITHHOLD every OPK and claim
+/// exhaustion, which is indistinguishable from genuine exhaustion. Refusing to talk in that case
+/// would convert a downgrade into a lockout — and exhaustion is attacker-inducible today (an
+/// unauthenticated fetch consumes one, issue #159). So the sender proceeds with 3-DH and REPORTS
+/// it (`KeyAgreement::used_one_time_prekey`), instead of either failing or staying quiet.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SignedOpk {
+    pub key: [u8; 32],
+    /// XEdDSA signature (64 B) by the OWNER's identity key over [`opk_sig_message`]. A `Vec`
+    /// only because serde has no impl for `[u8; 64]`; a wrong length fails verification, which
+    /// is the same door a wrong signature goes through.
+    pub sig: Vec<u8>,
+}
+
+/// The message an OPK signature covers: a domain tag ‖ the one-time prekey. Domain-separated from
+/// [`prekey_sig_message`] so neither signature can ever be replayed as the other.
+pub(crate) fn opk_sig_message(opk_pub: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16 + 32);
+    m.extend_from_slice(b"KARST-opk-sig-v1");
+    m.extend_from_slice(opk_pub);
+    m
 }
 
 /// The message the prekey signature covers: a domain tag ‖ the X25519 prekey ‖ the ML-KEM key ‖
@@ -101,7 +136,20 @@ impl PreKeyBundle {
         let Ok(sig): Result<[u8; 64], _> = self.prekey_sig.as_slice().try_into() else {
             return false; // wrong length = unsigned / incompatible bundle
         };
-        pk.verify(&msg, &sig).is_ok()
+        if pk.verify(&msg, &sig).is_err() {
+            return false;
+        }
+        // ...and the one-time prekey, if the bundle carries one. Same identity key, different
+        // domain tag. A bundle whose OPK does not verify is REJECTED WHOLE rather than downgraded
+        // to 3-DH: a bad signature is not "no key available", it is evidence of tampering, and
+        // quietly continuing would hand the attacker exactly the downgrade they were after.
+        match &self.opk {
+            None => true,
+            Some(o) => match <[u8; 64]>::try_from(o.sig.as_slice()) {
+                Ok(sig) => pk.verify(&opk_sig_message(&o.key), &sig).is_ok(),
+                Err(_) => false,
+            },
+        }
     }
 }
 
@@ -171,6 +219,22 @@ impl Account {
         pk
     }
 
+    /// Sign one of our one-time prekeys with the identity key, so a relay can hand it out but
+    /// cannot substitute one of its own (CRYPTO-04). Signing is the publisher's job — the relay
+    /// only ever holds the signed pair.
+    pub fn sign_opk(&self, opk_pub: &[u8; 32]) -> Vec<u8> {
+        use xeddsa::Sign;
+        let sk = x25519_dalek::StaticSecret::from(self.ik.to_secret_bytes());
+        let signer = xeddsa::xed25519::PrivateKey::from(&sk);
+        let sig: [u8; 64] = signer.sign(&opk_sig_message(opk_pub), rand010::rng());
+        sig.to_vec()
+    }
+
+    /// Our unconsumed one-time prekeys, each signed — exactly what `publish` advertises.
+    pub fn signed_opks(&self) -> Vec<SignedOpk> {
+        self.opks.keys().map(|k| SignedOpk { key: *k, sig: self.sign_opk(k) }).collect()
+    }
+
     /// How many unconsumed one-time prekeys remain (for the batch top-up policy later).
     pub fn opk_count(&self) -> usize {
         self.opks.len()
@@ -200,7 +264,8 @@ impl Account {
     /// This account's bundle carrying a specific one-time prekey (must be one of ours, via
     /// `add_opk`). The sender mixes it into the agreement and the recipient consumes it.
     pub fn prekey_bundle_with_opk(&self, opk_pub: [u8; 32]) -> PreKeyBundle {
-        PreKeyBundle { opk_pub: Some(opk_pub), ..self.prekey_bundle() }
+        let opk = SignedOpk { key: opk_pub, sig: self.sign_opk(&opk_pub) };
+        PreKeyBundle { opk: Some(opk), ..self.prekey_bundle() }
     }
 
     /// Сериализовать секреты для персистентности (§2.1-личность стабильна между
@@ -274,7 +339,7 @@ impl Account {
             ik_pub: self.ik.public.to_bytes(),
             prekey_pub,
             kem_ek,
-            opk_pub: None,
+            opk: None,
             prekey_sig,
             mailbox_pub,
         }
@@ -407,8 +472,8 @@ pub fn initiate_key_agreement(
     let dh2 = ek_a.dh_checked(&ik_b).ok_or(NON_CONTRIB)?; //         EK_A × IK_B
     let dh3 = ek_a.dh_checked(&prekey_b).ok_or(NON_CONTRIB)?; //     EK_A × PK_B
     // Fourth DH against the recipient's ONE-TIME prekey, iff the bundle carried one.
-    let dh4 = match bundle.opk_pub {
-        Some(opk) => Some(ek_a.dh_checked(&PublicKey::from(opk)).ok_or(NON_CONTRIB)?),
+    let dh4 = match &bundle.opk {
+        Some(o) => Some(ek_a.dh_checked(&PublicKey::from(o.key)).ok_or(NON_CONTRIB)?),
         None => None,
     };
 
@@ -423,14 +488,20 @@ pub fn initiate_key_agreement(
         &ek_a_pub,
         &bundle.prekey_pub,
         &kem_ct,
-        bundle.opk_pub.as_ref(),
+        bundle.opk.as_ref().map(|o| &o.key),
         sender_mailbox_pub,
     );
     let root_key = derive_root_key(&dh1, &dh2, &dh3, dh4.as_ref(), pq_shared.as_slice(), &transcript);
 
     Ok((
         root_key,
-        KeyAgreement { ik_a_pub, ek_a_pub, kem_ct, opk_pub: bundle.opk_pub, mailbox_a_pub: *sender_mailbox_pub },
+        KeyAgreement {
+            ik_a_pub,
+            ek_a_pub,
+            kem_ct,
+            opk_pub: bundle.opk.as_ref().map(|o| o.key),
+            mailbox_a_pub: *sender_mailbox_pub,
+        },
     ))
 }
 

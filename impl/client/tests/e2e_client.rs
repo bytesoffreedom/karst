@@ -713,9 +713,9 @@ fn republishing_opks_never_hands_the_same_prekey_twice() {
     let mut seen = std::collections::HashSet::new();
     let mut node = relay.lock().unwrap();
     while let Some(bundle) = node.get_bundle(&b_ik) {
-        match bundle.opk_pub {
+        match bundle.opk {
             Some(opk) => assert!(
-                seen.insert(opk),
+                seen.insert(opk.key),
                 "the relay handed out the same OPK twice after a republish (Bug C)"
             ),
             None => break,
@@ -1199,8 +1199,8 @@ fn publish_all_puts_the_bundle_on_every_relay_opks_on_the_primary_only() {
         .fetch_bundle(&bob_ik, NOW)
         .unwrap()
         .expect("the secondary has Bob's bundle"); // primary-only publish reds here
-    assert!(b1.opk_pub.is_some(), "the primary must advertise a one-time prekey");
-    assert!(b2.opk_pub.is_none(), "a secondary must NOT advertise a one-time prekey (reuse hazard)");
+    assert!(b1.opk.is_some(), "the primary must advertise a one-time prekey");
+    assert!(b2.opk.is_none(), "a secondary must NOT advertise a one-time prekey (reuse hazard)");
 
     std::fs::remove_dir_all(&bdir).ok();
 }

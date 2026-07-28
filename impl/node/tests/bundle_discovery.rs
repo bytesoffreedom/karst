@@ -134,7 +134,7 @@ fn swapped_prekey_bundle_is_rejected_by_the_signature() {
         ik_pub: bob_ik,             // Bob's genuine IK
         prekey_pub: eve.prekey_pub, // someone else's prekey
         kem_ek: eve.kem_ek,         // someone else's KEM
-        opk_pub: None,
+        opk: None,
         prekey_sig: eve.prekey_sig, // signed by EVE's IK, not Bob's → cannot verify under bob_ik
         mailbox_pub: eve.mailbox_pub,
     };
@@ -252,8 +252,8 @@ fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
     // an opener nobody can accept.
     let mut served = Vec::new();
     while let Some(b) = relay.borrow_mut().get_bundle(&bob_ik) {
-        match b.opk_pub {
-            Some(k) => served.push(k),
+        match b.opk {
+            Some(k) => served.push(k.key),
             None => break,
         }
     }

@@ -898,7 +898,12 @@ fn hidden_work_dir(base: &std::path::Path) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     base.hash(&mut h);
-    client::container::ram_backed_hidden_dir(&format!("{:016x}", h.finish()))
+    // The PID is part of the name on purpose. It used to be derived from the vault path ALONE, so
+    // two windows on the same vault shared one directory — and the startup sweep, which deleted
+    // every `karst-hid-*`, would wipe the LIVE plaintext work dir of an already-running process,
+    // leaving it reading files that had vanished underneath it (A3-7). Per-process names make the
+    // sweep able to tell "mine / dead owner" from "someone else's live session".
+    client::container::ram_backed_hidden_dir(&format!("{:016x}-p{}", h.finish(), std::process::id()))
 }
 
 /// Snapshot the container-backed account's work dir back into the deniable container. Called after
@@ -958,11 +963,13 @@ fn container_add_hidden(app: State<App>, hidden_password: String) -> Result<Vec<
     let m = client::seed::generate_mnemonic();
     let words: Vec<String> = m.to_string().split_whitespace().map(|s| s.to_string()).collect();
     let entropy = client::seed::entropy_of(&m);
-    let build = {
-        let shm = std::path::Path::new("/dev/shm");
-        let uniq = format!("karst-hidbuild-{}", std::process::id());
-        if shm.is_dir() { shm.join(uniq) } else { std::env::temp_dir().join(uniq) }
-    };
+    // The hidden account is BUILT in the clear before being sealed into the container, so this
+    // directory holds the seed. It used to fall back to `std::env::temp_dir()` when /dev/shm was
+    // missing — putting that seed on the real disk, the same hole already closed for the work dir
+    // — and it was named `karst-hidbuild-*`, which the `karst-hid-` sweep never matched, so a
+    // crash mid-creation left it behind (A3-5). Now: RAM-backed or refuse, and one naming scheme.
+    let build = client::container::ram_backed_hidden_dir(&format!("build-p{}", std::process::id()))
+        .ok_or("a hidden account needs a RAM-backed store (tmpfs); none is available on this system")?;
     let mut g = app.container.lock().unwrap();
     let cv = g.as_mut().ok_or("open a container account first")?;
     // Build the empty hidden account in RAM, sealed under the HIDDEN region's key (so its own
@@ -3404,11 +3411,30 @@ fn sweep_stale_hidden_tmpfs() {
     let shm = std::path::Path::new("/dev/shm");
     if let Ok(rd) = std::fs::read_dir(shm) {
         for e in rd.flatten() {
-            if e.file_name().to_string_lossy().starts_with("karst-hid-") {
-                let _ = std::fs::remove_dir_all(e.path());
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("karst-hid-") {
+                continue;
             }
+            if !hidden_dir_owner_is_gone(&name) {
+                continue; // another process is USING it — deleting it would break a live session
+            }
+            let _ = std::fs::remove_dir_all(e.path());
         }
     }
+}
+
+/// May this hidden-account directory be swept? Only when nobody is using it: either it is ours
+/// (we just started, so it is a leftover of a previous run of this PID) or the process named in
+/// its `-p<pid>` suffix no longer exists. A name without a suffix predates per-process naming and
+/// cannot belong to a live session of this build, so it is collectable.
+fn hidden_dir_owner_is_gone(name: &str) -> bool {
+    let Some(pid) = name.rsplit_once("-p").and_then(|(_, p)| p.parse::<u32>().ok()) else {
+        return true;
+    };
+    if pid == std::process::id() {
+        return true;
+    }
+    !std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 fn main() {
@@ -3551,5 +3577,32 @@ mod tests {
     fn pushing_to_an_unknown_id_errors() {
         let mut sends: HashMap<String, Vec<u8>> = HashMap::new();
         assert!(append_chunk(&mut sends, "nope", b"x", MAX_STREAM_BYTES).is_err());
+    }
+
+    /// A3-7 — the startup sweep must never delete a directory another process is USING.
+    ///
+    /// It used to remove every `karst-hid-*`, so launching a second window wiped the live
+    /// plaintext work dir of the first — which kept running against a Store whose files had
+    /// vanished. The name now carries the owning PID, and only our own or a dead owner's
+    /// directory is collectable.
+    #[test]
+    fn the_sweep_spares_a_live_owner_and_collects_the_dead() {
+        let me = std::process::id();
+        assert!(
+            super::hidden_dir_owner_is_gone(&format!("karst-hid-abc-p{me}")),
+            "our own leftover is collectable"
+        );
+        // PID 1 always exists on Linux and is not us — stands in for another live instance.
+        assert!(
+            !super::hidden_dir_owner_is_gone("karst-hid-abc-p1"),
+            "a LIVE owner's directory must be left alone — deleting it breaks that session"
+        );
+        // A PID that cannot be running (kernel max is far below this) → collectable.
+        assert!(
+            super::hidden_dir_owner_is_gone("karst-hid-abc-p4294967290"),
+            "a dead owner's directory is collectable"
+        );
+        // Pre-per-process names carry no owner and cannot belong to a live session of this build.
+        assert!(super::hidden_dir_owner_is_gone("karst-hid-abc"), "unowned legacy name is collectable");
     }
 }

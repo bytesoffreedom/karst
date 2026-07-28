@@ -3006,3 +3006,126 @@ fn cover_traffic_deposits_via_the_real_path_and_is_self_addressed() {
     assert!(got.into_iter().flatten().next().is_none(), "cover never clutters our inbox");
     let _ = a_ik;
 }
+
+// Coverage restored after the legacy egui worker was retired: its `worker_e2e` suite was the ONLY
+// place the next three behaviours were exercised end to end, and the shipping desktop has no tests
+// of its own. They are asserted here, at the `client` layer where the logic actually lives and
+// which the desktop reuses verbatim.
+
+/// A DISAPPEARING message is delivered but must never be written to disk. If it were persisted,
+/// "disappearing" would be a UI illusion — the plaintext would outlive the timer in history.
+#[test]
+fn an_expiring_message_is_delivered_but_never_persisted() {
+    let (relay_addr, relay_id) = spawn_relay();
+    let adir = temp_dir("expiring-a");
+    let bdir = temp_dir("expiring-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    seed_provision(&astore);
+    seed_provision(&bstore);
+    astore.save_capability(&client::dev_capability()).unwrap();
+    bstore.save_capability(&client::dev_capability()).unwrap();
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+
+    let r = ctx(relay_addr, &relay_id);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
+
+    client::send_text_expiring(&astore, &r, &bob_ik, b"burn after reading", 300, NOW).unwrap();
+    let got = client::recv_session(&bstore, &r, NOW).unwrap();
+    let texts: Vec<Vec<u8>> = got
+        .into_iter()
+        .flatten()
+        .filter_map(|m| match client::content::decode(&m.plaintext) {
+            Ok(client::content::Content::TextExpiring { text, .. }) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec![b"burn after reading".to_vec()], "it IS delivered to the caller");
+    assert!(
+        bstore.load_history().unwrap().is_empty(),
+        "a disappearing message must leave nothing on disk — otherwise the timer is decoration"
+    );
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}
+
+/// DELETE-FOR-EVERYONE must reach the recipient as a control envelope carrying the shared
+/// timestamp, so the peer can find and remove the same record. The sender cannot rely on the
+/// recipient's local ids — the shared `ts` is the join key.
+#[test]
+fn delete_for_everyone_reaches_the_peer_with_the_shared_timestamp() {
+    let (relay_addr, relay_id) = spawn_relay();
+    let adir = temp_dir("delfe-a");
+    let bdir = temp_dir("delfe-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    seed_provision(&astore);
+    seed_provision(&bstore);
+    astore.save_capability(&client::dev_capability()).unwrap();
+    bstore.save_capability(&client::dev_capability()).unwrap();
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+
+    let r = ctx(relay_addr, &relay_id);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
+
+    client::send_text(&astore, &r, &bob_ik, b"regrettable", NOW, NOW).unwrap();
+    let _ = client::recv_session(&bstore, &r, NOW).unwrap();
+    assert_eq!(bstore.load_history().unwrap().len(), 1, "the message landed");
+
+    client::send_delete_for_everyone(&astore, &r, &bob_ik, NOW, b"regrettable", NOW).unwrap();
+    let got = client::recv_session(&bstore, &r, NOW).unwrap();
+    let deletes: Vec<u64> = got
+        .into_iter()
+        .flatten()
+        .filter_map(|m| match client::content::decode(&m.plaintext) {
+            Ok(client::content::Content::DeleteForEveryone { ts, .. }) => Some(ts),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deletes, vec![NOW], "the peer receives the delete with the SHARED timestamp");
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}
+
+/// CLEAR CHAT must wipe the conversation from DISK, not just from a view — and it must survive a
+/// reload, or "cleared" would mean "hidden until you restart".
+#[test]
+fn clearing_a_chat_wipes_it_from_disk_across_a_reload() {
+    let (relay_addr, relay_id) = spawn_relay();
+    let adir = temp_dir("clear-a");
+    let bdir = temp_dir("clear-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    seed_provision(&astore);
+    seed_provision(&bstore);
+    astore.save_capability(&client::dev_capability()).unwrap();
+    bstore.save_capability(&client::dev_capability()).unwrap();
+    let alice_ik = astore.load_account().unwrap().identity_public();
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+
+    let r = ctx(relay_addr, &relay_id);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
+
+    client::send_text(&astore, &r, &bob_ik, b"one", NOW, NOW).unwrap();
+    client::send_text(&astore, &r, &bob_ik, b"two", NOW + 1, NOW + 1).unwrap();
+    let _ = client::recv_session(&bstore, &r, NOW + 2).unwrap();
+    assert_eq!(bstore.load_history().unwrap().len(), 2, "both landed");
+
+    bstore.delete_conversation(alice_ik).unwrap();
+    assert!(bstore.load_history().unwrap().is_empty(), "cleared in this handle");
+
+    // Re-open the vault from disk: a view-only clear would reappear here.
+    let reopened = Store::unlock(&bdir, b"pw").unwrap();
+    assert!(
+        reopened.load_history().unwrap().is_empty(),
+        "the conversation must be gone from DISK, not merely hidden until the next start"
+    );
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}

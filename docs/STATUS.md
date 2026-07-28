@@ -2218,11 +2218,14 @@ in one could (and did) sit unfixed in the other. It also pulled the whole
 eframe→winit→wayland-scanner→quick-xml chain into the tree, which is where both open
 RustSec advisories (RUSTSEC-2026-0194/0195) came from — removing it closes them.
 
-**Honest consequence, not hidden:** those 36 worker tests exercised the legacy client's
-own worker, so they retire with the code they tested — but several behaviours were only
-ever covered end-to-end THERE (disappearing messages, delete-for-everyone, clear-chat),
-and the shipping Tauri client has almost no e2e tests of its own. That coverage gap is
-tracked, not written off.
+**Honest consequence, and what was done about it:** those 36 worker tests exercised the
+legacy client's own worker, so they retired with the code they tested — but three
+behaviours were only ever covered end-to-end THERE. Those are now pinned at the `client`
+layer, where the logic actually lives and which the desktop reuses verbatim:
+`an_expiring_message_is_delivered_but_never_persisted`,
+`delete_for_everyone_reaches_the_peer_with_the_shared_timestamp`, and
+`clearing_a_chat_wipes_it_from_disk_across_a_reload`. The broader point stands: the
+shipping Tauri client still has almost no e2e tests of its own.
 
 ## Calls (§21) — NOT implemented (honestly)
 

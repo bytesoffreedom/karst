@@ -651,8 +651,13 @@ fn discovery_delete_at(store: &Store, relay: &Relay) -> Result<bool, String> {
 /// relay actually removed the record NOW — `false` means the relay was unreachable (or already had
 /// nothing), so the record lingers until it expires. The local key is always cleared regardless.
 pub fn discovery_off(store: &Store, relay: &Relay) -> Result<bool, String> {
+    // Retire the PUBLISHED record first, and do not swallow the failure. The local discovery key
+    // is the ONLY thing that can authorise that deletion, so dropping it before the relay confirms
+    // leaves the record published with nothing able to retire it — while the user is told
+    // discovery is off (A6-7). On failure the key is KEPT so a retry is possible.
     let removed = if store.has_discovery() {
-        discovery_delete_at(store, relay).unwrap_or(false)
+        discovery_delete_at(store, relay)
+            .map_err(|e| format!("could not retire the published record ({e}) — discovery is NOT off; the key is kept so you can retry"))?
     } else {
         false
     };

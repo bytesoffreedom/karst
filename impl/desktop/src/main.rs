@@ -778,7 +778,13 @@ fn unlock(app: State<App>, password: String, vault_dir: Option<String>) -> Resul
     if password.is_empty() {
         return Err("enter your password".into());
     }
-    match Vault::open(resolve_home(vault_dir), password.as_bytes()).map_err(|_| "wrong password".to_string())? {
+    // Fire the dead-man switch for THIS vault before opening it. `account_exists` only ever
+    // checked the default `home()`, so a vault opened by an explicit `vault_dir` (a second
+    // window, a chosen profile) skipped the switch entirely — it could lapse for months and
+    // still open (A3-11). Checked here, every path that opens a vault is covered.
+    let base = resolve_home(vault_dir);
+    let _ = Vault::deadman_check(&base, now_secs());
+    match Vault::open(&base, password.as_bytes()).map_err(|_| "wrong password".to_string())? {
         Opened::Real(vault) => {
             let reg = vault.load_registry().map_err(|e| e.to_string())?;
             let id = reg

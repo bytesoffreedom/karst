@@ -3039,7 +3039,21 @@ pub struct Deadman {
     pub interval_secs: u64,
     /// Unix-secs of the last real unlock (the countdown restarts from here).
     pub last_seen: u64,
+    /// High-water mark of the wall clock as we have actually OBSERVED it. The switch destroys
+    /// data irreversibly, so it must not act on a single unverified `SystemTime::now()`: a
+    /// forward jump (wrong RTC, restored VM snapshot, manual date change) would otherwise wipe a
+    /// perfectly live vault on the next launch, and setting the clock BACK would postpone the
+    /// wipe indefinitely. Comparing against this mark bounds both directions (A3-11).
+    /// Appended field → `serde(default)`, so an older file reads as "never observed".
+    #[serde(default)]
+    pub last_check: u64,
 }
+
+/// A forward clock movement larger than this, between two launches, is treated as a clock ANOMALY
+/// rather than as evidence that the owner has been absent that long. 32 days: comfortably beyond
+/// any real gap between launches we would act on, far below the multi-year jumps a wrong RTC or a
+/// restored snapshot produces.
+pub const DEADMAN_MAX_PLAUSIBLE_JUMP_SECS: u64 = 32 * 24 * 3600;
 
 impl Deadman {
     pub fn armed(&self) -> bool {
@@ -3693,8 +3707,34 @@ impl Vault {
     /// crypto-erase everything and report `true` (wiped). Call at LAUNCH, before any password.
     pub fn deadman_check(base: impl Into<PathBuf>, now: u64) -> io::Result<bool> {
         let base = base.into();
-        let dm = deadman_load(&base);
-        if dm.armed() && now >= dm.last_seen.saturating_add(dm.interval_secs) {
+        let mut dm = deadman_load(&base);
+        if !dm.armed() {
+            return Ok(false);
+        }
+
+        // A wall clock alone must never authorise an irreversible wipe.
+        //
+        // FORWARD anomaly: if the clock has leapt further than any plausible gap between
+        // launches, that is a broken RTC / restored snapshot / edited date — not proof the owner
+        // vanished. Re-anchor the observation instead of destroying the vault; the countdown
+        // continues from the corrected mark, so a genuinely absent owner still trips it later.
+        if dm.last_check != 0 && now.saturating_sub(dm.last_check) > DEADMAN_MAX_PLAUSIBLE_JUMP_SECS
+        {
+            dm.last_check = now;
+            let _ = deadman_save(&base, &dm);
+            return Ok(false);
+        }
+
+        // BACKWARD movement: judge against the latest time we ever saw, so winding the clock back
+        // cannot postpone the wipe forever.
+        let effective_now = now.max(dm.last_check);
+        let overdue = effective_now >= dm.last_seen.saturating_add(dm.interval_secs);
+
+        if dm.last_check < now {
+            dm.last_check = now;
+            let _ = deadman_save(&base, &dm);
+        }
+        if overdue {
             crypto_erase(&base)?;
             return Ok(true);
         }
@@ -3705,7 +3745,7 @@ impl Vault {
     /// Real session only (the desktop hides this from a decoy session so a coerced login cannot
     /// disarm the wipe).
     pub fn set_deadman(&self, interval_secs: u64, now: u64) -> io::Result<()> {
-        deadman_save(&self.base, &Deadman { interval_secs, last_seen: now })
+        deadman_save(&self.base, &Deadman { interval_secs, last_seen: now, last_check: now })
     }
 
     /// Refresh `last_seen = now` if armed — call after a REAL unlock (never a decoy). No-op when
@@ -3714,6 +3754,7 @@ impl Vault {
         let mut dm = deadman_load(&self.base);
         if dm.armed() {
             dm.last_seen = now;
+            dm.last_check = dm.last_check.max(now); // never let the observed mark go backwards
             deadman_save(&self.base, &dm)?;
         }
         Ok(())
@@ -4556,6 +4597,59 @@ mod tests {
         assert!(!dir.join("salt").exists(), "salt shredded");
         assert!(!dir.join("c").exists());
         assert!(Vault::open(&dir, b"realpw").is_err(), "real opens nothing post-wipe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A3-11 — the dead-man switch destroys data irreversibly, so a bare `SystemTime::now()`
+    /// must not be enough to fire it.
+    ///
+    /// FORWARD: a wrong RTC, a restored VM snapshot or an edited date can jump the clock by
+    /// years. Treating that as "the owner has been absent for years" wipes a vault that was in
+    /// use yesterday — the accident this guard exists to prevent. The launch re-anchors instead,
+    /// and a genuinely overdue owner still trips the switch afterwards, so the feature keeps
+    /// working.
+    ///
+    /// BACKWARD: judged against the latest time ever OBSERVED, so winding the clock back cannot
+    /// postpone the wipe indefinitely.
+    #[test]
+    fn deadman_survives_a_clock_jump_and_resists_a_rewind() {
+        let dir = mp_dir("deadman-clock");
+        let real = Vault::create(&dir, b"realpw").unwrap();
+        real.save_registry(&[AccountEntry { id: "r".into(), label: "R".into(), ik: [1u8; 32] }]).unwrap();
+        real.set_deadman(100, 1_000).unwrap();
+
+        // A launch far in the future — a decade, not a plausible gap between launches.
+        let decade = 1_000 + 10 * 365 * 24 * 3600;
+        assert!(
+            !Vault::deadman_check(&dir, decade).unwrap(),
+            "an implausible forward clock jump must NOT wipe a live vault"
+        );
+        assert!(matches!(Vault::open(&dir, b"realpw").unwrap(), Opened::Real(_)), "vault intact");
+
+        // Winding the clock back must not buy the coercer extra time: the observed high-water
+        // mark from the previous launch already stands past the deadline.
+        assert!(
+            Vault::deadman_check(&dir, 900).unwrap(),
+            "a backwards clock must not postpone an already-overdue wipe"
+        );
+        assert!(!dir.join("salt").exists(), "the overdue switch still fires");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plausible absence still fires: the anomaly guard must not have disarmed the feature.
+    #[test]
+    fn deadman_still_fires_after_a_plausible_absence() {
+        let dir = mp_dir("deadman-plausible");
+        let real = Vault::create(&dir, b"realpw").unwrap();
+        real.save_registry(&[AccountEntry { id: "r".into(), label: "R".into(), ik: [1u8; 32] }]).unwrap();
+        real.set_deadman(24 * 3600, 1_000_000).unwrap(); // one day
+
+        // Three days later — an ordinary gap, well inside the plausibility bound.
+        assert!(
+            Vault::deadman_check(&dir, 1_000_000 + 3 * 24 * 3600).unwrap(),
+            "an overdue switch must still wipe after a NORMAL absence"
+        );
+        assert!(!dir.join("salt").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

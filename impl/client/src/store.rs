@@ -1603,6 +1603,30 @@ impl Store {
     /// A sidecar, deliberately SEPARATE from `account.key`: the long-lived identity is
     /// never touched, so there is no migration risk. Absent → empty (backward compatible).
     /// Encrypted at rest like every other secret file.
+    /// Path of the sealed in-flight inline-transfer state (see `content::Reassembler::export`).
+    fn partials_path(&self) -> PathBuf {
+        self.net_file("partials.dat")
+    }
+
+    /// Persist the in-flight inline transfers, sealed. Called after a receive batch so a crash
+    /// cannot lose chunks whose carrier messages were already acked (the relay drops those).
+    pub fn save_partials(&self, blob: &[u8]) -> io::Result<()> {
+        self.write_atomic(&self.partials_path(), &self.key.seal(blob))
+    }
+
+    /// Load the in-flight inline transfers. Absent = nothing was in flight; a file that EXISTS but
+    /// cannot be opened is an ERROR, not "nothing" — treating corruption as empty is exactly the
+    /// silent loss this state was added to prevent.
+    pub fn load_partials(&self) -> io::Result<Vec<u8>> {
+        match std::fs::read(self.partials_path()) {
+            Ok(blob) => self.key.open(&blob).map_err(|e| {
+                io_err(format!("in-flight transfers unreadable ({e}) — refusing to treat them as absent"))
+            }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn load_opks(&self) -> io::Result<Vec<[u8; 32]>> {
         match std::fs::read(self.opks_path()) {
             // A file that exists but cannot be opened or decoded is an ERROR, not "no keys".

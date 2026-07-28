@@ -862,6 +862,69 @@ pub fn publish_bundle(
     peer.publish(now)
 }
 
+/// Persist the in-flight inline transfers held by a set of per-sender reassemblers.
+///
+/// Inline chunks were reassembled ONLY in RAM while their carrier messages had already been ACKed
+/// — and an acked message is one the relay may delete. So a crash mid-transfer lost the file with
+/// no record and no retry: the sender saw "delivered", the receiver had nothing to show or resume.
+/// The large-file (blob) path was already crash-safe via pending downloads; this gives the inline
+/// path the same property. Failures are reported, never silent.
+pub fn save_reassemblers(
+    store: &Store,
+    reasm: &std::collections::HashMap<[u8; 32], content::Reassembler>,
+) {
+    let mut out: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    for (sender, re) in reasm {
+        if re.in_flight() == 0 {
+            continue;
+        }
+        match re.export() {
+            Ok(b) => out.push((*sender, b)),
+            Err(e) => eprintln!("warning: could not encode in-flight transfers: {e}"),
+        }
+    }
+    match postcard::to_stdvec(&out) {
+        Ok(blob) => {
+            if let Err(e) = store.save_partials(&blob) {
+                eprintln!("warning: could not persist in-flight transfers: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: could not encode in-flight transfers: {e}"),
+    }
+}
+
+/// Restore what [`save_reassemblers`] wrote. A failure is reported and yields "none in flight" —
+/// the same outcome as before this state existed, never worse.
+pub fn load_reassemblers(store: &Store) -> std::collections::HashMap<[u8; 32], content::Reassembler> {
+    let mut map = std::collections::HashMap::new();
+    let blob = match store.load_partials() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("warning: could not read in-flight transfers: {e}");
+            return map;
+        }
+    };
+    if blob.is_empty() {
+        return map;
+    }
+    let entries: Vec<([u8; 32], Vec<u8>)> = match postcard::from_bytes(&blob) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("warning: could not decode in-flight transfers: {e}");
+            return map;
+        }
+    };
+    for (sender, bytes) in entries {
+        match content::Reassembler::restore(&bytes) {
+            Ok(re) => {
+                map.insert(sender, re);
+            }
+            Err(e) => eprintln!("warning: dropping an unreadable in-flight transfer: {e}"),
+        }
+    }
+    map
+}
+
 /// How many unconsumed one-time prekeys to keep published. A fetch consumes one; the batch
 /// is topped back up to this on each publish. Small: it bounds the relay's per-IK store and
 /// the sidecar, and exhaustion falls back to the 3-DH agreement anyway.

@@ -578,6 +578,7 @@ pub fn chunk_post_attachment(
 }
 
 /// Whether an in-flight transfer becomes a saved file or an avatar image.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum TransferKind {
     File { name: String },
     Avatar,
@@ -587,6 +588,7 @@ enum TransferKind {
 }
 
 /// Незавершённая передача: метаданные из манифеста + пришедшие чанки.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Partial {
     kind: TransferKind,
     size: u64,
@@ -608,6 +610,35 @@ pub struct Reassembler {
 impl Reassembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Serialize the in-flight transfers so they can outlive the process.
+    ///
+    /// Inline chunks were reassembled ONLY in RAM while the messages carrying them were already
+    /// ACKed — so the relay had been told to delete them. A crash mid-transfer therefore lost the
+    /// file with no record and no retry: the sender saw "delivered", the receiver had nothing. The
+    /// large-file (blob) path was already crash-safe via pending downloads; this closes the same
+    /// hole for the inline path, which is bounded to `MAX_INLINE_FILE` but still a real message.
+    pub fn export(&self) -> Result<Vec<u8>, String> {
+        let v: Vec<([u8; 16], Partial)> =
+            self.transfers.iter().map(|(k, p)| (*k, p.clone())).collect();
+        postcard::to_stdvec(&v).map_err(|e| format!("encoding partial transfers: {e}"))
+    }
+
+    /// Restore transfers saved by [`Reassembler::export`]. Unreadable state is reported, never
+    /// silently treated as "nothing in flight" — that is how the loss looked in the first place.
+    pub fn restore(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        let v: Vec<([u8; 16], Partial)> = postcard::from_bytes(bytes)
+            .map_err(|e| format!("decoding partial transfers: {e}"))?;
+        Ok(Reassembler { transfers: v.into_iter().collect() })
+    }
+
+    /// How many transfers are mid-flight (for the caller's "save only when it changed" check).
+    pub fn in_flight(&self) -> usize {
+        self.transfers.len()
     }
 
     /// Feed one envelope. `Text` etc. -> ignored (not a transfer). Returns `Some(...)`
@@ -1218,5 +1249,43 @@ mod tests {
         // Well past t0 but only 10s since the last chunk: a reap must NOT drop it.
         assert_eq!(r.reap_stale(t0 + STALE_PARTIAL_SECS + 5), 0, "an active transfer must survive");
         assert_eq!(r.pending(), 1);
+    }
+
+    /// Bug E — an inline transfer must survive the process, because its carrier messages are
+    /// already ACKed and the relay may have dropped them.
+    ///
+    /// Chunks used to be reassembled ONLY in RAM, so a crash mid-transfer lost the file with no
+    /// record and no retry: the sender saw "delivered", the receiver had nothing to show or
+    /// resume. Discriminating: the export/restore round-trip happens BETWEEN chunks, and the file
+    /// must still assemble with byte-identical contents afterwards.
+    #[test]
+    fn an_inline_transfer_survives_a_restart_between_chunks() {
+        let payload: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+        let (manifest, chunks) = chunk_file("report.pdf", &payload).unwrap();
+        assert!(chunks.len() >= 2, "the payload must span several chunks for this to mean anything");
+
+        let mut re = Reassembler::new();
+        assert!(re.offer(manifest, 100).unwrap().is_none());
+        assert!(re.offer(chunks[0].clone(), 101).unwrap().is_none());
+        assert_eq!(re.in_flight(), 1, "a transfer is mid-flight");
+
+        // The process stops here and comes back.
+        let saved = re.export().expect("in-flight state is serializable");
+        let mut re = Reassembler::restore(&saved).expect("and restorable");
+        assert_eq!(re.in_flight(), 1, "the transfer came back");
+
+        let mut done = None;
+        for c in chunks.iter().skip(1) {
+            if let Some(a) = re.offer(c.clone(), 102).unwrap() {
+                done = Some(a);
+            }
+        }
+        match done {
+            Some(Assembled::File(f)) => {
+                assert_eq!(f.name, "report.pdf");
+                assert_eq!(f.bytes, payload, "the file must be byte-identical across the restart");
+            }
+            other => panic!("the transfer did not complete after the restart: {other:?}"),
+        }
     }
 }

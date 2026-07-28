@@ -636,6 +636,10 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
         let _ = store.save_capability(&client::dev_capability());
     }
     let relays = build_relays(&store);
+    // Pick up any inline transfer that was mid-flight when the process last stopped. Its carrier
+    // messages were already acked, so the relay will not resend them — without this the chunks
+    // were simply gone (Bug E).
+    *app.reasm.lock().unwrap() = client::load_reassemblers(&store);
     // Proxy-identity model: an account is reached only through proxies, so ensure one exists
     // (pre-proxy / fresh accounts get proxy 0 here). The root is never published.
     let _ = default_proxy(&store);
@@ -3218,6 +3222,9 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     // Persist a container-backed account after receiving (design: save on each message; a poll
     // batches a burst into one save). No-op for the file-tree path.
     if !out.is_empty() {
+        // In-flight inline chunks are durable from here on: their carrier messages are about to be
+        // (or have just been) acked, so RAM is no longer a safe place to keep them.
+        client::save_reassemblers(&root, &app.reasm.lock().unwrap());
         if let Some(cv) = app.container.lock().unwrap().as_mut() {
             // Not fatal here (unlike `lock`): nothing is deleted, the work dir still holds the
             // data and the next poll's save retries. But it must not be SILENT, or a container

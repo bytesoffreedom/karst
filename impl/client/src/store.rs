@@ -1129,10 +1129,23 @@ impl Store {
 
     fn load_pending_uploads(&self) -> io::Result<std::collections::BTreeMap<[u8; 32], PendingUpload>> {
         match std::fs::read(self.uploads_path()) {
-            Ok(blob) => Ok(match self.open_versioned(&blob) {
-                Some((UPLOADS_VERSION, inner)) => postcard::from_bytes(&inner).unwrap_or_default(),
-                _ => Default::default(),
-            }),
+            // Absent = nothing pending. A file that EXISTS but cannot be opened, carries an
+            // unknown version, or fails to decode is an ERROR — it used to collapse to "nothing
+            // pending", silently forgetting an in-flight upload instead of reporting it, so a
+            // resumable transfer vanished with no diagnosis (A4-12). Same rule already applied to
+            // opks.dat and the proxy sidecars.
+            Ok(blob) => {
+                let (ver, inner) = self
+                    .open_versioned(&blob)
+                    .ok_or_else(|| io_err("pending uploads fail authentication"))?;
+                if ver != UPLOADS_VERSION {
+                    return Err(io_err(format!(
+                        "pending uploads are version {ver}, this build understands {UPLOADS_VERSION}"
+                    )));
+                }
+                postcard::from_bytes(&inner)
+                    .map_err(|e| io_err(format!("pending uploads malformed: {e}")))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Default::default()),
             Err(e) => Err(e),
         }

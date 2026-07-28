@@ -420,3 +420,89 @@ fn an_oversized_ordinary_request_is_dropped_instead_of_served() {
     // serves normally.
     assert!(server_alive(addr, npub), "server must survive the oversized frame and keep serving");
 }
+
+/// #142: a slow BLOB write must not stall everyone else's mail.
+///
+/// The relay used to keep one `Mutex<RelayNode>` over everything, so `handle_blob_put` did its
+/// file I/O — tens of KiB per chunk — while holding the same lock that `Send`, `Fetch` and `Ack`
+/// need. One upload head-of-line-blocked every other client on the relay; the connection cap
+/// bounded threads but not this serial bottleneck.
+///
+/// The blob store now sits behind its OWN lock, and the serve loop takes the relay lock only to
+/// ADMIT a blob request (cookie, nonce, capability, quota) before releasing it and doing the I/O.
+/// This test makes that structural: the test thread HOLDS the blob store's lock — standing in
+/// for an arbitrarily slow chunk write, without needing a slow disk or a timing threshold to
+/// simulate one — an upload is issued against it and parks, and then an ordinary message must
+/// still be Accepted. Put the write back under the relay lock and the send waits behind it: RED.
+///
+/// The bound on the send is deliberately generous (a fixed budget is fine here because it is not
+/// measuring anything — when the fix works the send is immediate, and when it does not the send
+/// can never complete at all while the lock is held).
+#[test]
+fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut relay = node::node::RelayNode::new(NOW);
+    relay.issue_capability(capability([0x33; 32]));
+    let blob_dir = std::env::temp_dir().join(format!("karst-hol-{}", std::process::id()));
+    relay
+        .enable_blobs(blob_dir.clone(), NOW, node::node::BlobPersistence::Ephemeral)
+        .unwrap();
+    let store = relay.blob_store().expect("blobs are enabled");
+    let fetch_pub = relay.relay_public().to_bytes();
+    let server = RelayServer::new(relay, Arc::new(move || NOW));
+    let noise_pub = server.noise_public();
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+
+    // The stand-in for a slow disk: nothing can write a chunk until this guard is dropped.
+    let guard = store.lock().expect("blob store mutex");
+
+    // An upload that will park inside the relay, past admission, waiting for that guard.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let uploader = thread::spawn(move || {
+        let t = SocketTransport::new(addr, noise_pub);
+        let mut cookie = None;
+        let _ = started_tx.send(());
+        loop {
+            let nonce = node::node::blob_put_nonce(&[0xB1; 32], 0);
+            let req = node::node::BlobPutRequest {
+                request_nonce: nonce.clone(),
+                capability_proof: capability([0x33; 32]).prove(&nonce, 0),
+                client_addr: vec![0x44u8; 32],
+                carrier_id: b"karst-blob".to_vec(),
+                cookie,
+                blob_id: [0xB1; 32],
+                index: 0,
+                count: 1,
+                data: vec![7u8; 1024],
+            };
+            match t.blob_put(&req) {
+                node::node::BlobResponse::NeedCookie(c) => cookie = Some(c), // one round trip, then it parks
+                _ => break,
+            }
+        }
+    });
+    started_rx.recv().expect("uploader started");
+    // Synchronisation, not a measurement: give the parked upload time to reach the relay. If it
+    // has not, the test simply proves less — it can never produce a false GREEN, because the
+    // guard above is held for the whole assertion below either way.
+    thread::sleep(Duration::from_millis(300));
+
+    // The actual claim: ordinary mail goes through while that upload is stuck.
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut alice = Client::new(SocketTransport::new(addr, noise_pub), capability([0x33; 32]), b"alice");
+        let bob = Recipient::new(SocketTransport::new(addr, noise_pub), Identity::generate(), PublicKey::from(fetch_pub));
+        let _ = tx.send(matches!(alice.send(&bob.public(), b"mail during a blob write", NOW), Response::Accepted));
+    });
+    let accepted = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a send must not wait on blob file I/O — the relay lock is not the blob lock");
+    assert!(accepted, "the message should have been admitted");
+
+    drop(guard); // the "slow disk" finishes; the parked upload completes and the thread exits
+    uploader.join().expect("the parked upload finishes once the store is free");
+    std::fs::remove_dir_all(&blob_dir).ok();
+}

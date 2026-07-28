@@ -1852,6 +1852,21 @@ credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_l
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
 
+**Blob I/O is off the global relay lock (#142).** The relay keeps one `Mutex<RelayNode>`, and
+`handle_blob_put`/`handle_blob_get` used to do their FILE I/O — tens of KiB per chunk — while
+holding it, so a single upload head-of-line-blocked every other client's send, fetch and ACK on
+the whole relay (the connection cap bounds threads, not this serial bottleneck). The blob store
+now lives behind its own lock: the serve loop takes the relay lock only to ADMIT a blob request
+(cookie, nonce shape, capability, quota — all relay state), releases it, and does the I/O under
+the blob lock. Lock order is always relay → blobs, and the epoch's blob TTL sweep uses
+`try_lock` so housekeeping cannot reintroduce the stall. `BlobStat` likewise reads the store
+outside the relay lock. Pinned by `a_blob_write_in_progress_does_not_block_ordinary_mail`, which
+holds the blob store's lock (a stand-in for an arbitrarily slow disk, no timing threshold needed)
+and requires an ordinary send to still be Accepted — put the write back under the relay lock and
+the send never completes. **Named residual:** this fixes the largest offender, not the pattern.
+Message delivery, fetch, ACK, admission, quota and discovery still share one mutex; sharding
+mailboxes by recipient and giving admission/discovery their own ownership is the rest of #142.
+
 **Durable mailboxes are opt-in (R2-5).** `RelayNode::enable_durable_mail(dir, now)` opens an
 append-only `mail.log` (`node::mailstore`): a deposit is written and fsynced BEFORE `Accepted`
 is returned, deletions (fetch drain, ACK, TTL sweep) are appended without an fsync, and the log

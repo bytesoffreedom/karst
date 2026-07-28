@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use admission::capability::{
     pow_cap_id, pow_cap_secret, Capability, CapabilityProof, CapabilityQuotaTracker,
@@ -126,6 +127,35 @@ pub fn payload_id(payload: &Payload) -> [u8; 32] {
     h.update(b"KARST-mailbox-msgid-v1");
     h.update(postcard::to_stdvec(payload).expect("Payload serializes"));
     h.finalize().into()
+}
+
+/// An upload that has PASSED admission and still has to be written (#142). Holding this means
+/// the relay lock can be — and is — released before the file I/O begins.
+pub struct AdmittedBlobPut {
+    sender: [u8; 32],
+    store: Arc<Mutex<crate::blobstore::BlobStore>>,
+}
+
+impl AdmittedBlobPut {
+    /// Do the write. Takes only the BLOB store's lock, so a slow chunk blocks other blob work
+    /// and nothing else.
+    pub fn put(&self, req: &BlobPutRequest, now: u64) -> BlobResponse {
+        let mut store = self.store.lock().expect("blob store mutex");
+        match store.put_chunk(self.sender, req.blob_id, req.index, req.count, &req.data, now) {
+            crate::blobstore::BlobPut::Ok => BlobResponse::Stored,
+            crate::blobstore::BlobPut::Complete => BlobResponse::Complete,
+            crate::blobstore::BlobPut::Rejected(r) => BlobResponse::Rejected(r),
+        }
+    }
+}
+
+/// Read one chunk out of an already-admitted store. Same split as `AdmittedBlobPut::put`.
+pub fn blob_get_chunk(
+    store: &Arc<Mutex<crate::blobstore::BlobStore>>,
+    req: &BlobGetRequest,
+) -> BlobResponse {
+    let store = store.lock().expect("blob store mutex");
+    BlobResponse::Chunk(store.get_chunk(&req.blob_id, req.index))
 }
 
 /// Durably record an admitted deposit, if this relay is running with a mail log. A free function
@@ -561,7 +591,14 @@ pub struct RelayNode {
     mail_log: Option<crate::mailstore::MailLog>,
     /// §15 large-file blob store (disk-backed). `None` = blobs disabled (default; keeps
     /// the in-memory constructors/tests unchanged). Enabled via `enable_blobs`.
-    blobs: Option<crate::blobstore::BlobStore>,
+    ///
+    /// Behind its OWN lock, not the relay's (#142). Blob work is file I/O measured in tens of
+    /// KiB per chunk; message delivery, fetch and ACK are small in-memory operations. Sharing one
+    /// mutex meant a single chunk write head-of-line-blocked every other client's mail on the
+    /// whole relay. The serve loop now takes the relay lock only long enough to ADMIT a blob
+    /// request (cookie, nonce shape, capability, quota — all relay state) and does the I/O after
+    /// releasing it, under this lock. Lock ORDER is always relay → blobs, never the reverse.
+    blobs: Option<Arc<Mutex<crate::blobstore::BlobStore>>>,
     /// The operator's blob-persistence posture, remembered so the relay can ADVERTISE it in its
     /// policy (`policy()`). `None` when blobs are disabled.
     blob_persistence: Option<BlobPersistence>,
@@ -636,10 +673,10 @@ impl RelayNode {
     /// `Ephemeral` WIPES the store on start (blobs do not outlive the process — the lower-residue
     /// posture, an operator's call). `now` drives the recovery-time TTL sweep. Off by default.
     pub fn enable_blobs(&mut self, dir: std::path::PathBuf, now: u64, persist: BlobPersistence) -> std::io::Result<()> {
-        self.blobs = Some(match persist {
+        self.blobs = Some(Arc::new(Mutex::new(match persist {
             BlobPersistence::Durable => crate::blobstore::BlobStore::open(dir, now)?,
             BlobPersistence::Ephemeral => crate::blobstore::BlobStore::new(dir)?,
-        });
+        })));
         self.blob_persistence = Some(persist);
         Ok(())
     }
@@ -758,39 +795,75 @@ impl RelayNode {
     /// constant's doc comment for the arithmetic on why message-scale quota would just make
     /// every honest large upload time out instead of bounding abuse).
     pub fn handle_blob_put(&mut self, req: &BlobPutRequest, now: u64) -> BlobResponse {
+        match self.admit_blob_put(req, now) {
+            Ok(admitted) => admitted.put(req, now),
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// The ADMISSION half of a blob upload — everything that reads relay state, and nothing that
+    /// touches a file (#142). Returns the handle the caller then does the I/O through, AFTER it
+    /// has released the relay lock. `handle_blob_put` above is the same thing done in one step,
+    /// for callers that are not the serve loop (tests, in-process transports).
+    pub fn admit_blob_put(
+        &mut self,
+        req: &BlobPutRequest,
+        now: u64,
+    ) -> Result<AdmittedBlobPut, BlobResponse> {
         self.advance_epoch(now);
         match req.cookie {
             Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => {}
             _ => {
                 let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
-                return BlobResponse::NeedCookie(cookie);
+                return Err(BlobResponse::NeedCookie(cookie));
             }
         }
         // Cheap, no-crypto check BEFORE the capability HMAC (stage-ordering discipline, same as
         // the live-message pipeline): rejects a proof minted elsewhere (wrong nonce shape) at
         // zero crypto cost, rather than paying an HMAC verify only to reject it anyway.
         if req.request_nonce != blob_put_nonce(&req.blob_id, req.index) {
-            return BlobResponse::Rejected("bad request nonce".into());
+            return Err(BlobResponse::Rejected("bad request nonce".into()));
         }
         let cap = match self.capabilities.verify(&req.capability_proof, &req.request_nonce, Scope::MessageDelivery, now as u32) {
             Ok(c) => c,
-            Err(e) => return BlobResponse::Rejected(format!("capability: {e:?}")),
+            Err(e) => return Err(BlobResponse::Rejected(format!("capability: {e:?}"))),
         };
         if !self.blob_cap_quota.consume(cap.capability_id, &BLOB_CAP_QUOTA, req.data.len() as u64, now) {
-            return BlobResponse::Rejected("blob quota exceeded".into());
+            return Err(BlobResponse::Rejected("blob quota exceeded".into()));
         }
         let sender: [u8; 32] = match req.client_addr.as_slice().try_into() {
             Ok(s) => s,
-            Err(_) => return BlobResponse::Rejected("bad sender address".into()),
+            Err(_) => return Err(BlobResponse::Rejected("bad sender address".into())),
         };
-        let Some(blobs) = &mut self.blobs else {
-            return BlobResponse::Rejected("blobs disabled".into());
+        let Some(store) = self.blobs.clone() else {
+            return Err(BlobResponse::Rejected("blobs disabled".into()));
         };
-        match blobs.put_chunk(sender, req.blob_id, req.index, req.count, &req.data, now) {
-            crate::blobstore::BlobPut::Ok => BlobResponse::Stored,
-            crate::blobstore::BlobPut::Complete => BlobResponse::Complete,
-            crate::blobstore::BlobPut::Rejected(r) => BlobResponse::Rejected(r),
+        Ok(AdmittedBlobPut { sender, store })
+    }
+
+    /// The admission half of a blob DOWNLOAD: cookie only (see `handle_blob_get` for why this
+    /// path is deliberately not capability-gated). Same split as `admit_blob_put`.
+    pub fn admit_blob_get(
+        &mut self,
+        req: &BlobGetRequest,
+        now: u64,
+    ) -> Result<Arc<Mutex<crate::blobstore::BlobStore>>, BlobResponse> {
+        self.advance_epoch(now);
+        match req.cookie {
+            Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => {}
+            _ => {
+                let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
+                return Err(BlobResponse::NeedCookie(cookie));
+            }
         }
+        self.blobs.clone().ok_or_else(|| BlobResponse::Rejected("blobs disabled".into()))
+    }
+
+    /// The blob store's own handle, for the serve loop's public reads (`BlobStat`) — taken
+    /// WITHOUT the relay lock held, so a stat cannot be stuck behind a chunk write while holding
+    /// up everyone's mail. `None` = blobs disabled.
+    pub fn blob_store(&self) -> Option<Arc<Mutex<crate::blobstore::BlobStore>>> {
+        self.blobs.clone()
     }
 
     /// §15 download: return one ciphertext chunk (bearer-by-id). Cookie-gated for DoS.
@@ -799,18 +872,10 @@ impl RelayNode {
     /// EGRESS-bandwidth cost, a different resource with its own attribution question, left open
     /// as a separate, named gap rather than folded into this fix.
     pub fn handle_blob_get(&mut self, req: &BlobGetRequest, now: u64) -> BlobResponse {
-        self.advance_epoch(now);
-        match req.cookie {
-            Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => {}
-            _ => {
-                let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
-                return BlobResponse::NeedCookie(cookie);
-            }
+        match self.admit_blob_get(req, now) {
+            Ok(store) => blob_get_chunk(&store, req),
+            Err(refusal) => refusal,
         }
-        let Some(blobs) = &self.blobs else {
-            return BlobResponse::Rejected("blobs disabled".into());
-        };
-        BlobResponse::Chunk(blobs.get_chunk(&req.blob_id, req.index))
     }
 
     /// §15 upload progress: `(next, count, complete)` for a blob — how many chunks are already
@@ -818,7 +883,7 @@ impl RelayNode {
     /// `None` = the relay has never seen this blob (a fresh upload starts at 0) or blobs are off.
     /// Public read (bearer-by-id, like `FetchBundle`/`get_chunk`): no cookie, reveals only progress.
     pub fn blob_stat(&self, blob_id: &[u8; 32]) -> Option<(u32, u32, bool)> {
-        self.blobs.as_ref()?.stat(blob_id)
+        self.blobs.as_ref()?.lock().expect("blob store mutex").stat(blob_id)
     }
 
     /// Публичный ключ узла — клиент узнаёт его вне канала (как адрес) и
@@ -1150,8 +1215,14 @@ impl RelayNode {
             // metered (mirrors `cap_quota`'s use of `EPOCH_DURATION_SECS` as ITS fallback).
             self.blob_cap_quota.reap(now, BLOB_CAP_QUOTA.window_secs as u64);
             self.sweep_key_distribution(now);
-            if let Some(blobs) = &mut self.blobs {
-                blobs.sweep(now);
+            if let Some(blobs) = &self.blobs {
+                // TRY, don't wait: this runs while the relay lock is held, so blocking here on a
+                // chunk write in progress would reintroduce exactly the head-of-line stall the
+                // separate blob lock removes (#142). The TTL sweep is opportunistic housekeeping
+                // — skipping it until the next epoch costs nothing but a few minutes of lag.
+                if let Ok(mut blobs) = blobs.try_lock() {
+                    blobs.sweep(now);
+                }
             }
         }
     }

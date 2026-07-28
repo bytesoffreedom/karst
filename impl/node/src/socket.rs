@@ -392,11 +392,24 @@ fn handle_conn(
         }
         WireRequest::BlobPut(breq) => {
             let now = (clock)();
-            WireResponse::Blob(relay.lock().expect("relay mutex").handle_blob_put(&breq, now))
+            // #142: admission under the relay lock, the FILE WRITE after it is released. A blob
+            // chunk is tens of KiB of disk I/O; mail delivery, fetch and ACK are small in-memory
+            // operations. Doing both under one mutex meant one slow chunk stalled every other
+            // client's mail on the whole relay. The `admitted` binding is what forces the guard
+            // to drop before `put` runs — inlining it would extend the borrow across the write.
+            let admitted = relay.lock().expect("relay mutex").admit_blob_put(&breq, now);
+            WireResponse::Blob(match admitted {
+                Ok(a) => a.put(&breq, now),
+                Err(refusal) => refusal,
+            })
         }
         WireRequest::BlobGet(breq) => {
             let now = (clock)();
-            WireResponse::Blob(relay.lock().expect("relay mutex").handle_blob_get(&breq, now))
+            let admitted = relay.lock().expect("relay mutex").admit_blob_get(&breq, now);
+            WireResponse::Blob(match admitted {
+                Ok(store) => crate::node::blob_get_chunk(&store, &breq),
+                Err(refusal) => refusal,
+            })
         }
         WireRequest::JoinChallenge => {
             let now = (clock)();
@@ -425,7 +438,12 @@ fn handle_conn(
             WireResponse::Policy(relay.lock().expect("relay mutex").policy())
         }
         WireRequest::BlobStat(blob_id) => {
-            WireResponse::BlobStat(relay.lock().expect("relay mutex").blob_stat(&blob_id))
+            // Public read, and it takes the BLOB lock — so it is taken outside the relay lock
+            // too (#142): a stat stuck behind a chunk write must not also be holding up mail.
+            let store = relay.lock().expect("relay mutex").blob_store();
+            WireResponse::BlobStat(
+                store.and_then(|s| s.lock().expect("blob store mutex").stat(&blob_id)),
+            )
         }
         WireRequest::PublishDiscovery { record, write_sig } => {
             let now = (clock)();

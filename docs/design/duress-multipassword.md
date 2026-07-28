@@ -144,6 +144,24 @@ Enforcement points:
   the switch by simply not launching the app. Ship the app-launch check first;
   document the agent as the stronger tier.
 
+**Decided limitation — `deadman.dat` is unauthenticated (A3-11 residual).** The file
+must be readable BEFORE any password is entered, so there is no key available to MAC
+it with. Consequences, stated rather than implied:
+- a corrupt or truncated file reads as **disarmed**. That is fail-open for a feature
+  whose purpose is to act when nobody shows up. The opposite default — wipe on
+  unreadable state — was rejected as strictly more dangerous: a filesystem hiccup
+  would destroy a live vault, and that is not a trade a user can undo;
+- anyone with write access to the vault directory can disarm the switch by editing or
+  deleting one plaintext file. The switch therefore defends against **absence**, not
+  against an adversary who already has the disk while the vault is at rest.
+What IS enforced: the countdown cannot be advanced by a clock jump and cannot be
+postponed by winding the clock back — the state carries a high-water mark of the
+observed wall clock (`last_check`), and an implausible forward jump re-anchors instead
+of wiping.
+The only construction that would close the gap is an anchor outside the file — an OS
+keyring entry or a TPM-sealed monotonic counter — which would also give the signed
+monotonic checkpoints the clock guard really wants. Tracked, not assumed.
+
 Decoy unlocks do **not** reset the real `last_seen` (the point is that a coerced
 user giving the decoy password does not keep the real data alive).
 

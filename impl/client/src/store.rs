@@ -3764,25 +3764,84 @@ impl Vault {
     /// Arm (`interval_secs > 0`) or disarm (`0`) the dead-man switch, stamping `last_seen = now`.
     /// Real session only (the desktop hides this from a decoy session so a coerced login cannot
     /// disarm the wipe).
+    ///
+    /// Writes BOTH copies: the SEALED one (authoritative) and the plaintext hint the pre-password
+    /// launch check reads. See [`Vault::deadman_reconcile`].
     pub fn set_deadman(&self, interval_secs: u64, now: u64) -> io::Result<()> {
-        deadman_save(&self.base, &Deadman { interval_secs, last_seen: now, last_check: now })
+        let dm = Deadman { interval_secs, last_seen: now, last_check: now };
+        self.deadman_seal(&dm)?;
+        deadman_save(&self.base, &dm)
     }
 
     /// Refresh `last_seen = now` if armed — call after a REAL unlock (never a decoy). No-op when
-    /// disarmed.
+    /// disarmed. Updates the sealed copy first, then the hint.
     pub fn deadman_touch(&self, now: u64) -> io::Result<()> {
-        let mut dm = deadman_load(&self.base);
+        let mut dm = self.deadman_sealed().unwrap_or_else(|| deadman_load(&self.base));
         if dm.armed() {
             dm.last_seen = now;
             dm.last_check = dm.last_check.max(now); // never let the observed mark go backwards
+            self.deadman_seal(&dm)?;
             deadman_save(&self.base, &dm)?;
         }
         Ok(())
     }
 
-    /// Current dead-man state, for the Security card.
+    /// The AUTHORITATIVE dead-man state: sealed under the vault key, so it cannot be edited or
+    /// forged by anyone who merely has the directory. `None` = absent or undecryptable.
+    fn deadman_sealed(&self) -> Option<Deadman> {
+        let blob = std::fs::read(self.base.join("deadman.sealed")).ok()?;
+        let plain = self.key.open(&blob).ok()?;
+        postcard::from_bytes(&plain).ok()
+    }
+
+    fn deadman_seal(&self, dm: &Deadman) -> io::Result<()> {
+        let blob = self.key.seal(&postcard::to_stdvec(dm).map_err(io_err)?);
+        write_fixed_0600(&self.base.join("deadman.sealed"), &blob)
+    }
+
+    /// Reconcile the plaintext hint against the SEALED truth — call right after a real unlock.
+    ///
+    /// `deadman.dat` has to be readable BEFORE any password exists, so it cannot be authenticated:
+    /// editing or deleting it used to disarm the switch outright, and a corrupt file read as
+    /// "disarmed" (A3-11 residual). Authentication alone could never fix that — an attacker with
+    /// the directory can always delete a file. So the plaintext copy is demoted to a HINT that only
+    /// makes the pre-password check possible, and the sealed copy decides:
+    /// - sealed says armed and the deadline has passed → wipe NOW, whatever the hint claimed;
+    /// - otherwise → rewrite the hint from the sealed state, undoing tampering or corruption.
+    ///
+    /// Honest boundary that remains: an adversary who simply never runs the app is not wiped by
+    /// either copy — the switch fires on absence of the OWNER, and it cannot act while nothing runs.
+    /// Returns `true` if the vault was wiped.
+    pub fn deadman_reconcile(&self, now: u64) -> io::Result<bool> {
+        let Some(mut sealed) = self.deadman_sealed() else {
+            // No sealed copy yet (first run after upgrade): adopt whatever the hint says, so the
+            // switch keeps working and is authoritative from here on.
+            let hint = deadman_load(&self.base);
+            if hint.armed() {
+                self.deadman_seal(&hint)?;
+            }
+            return Ok(false);
+        };
+        if !sealed.armed() {
+            deadman_save(&self.base, &sealed)?;
+            return Ok(false);
+        }
+        let effective_now = now.max(sealed.last_check);
+        let jumped = sealed.last_check != 0
+            && now.saturating_sub(sealed.last_check) > DEADMAN_MAX_PLAUSIBLE_JUMP_SECS;
+        if !jumped && effective_now >= sealed.last_seen.saturating_add(sealed.interval_secs) {
+            crypto_erase(&self.base)?;
+            return Ok(true);
+        }
+        sealed.last_check = sealed.last_check.max(now);
+        self.deadman_seal(&sealed)?;
+        deadman_save(&self.base, &sealed)?; // repair a tampered or corrupted hint
+        Ok(false)
+    }
+
+    /// Current dead-man state, for the Security card. Prefers the sealed truth.
     pub fn deadman(&self) -> Deadman {
-        deadman_load(&self.base)
+        self.deadman_sealed().unwrap_or_else(|| deadman_load(&self.base))
     }
 
     /// A handle to the SAME compartment but keyed from `pass` — for re-verifying the password inside
@@ -4643,6 +4702,63 @@ mod tests {
 
         assert_eq!(std::fs::read(&dest).unwrap(), b"new", "the new bytes are published");
         assert!(!tmp.exists(), "the temp file must be gone, not left as debris");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A3-11 residual — deleting or editing the PLAINTEXT hint must not disarm the switch.
+    ///
+    /// `deadman.dat` has to be readable before any password exists, so it cannot be
+    /// authenticated: an adversary with the directory could simply blank it, and a corrupt file
+    /// read as "disarmed". Authentication alone could never fix that (a file can always be
+    /// deleted), so the hint is demoted — the SEALED copy decides. Here the hint is tampered into
+    /// "disarmed" and the vault is opened anyway: reconcile must still wipe.
+    #[test]
+    fn tampering_with_the_plaintext_hint_does_not_disarm_the_dead_man() {
+        let dir = mp_dir("deadman-tamper");
+        let real = Vault::create(&dir, b"realpw").unwrap();
+        real.save_registry(&[AccountEntry { id: "r".into(), label: "R".into(), ik: [1u8; 32] }]).unwrap();
+        real.set_deadman(100, 1_000).unwrap();
+
+        // The attacker's move: rewrite the pre-password hint to say "disarmed".
+        deadman_save(&dir, &Deadman { interval_secs: 0, last_seen: 0, last_check: 0 }).unwrap();
+        assert!(
+            !Vault::deadman_check(&dir, 5_000).unwrap(),
+            "the pre-password check believes the hint — that is exactly why it cannot be the truth"
+        );
+        assert!(matches!(Vault::open(&dir, b"realpw").unwrap(), Opened::Real(_)), "still opens");
+
+        // At a real unlock the sealed state is authoritative: overdue ⇒ wipe.
+        let v = match Vault::open(&dir, b"realpw").unwrap() {
+            Opened::Real(v) => v,
+            _ => panic!("real password opens the real vault"),
+        };
+        assert!(
+            v.deadman_reconcile(5_000).unwrap(),
+            "a tampered hint must not save an overdue vault from the wipe"
+        );
+        assert!(!dir.join("salt").exists(), "the vault really was erased");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror case: an armed, NOT-overdue switch survives a tampered hint, and the hint is
+    /// repaired from the sealed truth — so the pre-password check works again next launch.
+    #[test]
+    fn reconcile_repairs_a_tampered_hint_without_wiping_a_live_vault() {
+        let dir = mp_dir("deadman-repair");
+        let real = Vault::create(&dir, b"realpw").unwrap();
+        real.save_registry(&[AccountEntry { id: "r".into(), label: "R".into(), ik: [1u8; 32] }]).unwrap();
+        real.set_deadman(10_000, 1_000).unwrap();
+
+        deadman_save(&dir, &Deadman { interval_secs: 0, last_seen: 0, last_check: 0 }).unwrap();
+        let v = match Vault::open(&dir, b"realpw").unwrap() {
+            Opened::Real(v) => v,
+            _ => panic!("real password opens the real vault"),
+        };
+        assert!(!v.deadman_reconcile(2_000).unwrap(), "a live vault must not be wiped");
+        assert!(dir.join("salt").exists(), "still intact");
+        let repaired = deadman_load(&dir);
+        assert!(repaired.armed(), "the hint was repaired from the sealed state");
+        assert_eq!(repaired.interval_secs, 10_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

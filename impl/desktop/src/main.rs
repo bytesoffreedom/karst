@@ -791,6 +791,12 @@ fn unlock(app: State<App>, password: String, vault_dir: Option<String>) -> Resul
                 .first()
                 .map(|e| e.id.clone())
                 .ok_or("no account in this profile — create one")?;
+            // The pre-password check reads a PLAINTEXT hint, which anyone with the directory can
+            // edit or delete. Now that the vault is open we have the key: reconcile against the
+            // SEALED state, which fires the wipe if it is overdue and repairs a tampered hint.
+            if vault.deadman_reconcile(now_secs()).unwrap_or(false) {
+                return Err("this vault's dead-man switch had lapsed — it has been erased".into());
+            }
             let _ = vault.deadman_touch(now_secs()); // a real check-in restarts the countdown
             Ok(enter(&app, vault, id, false, false))
         }

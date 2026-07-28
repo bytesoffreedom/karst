@@ -44,6 +44,10 @@ pub const MAX_ADDRS_PER_RELAY: usize = 4;
 /// so it must be bounded in BOTH length and count before it is stored, or 4 hints × ~16 KB
 /// across the discovery map (~100 000 slots) is a multi-GB memory-growth DoS.
 pub const MAX_ADDR_LEN: usize = 256;
+
+/// Cap on ids in ONE `AckRequest`. A recipient cannot have received more than a mailbox holds, so
+/// a larger list is not a legitimate ack — it is work being bought cheaply (SEC-28).
+pub const MAX_ACK_IDS: usize = crate::wire::MAX_FETCH_SEALS;
 /// Cap on stored one-time prekeys per IK (bounded relay state; see `PublishRequest::opks`).
 pub const MAX_OPKS_PER_IK: usize = 256;
 
@@ -900,8 +904,20 @@ impl RelayNode {
             return AckResponse::Rejected("ack auth failed".into());
         }
 
+        // Bounded work, and each payload hashed ONCE.
+        //
+        // This ran `payload_id` — a full serialization plus SHA-256 — inside a nested loop, once
+        // per (queued message, requested id) PAIR, with `ids` limited only by the request frame.
+        // One authenticated ack could therefore make the relay perform hundreds of thousands of
+        // hashes while holding the global mutex, stalling every other client, and could be
+        // repeated for free (SEC-28). A recipient can never legitimately ack more than a mailbox
+        // can hold, so anything beyond that is refused rather than served.
+        if req.ids.len() > MAX_ACK_IDS {
+            return AckResponse::Rejected("too many ids in one ack".into());
+        }
         if let Some(mbox) = self.mailboxes.get_mut(&req.mailbox) {
-            mbox.retain(|e| !req.ids.iter().any(|id| id.ct_eq(&payload_id(&e.payload)).unwrap_u8() == 1));
+            let wanted: std::collections::HashSet<[u8; 32]> = req.ids.iter().copied().collect();
+            mbox.retain(|e| !wanted.contains(&payload_id(&e.payload)));
             if mbox.is_empty() {
                 self.mailboxes.remove(&req.mailbox);
             }
@@ -1574,6 +1590,46 @@ mod tests {
 
     fn boxed(relay: &RelayNode, recip: &Identity) -> bool {
         relay.mailboxes.contains_key(&recip.public.to_bytes())
+    }
+
+    /// SEC-28 — an ack must not be a cheap way to buy relay work.
+    ///
+    /// `payload_id` (serialize + SHA-256) used to run once per (queued message, requested id)
+    /// PAIR, with the id list bounded only by the request frame — so one authenticated ack could
+    /// force hundreds of thousands of hashes while holding the global mutex, repeatable for free.
+    /// A recipient can never legitimately ack more than a mailbox can hold, so a longer list is
+    /// refused outright; within the cap, each payload is hashed once.
+    #[test]
+    fn an_oversized_ack_is_refused_rather_than_served() {
+        let mut relay = RelayNode::new(NOW);
+        let recip = Identity::generate();
+        let address = recip.public.to_bytes();
+        let cookie = relay.keyring.issue(&address, b"c", NOW as u32);
+        let shared = recip.dh(&relay.relay_public());
+        let proof = fetch_proof(&shared, &cookie.mac, &address);
+
+        let over = MAX_ACK_IDS + 1;
+        let req = AckRequest {
+            mailbox: address,
+            client_addr: address.to_vec(),
+            carrier_id: b"c".to_vec(),
+            cookie: Some(cookie),
+            proof,
+            ids: vec![[7u8; 32]; over],
+            own_proof: Vec::new(),
+        };
+        assert!(
+            matches!(relay.handle_ack(&req, NOW), AckResponse::Rejected(_)),
+            "an ack larger than a mailbox can hold must be refused, not processed"
+        );
+
+        // The same ack within the cap is still served normally — the guard must bound work, not
+        // break acking.
+        let ok = AckRequest { ids: vec![[7u8; 32]; MAX_ACK_IDS], ..req };
+        assert!(
+            !matches!(relay.handle_ack(&ok, NOW), AckResponse::Rejected(_)),
+            "a legitimate full-size ack must still work"
+        );
     }
 
     /// Legacy `ack: false` fetch still DELETES on read — the un-updated path is untouched.

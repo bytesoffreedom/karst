@@ -132,6 +132,34 @@ it is never derived from, or storable back into, the recovery phrase. Consequenc
    way to *prove* "it is still me" to a contact after you rotate a proxy without linking the two —
    which would defeat the point. Long-lived relationships keep their proxy; you rotate the
    one-time / suspect ones, and re-establish out of band when you rotate a kept one.
+6. **The admission capability is shared across every proxy — a DELIBERATE limit, not an oversight
+   (A8-4).** `Store::capability_path()` lives on the account's root path (`self.dir`), not the
+   per-proxy `net_file` namespace every network-identity file uses (`sessions.p<index>.dat`,
+   `opks.p<index>.dat`, discovery key, …). Every proxy therefore presents the SAME
+   `CapabilityProof`/`capability_id` when it sends. A relay tracks quota by that id, so it can see
+   `proxy A deposit`, `proxy B deposit`, `proxy C deposit` all carry one identical id — clustering
+   proxies back together exactly the way they were supposed to be kept apart, and letting one
+   proxy's traffic burn through another's rate budget.
+
+   **Why this is not being fixed by minting a capability per proxy:** limit #1 above already
+   concedes that a relay serving several of your proxies over one connection/IP can cluster them
+   from fetch timing alone, closable only by putting each proxy on its own circuit (Tor/bridge) —
+   which does not exist yet. Splitting the capability removes one linkage channel while a strictly
+   stronger one (the connection itself) stays wide open, so it buys no real anonymity gain against
+   the threat model this document states, for the price of a new per-proxy PoW-earn/backfill flow,
+   burn-time cleanup, a new "can't publish because its solve failed while offline" failure mode,
+   and — since a relay's per-capability quota is a real anti-abuse control — an N× increase in one
+   account's total addressable relay throughput that nobody asked to grant. The PoW itself is cheap
+   in isolation (`DEFAULT_POW_BITS = 20`, "a sub-second-to-seconds speed bump on a CPU" per
+   `admission::params`) — a handful to a few dozen proxies would cost a few dozen seconds of CPU a
+   day — so cost is not the blocker; the missing per-circuit isolation is. Revisit this once #1 has
+   a real fix (each proxy on its own circuit); until then, a shared capability is consistent, not an
+   extra hole.
+
+   **The one real consequence today is a reliability cost, not a privacy one:** a proxy sent under
+   heavy load can exhaust the ONE shared 100-request/10-minute window (`POW_CAP_QUOTA`) and starve
+   every other proxy's sends until the window rolls over. That is a known, accepted limit of the
+   current shared-capability design, not a bug to chase separately from #1.
 
 ## Relationship to what is already shipped
 

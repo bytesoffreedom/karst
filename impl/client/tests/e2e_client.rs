@@ -996,6 +996,72 @@ fn a_channel_migration_repoints_a_contact_and_clears_verified() {
     std::fs::remove_dir_all(&bdir).ok();
 }
 
+/// CRYPTO-27, end-to-end: a migration message that only reaches the relay's queue (not the relay
+/// itself) must NOT be treated as delivered, and burning the proxy it is queued on must be refused
+/// while it sits there — otherwise the ciphertext (the only authenticated proof of the old→new
+/// identity link) is destroyed with nothing sent. Neuter either half — make `send_channel_migrate`
+/// discard the bool again, or drop `burn_proxy`'s outbox check — and this reddens.
+#[test]
+fn a_queued_channel_migration_blocks_burn_until_it_is_actually_delivered() {
+    let (relay_addr, relay_id) = spawn_relay();
+    let adir = temp_dir("mig-queued-a");
+    let bdir = temp_dir("mig-queued-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    seed_provision(&astore);
+    seed_provision(&bstore);
+    astore.save_capability(&client::dev_capability()).unwrap();
+    bstore.save_capability(&client::dev_capability()).unwrap();
+    astore.create_proxy("p0", NOW).unwrap();
+    astore.create_proxy("p1", NOW).unwrap();
+    bstore.create_proxy("p0", NOW).unwrap();
+
+    let a0 = astore.as_proxy(0);
+    let a1 = astore.as_proxy(1);
+    let b0 = bstore.as_proxy(0);
+    let a1_ik = a1.load_account().unwrap().identity_public();
+    let b0_ik = b0.load_account().unwrap().identity_public();
+
+    let live = ctx(relay_addr, &relay_id);
+    let pr = client::publish_bundle(&live, b0.load_account().unwrap(), b0.load_capability().unwrap(), NOW);
+    assert!(matches!(pr, PublishResponse::Published), "bob proxy publish: {pr:?}");
+
+    // Establish a real ratchet session P0(Alice) <-> P0(Bob) over the LIVE relay first — a
+    // migration send only skips the network round-trip of `connect` when a session already
+    // exists, same precondition `outbox_batch.rs`'s tests rely on.
+    let delivered = client::send_text(&a0, &live, &b0_ik, b"hi", NOW, NOW).unwrap();
+    assert!(delivered, "handshake reaches the live relay");
+    assert_eq!(client::outbox_len(&a0).unwrap(), 0, "handshake left nothing queued");
+    let _ = client::recv_session(&b0, &live, NOW).unwrap(); // drain, not the point of this test
+
+    // Now the relay Alice's P0 talks to is DEAD (nothing listening on this port).
+    let dead = client::Relay::new("127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(), relay_id, None);
+    let ok = client::send_channel_migrate(&a0, &dead, &b0_ik, a1_ik, NOW).unwrap();
+    assert!(!ok, "the dead relay never accepts it — must report `false`, not `true`");
+    assert_eq!(client::outbox_len(&a0).unwrap(), 1, "the migration ciphertext is durably queued, not lost");
+
+    // Burning P0 now must be refused: it would delete `sessions.dat`, and with it the only
+    // authenticated copy of the migration Bob never received.
+    let burn_err = astore.burn_proxy(0).expect_err("burn must refuse while the migration is queued");
+    assert!(
+        burn_err.to_string().contains("undelivered"),
+        "the refusal must say WHY, not just fail silently: {burn_err}"
+    );
+    // Nothing was destroyed by the refused attempt: the identity and its queued outbox survive.
+    assert!(a0.load_account().is_ok(), "proxy 0's registry entry must still exist after a refused burn");
+    assert_eq!(client::outbox_len(&a0).unwrap(), 1, "the queued migration must still be there after a refused burn");
+
+    // Control: once the relay is reachable again and the queued send actually lands, the outbox
+    // drains and the SAME burn call that was just refused now succeeds.
+    let flushed = client::flush_outbox(&a0, &live, NOW).unwrap();
+    assert_eq!(flushed, 1, "the retry delivers the previously-queued migration");
+    assert_eq!(client::outbox_len(&a0).unwrap(), 0, "outbox drained");
+    astore.burn_proxy(0).expect("control: an empty outbox must not block burning");
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}
+
 /// A PUBLICATION fanned out to a contact arrives as `Content::Publication` with its id/text/ts
 /// intact, is NOT written to the recipient's chat history (it's a feed entry, not a 1:1 message),
 /// and — simulating the desktop poll wiring — lands in the recipient's feed via `append_feed`.

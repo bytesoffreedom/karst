@@ -402,6 +402,14 @@ pub struct Store {
     /// never cross session/ratchet state. DEVICE/RELAY-scoped state (the relay capability, blob
     /// transfer queues) and all DATA (contacts/history/feed/profile/…) stay on the root paths, one
     /// copy — a proxy is a channel, not a persona.
+    ///
+    /// **A8-4, honest and DELIBERATE (see `docs/design/proxy-identity.md` § Honest limits #6):**
+    /// sharing the relay capability across every proxy means every proxy presents the SAME
+    /// `capability_id` on send, which a relay can use to cluster proxies back together — but a
+    /// relay serving several of your proxies over one connection already clusters them from fetch
+    /// timing alone (limit #1), a strictly stronger channel a per-proxy capability would not close.
+    /// Do not "fix" this in isolation — see `capability_path` and the doc for the actual tradeoff
+    /// (a real N× relay-throughput increase, for zero anonymity gain until #1 has a fix).
     proxy: Option<u32>,
     /// At-rest CONTEXT prefix for this store (CRYPTO-05): `acct:<id>` inside a vault, `vault`
     /// for the vault's own files, `store` for a standalone single-account directory. Combined
@@ -1362,6 +1370,12 @@ impl Store {
 
     pub fn capability_path(&self) -> PathBuf {
         // .dat, а не .json: на диске зашифрованный blob, не JSON.
+        //
+        // Deliberately `self.dir`, NOT `net_file` — unlike every IDENTITY-keyed network file
+        // (sessions/opks/discovery), the capability is NOT namespaced per proxy: every proxy this
+        // account has reads and presents the SAME capability_id (A8-4, see the `proxy` field doc
+        // above and `docs/design/proxy-identity.md` § Honest limits #6 for why this is a named,
+        // deliberate limit rather than a gap to close here).
         self.dir.join("capability.dat")
     }
 
@@ -2594,6 +2608,30 @@ impl Store {
     /// not a data-integrity invariant, and belongs in the caller (see the desktop `burn_proxy`
     /// command, which enforces exactly that before calling this).
     pub fn burn_proxy(&self, index: u32) -> io::Result<()> {
+        // CRYPTO-27: this proxy's outbox (in `sessions.dat`, removed a few lines down) can hold the
+        // ONLY authenticated copy of a message it ever sent — most dangerously a `ChannelMigrate`,
+        // the sole proof-of-continuity handed to a contact who is being moved OFF this exact
+        // channel (`send_channel_migrate` durably queues it and reports `Ok(false)` rather than
+        // losing it when the relay is down; see its doc comment). If burn is allowed to run anyway,
+        // that queued ciphertext is deleted before it ever reaches the contact, who then never
+        // learns `new_ik` and sees the next message from it as an unknown sender — a silent,
+        // unrecoverable split. Refusing here, in the one method that actually destroys
+        // `sessions.dat`, closes the path regardless of which caller forgot to check first.
+        //
+        // A read error (corrupt/unauthenticated `sessions.dat`) is refused too, NOT treated as "no
+        // outbox": `unwrap_or(0)` here would be the exact "any failure → assume empty" shape 1dd5de7
+        // fixed for the proxy registry — reintroducing it for the outbox would just move the bug.
+        // An absent file (this proxy never sent anything) is genuinely empty and proceeds.
+        let victim = self.as_proxy(index);
+        let pending = victim.load_sessions()?.outbox_len();
+        if pending > 0 {
+            return Err(io_err(format!(
+                "proxy #{index} still has {pending} undelivered message(s) queued — burning now \
+                 would destroy them, including any in-flight channel migration; retry sending (or \
+                 wait for the relay to come back) before burning this channel"
+            )));
+        }
+
         let mut reg = self.load_registry()?;
         let before = reg.entries.len();
         reg.entries.retain(|p| p.index != index);
@@ -2603,7 +2641,6 @@ impl Store {
 
         // Drop the namespaced network files this proxy owned. Best-effort: NotFound just means
         // this proxy never got that far (e.g. burned before its first publish).
-        let victim = self.as_proxy(index);
         for path in [
             victim.net_file("discovery.key"),
             victim.net_file("reduced_fs.dat"),
@@ -2760,6 +2797,26 @@ impl Store {
         if !map.contains_key(&ik) && map.len() >= MAX_CONTACTS {
             eprintln!("warning: contact→proxy map at cap ({MAX_CONTACTS}) — not tagging a new sender IK");
             return Ok(());
+        }
+        // CRYPTO-28: the safety number desktop displays is computed over
+        // `own_proxy_ik_for_this_contact || peer_ik` — this tag IS the "own" half. Any real change
+        // to it (we are past the no-op check above) means the pair a previous OOB verification
+        // covered no longer matches what the UI would compute now, exactly like `migrate_contact_ik`
+        // already does for a change on the PEER'S side. That includes the untagged→Some case, the
+        // common one: a contact can be added and verified before their first inbound message ever
+        // reaches `set_contact_proxy` (every inbound tags the sender's proxy before decoding
+        // `Content`), so "only reset when replacing a DIFFERENT known index" would miss it — this
+        // function cannot assume a not-yet-tagged contact is never already `verified`. Clearing
+        // unconditionally on any tag change is the conservative side to err on: a false
+        // "unverified" only re-prompts a check that already happened; a false "verified" is the bug.
+        // Written to `contacts.dat` BEFORE `contact_proxy.dat` — a crash between the two writes
+        // leaves "unverified, old tag" (harmless) rather than "verified, new tag" if reversed.
+        let mut cs = self.load_contacts()?;
+        if let Some(c) = cs.iter_mut().find(|c| c.ik == ik) {
+            if c.verified {
+                c.verified = false;
+                self.save_contacts(&cs)?;
+            }
         }
         map.insert(ik, index);
         let plain = postcard::to_stdvec(&map).map_err(io_err)?;
@@ -5162,8 +5219,8 @@ mod tests {
         let free = [11u8; 32]; // nobody's key — legitimate target
 
         s.save_contacts(&[
-            ContactRecord { name: "AliceDemo".into(), ik: old, verified: true },
-            ContactRecord { name: "BobDemo".into(), ik: victim, verified: true },
+            ContactRecord { name: "AliceDemo".into(), ik: old, verified: false },
+            ContactRecord { name: "BobDemo".into(), ik: victim, verified: false },
         ])
         .unwrap();
         s.set_peer_avatar(old, vec![1, 2, 3]).unwrap();
@@ -5172,6 +5229,15 @@ mod tests {
         s.set_peer_avatar(victim, vec![9, 9, 9]).unwrap();
         s.set_peer_profile(victim, "BobDemo", "bob bio").unwrap();
         s.set_contact_proxy(victim, 1).unwrap();
+        // Verify BOTH only now, after tagging (CRYPTO-28: `set_contact_proxy` itself resets
+        // `verified` on a tag change, so setting it before tagging would not survive to this
+        // point — verifying afterwards is also what a real user's OOB check looks like: the
+        // proxy tag is already pinned by then).
+        let mut cs = s.load_contacts().unwrap();
+        for c in cs.iter_mut() {
+            c.verified = true;
+        }
+        s.save_contacts(&cs).unwrap();
 
         // Attempt: migrate Alice (`old`) onto Bob's already-occupied key (`victim`).
         let err = s
@@ -5564,6 +5630,102 @@ mod tests {
             s.contact_proxy(&known),
             Some(7),
             "re-tagging an already-known ik must still work at the cap"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CRYPTO-27: `burn_proxy` must refuse when its outbox check itself fails (a corrupt or
+    /// unauthenticated `sessions.dat`), not treat the read failure as "outbox empty" — that
+    /// `unwrap_or(0)` shape is exactly the bug 1dd5de7 fixed for the proxy registry, and doing it
+    /// here for the outbox would reopen it: a tampered or torn `sessions.dat` could hide a still-
+    /// undelivered migration exactly as effectively as a genuinely empty one would. Neuter the `?`
+    /// on `load_sessions()` back into an `unwrap_or(0)` and this reddens.
+    #[test]
+    fn burn_proxy_refuses_when_its_own_outbox_cannot_be_authenticated() {
+        let dir = std::env::temp_dir().join(format!("karst-store-burn-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let e0 = s.create_proxy("p0", 0).unwrap();
+        let p0 = s.as_proxy(e0.index);
+        // Not a sealed blob at all — `MasterKey::open` fails authentication, distinct from the
+        // file simply being absent (which correctly means "empty" and must keep working).
+        std::fs::write(p0.sessions_path(), b"not a sealed blob").unwrap();
+
+        let err = s.burn_proxy(e0.index).expect_err("an unauthenticated sessions.dat must refuse the burn");
+        assert!(
+            !err.to_string().to_lowercase().contains("undelivered"),
+            "this must be the AUTHENTICATION failure, not the pending-outbox message: {err}"
+        );
+        assert!(
+            s.try_load_proxies().unwrap().iter().any(|p| p.index == e0.index),
+            "the refused burn must not have deleted the registry entry"
+        );
+
+        // Control: a proxy that never wrote a sessions.dat at all (genuinely no outbox, not a
+        // corrupt one) still burns cleanly — absence must keep reading as empty.
+        let e1 = s.create_proxy("p1", 0).unwrap();
+        s.burn_proxy(e1.index).expect("control: a proxy with no sessions.dat at all must still burn");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CRYPTO-28: the safety number desktop shows is `own_proxy_ik_for_this_contact || peer_ik` —
+    /// `set_contact_proxy` picks the own half. Proves `verified` is cleared whenever that tag
+    /// actually changes, INCLUDING untagged→first-tag (a contact can be verified out-of-band
+    /// before their first inbound message ever reaches this function — every inbound tags the
+    /// sender's proxy before `Content` is even decoded), not only when it moves between two
+    /// already-known indices. Neuter the reset and this reddens; the two controls (same-index
+    /// re-tag, an unrelated contact) catch a fix that resets `verified` unconditionally instead of
+    /// only on an actual change.
+    #[test]
+    fn set_contact_proxy_resets_a_stale_verified_flag_whenever_the_own_tag_actually_changes() {
+        let dir = std::env::temp_dir().join(format!("karst-store-verifiedstale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let alice = [0xA1u8; 32];
+        let carol = [0xC1u8; 32];
+        s.save_contacts(&[
+            ContactRecord { name: "Alice".into(), ik: alice, verified: true },
+            ContactRecord { name: "Carol".into(), ik: carol, verified: true },
+        ])
+        .unwrap();
+
+        // Alice was verified out-of-band BEFORE any inbound message ever tagged her proxy — the
+        // untagged→Some case this fix has to cover, not just index→different-index.
+        assert_eq!(s.contact_proxy(&alice), None, "not yet tagged");
+        s.set_contact_proxy(alice, 0).unwrap();
+        assert!(
+            !s.load_contacts().unwrap().iter().find(|c| c.ik == alice).unwrap().verified,
+            "the first-ever proxy tag must reset a pre-existing verified flag — the own half of \
+             the safety number just became defined for the first time"
+        );
+
+        // Re-verify (a fresh OOB check against the p0 pairing), then re-tag to the SAME index —
+        // control: a no-op tag must not disturb `verified`.
+        let mut cs = s.load_contacts().unwrap();
+        cs.iter_mut().find(|c| c.ik == alice).unwrap().verified = true;
+        s.save_contacts(&cs).unwrap();
+        s.set_contact_proxy(alice, 0).unwrap();
+        assert!(
+            s.load_contacts().unwrap().iter().find(|c| c.ik == alice).unwrap().verified,
+            "control: re-tagging to the SAME index must not reset verified"
+        );
+
+        // A genuine change (0 -> 1) resets it again.
+        s.set_contact_proxy(alice, 1).unwrap();
+        assert!(
+            !s.load_contacts().unwrap().iter().find(|c| c.ik == alice).unwrap().verified,
+            "a real change of the own proxy tag resets verified — the safety number's own half \
+             changed under it"
+        );
+
+        // Control: an unrelated contact was never tagged here and keeps her flag throughout.
+        assert!(
+            s.load_contacts().unwrap().iter().find(|c| c.ik == carol).unwrap().verified,
+            "control: an unrelated contact's verified flag must never move"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

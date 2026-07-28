@@ -2821,15 +2821,14 @@ fn ensure_conversation(root: &Store, ik: [u8; 32]) {
 }
 
 /// Ensure `ik` is a CONFIRMED contact: add the record if new AND clear any unconfirmed flag. Used
-/// when a mutual add completes (ContactAccept) or the user explicitly confirms — this is what
-/// unlocks showing their name/avatar/posts and fanning ours out to them.
+/// when a mutual add completes (ContactAccept) — this is what unlocks showing their
+/// name/avatar/posts and fanning ours out to them.
+///
+/// SEC-44: the cap lives with the persisted state in `Store::add_confirmed_contact` (this call
+/// site is driven by a REMOTE `ContactAccept`, processed automatically on receipt — the same
+/// flood surface as `ensure_conversation`), not here — this is now a thin call site.
 fn ensure_confirmed_contact(root: &Store, ik: [u8; 32]) {
-    let Ok(mut cs) = root.load_contacts() else { return };
-    if !cs.iter().any(|c| c.ik == ik) {
-        cs.push(ContactRecord { name: String::new(), ik, verified: false });
-        let _ = root.save_contacts(&cs);
-    }
-    let _ = root.set_unconfirmed(ik, false); // promote to a confirmed contact
+    let _ = root.add_confirmed_contact(ik);
 }
 
 /// Whether `ik`'s publications belong in our feed: an account we SUBSCRIBED to, OR one we live-pulled

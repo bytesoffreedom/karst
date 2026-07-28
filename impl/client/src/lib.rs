@@ -876,12 +876,15 @@ pub fn publish_bundle(
 /// traffic for a P2P messenger) while bounding the map to a fixed size regardless of how many
 /// identities an attacker mints.
 pub const MAX_REASSEMBLY_SENDERS: usize = 64;
-/// SEC-43: cap on TOTAL in-flight reassembly bytes across every sender combined. One sender's
-/// worst case alone is already ~4.5 MiB (`MAX_CONCURRENT_TRANSFERS` × the largest transfer kind,
-/// a gallery) — multiplying that by `MAX_REASSEMBLY_SENDERS` would still let a flood reach
-/// hundreds of MiB, so the cross-sender total needs its OWN bound, independent of sender count.
-/// 8 MiB comfortably covers dozens of concurrent avatar/file-sized transfers (the realistic case)
-/// while keeping a flood's worst case a small, fixed amount of RAM.
+/// SEC-43: cap on TOTAL in-flight reassembly bytes across every sender combined, checked against
+/// each manifest's DECLARED size (`content::manifest_declared_size`), NOT arrived chunk bytes — a
+/// bare manifest carries no payload, so gating on arrived bytes would let a flood of manifests
+/// with no chunks ever sent reserve every slot for free before the count ever moved. One sender's
+/// worst case alone is already ~4.5 MiB (`MAX_CONCURRENT_TRANSFERS` × the largest transfer kind, a
+/// gallery) — multiplying that by `MAX_REASSEMBLY_SENDERS` would still let a flood reach hundreds
+/// of MiB, so the cross-sender total needs its OWN bound, independent of sender count. 8 MiB
+/// comfortably covers dozens of concurrent avatar/file-sized transfers (the realistic case) while
+/// keeping a flood's worst case a small, fixed amount of committed memory.
 pub const MAX_REASSEMBLY_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 /// Reap idle partials across EVERY sender's `Reassembler`, then drop any sender entry left
@@ -906,9 +909,18 @@ pub fn reap_reassemblers(
     evicted
 }
 
-/// Sum of `Reassembler::bytes_in_flight` across every sender — the quantity `MAX_REASSEMBLY_TOTAL_BYTES` bounds.
+/// Sum of `Reassembler::bytes_in_flight` (ARRIVED bytes) across every sender — a diagnostic
+/// figure, NOT what the admission check below bounds (see `total_declared_reassembly_bytes`).
 pub fn total_reassembly_bytes(reasm: &std::collections::HashMap<[u8; 32], content::Reassembler>) -> usize {
     reasm.values().map(content::Reassembler::bytes_in_flight).sum()
+}
+
+/// Sum of `Reassembler::declared_bytes_in_flight` (the sender's COMMITTED manifest size, not
+/// arrived bytes) across every sender — the quantity `MAX_REASSEMBLY_TOTAL_BYTES` actually bounds.
+pub fn total_declared_reassembly_bytes(
+    reasm: &std::collections::HashMap<[u8; 32], content::Reassembler>,
+) -> u64 {
+    reasm.values().map(|re| re.declared_bytes_in_flight() as u64).sum()
 }
 
 /// Feed one envelope into the per-sender pool, enforcing the GLOBAL bounds above before it ever
@@ -916,6 +928,14 @@ pub fn total_reassembly_bytes(reasm: &std::collections::HashMap<[u8; 32], conten
 /// `has_transfer` so an idempotent resend of an already-admitted manifest is never refused) is
 /// admission-checked — a chunk for an already-tracked transfer, or an orphan chunk that will be
 /// refused for its own reasons inside `Reassembler::offer`, never allocates a pool slot.
+///
+/// The byte cap gates on the manifest's DECLARED size (`manifest_declared_size`), never on what
+/// has arrived: a bare manifest carries zero payload, so an arrived-bytes check would let a flood
+/// of manifests with no chunks EVER sent reserve every slot for free, becoming visible only once
+/// chunks started streaming in — by which point admission had already been granted to all of
+/// them. Declared-size accounting closes that off: the sender's commitment is charged the moment
+/// the manifest is accepted, so the running total never exceeds the cap regardless of whether any
+/// chunk ever follows.
 ///
 /// DELIBERATELY never evicts another sender's already-admitted (legitimate, in-progress)
 /// transfer to make room for a new one: the two callers here are equally entitled, there is no
@@ -940,9 +960,18 @@ pub fn offer_reassembly(
                     "too many senders with in-flight transfers (cap {MAX_REASSEMBLY_SENDERS})"
                 ));
             }
-            if total_reassembly_bytes(reasm) >= MAX_REASSEMBLY_TOTAL_BYTES {
+            // This runs BEFORE `Reassembler::offer`, i.e. before the per-kind size validation
+            // that normally rejects an absurd declared size — so `declared_new` here is still the
+            // RAW attacker-declared value (a `FileManifest` can claim `size: u64::MAX`).
+            // `saturating_add` keeps the comparison meaningful instead of wrapping/panicking: any
+            // honest manifest is unaffected, and an absurd one is refused here (loud Err) rather
+            // than by luck once it reaches the per-kind check downstream.
+            let declared_new = content::manifest_declared_size(&c).unwrap_or(0);
+            let declared_total = total_declared_reassembly_bytes(reasm);
+            if declared_total.saturating_add(declared_new) > MAX_REASSEMBLY_TOTAL_BYTES as u64 {
                 return Err(format!(
-                    "in-flight reassembly memory at capacity (cap {MAX_REASSEMBLY_TOTAL_BYTES} bytes)"
+                    "in-flight reassembly memory at capacity (cap {MAX_REASSEMBLY_TOTAL_BYTES} \
+                     bytes, this manifest commits to {declared_new} more)"
                 ));
             }
         }
@@ -3293,84 +3322,110 @@ mod tests {
         );
     }
 
-    /// SEC-43, the TOTAL-RAM half. `MAX_REASSEMBLY_SENDERS` alone would still let a flood reach
-    /// `senders × ~4.5 MiB` (one sender's worst case: `MAX_CONCURRENT_TRANSFERS` galleries) —
-    /// hundreds of MiB. The byte cap must bind independently, using only a HANDFUL of senders
-    /// (well under the sender cap), so this is really testing the byte accounting, not the count.
-    /// Discriminating both ways: a new transfer once at capacity is refused, AND a CHUNK
-    /// continuing an already-admitted transfer still lands — the cap must never silently kill
-    /// progress already accepted, only refuse a transfer that has not started yet.
+    /// SEC-43, the TOTAL-RAM half — and specifically the manifest-flood adversary: a manifest
+    /// carries NO payload, so if the cap only counted ARRIVED bytes, an attacker could send
+    /// hundreds of bare manifests (never a single chunk) and every one would be admitted for
+    /// free — the cap would only "notice" once chunks started streaming, by which point every
+    /// slot was already reserved. `MAX_REASSEMBLY_SENDERS` alone would still let that flood
+    /// reserve `senders × ~4.5 MiB` (one sender's worst case: `MAX_CONCURRENT_TRANSFERS` galleries)
+    /// — hundreds of MiB. This test sends ONLY manifests, to 20 distinct senders (well past the
+    /// ~2 that would exhaust the byte cap alone, and well under `MAX_REASSEMBLY_SENDERS` = 64), so
+    /// a pass here cannot be explained by the sender cap or by any chunk ever arriving.
+    ///
+    /// Discriminating both ways: refused well before all 160 (20 × 8) manifests are admitted, AND
+    /// a CHUNK continuing an already-admitted transfer still lands afterwards — the cap must
+    /// refuse only a transfer that has not started, never kill progress already accepted.
     #[test]
-    fn global_byte_cap_refuses_a_new_transfer_at_capacity_but_lets_existing_ones_finish_receiving() {
+    fn global_byte_cap_uses_the_manifests_declared_size_so_a_bare_manifest_flood_cannot_bypass_it() {
         let mut reasm: std::collections::HashMap<[u8; 32], content::Reassembler> =
             std::collections::HashMap::new();
         let now = 2_000u64;
-        // Each transfer accumulates 560 KiB of REAL received bytes (declared one chunk short of
-        // complete, so it never finishes and keeps pinning that RAM).
-        const CHUNKS_PER_TRANSFER: u32 = 560;
-        // The declared size/hash match what completing ALL `CHUNKS_PER_TRANSFER + 1` chunks would
-        // assemble to — so the one existing transfer we DO complete at the end (below) verifies
-        // for real, not by luck.
-        let full_bytes = vec![7u8; (CHUNKS_PER_TRANSFER as usize + 1) * 1024];
-        let full_hash: [u8; 32] = {
-            use sha2::{Digest, Sha256};
-            Sha256::digest(&full_bytes).into()
-        };
+        let declared = content::MAX_GALLERY_BYTES as u32; // the largest single-transfer commitment
         let mut admitted = 0usize;
-        let mut sender_of = Vec::new(); // (sender, id) for every transfer admitted, in order
-        'outer: for sender_idx in 0u8..3 {
+        let mut first: Option<([u8; 32], [u8; 16])> = None;
+        'outer: for sender_idx in 0u8..20 {
             let sender = [sender_idx; 32];
             for slot in 0u8..content::MAX_CONCURRENT_TRANSFERS as u8 {
-                let id = [sender_idx.wrapping_mul(16).wrapping_add(slot); 16];
+                let id = [sender_idx.wrapping_mul(8).wrapping_add(slot); 16];
                 let manifest = content::Content::GalleryManifest {
                     id,
-                    size: full_bytes.len() as u32,
-                    chunks: CHUNKS_PER_TRANSFER + 1, // one MORE than sent below => never completes yet
-                    hash: full_hash,
+                    size: declared,
+                    chunks: declared / 1024 + 1,
+                    hash: [0; 32],
                 };
                 match offer_reassembly(&mut reasm, sender, manifest, now) {
-                    Ok(None) => {}
+                    Ok(None) => {
+                        first.get_or_insert((sender, id));
+                        admitted += 1;
+                    }
                     Err(_) => break 'outer, // the byte cap kicked in — stop, this is what we test
-                    Ok(Some(_)) => panic!("a deliberately-incomplete manifest must not complete"),
+                    Ok(Some(_)) => panic!("a bare manifest cannot complete on its own"),
                 }
-                for idx in 0..CHUNKS_PER_TRANSFER {
-                    let c = content::Content::AvatarChunk { id, index: idx, data: vec![7u8; 1024] };
-                    assert_eq!(offer_reassembly(&mut reasm, sender, c, now).unwrap(), None);
-                }
-                admitted += 1;
-                sender_of.push((sender, id));
+                // Deliberately NO chunk is ever sent — `bytes_in_flight` (arrived) stays at 0 for
+                // every one of these. Only declared-size accounting can catch this flood.
             }
         }
         assert!(
-            admitted < 24,
-            "the byte cap must refuse a transfer before all 24 (3 senders × 8 slots) are admitted; \
-             got {admitted} admitted with none refused — the cap never engaged"
+            admitted < 160,
+            "the byte cap must refuse a bare manifest well before 160 (20 senders × 8 slots) are \
+             admitted with NO chunk ever sent; got {admitted} admitted with none refused — a \
+             manifest flood bypassed the cap"
         );
-        // The cap is checked BEFORE a transfer is added, so the transfer that crosses the
-        // threshold is still let in whole (no partial admission) — the overshoot is bounded by
-        // ONE transfer's worth, never unbounded.
-        let one_transfer = CHUNKS_PER_TRANSFER as usize * 1024;
-        assert!(
-            total_reassembly_bytes(&reasm) >= MAX_REASSEMBLY_TOTAL_BYTES,
-            "the loop must have stopped BECAUSE the total reached the cap"
+        assert_eq!(
+            total_reassembly_bytes(&reasm),
+            0,
+            "control: confirms this really is a bare-manifest flood — zero bytes ever arrived"
         );
         assert!(
-            total_reassembly_bytes(&reasm) < MAX_REASSEMBLY_TOTAL_BYTES + one_transfer,
-            "overshoot past the cap must be bounded by one transfer's worth, not unbounded"
+            total_declared_reassembly_bytes(&reasm) <= MAX_REASSEMBLY_TOTAL_BYTES as u64,
+            "committed declared bytes must never exceed the cap, even before any chunk arrives"
         );
 
-        // A CHUNK continuing an already-admitted transfer still lands — the cap only ever refuses
-        // a transfer that has not started, never one already let in.
-        let (existing_sender, existing_id) = sender_of[0];
-        let more = content::Content::AvatarChunk {
-            id: existing_id,
-            index: CHUNKS_PER_TRANSFER, // the one chunk short of "complete" we withheld above
-            data: vec![7u8; 1024],
-        };
+        // A CHUNK continuing an already-admitted transfer still lands even with the declared
+        // budget fully committed — the cap only ever refuses a NEW transfer, never one in progress.
+        let (sender, id) = first.expect("at least one manifest must have been admitted");
+        let chunk = content::Content::AvatarChunk { id, index: 0, data: vec![7u8; 1024] };
         assert_eq!(
-            offer_reassembly(&mut reasm, existing_sender, more, now).unwrap(),
-            Some(content::Assembled::Gallery { bytes: full_bytes }),
-            "an already-admitted transfer must still be able to finish at the byte cap"
+            offer_reassembly(&mut reasm, sender, chunk, now).unwrap(),
+            None,
+            "an already-admitted transfer must still be able to receive chunks at the byte cap"
+        );
+    }
+
+    /// SEC-43 overflow guard: the admission check runs BEFORE `Reassembler::offer`'s own per-kind
+    /// bound (`size > MAX_FILE_SIZE`, etc.) ever gets a chance to reject an absurd manifest, so
+    /// `manifest_declared_size` is still the RAW attacker-declared value at that point — a
+    /// `FileManifest` claiming `size: u64::MAX` must not overflow `declared_total + declared_new`.
+    /// Discriminating: swap the admission check's `saturating_add` for plain `+` and this panics
+    /// (debug builds trap on overflow) instead of returning a loud `Err`.
+    #[test]
+    fn global_byte_cap_refuses_an_absurd_declared_size_without_overflowing() {
+        let mut reasm: std::collections::HashMap<[u8; 32], content::Reassembler> =
+            std::collections::HashMap::new();
+        let now = 5_000u64;
+        // One small, honest manifest first, so `declared_total` is non-zero going into the
+        // overflow attempt — the bug is in `total + huge`, not in `huge` alone.
+        let sender_a = [1u8; 32];
+        let small = content::Content::FileManifest {
+            id: [1; 16],
+            name: "f".into(),
+            size: 10,
+            chunks: 2,
+            hash: [0; 32],
+        };
+        assert_eq!(offer_reassembly(&mut reasm, sender_a, small, now).unwrap(), None);
+
+        let sender_b = [2u8; 32];
+        let absurd = content::Content::FileManifest {
+            id: [2; 16],
+            name: "f".into(),
+            size: u64::MAX, // far past any per-kind bound `Reassembler::offer` would reject
+            chunks: 1,
+            hash: [0; 32],
+        };
+        assert!(
+            offer_reassembly(&mut reasm, sender_b, absurd, now).is_err(),
+            "an absurd declared size must be refused by the global cap, not overflow past it"
         );
     }
 

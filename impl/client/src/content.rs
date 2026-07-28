@@ -376,6 +376,22 @@ pub fn manifest_transfer_id(c: &Content) -> Option<[u8; 16]> {
     }
 }
 
+/// The byte size a MANIFEST variant declares it will assemble to (`None` for a chunk or any other
+/// `Content`) — the sender's COMMITMENT, not what has arrived. SEC-43: a bare manifest carries no
+/// payload, so a cap that only counted arrived chunk bytes would let a flood of manifests (no
+/// chunks ever sent) reserve every slot for free; the caller's admission check uses THIS instead,
+/// exactly like `Reassembler::declared_bytes_in_flight` on the already-admitted side.
+pub fn manifest_declared_size(c: &Content) -> Option<u64> {
+    match c {
+        Content::FileManifest { size, .. } => Some(*size),
+        Content::AvatarManifest { size, .. }
+        | Content::GalleryManifest { size, .. }
+        | Content::PostImageManifest { size, .. }
+        | Content::PostAttachmentManifest { size, .. } => Some(*size as u64),
+        _ => None,
+    }
+}
+
 /// Завершённая, собранная и проверенная по хэшу передача файла.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedFile {
@@ -815,12 +831,21 @@ impl Reassembler {
 
     /// Total bytes currently held across all in-flight partials in THIS Reassembler (the sum of
     /// arrived-so-far chunk payloads, not the declared manifest sizes — a transfer that is only
-    /// half-arrived pins only half its final weight). Used by the caller to enforce a GLOBAL RAM
-    /// bound across every sender's Reassembler (SEC-43): the per-sender `MAX_CONCURRENT_TRANSFERS`
-    /// cap bounds ONE sender, but says nothing about how many senders exist — an IK is free to
-    /// mint, so the cross-sender total needs its own accounting.
+    /// half-arrived pins only half its final weight). A DIAGNOSTIC figure only — the cross-sender
+    /// admission cap (SEC-43, see `declared_bytes_in_flight`) does NOT use this, because a bare
+    /// manifest carries zero payload: gating on arrived bytes would let a flood of manifests with
+    /// no chunks ever sent reserve every slot for free before this number moves at all.
     pub fn bytes_in_flight(&self) -> usize {
         self.transfers.values().map(|p| p.received.values().map(Vec::len).sum::<usize>()).sum()
+    }
+
+    /// Sum of DECLARED transfer sizes (the manifest's `size` field — the sender's commitment)
+    /// across all in-flight partials in THIS Reassembler. This, not `bytes_in_flight`, is what the
+    /// caller's global RAM cap (SEC-43) must admission-check a new manifest against: it bounds the
+    /// worst case the sender has already promised to make us allocate, the moment the manifest is
+    /// accepted — before a single chunk has to arrive to "prove" the cost is real.
+    pub fn declared_bytes_in_flight(&self) -> usize {
+        self.transfers.values().map(|p| p.size as usize).sum()
     }
 
     /// Whether transfer `id` is already tracked here. Lets the caller tell "a repeated manifest

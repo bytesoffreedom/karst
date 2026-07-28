@@ -1661,6 +1661,34 @@ impl Store {
         Ok(true)
     }
 
+    /// Ensure `ik` is a CONFIRMED contact: add the record if new (subject to the SAME cap as
+    /// `add_unconfirmed_contact`) and clear any unconfirmed flag either way — used when a mutual
+    /// add completes (`ContactAccept`) or the user explicitly confirms.
+    ///
+    /// SEC-44: a `ContactAccept` is processed AUTOMATICALLY on receipt (no per-message human
+    /// click gates it — see the desktop poll loop), so this call site is exactly as
+    /// remote-reachable as `add_unconfirmed_contact`'s. It MUST share `MAX_CONTACTS`, or an
+    /// attacker could bypass the cap entirely just by sending `ContactAccept` instead of any
+    /// other content: unbounded `contacts.dat` growth, same O(N²) full-file rewrites. An EXPLICIT
+    /// user action (`add_contact`) is a different call and is never capped by this.
+    ///
+    /// Returns whether a new entry was added (false: already known, or refused at the cap).
+    pub fn add_confirmed_contact(&self, ik: [u8; 32]) -> io::Result<bool> {
+        let mut cs = self.load_contacts()?;
+        let added = if cs.iter().any(|c| c.ik == ik) {
+            false
+        } else if cs.len() >= MAX_CONTACTS {
+            eprintln!("warning: contacts at cap ({MAX_CONTACTS}) — ignoring a new sender IK");
+            return Ok(false); // refused outright: never partially add, never touch unconfirmed
+        } else {
+            cs.push(ContactRecord { name: String::new(), ik, verified: false });
+            self.save_contacts(&cs)?;
+            true
+        };
+        self.set_unconfirmed(ik, false)?; // promote to confirmed either way (already-known or new)
+        Ok(added)
+    }
+
     /// Whether `ik` is a CONFIRMED contact: present in `contacts.dat` and NOT flagged unconfirmed.
     /// The single gate for "may we show their name/avatar/posts and fan ours out to them".
     pub fn is_confirmed_contact(&self, ik: &[u8; 32]) -> io::Result<bool> {
@@ -4871,6 +4899,54 @@ mod tests {
         assert!(
             !s.add_unconfirmed_contact(known).unwrap(),
             "an already-known ik returns false (no-op), same as before any cap existed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-44: `add_confirmed_contact` is the OTHER remote-reachable auto-registration path — a
+    /// `ContactAccept` is processed automatically on receipt, with no per-message human click, so
+    /// it must share `MAX_CONTACTS` with `add_unconfirmed_contact` rather than offering an
+    /// attacker a second, uncapped door into `contacts.dat`.
+    #[test]
+    fn add_confirmed_contact_refuses_a_new_sender_ik_once_contacts_are_at_cap() {
+        let dir = std::env::temp_dir().join(format!("karst-store-confirmedcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let full: Vec<ContactRecord> = (0..MAX_CONTACTS)
+            .map(|i| {
+                let mut ik = [0u8; 32];
+                ik[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                ContactRecord { name: String::new(), ik, verified: false }
+            })
+            .collect();
+        s.save_contacts(&full).unwrap();
+
+        let newcomer = [0xCCu8; 32];
+        assert!(
+            !s.add_confirmed_contact(newcomer).unwrap(),
+            "a brand-new sender ik must be refused once contacts.dat is at the cap, even via the \
+             confirmed-contact path"
+        );
+        assert_eq!(
+            s.load_contacts().unwrap().len(),
+            MAX_CONTACTS,
+            "contacts.dat must not grow past the cap via ContactAccept either"
+        );
+
+        // Control: an already-known ik is still promoted to confirmed (a no-op on contacts.dat,
+        // but set_unconfirmed(false) must still run) — the cap must never block a legitimate
+        // promotion of an existing contact.
+        let known = full[0].ik;
+        let _ = s.set_unconfirmed(known, true); // start it flagged chat-only
+        assert!(
+            !s.add_confirmed_contact(known).unwrap(),
+            "an already-known ik returns false (no new record), same as before any cap existed"
+        );
+        assert!(
+            !s.load_unconfirmed().unwrap().contains(&known),
+            "an already-known ik must still be promoted to confirmed despite the cap"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -926,7 +926,12 @@ impl Store {
         let _lock = self.lock_files_index()?;
         let mut map = self.load_pending_downloads()?;
         if !map.contains_key(&pd.blob_id) && map.len() >= MAX_PENDING_DOWNLOADS {
-            return Ok(()); // over cap: drop the announcement rather than grow unbounded
+            // An ERROR, not a silent drop. The caller treats `Ok` as "durably recorded" and then
+            // acks the carrier message, so the relay deletes the only pointer to that file while
+            // we quietly kept nothing — and an attacker who fills this queue with their own
+            // objects makes everyone else's attachments disappear (A8-6). Failing here means the
+            // message is not acked and stays on the relay until its TTL.
+            return Err(io_err("pending-download queue is full — refusing to drop an announcement"));
         }
         map.insert(pd.blob_id, pd.clone());
         self.save_pending_downloads(&map)
@@ -1051,7 +1056,7 @@ impl Store {
         let _lock = self.lock_files_index()?;
         let mut map = self.load_pending_post_attachments()?;
         if !map.contains_key(&ppa.blob_id) && map.len() >= MAX_PENDING_POST_ATTACHMENTS {
-            return Ok(()); // over cap: drop the announcement rather than grow unbounded
+            return Err(io_err("pending post-attachment queue is full — refusing to drop it silently"));
         }
         map.insert(ppa.blob_id, ppa.clone());
         self.save_pending_post_attachments(&map)
@@ -1103,7 +1108,7 @@ impl Store {
         let _lock = self.lock_files_index()?;
         let mut map = self.load_pending_galleries()?;
         if !map.contains_key(&pg.sender) && map.len() >= MAX_PENDING_GALLERIES {
-            return Ok(()); // over cap: drop rather than grow unbounded
+            return Err(io_err("pending gallery queue is full — refusing to drop it silently"));
         }
         map.insert(pg.sender, pg.clone());
         self.save_pending_galleries(&map)
@@ -4780,6 +4785,48 @@ mod tests {
 
         assert_eq!(std::fs::read(&dest).unwrap(), b"new", "the new bytes are published");
         assert!(!tmp.exists(), "the temp file must be gone, not left as debris");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A8-6 — a full pending queue must REPORT the overflow, not return success.
+    ///
+    /// It returned `Ok(())` while discarding the entry. The receive path reads that as "durably
+    /// recorded", saves the ratchet and ACKs the carrier message — so the relay deletes the only
+    /// pointer to that file while nothing was kept locally. An attacker who fills the queue with
+    /// their own objects therefore makes OTHER contacts' attachments disappear silently. Failing
+    /// instead leaves the message unacked and on the relay until its TTL.
+    #[test]
+    fn a_full_pending_download_queue_reports_the_overflow() {
+        let dir = mp_dir("queue-full");
+        let vault = Vault::create(&dir, b"pw").unwrap();
+        vault.create_account_dir("a").unwrap();
+        let store = vault.account("a");
+
+        let mk = |n: u32| PendingDownload {
+            blob_id: {
+                let mut b = [0u8; 32];
+                b[..4].copy_from_slice(&n.to_le_bytes());
+                b
+            },
+            key: [1u8; 32],
+            hash: [2u8; 32],
+            name: format!("f{n}"),
+            size: 10,
+            chunks: 1,
+            sender: [3u8; 32],
+            ts: 1,
+            queued_at: 1,
+            container_id: None,
+        };
+        for n in 0..MAX_PENDING_DOWNLOADS as u32 {
+            store.add_pending_download(&mk(n)).expect("fits under the cap");
+        }
+        assert!(
+            store.add_pending_download(&mk(u32::MAX)).is_err(),
+            "an overflow must be reported so the carrier message is not acked away"
+        );
+        // An entry already present is still an update, not an overflow.
+        assert!(store.add_pending_download(&mk(0)).is_ok(), "updating an existing entry still works");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

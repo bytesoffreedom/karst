@@ -59,14 +59,20 @@ pub const BLOB_TTL_SECS: u64 = 7 * 24 * 3600;
 /// relay a full `Meta` entry plus its `.meta`/`.c0` sidecar files on disk — so the byte caps
 /// alone never bound how many ids one sender can mint. A legitimate sender's concurrent
 /// transfers (a multi-attachment post, a handful of open chats each mid-upload) is a small
-/// number; 1_000 is generous headroom above that while still making the per-blob bookkeeping
-/// this attack grows bounded rather than open-ended.
+/// number, and for HONEST transfers with real content `MAX_SENDER_BYTES` (2 GiB) binds long
+/// before this count would — a sender would need 1_000 concurrent transfers averaging under 2 MB
+/// each to hit this instead of the byte cap, which is not a realistic legitimate pattern. 1_000
+/// is generous headroom above real concurrent-transfer counts while still making the per-blob
+/// bookkeeping this attack grows bounded rather than open-ended.
 pub const MAX_BLOBS_PER_SENDER: usize = 1_000;
 /// Global ceiling on distinct blob ids, for the same reason `MAX_BLOBS_PER_SENDER` is
 /// independent of `MAX_SENDER_BYTES`: many senders each parking a handful of near-empty blobs
-/// still adds up. Same order of magnitude as `MAX_BUNDLES` in `node.rs` — this project's other
-/// "one entry per identity" table — which is the scale already accepted here as a sane
-/// population ceiling for a single relay.
+/// still adds up. NOT one-per-identity like `MAX_BUNDLES` — a blob is one in-flight or parked
+/// LARGE-file transfer (TTL-swept at `BLOB_TTL_SECS`), so this represents "how many concurrent
+/// transfers this relay ever holds bookkeeping for", not a population size. For real (non-empty)
+/// traffic `MAX_STORE_BYTES` (8 GiB total) binds first — 100_000 concurrent multi-KB-or-larger
+/// transfers would demand far more than 8 GiB, so this count ceiling only bites the near-empty-
+/// blob flood it exists for.
 pub const MAX_BLOBS_TOTAL: usize = 100_000;
 
 /// Outcome of a `put_chunk`.
@@ -721,6 +727,11 @@ mod tests {
         assert_eq!(s.total_bytes, 0);
         assert!(!dir.join(format!("{}.c0", hex::encode(b))).exists(), "chunk deleted");
         assert!(!dir.join(format!("{}.meta", hex::encode(b))).exists(), "sidecar deleted");
+        // The `senders` aggregate must not learn about a blob that never made it past the
+        // expiry check in `parse_meta_header` — `recover`'s early `continue` on a `None` header
+        // skips the `blobs` insert AND the `senders` update together, so this sender should look
+        // exactly as absent as if it never existed.
+        assert_eq!(s.sender_blob_count(&sender(1)), 0, "an expired-at-recovery blob leaves no trace in the aggregate");
     }
 
     #[test]

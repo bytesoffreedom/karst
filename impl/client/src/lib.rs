@@ -2941,7 +2941,6 @@ pub fn recv_session(
     // the advanced ratchet, then `ack_all` deletes them. A crash before the ACK redelivers
     // the exact ciphertext; the ratchet's transactional decrypt fails closed on the
     // already-consumed duplicate, so redelivery is effectively-once with no dedup store.
-    peer.enable_ack();
 
     let _lock = store.lock_sessions().map_err(|e| format!("замок сессий: {e}"))?;
     peer.import_state(store.load_sessions().map_err(|e| format!("чтение сессий: {e}"))?);
@@ -3036,7 +3035,6 @@ pub fn receive_threaded<T: Transport + Clone>(
         // already bounded, on a path that is doing network round trips anyway.
         let before = postcard::to_stdvec(&state).map_err(|e| e.to_string());
         let mut peer = Peer::new(transport.clone(), account.clone(), dev_capability(), *relay_pub);
-        peer.enable_ack();
         peer.import_state(state);
         peer.load_opks(&opks);
         let opks_before = opks.clone();

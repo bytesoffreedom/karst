@@ -64,7 +64,6 @@ fn poll(
     crash: Crash,
 ) -> Vec<Vec<u8>> {
     let mut p = Peer::new(transport.clone(), account.clone(), dev_cap(), relay_pub);
-    p.enable_ack();
     if !disk.is_empty() {
         let state: PeerState = postcard::from_bytes(disk).expect("state deserializes");
         p.import_state(state);
@@ -90,8 +89,9 @@ fn poll(
 
 /// Crash BEFORE `save_sessions`: the ratchet never advanced on disk, so the redelivered
 /// ciphertext decrypts fresh — delivered exactly once (the pre-crash in-memory delivery
-/// evaporates with the process). Delete `enable_ack`/lease and poll 1 would DRAIN the
-/// relay, so poll 3 reds — this is what the lease buys.
+/// evaporates with the process). Make `ack_all` run unconditionally (rather than only on
+/// `Crash::None`) and poll 1 would DRAIN the relay, so poll 3 reds — this is what the lease
+/// buys. The lease itself is no longer opt-in: since #179 every fetch takes one.
 #[test]
 fn crash_before_save_redelivers_exactly_once() {
     let (transport, relay_pub) = shared();

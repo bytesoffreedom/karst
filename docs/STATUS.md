@@ -617,7 +617,16 @@ else, and we either refused it (an authority, a token) or could not verify it
   behaviour — it only decides whether this receive records receipts to ACK later. Pinned by
   `a_fetch_can_no_longer_ask_the_relay_to_delete_on_read`, which asserts the message is STILL on the
   relay after being served (a second fetch coming back empty is true under both behaviours and would
-  pin nothing) and that it redelivers once the lease lapses.
+  pin nothing) and that it redelivers once the lease lapses. Two follow-ups that the flag's removal
+  made necessary rather than optional: `Peer` now records ACK receipts UNCONDITIONALLY (the old
+  `enable_ack` opt-in made sense only while it also selected the relay's behaviour — with every
+  fetch leasing, a receive that recorded nothing left mail on the relay with no receipt anywhere,
+  the same "a signal exists that no caller consumes" shape this project has been caught by before);
+  the receipts are bounded by `MAX_PENDING_ACKS`, dropping the oldest, whose leases lapse first
+  anyway. And the reference `Recipient` acks ONLY the payloads it could actually open — an ACK says
+  "the relay may forget this", and a `Payload::Session` envelope in its mailbox belongs to `Peer`.
+  Pinned by `the_reference_receiver_only_acks_what_it_could_open`, discriminating on what SURVIVES
+  on the relay.
 - **Session receive is effectively-once, with one narrow residual loss.** The `recv_session` path now
   fetches under a **lease** and only tells the relay to delete a message (an ACK carrying the same
   ownership proof as the fetch) *after* the advanced ratchet is durably saved. A crash before the save

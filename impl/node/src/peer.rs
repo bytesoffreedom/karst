@@ -138,6 +138,12 @@ const MAX_OUTBOX: usize = 512;
 /// the caller can surface) rather than a message silently vanishing with no trace at all.
 const MAX_SESSIONS: usize = 10_000;
 
+/// Ceiling on receipts held for a later ACK. One receipt per (relay, box) page fetched in a
+/// receive cycle, so a legitimate multi-homed poll produces a handful; anything approaching this
+/// means the caller is fetching without ever acking, and the oldest receipts are the ones whose
+/// leases lapse first anyway.
+const MAX_PENDING_ACKS: usize = 1_024;
+
 /// Drop an undelivered queued message after this long (wall-clock, from queue time). The
 /// recipient's mailbox TTL bounds how long a deposit could survive anyway, and a ratchet
 /// step likely made the exact ciphertext undeliverable well before — so retrying past this
@@ -426,16 +432,6 @@ pub struct Peer<T: Transport> {
     /// each on its own drop-box. Invariant: `inbound implies outbound` — a pure first-contact
     /// responder still lands in `sessions`, so `send`/`has_session`/`connect` are untouched.
     inbound_sessions: HashMap<[u8; 32], SessionState>,
-    /// `true` = remember what to ACK after this receive. Off by default: only a caller that
-    /// will call [`Peer::ack_all`] AFTER durably persisting the advanced ratchet state (i.e.
-    /// `recv_session`) turns it on. Never persisted — it is a per-receive mode, not session
-    /// state.
-    ///
-    /// It no longer selects the RELAY's behaviour: since #179 a fetch always leases and there is
-    /// no delete-on-read to opt out of. So a receive with this off does not destroy anything —
-    /// it just never ACKs, and the lease expires and redelivers. Strictly safer than the mode it
-    /// replaced, at the cost of a duplicate the receiver's dedup absorbs.
-    lease: bool,
     /// Messages fetched-under-lease this receive, awaiting an ACK once the caller has
     /// saved the ratchet. Drained by [`Peer::ack_all`] / [`Peer::take_pending_acks`].
     /// In-memory only.
@@ -551,22 +547,12 @@ impl<T: Transport> Peer<T> {
             last_sweep: 0,
             sessions: HashMap::new(),
             inbound_sessions: HashMap::new(),
-            lease: false,
             pending_ack: Vec::new(),
             outbox: Vec::new(),
             outbox_next_id: 0,
             sessions_refused: 0,
             decrypt_attempts_for_test: 0,
         }
-    }
-
-    /// Opt into lease/ACK receive: fetches keep their messages on the relay (leased) until
-    /// [`Peer::ack_all`] deletes them. The caller MUST call `ack_all` only AFTER the
-    /// advanced ratchet state is durable — that ordering is what turns at-most-once into
-    /// effectively-once (a crash before the ACK redelivers the exact ciphertext, and the
-    /// ratchet's transactional decrypt fails closed on the already-consumed duplicate).
-    pub fn enable_ack(&mut self) {
-        self.lease = true;
     }
 
     /// The relay this `Peer` talks to, as the namespace key for handles and cookies.
@@ -1403,13 +1389,28 @@ impl<T: Transport> Peer<T> {
                     // until the ACK runs (after the caller persists the ratchet). The
                     // receipt captures the cookie that just authorised this fetch, so it can
                     // be acked later without the Peer. Empty pages leave nothing to ACK.
-                    if self.lease && !payloads.is_empty() {
+                    // ALWAYS record a receipt (#179 follow-up). This used to be gated on an
+                    // `enable_ack` flag, which made sense while the flag ALSO selected the
+                    // relay's behaviour: a non-lease fetch destroyed its messages, so there was
+                    // nothing to remember. Now every fetch leases, so a receive that records
+                    // nothing leaves mail sitting on the relay with no receipt anywhere — it
+                    // redelivers when the lease lapses, silently, and no caller can choose to
+                    // clean it up. Recording costs a Vec entry; the real control is `ack_all`,
+                    // which the caller still only runs once the ratchet is durable.
+                    if !payloads.is_empty() {
                         // The later ACK re-proves ownership: DH needs `shared`, a drop-box needs
                         // its fetch secret.
                         let (shared, own_fetch_secret) = match &auth {
                             BoxAuth::Identity(id) => (id.dh(&self.relay_pub), None),
                             BoxAuth::DropBox { fetch_secret, .. } => ([0u8; 32], Some(*fetch_secret)),
                         };
+                        // A caller that never runs `ack_all` (a probe, a test, an aborted
+                        // receive) must not grow this without bound. Dropping the OLDEST
+                        // receipt is the safe direction: that mail stays on the relay and
+                        // redelivers when its lease lapses, exactly as if the ACK had failed.
+                        if self.pending_ack.len() >= MAX_PENDING_ACKS {
+                            self.pending_ack.remove(0);
+                        }
                         self.pending_ack.push(AckReceipt {
                             mailbox,
                             client_addr: client_addr.clone(),

@@ -2167,14 +2167,27 @@ impl<T: Transport> Recipient<T> {
                     // at which it would be safer to ACK. `Peer` (the real path) is the one that
                     // waits until the advanced ratchet is on disk. A failed ACK is not an error
                     // here: the messages simply stay leased and are redelivered.
-                    if let Some(cookie) = self.cookie {
+                    //
+                    // ONLY what it actually opened. An ACK says "the relay may forget this", and
+                    // this receiver must not say that about mail it could not read: a
+                    // `Payload::Session` envelope belongs to `Peer`, not here, and a seal that
+                    // failed to open is not ours either. Those stay leased and redeliver to
+                    // whoever they were for. (Before #179 the relay destroyed them regardless,
+                    // which is precisely the behaviour that went away.)
+                    let mine: Vec<[u8; 32]> = payloads
+                        .iter()
+                        .zip(opened.iter())
+                        .filter(|(_, o)| o.is_some())
+                        .map(|(p, _)| payload_id(p))
+                        .collect();
+                    if let (Some(cookie), false) = (self.cookie, mine.is_empty()) {
                         let ack = AckRequest {
                             mailbox,
                             client_addr: self.client_addr.clone(),
                             carrier_id: self.carrier_id.clone(),
                             cookie: Some(cookie),
                             proof: fetch_proof(&shared, &cookie.mac, &mailbox),
-                            ids: payloads.iter().map(payload_id).collect(),
+                            ids: mine,
                             own_proof: Vec::new(),
                         };
                         let _ = self.transport.ack(&ack, now);
@@ -2614,6 +2627,56 @@ mod tests {
         assert!(
             !matches!(relay.handle_ack(&ok, NOW), AckResponse::Rejected(_)),
             "a legitimate full-size ack must still work"
+        );
+    }
+
+    /// #179 follow-up: an ACK is "the relay may forget this", so a receiver must only say it
+    /// about mail it could actually read.
+    ///
+    /// The skeleton `Recipient` acks on receipt (it holds nothing durable, so there is no later
+    /// moment at which acking would be safer). But a mailbox can hold envelopes that are not
+    /// its business — a `Payload::Session` belongs to `Peer` — and acking those would tell the
+    /// relay to destroy someone else's mail. Before #179 the relay destroyed them anyway on a
+    /// delete-on-read fetch; now that it does not, this receiver must not re-create that.
+    ///
+    /// Discriminating on WHAT SURVIVES, not on what came back: the unopenable envelope must
+    /// still be on the relay afterwards. Ack the whole page instead and it reddens.
+    #[test]
+    fn the_reference_receiver_only_acks_what_it_could_open() {
+        let identity = Identity::generate();
+        let relay = Rc::new(RefCell::new(RelayNode::with_identity(NOW, identity.clone())));
+        let cap = publish_cap();
+        relay.borrow_mut().issue_capability(cap.clone());
+        let bob = Identity::generate();
+
+        // One seal Bob can open...
+        let mut alice = Client::new(InMemoryTransport::new(relay.clone()), cap, b"alice");
+        assert!(matches!(alice.send(&bob.public, b"for bob", NOW), Response::Accepted));
+        // ...and one session envelope that is not his to read (it is `Peer`'s business).
+        relay.borrow_mut().mailboxes.entry(bob.public.to_bytes()).or_default().push(MailboxEntry {
+            enqueued_at: NOW,
+            leased_until: 0,
+            payload: Payload::Session(SessionEnvelope::Ratchet(crate::ratchet::RatchetMessage {
+                header: crate::ratchet::Header {
+                    dh: [9u8; 32],
+                    pn: 0,
+                    n: 0,
+                    salt: [9u8; crate::ratchet::SALT_LEN],
+                },
+                ciphertext: vec![9u8; 16],
+            })),
+        });
+        assert_eq!(relay.borrow().mailbox_len_for_test(&bob.public.to_bytes()), 2);
+
+        let mut recip = Recipient::new(InMemoryTransport::new(relay.clone()), bob.clone(), identity.public);
+        let got = recip.receive(NOW).expect("fetch succeeds");
+        assert_eq!(got.len(), 2, "both entries were served");
+        assert_eq!(got.iter().filter(|o| o.is_some()).count(), 1, "only one was openable");
+
+        assert_eq!(
+            relay.borrow().mailbox_len_for_test(&bob.public.to_bytes()),
+            1,
+            "the opened seal is ACKed away; the envelope this receiver could not read is NOT"
         );
     }
 

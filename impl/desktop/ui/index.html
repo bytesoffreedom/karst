@@ -2439,7 +2439,22 @@ async function openAccountSwitcher(){
       try{await inv('switch_account',{id});await loadApp();go('app');}catch(e){toast(String(e));}};});
   showModal('modal-accounts');
 }
-function closePhrase(){document.getElementById('modal-phrase').style.display='none';
+// The recovery phrase is the ROOT of the identity, proxy keys and mailbox material, so it must
+// not outlive the screen that showed it. It used to sit in `window._phrase` AND in the grid's DOM
+// nodes after onboarding finished, after the modal closed, and after lock — readable by any later
+// code in this webview, devtools, or a renderer exploit (CRYPTO-22). JS strings cannot be zeroized,
+// so the only lever is lifetime: drop the reference and remove the nodes at every exit.
+function forgetPhrase(){
+  try{window._phrase=null;}catch(e){}
+  ['phrase-grid','phrasegrid','hiddenacct-phrase'].forEach(id=>{
+    const el=document.getElementById(id); if(el){el.textContent='';el.innerHTML='';}
+  });
+  ['phrase-pw','create-w3','create-w7','create-w11','restore-phrase'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.value='';
+  });
+  const w=document.getElementById('hiddenacct-phrase-wrap'); if(w) w.style.display='none';
+}
+function closePhrase(){forgetPhrase();document.getElementById('modal-phrase').style.display='none';
   document.getElementById('phrase-ask').style.display='block';document.getElementById('phrase-show').style.display='none';
   document.getElementById('phrase-pw').value='';err('phrase-err','');}
 async function revealPhrase(){
@@ -2648,6 +2663,8 @@ if(TA){
       }
     }
     catch(e){err('create-err',e);return;}
+    // Created: the phrase has served its purpose, so it stops existing in the renderer.
+    forgetPhrase();
     // Account made — now the dedicated relay step (its own screen, not mixed with the password).
     go('relaycfg');};
   // Reveal container size/warning only when the deniable-container option is ticked.
@@ -2656,6 +2673,7 @@ if(TA){
   document.getElementById('btn-restore').onclick=async()=>{
     try{await inv('create_account',{phrase:document.getElementById('restore-phrase').value,password:document.getElementById('restore-pw').value,vaultDir:_vaultDir});}
     catch(e){err('restore-err',e);return;}
+    forgetPhrase(); // the typed phrase must not linger in the input either
     go('relaycfg');};
   // Relay step: Finish saves what was typed (bad relay-id/invite → toast, account still lands);
   // Skip trusts the KARST_RELAY env fallback. Either way, into the app.
@@ -2703,6 +2721,7 @@ if(TA){
   const doLock=async()=>{
     try{await inv('lock');}
     catch(e){toast(String(e&&e.message?e.message:e));return;}
+    forgetPhrase(); // locking must not leave the root secret readable in the renderer
     _hiddenSession=false;scheduleCover();go('unlock');document.getElementById('unlock-pw').value='';
   };
   document.getElementById('btn-lock').onclick=doLock;

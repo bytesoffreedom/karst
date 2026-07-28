@@ -155,7 +155,18 @@ struct App {
     /// OFFLINE mode: when true, the session emits NOTHING to the network — no publish, no poll — so
     /// an observer sees no traffic for it at all. Default ON for a HIDDEN account (its whole network
     /// deniability is "silent unless you deliberately sync"); the user toggles it off to sync.
-    offline: Mutex<bool>,
+    /// `Arc<AtomicBool>` (not a plain `Mutex<bool>`) so a background thread that has no `State<App>`
+    /// — the cover-traffic deposit, the `PostsRequest` reply loop — can still clone a live handle
+    /// and re-check the flag mid-run instead of only at spawn time (SEC-45: a toggle read once
+    /// before a thread starts doing I/O is stale for as long as that thread keeps running).
+    offline: Arc<AtomicBool>,
+    /// How many network-emitting calls with NO per-item cancel flag (a `poll`, a cover-traffic
+    /// deposit, the `PostsRequest` reply loop) are currently between "read offline=false" and
+    /// "done touching the wire." `stop_for_offline` waits for this to hit zero — together with
+    /// every transfer's cancel flag landing — before it will claim nothing further is being
+    /// emitted (SEC-45: without this, `set_net_offline(true)` could return success while one of
+    /// these was still mid-flight on a relay handle captured before the flip).
+    net_active: Arc<AtomicU64>,
 }
 
 impl App {
@@ -183,7 +194,7 @@ impl App {
     /// so returning an EMPTY set when offline makes all of them find "no relay" and emit nothing —
     /// airtight without gating each command. Read-only commands ignore the relays, so this is safe.
     fn relays_or_empty(&self, relays: &[Relay]) -> Vec<Relay> {
-        if *self.offline.lock().unwrap() {
+        if self.offline.load(Ordering::SeqCst) {
             Vec::new()
         } else {
             relays.to_vec()
@@ -214,6 +225,83 @@ impl App {
     fn new_tid(&self) -> u64 {
         self.next_tid.fetch_add(1, Ordering::Relaxed)
     }
+}
+
+/// RAII marker for "a network-emitting call with no per-item cancel flag is between its offline
+/// check and being done with the wire" — held by `poll`, `cover_tick`'s spawned deposit, and the
+/// `PostsRequest` reply loop. `stop_for_offline` spins on `App::net_active` hitting zero, so
+/// forgetting to drop this on an early return would hang the Offline toggle forever; tying it to
+/// Drop means every return path (including `?`) releases it.
+struct NetGuard(Arc<AtomicU64>);
+impl NetGuard {
+    /// Enter BEFORE checking `offline`, not after — otherwise a call that reads offline=false the
+    /// instant before `stop_for_offline` observes `net_active == 0` can still start its round trip
+    /// after Offline has already reported success (SEC-45's exact failure mode, just moved one
+    /// layer down).
+    fn enter(counter: &Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+impl Drop for NetGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Bound on how long `stop_for_offline` waits (in `STOP_WAIT_STEP`-sized polls) for cancellable
+/// network work to actually quiesce before giving up and reporting the honest residual instead of
+/// a false "done". A stuck relay call (dead socket that never times out at the transport layer)
+/// must not hang the toggle forever.
+const STOP_WAIT_STEPS: u32 = 250;
+const STOP_WAIT_STEP: std::time::Duration = std::time::Duration::from_millis(20); // ~5s bound
+
+/// Make going offline mean what it says: not "a bool flipped," but "verified nothing further is
+/// being emitted" (SEC-45). Two kinds of network I/O outlive the `set_net_offline` call itself,
+/// running on relay handles captured before the flip:
+///
+///   1. Chunked transfers (upload/download) — cancelled here via the SAME `AtomicBool` convention
+///      `cancel_transfer` already uses; `client::blob_upload_with` / `client::download_blob` check
+///      it at the next chunk boundary, not mid-chunk.
+///   2. `poll`, `cover_tick`'s deposit, and the `PostsRequest` reply loop — no per-item transfer to
+///      cancel, so each instead holds a `NetGuard` for as long as it might still touch the wire and
+///      re-checks `App::offline` at its own loop boundaries once this has set it.
+///
+/// This flips every transfer's cancel flag EVERY TICK (not just once up front — see the loop
+/// below for why), then WAITS for both (1) and (2) to actually reach quiet before returning `Ok`
+/// — "success" is a fact this function has verified, not a promise made in advance and hoped for.
+///
+/// HONEST LIMIT: a single request already on the wire with no internal chunk boundary — a cover
+/// deposit, a `download_post_attachment`/`download_gallery` fetch already started (they take no
+/// cancel flag; see the report for why), or the one relay round trip a chunked transfer is
+/// blocked on right now — cannot be torn down from this layer. It finishes on its own, normally
+/// well under the wait bound below. If the bound is hit anyway (a wedged call that never returns),
+/// this returns an error instead of falsely claiming silence; `offline` itself stays SET either
+/// way (nothing NEW starts), so a caller that ignores the error has not been lied to about that.
+fn stop_for_offline(app: &App) -> Result<(), String> {
+    for _ in 0..STOP_WAIT_STEPS {
+        // Re-flip EVERY tick, not just once before the loop: `drive_pending_downloads` can still
+        // be between its own (racing) offline check and `transfers.insert(..., cancel: false)` —
+        // a transfer that lands mid-wait would otherwise carry a cancel flag nobody ever set, and
+        // this function would wait out the WHOLE download (many chunk round trips) before timing
+        // out, instead of catching it within one tick. Scoped so the lock never spans the sleep.
+        {
+            let t = app.transfers.lock().unwrap();
+            for st in t.values() {
+                st.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        let transfers_quiet = app.transfers.lock().unwrap().values().all(|t| t.state != "active");
+        let net_quiet = app.net_active.load(Ordering::SeqCst) == 0;
+        if transfers_quiet && net_quiet {
+            return Ok(());
+        }
+        std::thread::sleep(STOP_WAIT_STEP);
+    }
+    Err("offline is set — nothing new will start — but a network call already in flight (a \
+         transfer's current chunk, a poll's current round trip, or a cover deposit) hasn't \
+         finished yet; it will complete on its own shortly and emit nothing further after that"
+        .into())
 }
 
 /// Update a transfer's byte counters (called from the blob progress callback).
@@ -654,7 +742,7 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
     // Clear any container from a previous session; the container-backed paths re-set it AFTER
     // calling `enter`, so a normal file-tree unlock correctly leaves it `None`.
     *app.container.lock().unwrap() = None;
-    *app.offline.lock().unwrap() = offline;
+    app.offline.store(offline, Ordering::SeqCst);
     let store = vault.account(&id);
     // Refresh the DEV capability so an account made on an older build picks up quota changes (the
     // dev cap's request/byte window grew a lot so multi-image posts fit). ONLY overwrite our own
@@ -969,21 +1057,29 @@ fn container_hidden(app: State<App>) -> bool {
 /// Whether the active session is in OFFLINE mode (emits no network traffic).
 #[tauri::command]
 fn net_offline(app: State<App>) -> bool {
-    *app.offline.lock().unwrap()
+    app.offline.load(Ordering::SeqCst)
 }
 
-/// Toggle OFFLINE mode. Going ONLINE announces the account's bundle once (so it becomes reachable);
-/// going offline stops all network activity. For a hidden account this is the deliberate,
-/// user-controlled sync window — the rest of the time it emits nothing.
+/// Toggle OFFLINE mode. Going ONLINE announces the account's bundle once (so it becomes reachable).
+/// Going OFFLINE does not just flip the flag: it cancels every in-flight transfer and WAITS
+/// (`stop_for_offline`) for that plus any guarded background call (`poll`, cover traffic, a
+/// PostsRequest reply) to actually quiesce before returning — SEC-45 was this command reporting
+/// success while a poll/upload/download already running on a captured relay handle kept emitting
+/// after the toggle returned. `async` because the wait can (rarely, see `stop_for_offline`'s doc)
+/// take real time; blocking this command's own thread is fine, same as `poll`'s fully-synchronous
+/// body already does. For a hidden account this is the deliberate, user-controlled sync window —
+/// the rest of the time it emits nothing.
 #[tauri::command]
-fn set_net_offline(app: State<App>, offline: bool) -> Result<(), String> {
-    *app.offline.lock().unwrap() = offline;
-    if !offline {
+async fn set_net_offline(app: State<'_, App>, offline: bool) -> Result<(), String> {
+    app.offline.store(offline, Ordering::SeqCst);
+    if offline {
+        stop_for_offline(&app)
+    } else {
         // Coming online: publish the bundle so the account is reachable this session.
         let (store, relays) = app.snapshot()?;
-        do_publish(&store, &relays, *app.offline.lock().unwrap());
+        do_publish(&store, &relays, app.offline.load(Ordering::SeqCst));
+        Ok(())
     }
-    Ok(())
 }
 
 /// Add a HIDDEN account to the open container: mints a FRESH identity + recovery phrase, provisions
@@ -1105,11 +1201,16 @@ fn set_relay(app: State<App>, addr: String, relay_id: String, socks5: String, mi
     // actually unlock sending. A private, invite-only relay has no open door, so `join` fails —
     // that path is not fatal (the operator's invite is imported instead) and the dev/imported
     // capability is left untouched.
-    if let Ok(cap) = client::earn_capability(&relay) {
-        let _ = store.save_capability(&cap);
+    // SEC-45: this hits the relay directly (a PoW admission round trip), NOT through
+    // `relays_or_empty` — the ONE choke every other deposit relies on — so it must check `offline`
+    // itself or Offline would still emit a request the moment a relay is configured.
+    if !app.offline.load(Ordering::SeqCst) {
+        if let Ok(cap) = client::earn_capability(&relay) {
+            let _ = store.save_capability(&cap);
+        }
     }
     s.relays = build_relays(&store);
-    do_publish(&store, &s.relays, *app.offline.lock().unwrap());
+    do_publish(&store, &s.relays, app.offline.load(Ordering::SeqCst));
     Ok(())
 }
 
@@ -1139,7 +1240,7 @@ fn add_extra_relay(app: State<App>, addr: String, relay_id: String) -> Result<()
         store.save_extra_relays(&list).map_err(|e| e.to_string())?;
     }
     s.relays = build_relays(&store);
-    do_publish(&store, &s.relays, *app.offline.lock().unwrap());
+    do_publish(&store, &s.relays, app.offline.load(Ordering::SeqCst));
     Ok(())
 }
 
@@ -1173,7 +1274,7 @@ fn import_capability(app: State<App>, invite_json: String) -> Result<(), String>
     let cap = serde_json::from_str(invite_json.trim()).map_err(|e| format!("parsing invite: {e}"))?;
     let (store, relays) = app.snapshot()?;
     store.save_capability(&cap).map_err(|e| format!("writing capability: {e}"))?;
-    do_publish(&store, &relays, *app.offline.lock().unwrap());
+    do_publish(&store, &relays, app.offline.load(Ordering::SeqCst));
     Ok(())
 }
 
@@ -2586,7 +2687,7 @@ fn all_received_files(app: State<App>) -> Result<Vec<FileEntry>, String> {
 /// history like before.
 #[tauri::command]
 fn send(app: State<App>, peer_ik: String, text: String) -> Result<Msg, String> {
-    if *app.offline.lock().unwrap() {
+    if app.offline.load(Ordering::SeqCst) {
         return Err("you're offline — turn off Offline mode in Settings to send".into());
     }
     let peer = parse_ik(&peer_ik)?;
@@ -2774,6 +2875,7 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
     );
     let transfers = app.transfers.clone();
     let name2 = name.clone();
+    let offline = app.offline.clone();
     std::thread::spawn(move || {
         let root = vault.account(&id);
         let store = root.as_proxy(proxy_for_contact(&root, &peer)); // the FileRef rides the contact's proxy
@@ -2799,7 +2901,19 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
         })();
         match res {
             Ok(()) => transfer_finish(&transfers, tid, "done", None, None),
-            Err(e) if e == "cancelled" => transfer_finish(&transfers, tid, "cancelled", None, None),
+            Err(e) if e == "cancelled" => {
+                // SEC-45: `stop_for_offline` cancels every active transfer the same way the
+                // Cancel button does, but unlike a manual abandon this one is NOT data loss — the
+                // bytes we were uploading are our own file, still untouched on the user's disk
+                // (only the in-memory copy this thread held is dropped), so "reported" (not
+                // "resumed") satisfies the never-silently-lose-data bar. Say which one happened.
+                let msg = offline.load(Ordering::SeqCst).then(|| {
+                    "stopped by Offline — resend when back online (nothing was sent; your file \
+                     on disk is untouched)"
+                        .to_string()
+                });
+                transfer_finish(&transfers, tid, "cancelled", None, msg);
+            }
             Err(e) => transfer_finish(&transfers, tid, "error", None, Some(e)),
         }
     });
@@ -2875,8 +2989,14 @@ fn is_feed_source(store: &Store, ik: &[u8; 32]) -> bool {
 /// Honest scope: additive noise masking THIS client's timing — not full unobservability.
 #[tauri::command]
 async fn cover_tick(app: State<'_, App>) -> Result<(), String> {
+    // Held until the (single, unchunked) deposit below is sent or skipped — SEC-45:
+    // `stop_for_offline` waits on this so it can't report success while a tick that read
+    // offline=false a moment ago is still about to touch the wire. Entered BEFORE the offline
+    // check for the same reason `NetGuard::enter`'s doc gives: check-then-act must not straddle
+    // the flip.
+    let guard = NetGuard::enter(&app.net_active);
     // OFFLINE mode must emit NOTHING — cover traffic is a network deposit, so skip it too.
-    if *app.offline.lock().unwrap() {
+    if app.offline.load(Ordering::SeqCst) {
         return Ok(());
     }
     let (root, relays) = app.snapshot()?;
@@ -2888,7 +3008,16 @@ async fn cover_tick(app: State<'_, App>) -> Result<(), String> {
     // A cover deposit from ONE random proxy this tick (not all — that would itself be a pattern).
     let idx = proxies[(now_secs() as usize) % proxies.len()];
     let ps = root.as_proxy(idx);
+    let offline = app.offline.clone();
     std::thread::spawn(move || {
+        let _guard = guard; // released when this (one-shot, non-cancellable) call returns
+        // HONEST LIMIT: `send_cover` is a single request/response with no chunk boundary to
+        // recheck against — unlike a transfer, there is nowhere mid-call to notice `offline`
+        // flipping. Re-checking right before the call at least shrinks the window to "between
+        // spawn and send" instead of "any time this thread happens to run".
+        if offline.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = client::send_cover(&ps, &relay, now_secs());
     });
     Ok(())
@@ -2900,8 +3029,15 @@ async fn cover_tick(app: State<'_, App>) -> Result<(), String> {
 #[tauri::command]
 async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     let mut out: Vec<Incoming> = Vec::new();
+    // Held for this whole call (dropped on every return path, including the ones below and any
+    // `?`) — SEC-45: `stop_for_offline` waits on this reaching zero before it will report success,
+    // so a poll that is mid-drain across several relays/proxies can't keep emitting after Offline
+    // has already returned. Entered BEFORE the offline check: otherwise a poll that read
+    // offline=false the instant before `stop_for_offline` observed `net_active == 0` could still
+    // run its whole drain after Offline reported done.
+    let _net_guard = NetGuard::enter(&app.net_active);
     // OFFLINE mode: emit nothing — no relay round trips at all, so there is no network signal.
-    if *app.offline.lock().unwrap() {
+    if app.offline.load(Ordering::SeqCst) {
         return Ok(PollOut { messages: out, reachable: Vec::new() });
     }
     let (vault, id, relays) = app.session_parts()?;
@@ -2926,12 +3062,24 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     // handle — its NETWORK state (sessions/opks) is per-proxy, while the history/feed/files it
     // writes land on the shared ROOT data paths, so incoming lands in one unified inbox.
     for pidx in proxies {
+        // SEC-45: Offline can flip WHILE this poll is mid-drain across proxies/relays/pages — the
+        // per-item checks below (and this one) stop it from starting the NEXT round trip once that
+        // happens, instead of running the whole remaining drain to completion. The round trip
+        // already in flight when the flag flips still finishes (no lower-level cancel exists for a
+        // single blocking network call from this layer) — that residual is `stop_for_offline`'s
+        // documented honest limit, not something this loop can close.
+        if app.offline.load(Ordering::SeqCst) {
+            break;
+        }
         let store = root.as_proxy(pidx);
         // Send-side retry + MULTI-HOMING on the poll cadence: retransmit (verbatim) any queued
         // message across EVERY relay, so a down/blocked primary doesn't strand it — the first
         // reachable relay delivers it and it's removed from the outbox (the rest then have nothing
         // to flush). The recipient polls all relays + dedups, so wherever it lands, they get it.
         for p in &relays {
+            if app.offline.load(Ordering::SeqCst) {
+                break;
+            }
             let _ = client::flush_outbox(&store, p, now_secs());
         }
         // DRAIN the mailbox this poll instead of one fetch page: a bulk transfer — a multi-image
@@ -2942,6 +3090,9 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
         // thread.
         let mut drained = Vec::new();
         for _ in 0..MAX_DRAIN_PAGES {
+            if app.offline.load(Ordering::SeqCst) {
+                break; // don't start another page's round trip once Offline is set
+            }
             let poll = match client::recv_session_multi(&store, &relays, now_secs()) {
                 Ok(p) => p,
                 Err(_) => break,
@@ -3172,8 +3323,15 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
                 let auto = is_channel || store.is_confirmed_contact(&r.sender).unwrap_or(false);
                 if auto {
                     if let Ok(true) = store.add_subscriber(r.sender, now_secs()) {
-                        if let Some(relay) = relays.first() {
-                            let _ = client::send_join_accept(&store, relay, &r.sender, is_channel, now_secs());
+                        // SEC-45: this whole dispatch loop runs inside `poll`'s NetGuard, so
+                        // `stop_for_offline` never reports done while it's mid-batch — but nothing
+                        // stops it from replying to the REST of a drained batch once Offline is
+                        // set. Same shape as the `PostsRequest` reply loop's per-item check, just
+                        // with each reply already one atomic send (no separate thread to guard).
+                        if !app.offline.load(Ordering::SeqCst) {
+                            if let Some(relay) = relays.first() {
+                                let _ = client::send_join_accept(&store, relay, &r.sender, is_channel, now_secs());
+                            }
                         }
                         out.push(Incoming::join(r.sender, "joined"));
                     }
@@ -3217,9 +3375,22 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
                     posts.truncate(POSTS_PULL_LIMIT);
                     let ps = store.as_proxy(proxy_for_contact(&store, &r.sender));
                     let to = r.sender;
+                    // SEC-45: this loop can run long past `poll`'s own return (a visitor with a
+                    // full POSTS_PULL_LIMIT history means up to 30 separate relay round trips), on
+                    // a relay handle captured before any later Offline toggle. Its own `NetGuard`
+                    // (not `poll`'s — this outlives that call) is what `stop_for_offline` waits on.
+                    let offline = app.offline.clone();
+                    let guard = NetGuard::enter(&app.net_active);
                     std::thread::spawn(move || {
+                        let _guard = guard;
                         let now = now_secs();
                         for f in posts {
+                            // Checked between posts, not mid-post: each `send_publication` is its
+                            // own atomic request, same as cover traffic — no chunk boundary inside
+                            // one to recheck against.
+                            if offline.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let _ = client::send_publication(&ps, &relay, &to, f.id, &f.text, f.ts, now);
                         }
                     });
@@ -3344,6 +3515,12 @@ fn drive_pending_downloads(
 ) {
     let pending = store.list_pending_downloads().unwrap_or_default();
     for pd in pending {
+        // SEC-45: don't START a new download thread once Offline is set — the pending entry just
+        // stays and the next (online) poll picks it up. Already-running download threads from an
+        // EARLIER poll are handled separately, by `stop_for_offline` flipping their `cancel` flag.
+        if app.offline.load(Ordering::SeqCst) {
+            break;
+        }
         // Bounded concurrency. This spawned ONE OS THREAD PER PENDING DOWNLOAD, and the number of
         // pending downloads is set by how many file references a peer chose to send — so a single
         // poll could start up to a thousand threads on the recipient's machine (A8-5). Anything
@@ -3382,6 +3559,8 @@ fn drive_pending_downloads(
         let relay = relay.clone();
         let transfers = app.transfers.clone();
         let in_flight = app.in_flight.clone();
+        let offline = app.offline.clone();
+        let pd_for_resume = pd.clone();
         std::thread::spawn(move || {
             let store = v.account(&aid);
             let outcome = client::download_blob(
@@ -3394,13 +3573,45 @@ fn drive_pending_downloads(
             );
             match outcome {
                 client::DownloadOutcome::Done(fid) => transfer_finish(&transfers, tid, "done", Some(fid), None),
-                client::DownloadOutcome::GaveUp(e) if e == "cancelled" => transfer_finish(&transfers, tid, "cancelled", None, None),
+                client::DownloadOutcome::GaveUp(e) if e == "cancelled" => {
+                    let (state, error) = download_cancelled_outcome(&store, pd_for_resume, offline.load(Ordering::SeqCst));
+                    transfer_finish(&transfers, tid, state, None, error);
+                }
                 client::DownloadOutcome::GaveUp(e) => transfer_finish(&transfers, tid, "error", None, Some(e)),
                 // Transient: the pending entry stays; the next poll re-drives it.
                 client::DownloadOutcome::Retry(e) => transfer_finish(&transfers, tid, "error", None, Some(e)),
             }
             in_flight.lock().unwrap().remove(&pd.blob_id);
         });
+    }
+}
+
+/// What to do with a pending download's record once its thread's outcome is
+/// `GaveUp("cancelled")`, and what to tell the UI. `client::download_blob` treats ANY cancel as a
+/// permanent user abandon: it already deleted the partial file and dropped the pending entry (its
+/// own doc: "the FileRef was already consumed"). That is the right call for the explicit Cancel
+/// button, but SEC-45 says Offline must never silently drop received data just because the user
+/// flipped a toggle — so when `was_offline` (this cancel was `stop_for_offline`'s, not a manual
+/// abandon), re-persist a FRESH pending-download entry from the announcement the caller still
+/// holds. The file then RE-FETCHES from scratch on the next online poll (the sender's blob still
+/// lives on the relay until its TTL) instead of being gone — not byte-for-byte resumed, but never
+/// lost. `container_id` is cleared: the partial container it pointed to was just deleted.
+///
+/// Pulled out of the download thread closure so it's unit-testable against a real `Store` without
+/// a live relay: the whole point is a durable-storage side effect (a pending-download row lands
+/// or it doesn't), which a fake in-memory stand-in can't verify.
+fn download_cancelled_outcome(store: &Store, pd: client::store::PendingDownload, was_offline: bool) -> (&'static str, Option<String>) {
+    if !was_offline {
+        return ("cancelled", None); // a genuine manual abandon — download_blob already cleaned up
+    }
+    let mut resumed = pd;
+    resumed.container_id = None;
+    if store.add_pending_download(&resumed).is_ok() {
+        ("cancelled", Some("stopped by Offline — will resume automatically when back online".into()))
+    } else {
+        // The pending-download queue is full (or unwritable) — re-queuing itself failed, so say
+        // so plainly rather than claim a resume that didn't happen.
+        ("error", Some("stopped by Offline and could not be re-queued — ask the sender to resend".into()))
     }
 }
 
@@ -3417,6 +3628,13 @@ fn drive_pending_post_attachments(app: &App, relay: &Relay, store: &Store, out: 
     let pending = store.list_pending_post_attachments().unwrap_or_default();
     let mut done_senders: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for ppa in pending.into_iter().take(MAX_PER_POLL) {
+        // SEC-45: stop starting NEW fetches once Offline is set; the entry stays pending for the
+        // next (online) poll. HONEST LIMIT: `download_post_attachment` takes no cancel flag (see
+        // the report) — a fetch already started when this check passes runs to completion, though
+        // it's small (bounded by MAX_POST_IMAGE_BYTES) so that's at most a handful of chunks.
+        if app.offline.load(Ordering::SeqCst) {
+            break;
+        }
         // Skip an entry another overlapping poll is already fetching (in_flight is keyed by blob_id,
         // which is unique across downloads + post attachments — both are random 32-byte ids).
         if !app.in_flight.lock().unwrap().insert(ppa.blob_id) {
@@ -3444,6 +3662,11 @@ fn drive_pending_galleries(app: &App, relay: &Relay, store: &Store, out: &mut Ve
     const MAX_PER_POLL: usize = 8;
     let pending = store.list_pending_galleries().unwrap_or_default();
     for pg in pending.into_iter().take(MAX_PER_POLL) {
+        // SEC-45: same choke as `drive_pending_post_attachments` — same honest limit too
+        // (`download_gallery` takes no cancel flag; an already-started fetch finishes).
+        if app.offline.load(Ordering::SeqCst) {
+            break;
+        }
         if !app.in_flight.lock().unwrap().insert(pg.blob_id) {
             continue;
         }
@@ -3656,8 +3879,282 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_chunk, MAX_STREAM_BYTES};
+    use super::{append_chunk, transfer_finish, App, TransferState, MAX_STREAM_BYTES};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// A minimal `TransferState` for tests that only care about the cancel/state machinery, not
+    /// the transfer's own bookkeeping fields.
+    fn fake_transfer(cancel: Arc<AtomicBool>) -> TransferState {
+        TransferState {
+            dir: "up",
+            peer: [0u8; 32],
+            name: "f".into(),
+            done: 0,
+            total: 10,
+            state: "active",
+            file_id: None,
+            error: None,
+            finished_at: None,
+            cancel,
+        }
+    }
+
+    /// Poll `flag` for up to ~10s (sleeping briefly between checks, never busy-spinning) and
+    /// return whether it became true. `stop_for_offline` only re-checks every `STOP_WAIT_STEP`
+    /// (20ms), so a `yield_now` loop with a fixed ITERATION cap is the wrong bound: it can burn
+    /// through its whole budget in far less than one real tick and falsely report "never
+    /// happened". Bounding on wall time that safely spans several ticks (well past
+    /// `STOP_WAIT_STEPS * STOP_WAIT_STEP`'s own ~5s budget) instead makes this reliable — the
+    /// PASS/FAIL fact under test is still "did the flag become true", not "how fast".
+    fn spin_wait(flag: &AtomicBool, order: Ordering) -> bool {
+        for _ in 0..2000 {
+            if flag.load(order) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// SEC-45 — going Offline used to flip a bool and report success immediately while an
+    /// already-running upload/download thread kept using the relay handle it captured before the
+    /// flip. `stop_for_offline` must actually cancel it (the same `AtomicBool` convention
+    /// `cancel_transfer` already uses) AND wait for it to actually stop before returning — not
+    /// just ask and hope.
+    ///
+    /// The fake worker below stands in for `client::download_blob`/`blob_upload_with`'s chunk
+    /// loop: it "emits" (increments a counter) once per iteration and checks its OWN cancel flag,
+    /// exactly like a real chunked transfer checks at a chunk boundary, then reports itself
+    /// terminal.
+    #[test]
+    fn stop_for_offline_cancels_an_active_transfer_and_waits_for_it_to_actually_stop() {
+        let app = App::default();
+        let tid = 1u64;
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.transfers.lock().unwrap().insert(tid, fake_transfer(cancel.clone()));
+
+        let emissions = Arc::new(AtomicU64::new(0));
+        let transfers = app.transfers.clone();
+        let worker_cancel = cancel.clone();
+        let worker_emissions = emissions.clone();
+        let handle = std::thread::spawn(move || loop {
+            if worker_cancel.load(Ordering::SeqCst) {
+                transfer_finish(&transfers, tid, "cancelled", None, None);
+                return;
+            }
+            worker_emissions.fetch_add(1, Ordering::SeqCst);
+            std::thread::yield_now();
+        });
+        // Don't race the worker's very first iteration — let it actually run before we stop it,
+        // so a no-op "fix" can't pass by sheer luck of the worker never having started.
+        while emissions.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+
+        super::stop_for_offline(&app).expect("the fake worker always honors cancel — this must converge, never time out");
+        handle.join().unwrap();
+
+        assert!(cancel.load(Ordering::SeqCst), "stop_for_offline must flip the transfer's cancel flag");
+        assert_ne!(
+            app.transfers.lock().unwrap().get(&tid).unwrap().state,
+            "active",
+            "stop_for_offline returned but the transfer it was supposed to stop is still marked active"
+        );
+    }
+
+    /// SEC-45 — `drive_pending_downloads` reads `offline` and THEN (racily) inserts a fresh
+    /// `TransferState { cancel: false, .. }` and spawns its thread; that insert can land AFTER
+    /// `stop_for_offline` has already taken a snapshot of `transfers`. This proves the fix for
+    /// that race: the cancel-flip must repeat every wait tick, not just once up front, so a
+    /// transfer that appears mid-wait still gets caught within one tick.
+    ///
+    /// Determinism (no `yield_now`/sleep race to prove ordering): a CANARY transfer is inserted
+    /// BEFORE the waiter even starts, so it is swept by any implementation's very first flip pass
+    /// — bounded-spinning on ITS cancel flag going true is a real, observable proof that at least
+    /// one flip pass has already completed, with no reliance on scheduling luck. Only once that is
+    /// confirmed do we insert the LATE transfer, which a "flip once up front" implementation can no
+    /// longer ever touch — reproducing the actual race deterministically instead of hoping the
+    /// insert happens to land inside a timing window.
+    #[test]
+    fn a_transfer_registered_after_stop_for_offline_has_already_started_waiting_is_still_cancelled() {
+        let app = Arc::new(App::default());
+        let guard = super::NetGuard::enter(&app.net_active); // keeps stop_for_offline from returning at all yet
+
+        let canary_tid = 0u64;
+        let canary_cancel = Arc::new(AtomicBool::new(false));
+        app.transfers.lock().unwrap().insert(canary_tid, fake_transfer(canary_cancel.clone()));
+
+        let app2 = app.clone();
+        let waiter = std::thread::spawn(move || super::stop_for_offline(&app2));
+
+        // Bounded spin proving the flip logic has run at least once. A busy `yield_now` loop is
+        // NOT good enough here: `stop_for_offline` only re-checks every `STOP_WAIT_STEP` (20ms),
+        // and a tight `yield_now` loop can burn through a large iteration count in well under
+        // that — "gave up" would then look identical to "never flipped". Sleeping a little each
+        // iteration bounds this on real ticks instead of raw iteration count, while the CAP still
+        // makes it a bounded wait, not an open-ended one.
+        assert!(
+            spin_wait(&canary_cancel, Ordering::SeqCst),
+            "the canary transfer (present since before the waiter started) must have been cancelled"
+        );
+
+        // NOW insert the late transfer — deterministically after at least one flip pass, exactly
+        // reproducing "this transfer did not exist for the earlier snapshot(s)."
+        let tid = 1u64;
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.transfers.lock().unwrap().insert(tid, fake_transfer(cancel.clone()));
+        assert!(!waiter.is_finished(), "stop_for_offline must still be blocked on the held guard");
+
+        drop(guard); // release — the NEXT tick can now converge, re-flipping cancel first
+
+        assert!(spin_wait(&cancel, Ordering::SeqCst), "the late-registered transfer's cancel flag must have been flipped");
+        // Stand in for the real worker threads reporting themselves terminal once they see cancel.
+        transfer_finish(&app.transfers, tid, "cancelled", None, None);
+        transfer_finish(&app.transfers, canary_tid, "cancelled", None, None);
+
+        let result = waiter.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "once every transfer reports terminal, stop_for_offline must converge, not time out: {result:?}"
+        );
+        assert_ne!(app.transfers.lock().unwrap().get(&tid).unwrap().state, "active");
+    }
+
+    /// Control: with `stop_for_offline` never invoked (ordinary online operation), a transfer's
+    /// cancel flag stays untouched and it keeps "emitting" — the machinery above must not affect
+    /// a session that never goes offline.
+    #[test]
+    fn an_ordinary_online_transfer_is_never_touched_by_the_offline_machinery() {
+        let app = App::default();
+        let tid = 1u64;
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.transfers.lock().unwrap().insert(tid, fake_transfer(cancel.clone()));
+
+        let emissions = Arc::new(AtomicU64::new(0));
+        let worker_cancel = cancel.clone();
+        let worker_emissions = emissions.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if worker_cancel.load(Ordering::SeqCst) {
+                    return; // would mean something cancelled it — the control asserts this never fires
+                }
+                worker_emissions.fetch_add(1, Ordering::SeqCst);
+                std::thread::yield_now();
+            }
+        });
+        handle.join().unwrap();
+
+        assert_eq!(emissions.load(Ordering::SeqCst), 500, "ordinary online work must run to completion, uninterrupted");
+        assert!(!cancel.load(Ordering::SeqCst), "nothing should have cancelled it — offline was never involved");
+        assert_eq!(
+            app.transfers.lock().unwrap().get(&tid).unwrap().state,
+            "active",
+            "an unfinished transfer stays active when nothing asked it to stop"
+        );
+    }
+
+    /// SEC-45 — a `poll`/`cover_tick`/PostsRequest-reply call holds a `NetGuard` for as long as it
+    /// might still touch the wire, and `stop_for_offline` is supposed to wait for every such guard
+    /// to release before claiming success. This proves the wait is real, not a no-op: while a
+    /// guard is held, `stop_for_offline` (run on another thread, since it blocks) must NOT have
+    /// returned yet — checked deterministically (a bounded spin on `JoinHandle::is_finished`, not
+    /// a wall-clock delay) — and only reports success once the guard is actually released.
+    #[test]
+    fn stop_for_offline_does_not_return_while_a_guarded_background_call_still_holds_net_active() {
+        let app = Arc::new(App::default());
+        let guard = super::NetGuard::enter(&app.net_active);
+        assert_eq!(app.net_active.load(Ordering::SeqCst), 1, "the guard must be visible while held");
+
+        let proceed = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let proceed2 = proceed.clone();
+        let exited2 = exited.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = guard; // released only when this returns
+            while !proceed2.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            exited2.store(true, Ordering::SeqCst);
+        });
+
+        let app2 = app.clone();
+        let waiter = std::thread::spawn(move || super::stop_for_offline(&app2));
+
+        // The holder cannot release until `proceed` is set, and no transfers exist, so a correct
+        // `stop_for_offline` has nothing to do BUT wait on `net_active` — it must still be
+        // running. A version that forgot to check `net_active` would already show finished here.
+        for _ in 0..2000 {
+            assert!(
+                !waiter.is_finished(),
+                "stop_for_offline returned success while a guarded background call still held net_active"
+            );
+            std::thread::yield_now();
+        }
+
+        proceed.store(true, Ordering::SeqCst);
+        let result = waiter.join().unwrap();
+        holder.join().unwrap();
+
+        assert!(result.is_ok(), "once the guard is released, stop_for_offline must report success: {result:?}");
+        assert!(exited.load(Ordering::SeqCst), "the background call must have actually run to its own exit");
+        assert_eq!(app.net_active.load(Ordering::SeqCst), 0, "the guard must be released, not leaked");
+    }
+
+    /// SEC-45's "never silently drop user data" bar for downloads: `download_blob` treats any
+    /// cancel — including one Offline caused — as a permanent abandon (it already deleted the
+    /// partial + dropped the pending entry). `download_cancelled_outcome` is what stops that from
+    /// meaning "the file is just gone": when the cancel was Offline's, it must re-persist a fresh
+    /// pending-download row so the file re-fetches on the next online poll.
+    #[test]
+    fn an_offline_triggered_download_cancel_is_re_queued_so_the_file_is_not_lost() {
+        let dir = std::env::temp_dir().join(format!("karst-desktop-test-offline-resume-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = client::store::Store::unlock(&dir, b"pw").unwrap();
+        let pd = client::store::PendingDownload {
+            blob_id: [9u8; 32], key: [1u8; 32], hash: [2u8; 32], name: "photo.jpg".into(),
+            size: 100, chunks: 2, sender: [3u8; 32], ts: 1, queued_at: 1,
+            container_id: Some("stale-partial-id".into()), // the partial download_blob just deleted
+        };
+
+        let (state, error) = super::download_cancelled_outcome(&store, pd.clone(), true);
+        assert_eq!(state, "cancelled");
+        assert!(
+            error.as_deref().unwrap_or("").contains("resume"),
+            "the UI must be told this will come back on its own: {error:?}"
+        );
+        let requeued = store.list_pending_downloads().unwrap();
+        assert_eq!(requeued.len(), 1, "the announcement must be re-persisted, not lost");
+        assert_eq!(requeued[0].blob_id, pd.blob_id);
+        assert_eq!(requeued[0].container_id, None, "the deleted partial's container id must not be reused");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The manual Cancel button is a genuine, intentional abandon — `download_cancelled_outcome`
+    /// must NOT auto-resume that (only an Offline-caused cancel gets re-queued), or clicking
+    /// Cancel would silently keep re-fetching a file the user explicitly gave up on.
+    #[test]
+    fn a_manually_cancelled_download_is_not_auto_requeued() {
+        let dir = std::env::temp_dir().join(format!("karst-desktop-test-manual-cancel-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = client::store::Store::unlock(&dir, b"pw").unwrap();
+        let pd = client::store::PendingDownload {
+            blob_id: [9u8; 32], key: [1u8; 32], hash: [2u8; 32], name: "photo.jpg".into(),
+            size: 100, chunks: 2, sender: [3u8; 32], ts: 1, queued_at: 1, container_id: None,
+        };
+
+        let (state, error) = super::download_cancelled_outcome(&store, pd, false);
+        assert_eq!(state, "cancelled");
+        assert!(error.is_none(), "a manual cancel carries no Offline-specific message");
+        assert!(
+            store.list_pending_downloads().unwrap().is_empty(),
+            "a manual abandon must stay abandoned, not silently come back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn streamed_chunks_accumulate_in_order() {

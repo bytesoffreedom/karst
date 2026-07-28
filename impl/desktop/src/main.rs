@@ -3237,6 +3237,11 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     Ok(PollOut { messages: out, reachable: reach_any })
 }
 
+/// How many large-file downloads may run at once. Downloads are one thread each, and the pending
+/// list is attacker-influenced (a peer sends the references), so this is the difference between a
+/// queue and a thread flood.
+const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+
 /// Spawn a crash-safe download thread for each pending large-file download not already in
 /// flight. `client::download_blob` owns completion (records the file + history + drops the
 /// pending entry) and retry semantics; here we only wire progress + the terminal UI state and
@@ -3252,6 +3257,14 @@ fn drive_pending_downloads(
 ) {
     let pending = store.list_pending_downloads().unwrap_or_default();
     for pd in pending {
+        // Bounded concurrency. This spawned ONE OS THREAD PER PENDING DOWNLOAD, and the number of
+        // pending downloads is set by how many file references a peer chose to send — so a single
+        // poll could start up to a thousand threads on the recipient's machine (A8-5). Anything
+        // over the limit simply stays pending; the loop below already re-drives leftovers on the
+        // next poll, and the blob lives on the relay until its TTL.
+        if app.in_flight.lock().unwrap().len() >= MAX_CONCURRENT_DOWNLOADS {
+            break;
+        }
         // Skip a blob whose download thread is already running.
         if !app.in_flight.lock().unwrap().insert(pd.blob_id) {
             continue;

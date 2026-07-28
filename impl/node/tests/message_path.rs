@@ -170,7 +170,6 @@ fn attacker_knowing_pubkey_cannot_drain_mailbox() {
         carrier_id: b"mem".to_vec(),
         cookie,
         proof: [0xAB; 16], // не тот proof — DH без секрета Bob не сошёлся
-        ack: false,
         own_proof: Vec::new(),
     };
     let cookie = match transport.fetch(&attacker_req(None), NOW) {

@@ -209,7 +209,6 @@ fn relay_server_with_tls_serves_a_wss_client_end_to_end() {
         carrier_id: b"probe".to_vec(),
         cookie: None,
         proof: [0u8; 16],
-        ack: false,
         own_proof: Vec::new(),
     };
     assert!(

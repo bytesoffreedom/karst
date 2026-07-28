@@ -426,10 +426,15 @@ pub struct Peer<T: Transport> {
     /// each on its own drop-box. Invariant: `inbound implies outbound` — a pure first-contact
     /// responder still lands in `sessions`, so `send`/`has_session`/`connect` are untouched.
     inbound_sessions: HashMap<[u8; 32], SessionState>,
-    /// `true` = fetch with `FetchRequest::ack` (lease-don't-delete) and remember what to
-    /// ACK. Off by default: only a caller that will call [`Peer::ack_all`] AFTER durably
-    /// persisting the advanced ratchet state (i.e. `recv_session`) turns it on. Never
-    /// persisted — it is a per-receive mode, not session state.
+    /// `true` = remember what to ACK after this receive. Off by default: only a caller that
+    /// will call [`Peer::ack_all`] AFTER durably persisting the advanced ratchet state (i.e.
+    /// `recv_session`) turns it on. Never persisted — it is a per-receive mode, not session
+    /// state.
+    ///
+    /// It no longer selects the RELAY's behaviour: since #179 a fetch always leases and there is
+    /// no delete-on-read to opt out of. So a receive with this off does not destroy anything —
+    /// it just never ACKs, and the lease expires and redelivers. Strictly safer than the mode it
+    /// replaced, at the cost of a duplicate the receiver's dedup absorbs.
     lease: bool,
     /// Messages fetched-under-lease this receive, awaiting an ACK once the caller has
     /// saved the ratchet. Drained by [`Peer::ack_all`] / [`Peer::take_pending_acks`].
@@ -1386,7 +1391,6 @@ impl<T: Transport> Peer<T> {
                 carrier_id: self.carrier_id.clone(),
                 cookie,
                 proof,
-                ack: self.lease,
                 own_proof,
             };
             match self.transport.fetch_isolated(&req, now, scope.as_deref()) {

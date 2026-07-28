@@ -607,6 +607,17 @@ else, and we either refused it (an authority, a token) or could not verify it
   fetch wire (`own_proof`). Bundles published before it fail signature verification and must be
   re-published; sessions established before it carry no `M` and **fail LOUD on the next send**
   ("re-establish this session") rather than silently dropping mail — reconnect to fix.
+- **A fetch is always a lease; delete-on-read is gone (#179).** `FetchRequest` used to carry an
+  `ack` flag, and with it clear the relay DESTROYED the served messages immediately — before the
+  recipient had decrypted them, let alone written them down. The flag is removed, so no caller can
+  select destructive reads and no default can be got wrong: every fetch leases, and a receiver that
+  never ACKs costs a redelivery, not a loss. The skeleton `Recipient` (a reference receiver holding
+  nothing durable) now ACKs on receipt, which is the honest moment for it; `Peer` still waits until
+  the advanced ratchet is on disk. `Peer::enable_ack` survives but no longer selects the RELAY's
+  behaviour — it only decides whether this receive records receipts to ACK later. Pinned by
+  `a_fetch_can_no_longer_ask_the_relay_to_delete_on_read`, which asserts the message is STILL on the
+  relay after being served (a second fetch coming back empty is true under both behaviours and would
+  pin nothing) and that it redelivers once the lease lapses.
 - **Session receive is effectively-once, with one narrow residual loss.** The `recv_session` path now
   fetches under a **lease** and only tells the relay to delete a message (an ACK carrying the same
   ownership proof as the fetch) *after* the advanced ratchet is durably saved. A crash before the save

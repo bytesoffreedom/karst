@@ -1419,25 +1419,15 @@ impl RelayNode {
             None => (Vec::new(), Vec::new()),
         };
         if let Some(mbox) = self.mailboxes.get_mut(&req.mailbox) {
-            if req.ack {
-                // Lease mode: keep the served messages, hide them until the lease expires
-                // or an ACK deletes them. The client will ACK once it has durably
-                // persisted the advanced ratchet state.
-                for i in served {
-                    mbox[i].leased_until = now + LEASE_SECS;
-                }
-            } else {
-                // Legacy delete-on-fetch: remove the served entries now (descending index
-                // keeps the earlier ones valid as we go).
-                for i in served.into_iter().rev() {
-                    let e = mbox.remove(i);
-                    if let Some(log) = self.mail_log.as_mut() {
-                        log.delete(req.mailbox, &e.payload);
-                    }
-                }
-                if mbox.is_empty() {
-                    self.mailboxes.remove(&req.mailbox);
-                }
+            // ALWAYS a lease (#179). A fetch used to be able to ask for delete-on-read, and the
+            // relay obliged: the message was destroyed the moment it was handed to the socket,
+            // before the recipient had decrypted it, let alone written it down. There is no
+            // caller for whom that is the right trade — a fetcher that never ACKs simply has the
+            // message redelivered when the lease expires, which is strictly better than losing
+            // it — so the choice is gone rather than defaulted. Removing the knob also removes
+            // the class: no future caller can re-select destructive reads by passing a flag.
+            for i in served {
+                mbox[i].leased_until = now + LEASE_SECS;
             }
         }
         FetchResponse::Fetched(seals)
@@ -1787,13 +1777,6 @@ pub struct FetchRequest {
     /// DH ownership proof (`fetch_proof`), used for the IDENTITY mailbox (an X25519 key). Empty/
     /// ignored when `own_proof` is set.
     pub proof: [u8; 16],
-    /// Lease instead of delete: `true` means "I will ACK once persisted", so the relay
-    /// keeps the served messages (hidden for `LEASE_SECS`) rather than deleting them on
-    /// fetch. `false` is the legacy at-most-once delete-on-fetch — a path that fetches
-    /// leased and never ACKs would redeliver until the lease/TTL expires, so only a
-    /// caller that follows through with `AckRequest` sets this.
-    #[serde(default)]
-    pub ack: bool,
     /// Schnorr ownership proof (`blind::FetchOwnershipProof`, 64 bytes) for a BLINDED drop-box —
     /// a Ristretto address has no DH with the relay's X25519 key, so it proves knowledge of the
     /// fetch secret (the discrete log of the address) instead. Empty = use the DH `proof` (the
@@ -2159,9 +2142,6 @@ impl<T: Transport> Recipient<T> {
                 carrier_id: self.carrier_id.clone(),
                 cookie: self.cookie,
                 proof,
-                // Skeleton receiver stays on legacy delete-on-fetch: it opens strangers'
-                // openers, not the ratchet path that gains the lease/ACK durability.
-                ack: false,
                 own_proof: Vec::new(), // identity mailbox → DH proof above
             };
             match self.transport.fetch(&req, now) {
@@ -2173,13 +2153,33 @@ impl<T: Transport> Recipient<T> {
                     // Скелет-получатель открывает только `Skeleton`; сессионные
                     // §2.1-конверты ему не адресованы (их обрабатывает `Peer`) —
                     // `None`, а не паника.
-                    return Ok(payloads
+                    let opened: Vec<Option<Vec<u8>>> = payloads
                         .iter()
                         .map(|p| match p {
                             Payload::Skeleton(s) => s.open(&self.identity),
                             Payload::Session(_) => None,
                         })
-                        .collect());
+                        .collect();
+                    // Every fetch is a LEASE now (#179) — the relay no longer offers
+                    // delete-on-read — so a receiver that wants its mail gone has to say so.
+                    // This one ACKs immediately, on receipt, which is the honest behaviour for a
+                    // REFERENCE receiver: it holds nothing durable, so there is no later moment
+                    // at which it would be safer to ACK. `Peer` (the real path) is the one that
+                    // waits until the advanced ratchet is on disk. A failed ACK is not an error
+                    // here: the messages simply stay leased and are redelivered.
+                    if let Some(cookie) = self.cookie {
+                        let ack = AckRequest {
+                            mailbox,
+                            client_addr: self.client_addr.clone(),
+                            carrier_id: self.carrier_id.clone(),
+                            cookie: Some(cookie),
+                            proof: fetch_proof(&shared, &cookie.mac, &mailbox),
+                            ids: payloads.iter().map(payload_id).collect(),
+                            own_proof: Vec::new(),
+                        };
+                        let _ = self.transport.ack(&ack, now);
+                    }
+                    return Ok(opened);
                 }
                 FetchResponse::Rejected(r) => return Err(r),
             }
@@ -2501,12 +2501,12 @@ mod tests {
 
     /// Build a valid authenticated `FetchRequest` for `recip`'s own mailbox: a fresh cookie
     /// at `now` (COOKIE_TTL is 30 s, so re-issue per call) + the ownership proof.
-    fn fetch_at(relay: &mut RelayNode, recip: &Identity, now: u64, ack: bool) -> FetchRequest {
+    fn fetch_at(relay: &mut RelayNode, recip: &Identity, now: u64) -> FetchRequest {
         let mailbox = recip.public.to_bytes();
         let cookie = relay.keyring.issue(&mailbox, b"c", now as u32);
         let shared = recip.dh(&relay.relay_public());
         let proof = fetch_proof(&shared, &cookie.mac, &mailbox);
-        FetchRequest { mailbox, client_addr: mailbox.to_vec(), carrier_id: b"c".to_vec(), cookie: Some(cookie), proof, ack, own_proof: Vec::new() }
+        FetchRequest { mailbox, client_addr: mailbox.to_vec(), carrier_id: b"c".to_vec(), cookie: Some(cookie), proof, own_proof: Vec::new() }
     }
 
     fn ack_at(relay: &mut RelayNode, recip: &Identity, now: u64, ids: Vec<[u8; 32]>) -> AckRequest {
@@ -2534,7 +2534,6 @@ mod tests {
             carrier_id: b"c".to_vec(),
             cookie: Some(cookie),
             proof: dh,
-            ack: false,
             own_proof: own,
         };
 
@@ -2618,18 +2617,38 @@ mod tests {
         );
     }
 
-    /// Legacy `ack: false` fetch still DELETES on read — the un-updated path is untouched.
+    /// #179: a fetch can no longer ask the relay to DELETE on read.
+    ///
+    /// `FetchRequest` used to carry an `ack` flag, and with it clear the relay destroyed the
+    /// served messages immediately — before the recipient had decrypted them, let alone written
+    /// them down. This was the "legacy" mode kept for callers that had not moved to lease/ACK;
+    /// the flag is gone, so there is no way to select it and no default to get wrong.
+    ///
+    /// Discriminating on the thing that actually matters — the message is STILL ON THE RELAY
+    /// after being served — rather than on "a second fetch is empty", which is true under BOTH
+    /// behaviours (deleted vs leased-and-hidden) and would therefore pin nothing.
     #[test]
-    fn legacy_fetch_deletes_on_read() {
+    fn a_fetch_can_no_longer_ask_the_relay_to_delete_on_read() {
         let mut relay = RelayNode::new(NOW);
         let bob = Identity::generate();
         deposit(&mut relay, &bob, NOW, test_seal(1));
 
-        let req = fetch_at(&mut relay, &bob, NOW, false);
-        assert_eq!(fetched(relay.handle_fetch(&req, NOW)).len(), 1);
-        // Gone immediately: a second fetch is empty.
-        let req2 = fetch_at(&mut relay, &bob, NOW, false);
-        assert!(fetched(relay.handle_fetch(&req2, NOW)).is_empty(), "legacy fetch drained the box");
+        let req = fetch_at(&mut relay, &bob, NOW);
+        assert_eq!(fetched(relay.handle_fetch(&req, NOW)).len(), 1, "the message is served");
+        assert!(boxed(&relay, &bob), "and is STILL on the relay: a fetch is a lease, never a delete");
+
+        // Hidden while leased (that part is unchanged)...
+        let req2 = fetch_at(&mut relay, &bob, NOW);
+        assert!(fetched(relay.handle_fetch(&req2, NOW)).is_empty(), "leased message hidden");
+        // ...and redelivered once the lease lapses, because nothing ACKed it. A receiver that
+        // simply drops the message on the floor now costs a duplicate, not a loss.
+        let later = NOW + LEASE_SECS + 1;
+        let req3 = fetch_at(&mut relay, &bob, later);
+        assert_eq!(
+            fetched(relay.handle_fetch(&req3, later)).len(),
+            1,
+            "an unacked lease redelivers instead of the message being gone"
+        );
     }
 
     /// `ack: true` LEASES: the message is returned but stays on the relay, hidden from a
@@ -2641,11 +2660,11 @@ mod tests {
         let bob = Identity::generate();
         deposit(&mut relay, &bob, NOW, test_seal(2));
 
-        let req = fetch_at(&mut relay, &bob, NOW, true);
+        let req = fetch_at(&mut relay, &bob, NOW);
         let got = fetched(relay.handle_fetch(&req, NOW));
         assert_eq!(got.len(), 1);
         // Leased → invisible to a second immediate fetch, but NOT deleted.
-        let req2 = fetch_at(&mut relay, &bob, NOW, true);
+        let req2 = fetch_at(&mut relay, &bob, NOW);
         assert!(fetched(relay.handle_fetch(&req2, NOW)).is_empty(), "leased message hidden");
         assert!(boxed(&relay, &bob), "still on relay before ACK");
 
@@ -2665,14 +2684,14 @@ mod tests {
         let payload = test_seal(3);
         deposit(&mut relay, &bob, NOW, payload.clone());
 
-        let req = fetch_at(&mut relay, &bob, NOW, true);
+        let req = fetch_at(&mut relay, &bob, NOW);
         assert_eq!(fetched(relay.handle_fetch(&req, NOW)).len(), 1);
         // Before expiry: hidden. After LEASE_SECS: visible again, same ciphertext.
         let mid = NOW + LEASE_SECS - 1;
-        let req_mid = fetch_at(&mut relay, &bob, mid, true);
+        let req_mid = fetch_at(&mut relay, &bob, mid);
         assert!(fetched(relay.handle_fetch(&req_mid, mid)).is_empty(), "still leased");
         let later = NOW + LEASE_SECS + 1;
-        let req_late = fetch_at(&mut relay, &bob, later, true);
+        let req_late = fetch_at(&mut relay, &bob, later);
         let re = fetched(relay.handle_fetch(&req_late, later));
         assert_eq!(re.len(), 1);
         assert_eq!(payload_id(&re[0]), payload_id(&payload), "exact ciphertext redelivered");
@@ -2685,7 +2704,7 @@ mod tests {
         let bob = Identity::generate();
         deposit(&mut relay, &bob, NOW, test_seal(4));
 
-        let req = fetch_at(&mut relay, &bob, NOW, true);
+        let req = fetch_at(&mut relay, &bob, NOW);
         let got = fetched(relay.handle_fetch(&req, NOW));
         let ids: Vec<[u8; 32]> = got.iter().map(payload_id).collect();
         // Forge the proof: valid shape, wrong value.
@@ -2704,7 +2723,7 @@ mod tests {
         deposit(&mut relay, &bob, NOW, test_seal(5));
 
         // Lease it (leased_until = NOW + LEASE_SECS — a "fresh" lease)...
-        let req = fetch_at(&mut relay, &bob, NOW, true);
+        let req = fetch_at(&mut relay, &bob, NOW);
         let _ = relay.handle_fetch(&req, NOW);
         // ...yet the sweep at deposit + TTL still removes it, lease notwithstanding.
         relay.sweep_mailboxes(NOW + MAILBOX_TTL_SECS + 1);
@@ -2818,7 +2837,7 @@ mod tests {
                 Rc::try_unwrap(shared).ok().expect("sole owner").into_inner()
             };
                         // Lease both, then ACK only the first.
-            let req = fetch_at(&mut relay, &bob, NOW, true);
+            let req = fetch_at(&mut relay, &bob, NOW);
             let got = fetched(relay.handle_fetch(&req, NOW));
             assert_eq!(got.len(), 2);
             let ack = ack_at(&mut relay, &bob, NOW, vec![payload_id(&got[0])]);

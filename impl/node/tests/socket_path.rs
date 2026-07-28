@@ -82,7 +82,6 @@ fn server_alive(addr: SocketAddr, noise_pub: [u8; 32]) -> bool {
         carrier_id: b"probe".to_vec(),
         cookie: None,
         proof: [0u8; 16],
-        ack: false,
         own_proof: Vec::new(),
     };
     matches!(t.fetch(&req, 0), FetchResponse::NeedCookie(_))
@@ -375,7 +374,6 @@ fn an_oversized_ordinary_request_is_dropped_instead_of_served() {
         carrier_id: b"probe".to_vec(),
         cookie: None,
         proof: [0u8; 16],
-        ack: false,
         own_proof: Vec::new(),
     });
     let normal_bytes = wire::encode(&normal).expect("a well-formed Fetch always encodes");
@@ -399,7 +397,6 @@ fn an_oversized_ordinary_request_is_dropped_instead_of_served() {
         carrier_id: b"probe".to_vec(),
         cookie: None,
         proof: [0u8; 16],
-        ack: false,
         own_proof: Vec::new(),
     });
     let req_bytes = wire::encode(&oversized).expect("a well-formed Fetch always encodes");

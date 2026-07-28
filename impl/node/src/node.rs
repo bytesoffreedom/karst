@@ -32,6 +32,12 @@ use crate::seal::{Identity, SkeletonSeal};
 /// нового IK, НЕ тихий сброс (та же дисциплина, что `MAX_FETCH_SEALS`).
 /// Перезапись СВОЕГО bundle всегда разрешена (не считается новым).
 pub const MAX_BUNDLES: usize = 100_000;
+
+/// How long a published bundle survives without being republished. 30 days: a client republishes
+/// on launch and on announce, so an account in ANY use stays live, while an abandoned or
+/// Sybil-minted slot returns its capacity instead of holding it until the process restarts.
+/// The one-time-prekey batch is swept with its bundle — the two are one resource.
+pub const BUNDLE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// Node-list (discovery plane) bounds. `known_relays` holds operator-curated descriptors
 /// (self + configured peers) in this slice — a bounded set keeps the served list inside one
 /// response frame and caps memory. Peer-to-peer gossip merge (with dial-verification) is a
@@ -243,6 +249,16 @@ pub enum Response {
     Rejected(String),
 }
 
+/// A published bundle plus when it was last (re)published. Bundles used to be immortal: nothing
+/// removed one, ever, so a Sybil could mint identities until `MAX_BUNDLES` and lock every new
+/// user out of publishing permanently — the store only emptied on relay restart (CRYPTO-18).
+/// A live client republishes on every launch, so a TTL costs nothing real and turns "forever"
+/// into "as long as somebody is actually using it".
+struct BundleSlot {
+    bundle: PreKeyBundle,
+    refreshed_at: u64,
+}
+
 /// One queued sealed message. `enqueued_at` drives the deposit-time TTL sweep;
 /// `leased_until` is the wall-clock time before which a leased-but-unacked message
 /// stays invisible to a fetch (0 = not leased). Leasing never resets `enqueued_at`, so
@@ -303,7 +319,7 @@ pub struct RelayNode {
     /// §12 discovery: опубликованные prekey-bundle по IK владельца. Публичный
     /// материал; запись гейтится ownership-proof, чтение открыто. Ограничен
     /// `MAX_BUNDLES` (отказ при полноте, не тихий сброс).
-    bundles: HashMap<[u8; 32], PreKeyBundle>,
+    bundles: HashMap<[u8; 32], BundleSlot>,
     /// One-time prekey batches per IK; a fetch pops one (see `PublishRequest::opks`).
     opk_batches: HashMap<[u8; 32], VecDeque<crate::pqxdh::SignedOpk>>,
     /// Rotating start offset for `node_list`, so advertisement is fair rather than always
@@ -479,6 +495,24 @@ impl RelayNode {
     /// reap call in `advance_epoch`.
     pub fn cap_quota_windows_for_test(&self) -> usize {
         self.cap_quota.len()
+    }
+
+    /// Issue a cookie the way the request handlers do — so a test can build an admission-gated
+    /// request by hand without reaching into the keyring.
+    pub fn issue_cookie_for_test(&mut self, addr: &[u8], carrier: &[u8], now: u64) -> Cookie {
+        self.keyring.issue(addr, carrier, now as u32)
+    }
+
+    /// Advance the relay's clock, running the periodic sweeps a real request would have run.
+    pub fn tick_for_test(&mut self, now: u64) {
+        self.advance_epoch(now);
+    }
+
+    /// Live published bundles and discovery records — so a test can prove the periodic sweep
+    /// actually returns capacity, rather than inferring it from a lookup that would have
+    /// removed the record itself.
+    pub fn key_distribution_len_for_test(&self) -> (usize, usize) {
+        (self.bundles.len(), self.discovery.len())
     }
 
     /// Выдать capability клиенту (relay — сам issuer, §7.2). Возвращает копию,
@@ -741,10 +775,30 @@ impl RelayNode {
             // other place per-cap state lived). Safe for all cap types: an active window is
             // kept, an idle one is dropped and simply re-created on the next send.
             self.cap_quota.reap(now, EPOCH_DURATION_SECS);
+            self.sweep_key_distribution(now);
             if let Some(blobs) = &mut self.blobs {
                 blobs.sweep(now);
             }
         }
+    }
+
+    /// Return the capacity held by abandoned key-distribution state: bundles nobody has
+    /// republished within `BUNDLE_TTL_SECS` (with their one-time-prekey batches), and discovery
+    /// records past their own signed expiry.
+    ///
+    /// Discovery records USED to be dropped only when somebody looked one up — so a record for a
+    /// pseudonym nobody ever resolves sat in the map until restart, and since the pseudonym is a
+    /// random per-user value an attacker could mint unlimited ones that would never be looked up
+    /// by anyone (CRYPTO-19). Expiry is now enforced on the relay's own clock, not on the arrival
+    /// of a reader.
+    ///
+    /// Runs on the epoch tick, not per request: an O(n) scan on every insert is its own DoS.
+    fn sweep_key_distribution(&mut self, now: u64) {
+        // `saturating_sub` makes a regressed clock look FRESH (kept), never spuriously stale —
+        // same monotonicity note as `sweep_mailboxes`.
+        self.bundles.retain(|_, slot| now.saturating_sub(slot.refreshed_at) <= BUNDLE_TTL_SECS);
+        self.opk_batches.retain(|ik, _| self.bundles.contains_key(ik));
+        self.discovery.retain(|_, rec| rec.expiry > now);
     }
 
     /// Drop undelivered mailbox entries older than `MAILBOX_TTL_SECS`, and forget any
@@ -951,10 +1005,59 @@ impl RelayNode {
         }
 
         // Bounded: перезапись существующего IK — ок; новый при полноте — отказ.
-        if !self.bundles.contains_key(&ik) && self.bundles.len() >= MAX_BUNDLES {
+        let is_new_slot = !self.bundles.contains_key(&ik);
+        if is_new_slot && self.bundles.len() >= MAX_BUNDLES {
             return PublishResponse::Rejected("BundleStoreFull".into());
         }
-        self.bundles.insert(ik, req.bundle.clone());
+        // CREATING a slot is metered; REFRESHING one you already own is not (CRYPTO-18).
+        //
+        // The ownership proof above stops you overwriting somebody ELSE's slot, but says nothing
+        // about how many slots you may create: identities are free to mint locally, and the
+        // cookie binds to a self-declared address, not to an identity. So a single client could
+        // publish 100_000 fresh IKs and every later legitimate publish got `BundleStoreFull`,
+        // permanently — the store had no TTL either.
+        //
+        // The asymmetry is deliberate. A live client republishes on every launch and announce;
+        // charging that against its quota would make normal use look like an attack. Creating a
+        // NEW slot is the operation that consumes a global, finite resource, so that is the one
+        // that must present a capability and be charged for it.
+        if is_new_slot {
+            let areq = Request {
+                raw_len: 2048, // a bundle is ~1.3 KiB; a fixed figure, not caller-chosen
+                client_addr: &req.client_addr,
+                carrier_id: &req.carrier_id,
+                cookie: req.cookie,
+                request_nonce: &req.request_nonce,
+                requested_scope: Scope::MessageDelivery,
+                credential: Credential::Capability(req.capability_proof),
+            };
+            let pipe = AdmissionPipeline {
+                keyring: &self.keyring,
+                capabilities: &self.capabilities,
+                token_verifier: &self.verifier,
+                issuer_ring: &self.issuer_ring,
+            };
+            let policy = self.quota_policy;
+            let outcome = pipe.process_with_policy(
+                &areq,
+                now,
+                self.epoch,
+                [0u8; 64],
+                &mut self.replay,
+                &mut self.cap_quota,
+                policy,
+            );
+            match outcome {
+                Outcome::Admit => {}
+                Outcome::Challenge(_) => {
+                    let cookie =
+                        self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
+                    return PublishResponse::NeedCookie(cookie);
+                }
+                other => return PublishResponse::Rejected(format!("{other:?}")),
+            }
+        }
+        self.bundles.insert(ik, BundleSlot { bundle: req.bundle.clone(), refreshed_at: now });
         // NOTE: publishing a bundle does NOT make you findable. Discovery is a separate, explicit
         // opt-in (`PublishDiscovery`) so that merely being reachable never leaks fact-of-partici-
         // pation into a lookup-able directory. See `handle_publish_discovery`.
@@ -1002,7 +1105,7 @@ impl RelayNode {
         // is destructive — that combination let anyone drain a victim's batch and push every
         // later first contact down to 3-DH (R2-3). The OPK-bearing form is
         // `handle_fetch_bundle_opk`, gated by the same capability a send needs.
-        self.bundles.get(ik).cloned()
+        self.bundles.get(ik).map(|s| s.bundle.clone())
     }
 
     /// §12 fetch WITH a one-time prekey: full send-grade admission (cookie → capability → quota),
@@ -1049,7 +1152,7 @@ impl RelayNode {
                 now as u32,
             )),
             Outcome::Admit => {
-                let Some(mut bundle) = self.bundles.get(&req.ik).cloned() else {
+                let Some(mut bundle) = self.bundles.get(&req.ik).map(|s| s.bundle.clone()) else {
                     return BundleOpkResponse::Bundle(None);
                 };
                 // Consume AFTER admission, so a rejected request never costs the victim a key.
@@ -1115,6 +1218,12 @@ pub struct PublishRequest {
     pub client_addr: Vec<u8>,
     pub carrier_id: Vec<u8>,
     pub cookie: Option<Cookie>,
+    /// Replay/quota nonce for the admission pipeline. Only consulted when this publish CREATES a
+    /// slot — a refresh never reaches the pipeline, so a republishing client neither spends quota
+    /// nor fills the replay filter.
+    pub request_nonce: Vec<u8>,
+    /// Capability proof, checked when this publish creates a NEW slot (CRYPTO-18).
+    pub capability_proof: CapabilityProof,
     pub proof: [u8; 16],
 }
 
@@ -1357,6 +1466,11 @@ impl InMemoryTransport {
     pub fn new(relay: Rc<RefCell<RelayNode>>) -> Self {
         InMemoryTransport { relay }
     }
+
+    /// The relay behind this transport, so an integration test can inspect or advance it.
+    pub fn relay_for_test(&self) -> Rc<RefCell<RelayNode>> {
+        self.relay.clone()
+    }
 }
 
 impl Transport for InMemoryTransport {
@@ -1530,6 +1644,18 @@ impl<T: Transport> Recipient<T> {
 
 #[cfg(test)]
 mod tests {
+    /// A capability the in-crate tests can present when a publish CREATES a slot (CRYPTO-18).
+    fn publish_cap() -> Capability {
+        Capability {
+            capability_id: [0xBC; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 1000, max_bytes: 1 << 24, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x77; 32],
+        }
+    }
+
     use super::*;
     use crate::pqxdh::Account;
 
@@ -1568,6 +1694,10 @@ mod tests {
         let addr = bob.identity_public().to_vec();
         let carrier = b"c".to_vec();
         let cookie = relay.keyring.issue(&addr, &carrier, NOW as u32);
+        // Creating a slot is metered now, so the publisher presents a capability.
+        let cap = publish_cap();
+        relay.issue_capability(cap.clone());
+        let nonce = b"publish-nonce-1".to_vec();
 
         // Владелец: proof под приватным IK Bob против relay — публикуется.
         let good = publish_proof(&bob.ik().dh(&relay_pub), &cookie.mac, &bundle);
@@ -1578,6 +1708,8 @@ mod tests {
             client_addr: addr.clone(),
             carrier_id: carrier.clone(),
             cookie: Some(cookie),
+            request_nonce: nonce.clone(),
+            capability_proof: cap.prove(&nonce, 0),
             proof: good,
         };
         assert!(matches!(relay.handle_publish(&ok, NOW), PublishResponse::Published));
@@ -1589,6 +1721,7 @@ mod tests {
         let mut forged = mallory.prekey_bundle();
         forged.ik_pub = bundle.ik_pub; // притворяемся Bob
         let bad = publish_proof(&mallory.ik().dh(&relay_pub), &cookie.mac, &forged);
+        let n2 = b"publish-nonce-2".to_vec();
         let attack = PublishRequest {
             bundle: forged,
             opks: Vec::new(),
@@ -1596,6 +1729,8 @@ mod tests {
             client_addr: addr,
             carrier_id: carrier,
             cookie: Some(cookie),
+            request_nonce: n2.clone(),
+            capability_proof: cap.prove(&n2, 0),
             proof: bad,
         };
         assert!(
@@ -1618,6 +1753,8 @@ mod tests {
             client_addr: bob.identity_public().to_vec(),
             carrier_id: b"c".to_vec(),
             cookie: None,
+            request_nonce: b"n".to_vec(),
+            capability_proof: publish_cap().prove(b"n", 0),
             proof: [0u8; 16],
         };
         assert!(matches!(relay.handle_publish(&req, NOW), PublishResponse::NeedCookie(_)));

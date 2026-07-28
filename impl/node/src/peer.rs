@@ -686,8 +686,14 @@ impl<T: Transport> Peer<T> {
                 Some(c) => publish_proof(&shared, &c.mac, &bundle),
                 None => [0u8; 16],
             };
+            // The nonce/proof are only consulted when this publish CREATES the slot; a refresh
+            // never reaches the admission pipeline. Minted per attempt so a cookie retry is not a
+            // replay.
+            let nonce = random32().to_vec();
             let req = PublishRequest {
                 bundle: bundle.clone(),
+                request_nonce: nonce.clone(),
+                capability_proof: self.capability.prove(&nonce, 0),
                 // Sign each one-time prekey here, at the only place that holds the identity
                 // secret. The relay stores opaque signed pairs and can hand one out, but cannot
                 // mint a substitute (CRYPTO-04).

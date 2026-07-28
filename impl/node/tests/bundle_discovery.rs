@@ -111,6 +111,9 @@ fn publish_request_fits_request_frame() {
         client_addr: vec![0u8; 32],
         carrier_id: b"mem".to_vec(),
         cookie: None,
+        // Worst case for the frame check: a full-length nonce and a real proof.
+        request_nonce: vec![0u8; 32],
+        capability_proof: dev_cap().prove(&[0u8; 32], 0),
         proof: [0u8; 16],
     };
     let wire = WireRequest::PublishBundle(req);
@@ -367,4 +370,92 @@ fn a_bundle_opk_fetch_without_a_valid_capability_is_rejected() {
         }
         BundleOpkResponse::NeedCookie(_) => panic!("persistent cookie challenge"),
     }
+}
+
+/// CRYPTO-18, THE carrying test. The ownership proof stops you overwriting SOMEBODY ELSE's slot,
+/// but said nothing about how many slots you may create — identities are free to mint locally,
+/// and the cookie binds to a self-declared address, not to an identity. So one client could
+/// publish until `MAX_BUNDLES` and every later legitimate publish got `BundleStoreFull`, forever,
+/// because nothing ever expired either.
+///
+/// Discriminating in both directions: a publish carrying a capability the relay never issued must
+/// be refused, and the same publish with a real capability must still succeed — a test that only
+/// checked the refusal would pass with publishing broken outright.
+#[test]
+fn creating_a_bundle_slot_requires_a_capability() {
+    let (t, relay_pub) = shared();
+
+    // A capability the relay never issued: right shape, wrong secret. Everything else about this
+    // publish is genuine, including the ownership proof.
+    let forged = Capability { secret: [0x11; 32], ..dev_cap() };
+    let mut sybil = Peer::new(t.clone(), Account::generate(), forged, relay_pub);
+    assert!(
+        matches!(sybil.publish_advertising(&[], NOW), PublishResponse::Rejected(_)),
+        "a new bundle slot was created with no valid capability — one client can then mint \
+         identities until the store is full and lock everyone else out permanently"
+    );
+
+    let mut honest = peer(&t, relay_pub);
+    assert!(
+        matches!(honest.publish_advertising(&[], NOW), PublishResponse::Published),
+        "control: a capability-bearing publish must still work"
+    );
+}
+
+/// The deliberate asymmetry: CREATING a slot is metered, REFRESHING one you already own is not.
+/// A live client republishes on every launch and announce; charging that against its quota would
+/// make ordinary use indistinguishable from an attack. The capability here allows ONE request, so
+/// if a refresh reached the admission pipeline the second publish would be refused.
+#[test]
+fn refreshing_your_own_bundle_does_not_spend_quota() {
+    let mut relay = RelayNode::new(NOW);
+    let tight = Capability {
+        quota: Quota { max_requests: 1, max_bytes: 1 << 20, window_secs: 600 },
+        ..dev_cap()
+    };
+    relay.issue_capability(tight.clone());
+    let relay_pub = relay.relay_public();
+    let t = InMemoryTransport::new(Rc::new(RefCell::new(relay)));
+    let mut me = Peer::new(t, Account::generate(), tight, relay_pub);
+
+    assert!(matches!(me.publish_advertising(&[], NOW), PublishResponse::Published), "slot created");
+    for _ in 0..4 {
+        assert!(
+            matches!(me.publish_advertising(&[], NOW), PublishResponse::Published),
+            "republishing an existing slot must not consume quota — a client that republishes on \
+             every launch would otherwise be locked out of its own identity"
+        );
+    }
+}
+
+/// CRYPTO-18/19 lifecycle: abandoned bundles and expired discovery records must return their
+/// capacity on the relay's OWN clock. Discovery records used to be dropped only when somebody
+/// looked one up — and the pseudonym is a random per-user value, so records nobody will ever
+/// resolve sat there until restart.
+#[test]
+fn abandoned_key_distribution_state_is_swept() {
+    use node::node::BUNDLE_TTL_SECS;
+
+    let (t, relay_pub) = shared();
+    let mut bob = peer(&t, relay_pub);
+    let opks = bob.add_opks(2);
+    bob.publish_advertising(&opks, NOW);
+
+    let relay = t.relay_for_test();
+    assert_eq!(relay.borrow().key_distribution_len_for_test().0, 1, "control: the bundle is there");
+
+    // Long past the TTL, and past an epoch boundary so the periodic sweep runs.
+    let later = NOW + BUNDLE_TTL_SECS + 10_000;
+    relay.borrow_mut().tick_for_test(later);
+
+    let (bundles, _) = relay.borrow().key_distribution_len_for_test();
+    assert_eq!(
+        bundles, 0,
+        "a bundle nobody republished for a month held its slot forever — that is what let a \
+         Sybil lock the store permanently"
+    );
+    assert!(
+        relay.borrow().get_bundle(&bob.identity()).is_none(),
+        "the swept bundle must really be gone, not merely uncounted"
+    );
 }

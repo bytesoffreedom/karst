@@ -2516,9 +2516,25 @@ fn persist_incoming_history(store: &Store, msgs: &[Option<Received>], now: u64) 
                 continue;
             }
             // TextExpiring is a disappearing message: delivered to the UI in memory, NEVER
-            // written to disk. Excluded here on purpose (a gui test pins "expiring is not
-            // persisted"); the caller surfaces it live.
-            _ => continue, // not a persistable text message — the caller handles it
+            // written to disk. Not persisted and not quarantined — for THIS type, being lost on
+            // a crash is the feature, so acking it while it exists only in RAM is correct.
+            Ok(content::Content::TextExpiring { .. }) => continue,
+            // Everything else — profile updates, publications, contact control messages, inline
+            // chunks, and any `Content` a newer build invented — is applied by the CALLER, after
+            // this function returns and after the ack. That ordering was the bug (SEC-40): the
+            // ack tells the relay to delete its only copy, so a crash, an account switch or a
+            // full disk between the ack and the handler lost an authenticated message for good.
+            //
+            // Advancing the ratchet proves the ciphertext cannot be read twice. It proves nothing
+            // about the application event surviving. So the plaintext is parked durably HERE,
+            // before the ack is allowed — losing it now takes losing the quarantine file too.
+            other => {
+                let _ = other; // the decode outcome itself is not needed; the bytes are
+                store
+                    .quarantine_incoming(m.sender, &m.plaintext, now)
+                    .map_err(|e| format!("quarantining an unapplied message: {e}"))?;
+                continue;
+            }
         };
         store
             .append_history_incoming(
@@ -2782,6 +2798,53 @@ mod tests {
     fn rx(sender: [u8; 32], text: &[u8], ts: u64, msg_id: [u8; 32]) -> node::peer::Received {
         let plaintext = content::encode(&content::Content::TextStamped { text: text.to_vec(), ts });
         node::peer::Received { sender, plaintext, msg_id }
+    }
+
+    /// SEC-40, THE carrying test. An ACK tells the relay to delete its ONLY copy of a message.
+    /// The receive path acked everything it could decrypt, but only a few `Content` kinds were
+    /// durably stored before that point — a profile update, a publication, a contact control
+    /// message or a variant from a newer build was handed to the caller in memory, and a crash,
+    /// an account switch or a full disk between the ack and the handler lost it for good.
+    ///
+    /// Discriminating both ways: a Profile (which no handler on this path applies) must be parked
+    /// durably, and a TextExpiring must NOT be — for that type, vanishing on a crash is the
+    /// feature, and quarantining it would be a disappearing message written to disk.
+    #[test]
+    fn content_no_handler_commits_is_parked_before_it_can_be_acked() {
+        let (dir, store) = tmp_store("quarantine");
+        let sender = [0xEE; 32];
+
+        let profile = content::encode(&content::Content::Profile {
+            name: "Alice".to_string(),
+            bio: "hi".to_string(),
+        });
+        let expiring = content::encode(&content::Content::TextExpiring {
+            text: b"burn after reading".to_vec(),
+            expire_at: 1_000,
+        });
+        let msgs = vec![
+            Some(node::peer::Received { sender, plaintext: profile.clone(), msg_id: [1u8; 32] }),
+            Some(node::peer::Received { sender, plaintext: expiring.clone(), msg_id: [2u8; 32] }),
+        ];
+
+        persist_incoming_history(&store, &msgs, 100).expect("commit succeeds");
+
+        let parked = store.load_quarantine().unwrap();
+        assert_eq!(
+            parked.len(),
+            1,
+            "exactly one message should be parked — the profile, which nothing on this path \
+             commits; got {parked:?}"
+        );
+        assert_eq!(parked[0].plaintext, profile, "the parked message must be the profile");
+        assert_eq!(parked[0].sender, sender);
+        assert!(
+            !parked.iter().any(|q| q.plaintext == expiring),
+            "a disappearing message was written to disk — for TextExpiring, being lost on a \
+             crash is the point"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Plaintext-first persist is idempotent by `payload_id`: re-running the SAME batch (the

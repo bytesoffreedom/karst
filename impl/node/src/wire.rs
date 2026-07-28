@@ -67,6 +67,54 @@ pub const MAX_RESPONSE_FRAME: usize = FETCH_PAGE_LEN + 512;
 /// padded small-message path does not (see docs/STATUS.md).
 pub const MAX_BLOB_FRAME: usize = 65_000;
 
+/// Wire size of one `pqxdh::SignedOpk`: the fixed 32-byte key plus its 64-byte XEdDSA
+/// signature carried as a length-prefixed `Vec<u8>`. Margin, not an exact postcard count.
+const SIGNED_OPK_WIRE: usize = 32 + 64 + 8;
+
+/// Wire size of one `pqxdh::PreKeyBundle`: two X25519 keys (`ik_pub`, `prekey_pub`), the
+/// ML-KEM-768 encapsulation key (1184 B, fixed by the KEM), an optional one-time prekey,
+/// the XEdDSA prekey signature (64 B), and the mailbox point. Margin, not an exact count.
+const PREKEY_BUNDLE_WIRE: usize = 32 + 32 + 1184 + SIGNED_OPK_WIRE + 64 + 32 + 16;
+
+/// `Ack` frame ceiling. A recipient may legitimately ack up to `node::MAX_ACK_IDS`
+/// payload ids in ONE request — several fetch pages' worth in one shot, capped for the
+/// same reason the app layer already caps it (SEC-28, see `RelayNode::handle_ack`).
+/// `MAX_REQUEST_FRAME` was sized for the tight Send/Fetch class and cannot carry a
+/// max-size ack, so this is that class's OWN ceiling — derived from the same cap the
+/// handler enforces, not hand-picked, so a future change to `MAX_ACK_IDS` moves this with
+/// it instead of silently drifting out of sync.
+pub const MAX_ACK_FRAME: usize = crate::node::MAX_ACK_IDS * 32 + 256;
+
+/// `PublishBundle` frame ceiling. One bundle plus up to `node::MAX_OPKS_PER_IK`
+/// freshly-signed one-time prekeys — a well-behaved client never sends more (the relay
+/// only ever stores that many, see `RelayNode::handle_publish`), so anything past this is
+/// never a legitimate publish, only padding.
+pub const MAX_PUBLISH_FRAME: usize =
+    PREKEY_BUNDLE_WIRE + crate::node::MAX_OPKS_PER_IK * SIGNED_OPK_WIRE + 256;
+
+// Compile-time, not test-only: a class ceiling that isn't actually LARGER than the tight
+// default is a no-op, and `MAX_BLOB_FRAME` must stay the largest bucket. Catches a bad edit
+// to any of these constants (or to `MAX_ACK_IDS`/`MAX_OPKS_PER_IK`) at `cargo build`, before
+// it ever reaches a test run.
+const _: () = assert!(MAX_ACK_FRAME > MAX_REQUEST_FRAME);
+const _: () = assert!(MAX_PUBLISH_FRAME > MAX_REQUEST_FRAME);
+const _: () = assert!(MAX_BLOB_FRAME > MAX_PUBLISH_FRAME);
+
+/// The real per-class ceiling for an INBOUND request, decidable only AFTER decode: the
+/// outer frame length is just a padding bucket (§2.2), and the padded size is
+/// attacker-chosen, so it cannot reveal which variant is inside before decrypt. Only the
+/// classes that structurally need more than the tight default get a larger one — see
+/// `socket::handle_conn`, which calls this immediately after `decode` and rejects anything
+/// over its class's ceiling before the request reaches a handler.
+pub fn max_frame_for(req: &WireRequest) -> usize {
+    match req {
+        WireRequest::Ack(_) => MAX_ACK_FRAME,
+        WireRequest::PublishBundle(_) => MAX_PUBLISH_FRAME,
+        WireRequest::BlobPut(_) => MAX_BLOB_FRAME,
+        _ => MAX_REQUEST_FRAME,
+    }
+}
+
 /// Fixed-size fetch page (§2.2 metadata hardening). On the wire it is ALWAYS
 /// `FETCH_PAGE_LEN` bytes, so the number of queued messages does not leak through
 /// the response length. Layout mirrors the session pad/unpad one layer up:
@@ -280,4 +328,81 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R, max: usize) -> Result
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
     postcard::from_bytes(&body).map_err(|_| WireError::Decode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use admission::capability::CapabilityProof;
+    use crate::pqxdh::PreKeyBundle;
+
+    fn dummy_ack() -> WireRequest {
+        WireRequest::Ack(AckRequest {
+            mailbox: [0u8; 32],
+            client_addr: Vec::new(),
+            carrier_id: Vec::new(),
+            cookie: None,
+            proof: [0u8; 16],
+            ids: Vec::new(),
+            own_proof: Vec::new(),
+        })
+    }
+
+    fn dummy_publish() -> WireRequest {
+        let bundle = PreKeyBundle {
+            ik_pub: [0u8; 32],
+            prekey_pub: [0u8; 32],
+            kem_ek: Vec::new(),
+            opk: None,
+            prekey_sig: Vec::new(),
+            mailbox_pub: [0u8; 32],
+        };
+        WireRequest::PublishBundle(PublishRequest {
+            bundle,
+            opks: Vec::new(),
+            replace_opks: false,
+            client_addr: Vec::new(),
+            carrier_id: Vec::new(),
+            cookie: None,
+            request_nonce: Vec::new(),
+            capability_proof: CapabilityProof {
+                capability_id: [0u8; 16],
+                epoch_id: 0,
+                not_after: 0,
+                mac: [0u8; 16],
+            },
+            proof: [0u8; 16],
+        })
+    }
+
+    fn dummy_blob_put() -> WireRequest {
+        WireRequest::BlobPut(BlobPutRequest {
+            client_addr: Vec::new(),
+            carrier_id: Vec::new(),
+            cookie: None,
+            blob_id: [0u8; 32],
+            index: 0,
+            count: 0,
+            data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn max_frame_for_gives_each_class_its_own_ceiling_not_the_ordinary_default() {
+        // Discriminating for the wiring, not just the arithmetic: if `max_frame_for` collapsed
+        // to `_ => MAX_REQUEST_FRAME` for everything (the bug this closes), these three would
+        // equal `MAX_REQUEST_FRAME` instead of their own, larger, structurally-derived ceilings.
+        assert_eq!(max_frame_for(&dummy_ack()), MAX_ACK_FRAME);
+        assert_eq!(max_frame_for(&dummy_publish()), MAX_PUBLISH_FRAME);
+        assert_eq!(max_frame_for(&dummy_blob_put()), MAX_BLOB_FRAME);
+
+        // (Each ceiling being strictly larger than `MAX_REQUEST_FRAME`, and `MAX_BLOB_FRAME`
+        // staying the largest, is checked at COMPILE time — see the `const _: () = assert!`
+        // trio above these constants' definitions.)
+
+        // Everything else (the vast majority of request variants) stays on the tight default —
+        // spot-check a unit variant and a small-struct variant.
+        assert_eq!(max_frame_for(&WireRequest::GetNodeList), MAX_REQUEST_FRAME);
+        assert_eq!(max_frame_for(&WireRequest::JoinChallenge), MAX_REQUEST_FRAME);
+    }
 }

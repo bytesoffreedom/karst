@@ -262,6 +262,23 @@ fn handle_conn(
         };
         let req: WireRequest = decode(&req_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"))?;
 
+        // §210: `MAX_REQUEST_FRAME` used to be dead on this path — every request was read
+        // with the wide blob ceiling above and NOTHING checked the decoded frame against a
+        // tighter per-class limit, so a `Send`/`Fetch`/`Join`/... padded up to ~65 KB was
+        // decoded and DISPATCHED exactly like a legitimate one. The class can't be known
+        // before decode (the outer length is only a padding bucket, chosen by the sender),
+        // so the tight bound has to be enforced HERE — before the request reaches any
+        // handler — rather than at read time. Not widened to fit everything: `Ack` and
+        // `PublishBundle` genuinely need more than the tight default (see
+        // `wire::max_frame_for`), so they get their own, still-well-below-blob ceilings.
+        let class_max = crate::wire::max_frame_for(&req);
+        if req_bytes.len() > class_max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too large for request class: {} > {class_max}", req_bytes.len()),
+            ));
+        }
+
         let resp = match req {
         WireRequest::Send(msg) => {
             let now = (clock)(); // время СЕРВЕРА

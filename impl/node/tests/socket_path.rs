@@ -23,7 +23,9 @@ use node::node::{
 use node::peer::Peer;
 use node::pqxdh::Account;
 use node::seal::Identity;
+use node::session::Session;
 use node::socket::{RelayServer, SocketTransport};
+use node::wire::{self, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME};
 use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;
@@ -340,4 +342,81 @@ fn a_relay_declared_difficulty_above_the_ceiling_is_refused() {
         msg.contains("difficulty 64 bits"),
         "the refusal must state the declared difficulty: {msg}"
     );
+}
+
+/// §210 — the ordinary-request ceiling (`MAX_REQUEST_FRAME`) used to be dead on the server's
+/// read path: EVERY inbound request was read with the wide blob ceiling, and nothing checked
+/// the decoded frame against a tighter per-class limit afterward — a `Fetch` padded to tens of
+/// KB was decoded and served exactly like a legitimate one.
+///
+/// Discriminating, and pinned tight against "the connection just died for some unrelated
+/// reason": both requests below go over the SAME live Noise session, in order. The FIRST
+/// (normal-sized) `Fetch` must round-trip to a concrete, decoded `WireResponse::NeedCookie` —
+/// proving the session, the handshake, and this exact code path are all healthy. The SECOND
+/// (oversized) `Fetch` — same session, same variant, only `client_addr` padded past the
+/// ordinary ceiling — must then get NO response at all. Since the session was demonstrably
+/// alive one message earlier, silence on the second can only be the new per-class check firing,
+/// not a flaky handshake, a dead socket, or a decode failure. Neuter the check
+/// (`socket::handle_conn`'s `if req_bytes.len() > class_max`) and the second request is instead
+/// SERVED — directly observable.
+#[test]
+fn an_oversized_ordinary_request_is_dropped_instead_of_served() {
+    let (addr, npub, _) = spawn_relay(false);
+
+    let stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut session = Session::connect(stream, &npub).expect("noise handshake succeeds");
+
+    // Control, first, on this SAME session: an ordinary-sized `Fetch` (no cookie) must be
+    // served and decode to a concrete, expected response variant.
+    let normal = WireRequest::Fetch(FetchRequest {
+        mailbox: [0u8; 32],
+        client_addr: b"probe".to_vec(),
+        carrier_id: b"probe".to_vec(),
+        cookie: None,
+        proof: [0u8; 16],
+        ack: false,
+        own_proof: Vec::new(),
+    });
+    let normal_bytes = wire::encode(&normal).expect("a well-formed Fetch always encodes");
+    assert!(normal_bytes.len() <= MAX_REQUEST_FRAME, "test setup: control must fit the ordinary ceiling");
+    session.write_msg(&normal_bytes, MAX_REQUEST_FRAME).expect("control write goes through");
+    let normal_resp: WireResponse =
+        wire::decode(&session.read_msg(MAX_RESPONSE_FRAME).expect("control must be served"))
+            .expect("control response decodes");
+    assert!(
+        matches!(normal_resp, WireResponse::NeedCookie(_)),
+        "control (no cookie) must get NeedCookie, got a different variant entirely"
+    );
+
+    // Now, same session: `Fetch` is not Ack/PublishBundle/BlobPut, so its ceiling is the tight
+    // ordinary default. Pad `client_addr` WAY past that — but still comfortably under
+    // `MAX_BLOB_FRAME`, so the outer read and postcard decode both succeed and only the new
+    // per-class check can reject it.
+    let oversized = WireRequest::Fetch(FetchRequest {
+        mailbox: [0u8; 32],
+        client_addr: vec![0u8; 20_000],
+        carrier_id: b"probe".to_vec(),
+        cookie: None,
+        proof: [0u8; 16],
+        ack: false,
+        own_proof: Vec::new(),
+    });
+    let req_bytes = wire::encode(&oversized).expect("a well-formed Fetch always encodes");
+    assert!(req_bytes.len() > MAX_REQUEST_FRAME, "test setup: must exceed the ordinary ceiling");
+    assert!(req_bytes.len() < MAX_BLOB_FRAME, "test setup: must still fit the outer read bound");
+    // Write with the WIDE bound so the client library's own write-side guard doesn't stop us
+    // from putting an oversized ORDINARY frame on the wire in the first place.
+    session.write_msg(&req_bytes, MAX_BLOB_FRAME).expect("write goes through");
+
+    let resp = session.read_msg(MAX_RESPONSE_FRAME);
+    assert!(
+        resp.is_err(),
+        "oversized ordinary request must get NO response (the SAME session just served the \
+         control above), got {resp:?}"
+    );
+
+    // Belt-and-braces: the server process overall survived too, and a fresh connection still
+    // serves normally.
+    assert!(server_alive(addr, npub), "server must survive the oversized frame and keep serving");
 }

@@ -98,6 +98,15 @@ pub struct StoredAttachment {
     pub failed: bool,
 }
 
+/// An authenticated message this build could not APPLY, parked before it was acked
+/// (see [`Store::quarantine_incoming`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedMessage {
+    pub sender: [u8; 32],
+    pub plaintext: Vec<u8>,
+    pub received_at: u64,
+}
+
 /// Channel configuration (`channel.dat`, sealed, LOCAL-ONLY). `enabled` = channel mode: the
 /// account auto-accepts every subscribe request (a public channel) instead of queuing it for
 /// manual approval (a private account). SECURITY INVARIANT: this bit is written ONLY by the
@@ -2638,6 +2647,67 @@ impl Store {
     // взяться. Append — O(1) (в отличие от переписывания всего файла O(n) на
     // сообщение → O(n²)). Конкурентность — ВЫДЕЛЕННЫЙ `history.lock` (никогда не
     // переименовывается, стабильный inode — как `sessions.lock`).
+
+    fn quarantine_path(&self) -> PathBuf {
+        self.net_file("quarantine.dat")
+    }
+
+    /// Durably park an authenticated message this build cannot APPLY, before it is acked.
+    ///
+    /// An ACK tells the relay to delete its only copy. The receive path used to ack everything it
+    /// could DECRYPT, but only a few `Content` kinds were durably stored before that point — a
+    /// profile update, a publication, a contact request, an inline chunk or a `Content` variant
+    /// from a newer build were handed to the caller in memory and then, if the process died or
+    /// the disk was full, gone for good (SEC-40). Successfully advancing the ratchet proves the
+    /// ciphertext cannot be read twice; it proves nothing about the application event surviving.
+    ///
+    /// So anything not committed by its own handler lands here first, plaintext-sealed, and only
+    /// then is the ack allowed. Losing it now takes losing this file too.
+    ///
+    /// RESIDUAL, deliberately not overstated: this makes the message RECOVERABLE, not
+    /// automatically re-applied — nothing yet drains this log back into the handlers on the next
+    /// launch. That replay is its own slice; what this closes is the permanent, silent loss.
+    pub fn quarantine_incoming(&self, sender: [u8; 32], plaintext: &[u8], now: u64) -> io::Result<()> {
+        if plaintext.len() > MAX_HISTORY_RECORD {
+            return Err(io_err("quarantined payload too large"));
+        }
+        let plain = postcard::to_stdvec(&(sender, plaintext, now)).map_err(io_err)?;
+        let blob = self.key.seal(&self.label(&self.quarantine_path()), &plain);
+        let len: u32 = blob.len().try_into().map_err(|_| io_err("quarantine record too large"))?;
+        let mut f = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(self.quarantine_path())?;
+        f.write_all(&len.to_le_bytes())?;
+        f.write_all(&blob)?;
+        f.sync_all()
+    }
+
+    /// Read the quarantined messages back. For an operator, or a later build that learns how to
+    /// apply them; the receive path never reads this.
+    pub fn load_quarantine(&self) -> io::Result<Vec<QuarantinedMessage>> {
+        let bytes = match std::fs::read(self.quarantine_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let label = self.label(&self.quarantine_path());
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 4 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if len == 0 || len > MAX_HISTORY_RECORD || pos + len > bytes.len() {
+                break; // torn tail: stop, do not guess
+            }
+            let plain = self.key.open(&label, &bytes[pos..pos + len]).map_err(io_err)?;
+            let (sender, plaintext, received_at) = postcard::from_bytes(&plain).map_err(io_err)?;
+            out.push(QuarantinedMessage { sender, plaintext, received_at });
+            pos += len;
+        }
+        Ok(out)
+    }
 
     fn history_path(&self) -> PathBuf {
         self.dir.join("history.dat")

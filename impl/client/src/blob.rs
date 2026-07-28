@@ -3,9 +3,11 @@
 //! threshold ride an encrypted blob parked on the relay, so offline delivery works).
 //!
 //! Per file: a **fresh random key `K`** — so the relay stores only ciphertext (compromising
-//! the blob store yields nothing) and a counter nonce is safe (no reuse across files).
-//! Each chunk is sealed INDEPENDENTLY (`ChaCha20-Poly1305`) so encryption/decryption
-//! STREAMS — peak RAM is O(chunk), not O(file), which is the whole point for GB files.
+//! the blob store yields nothing). Each chunk is sealed INDEPENDENTLY
+//! (`ChaCha20-Poly1305`) so encryption/decryption STREAMS — peak RAM is O(chunk), not
+//! O(file), which is the whole point for GB files. Its actual key and nonce are DERIVED
+//! per chunk from `K` and a fresh random salt (see [`chunk_aead`]), so a resume path that
+//! hands the same `K` to different bytes cannot produce a two-time pad.
 //! The chunk's position `(blob_id ‖ index ‖ count ‖ is_last)` is in the AEAD's AAD, so
 //! the untrusted relay cannot reorder / truncate / splice chunks without detection.
 //! A SHA-256 of the **plaintext** is the end-to-end backstop, verified incrementally on
@@ -39,27 +41,57 @@ pub fn random32() -> [u8; 32] {
     b
 }
 
-/// Counter nonce for chunk `index`. Unique within a file because `K` is fresh per file,
-/// so there is no nonce reuse under a fixed key (the catastrophe this must avoid).
-fn chunk_nonce(index: u32) -> Nonce {
-    let mut n = [0u8; 12];
-    n[..4].copy_from_slice(&index.to_le_bytes());
-    *Nonce::from_slice(&n)
+/// Per-chunk salt width, carried as a plaintext prefix on every sealed chunk. See
+/// [`chunk_aead`] for why a counter nonce alone was not enough.
+pub const CHUNK_SALT: usize = 16;
+
+/// `(AEAD key, nonce)` for ONE chunk: HKDF-SHA256 over the file key `K`, salted with that
+/// chunk's own random salt and bound to its index.
+///
+/// The old scheme was `key = K`, `nonce = LE32(index) ‖ 0^64`, safe under exactly one
+/// invariant: `K` is fresh for each immutable file and never encrypts other bytes. The resume
+/// layer broke it — `upload_id_for` identified a transfer by (recipient, basename, declared
+/// size), so a DIFFERENT file with the same name and size resumed onto the stored `blob_id` and
+/// `K`. Same key, same index, same nonce, same AAD, different plaintext: the relay holds two
+/// ciphertexts whose XOR is the XOR of the two plaintexts, and the Poly1305 key is reused.
+///
+/// Reusing `K` is now HARMLESS rather than forbidden: a fresh salt per chunk lands every
+/// encryption on its own key and nonce, whatever the resume layer does. `index` stays in the
+/// derivation so even a repeated salt across two chunks of the SAME file cannot collide.
+fn chunk_aead(key: &BlobKey, index: u32, salt: &[u8; CHUNK_SALT]) -> ([u8; 32], Nonce) {
+    let hk = hkdf::Hkdf::<Sha256>::new(Some(salt), key);
+    let mut info = [0u8; 23];
+    info[..19].copy_from_slice(b"KARST-blob-chunk-v2");
+    info[19..].copy_from_slice(&index.to_le_bytes());
+    let mut okm = [0u8; 44];
+    hk.expand(&info, &mut okm).expect("44 within HKDF output limit");
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&okm[..32]);
+    (k, *Nonce::from_slice(&okm[32..]))
 }
 
 /// Position-binding AAD: authenticates where this chunk sits so the relay cannot move,
 /// drop, or splice chunks undetected. `count`/`is_last` also pin the total length.
-fn chunk_aad(id: &BlobId, index: u32, count: u32, is_last: bool) -> [u8; 41] {
-    let mut a = [0u8; 41];
+fn chunk_aad(
+    id: &BlobId,
+    index: u32,
+    count: u32,
+    is_last: bool,
+    salt: &[u8; CHUNK_SALT],
+) -> [u8; 41 + CHUNK_SALT] {
+    let mut a = [0u8; 41 + CHUNK_SALT];
     a[..32].copy_from_slice(id);
     a[32..36].copy_from_slice(&index.to_le_bytes());
     a[36..40].copy_from_slice(&count.to_le_bytes());
     a[40] = is_last as u8;
+    a[41..].copy_from_slice(salt);
     a
 }
 
-/// Seal one plaintext chunk. Infallible for valid inputs (AEAD only fails on absurd
-/// lengths, which our fixed chunking never produces).
+/// Seal one plaintext chunk as `salt(16) ‖ ciphertext`. Infallible for valid inputs (AEAD only
+/// fails on absurd lengths, which our fixed chunking never produces). The salt rides in the
+/// clear — it is a KDF input, not a secret — and is covered by the AAD, so altering it in
+/// transit only breaks the tag.
 pub fn seal_chunk(
     key: &BlobKey,
     id: &BlobId,
@@ -68,27 +100,40 @@ pub fn seal_chunk(
     is_last: bool,
     plaintext: &[u8],
 ) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let aad = chunk_aad(id, index, count, is_last);
-    cipher
-        .encrypt(&chunk_nonce(index), Payload { msg: plaintext, aad: &aad })
-        .expect("ChaCha20-Poly1305 seal")
+    let mut salt = [0u8; CHUNK_SALT];
+    OsRng.fill_bytes(&mut salt);
+    let (k, nonce) = chunk_aead(key, index, &salt);
+    let cipher = ChaCha20Poly1305::new((&k).into());
+    let aad = chunk_aad(id, index, count, is_last, &salt);
+    let ct = cipher
+        .encrypt(&nonce, Payload { msg: plaintext, aad: &aad })
+        .expect("ChaCha20-Poly1305 seal");
+    let mut out = Vec::with_capacity(CHUNK_SALT + ct.len());
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&ct);
+    out
 }
 
-/// Open one ciphertext chunk at its claimed position. Fails (closed) on any tamper:
-/// flipped byte, wrong key, moved/relabelled chunk, or altered total.
+/// Open one `salt ‖ ciphertext` chunk at its claimed position. Fails (closed) on any tamper:
+/// flipped byte, wrong key, moved/relabelled chunk, altered total, or a swapped salt.
 pub fn open_chunk(
     key: &BlobKey,
     id: &BlobId,
     index: u32,
     count: u32,
     is_last: bool,
-    ciphertext: &[u8],
+    stored: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let aad = chunk_aad(id, index, count, is_last);
+    if stored.len() < CHUNK_SALT {
+        return Err("blob chunk shorter than its salt".to_string());
+    }
+    let mut salt = [0u8; CHUNK_SALT];
+    salt.copy_from_slice(&stored[..CHUNK_SALT]);
+    let (k, nonce) = chunk_aead(key, index, &salt);
+    let cipher = ChaCha20Poly1305::new((&k).into());
+    let aad = chunk_aad(id, index, count, is_last, &salt);
     cipher
-        .decrypt(&chunk_nonce(index), Payload { msg: ciphertext, aad: &aad })
+        .decrypt(&nonce, Payload { msg: &stored[CHUNK_SALT..], aad: &aad })
         .map_err(|_| "blob chunk authentication failed".to_string())
 }
 
@@ -161,6 +206,59 @@ pub fn plaintext_hash(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRYPTO-31, THE carrying test. Re-sealing the SAME position under the SAME file key with
+    /// DIFFERENT bytes is exactly what a resume onto a changed file did. Under the old scheme
+    /// (`key = K`, `nonce = LE32(index)`) the relay could XOR the two stored ciphertexts and read
+    /// the XOR of the two plaintexts without any key.
+    ///
+    /// Discriminating: it asserts that XOR relation is BROKEN, not merely that the two
+    /// ciphertexts differ — the latter held under the broken scheme too.
+    #[test]
+    fn resealing_a_chunk_position_does_not_reuse_the_keystream() {
+        let (key, id) = (random32(), random32());
+        let pt1 = b"the original file's first chunk.";
+        let pt2 = b"a different file, same position.";
+
+        let c1 = seal_chunk(&key, &id, 0, 1, true, pt1);
+        let c2 = seal_chunk(&key, &id, 0, 1, true, pt2);
+
+        assert_ne!(&c1[..CHUNK_SALT], &c2[..CHUNK_SALT], "each chunk must carry a FRESH salt");
+        let body1 = &c1[CHUNK_SALT..];
+        let body2 = &c2[CHUNK_SALT..];
+        let xor_ct: Vec<u8> = body1.iter().zip(body2).map(|(a, b)| a ^ b).collect();
+        let xor_pt: Vec<u8> = pt1.iter().zip(pt2.iter()).map(|(a, b)| a ^ b).collect();
+        assert_ne!(
+            &xor_ct[..xor_pt.len()],
+            &xor_pt[..],
+            "keystream reuse: the relay can XOR two stored chunks and recover the XOR of both \
+             plaintexts — the chunk key/nonce must depend on the per-chunk salt"
+        );
+    }
+
+    /// The salt is authenticated, not merely carried: swapping in another chunk's salt must fail
+    /// the tag. Guards against deriving from the salt while forgetting to bind it into the AAD.
+    #[test]
+    fn a_swapped_chunk_salt_fails_the_tag() {
+        let (key, id) = (random32(), random32());
+        let mut c = seal_chunk(&key, &id, 0, 1, true, b"payload");
+        c[0] ^= 1;
+        assert!(open_chunk(&key, &id, 0, 1, true, &c).is_err(), "tampered salt must not open");
+    }
+
+    /// A sealed chunk must still fit the relay's per-chunk ceiling with the salt on top —
+    /// otherwise a full-size upload would be rejected at the last moment, on the biggest files.
+    #[test]
+    fn a_full_size_sealed_chunk_stays_under_the_relay_ceiling() {
+        let (key, id) = (random32(), random32());
+        let sealed = seal_chunk(&key, &id, 0, 2, false, &vec![0u8; BLOB_CHUNK]);
+        assert!(
+            sealed.len() <= node::blobstore::MAX_BLOB_CHUNK,
+            "sealed chunk is {} B, over the relay's {} B ceiling",
+            sealed.len(),
+            node::blobstore::MAX_BLOB_CHUNK
+        );
+    }
 
     /// Seal `data` into positioned chunks (the send path does this streaming from disk;
     /// here we do it in memory to drive the receiver in tests).

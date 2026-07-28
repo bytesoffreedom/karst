@@ -68,7 +68,7 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
         initiate_key_agreement(&attacker, &[9u8; 32], &bundle).expect("well-formed bundle");
     ka.ik_a_pub = victim_ik;
     let garbage = RatchetMessage {
-        header: Header { dh: [1u8; 32], pn: 0, n: 0 },
+        header: Header { dh: [1u8; 32], pn: 0, n: 0, salt: [7u8; 16] },
         ciphertext: vec![7u8; 48],
     };
     // SEALED, so the refusal below is about authentication — not about the envelope form.

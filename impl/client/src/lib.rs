@@ -1540,11 +1540,12 @@ pub fn send_file(
         return Ok(());
     }
 
-    // Large file → RESUMABLE blob upload. A stable `upload_id` (recipient+name+size) keys a
-    // persisted record, so if the send crashes mid-upload, re-running it continues from the relay's
-    // watermark instead of re-sending the whole file. The record is cleared once the `FileRef`
-    // (the small pointer the recipient downloads from) has been delivered.
-    let upload_id = upload_id_for(to_ik, name, size);
+    // Large file → RESUMABLE blob upload. A stable `upload_id` keys a persisted record, so if the
+    // send crashes mid-upload, re-running it continues from the relay's watermark instead of
+    // re-sending the whole file. The record is cleared once the `FileRef` (the small pointer the
+    // recipient downloads from) has been delivered. The id covers the CONTENT, so a resume can
+    // only ever continue the same bytes — see `upload_id_for`.
+    let upload_id = upload_id_for(to_ik, name, size, &blob::plaintext_hash(bytes));
     let (blob_id, key) = match store.get_pending_upload(&upload_id).map_err(|e| format!("pending uploads: {e}"))? {
         Some(pu) => (pu.blob_id, pu.key),
         None => {
@@ -1573,13 +1574,19 @@ pub fn send_file(
 /// A stable id for an in-flight upload — a domain-separated hash of recipient+name+size — so a
 /// re-run of the same send finds the persisted record and resumes rather than restarting. Shared
 /// by the CLI (`send_file`) and the GUI (`spawn_blob_upload`) so both key the same record.
-pub fn upload_id_for(to_ik: &[u8; 32], name: &str, size: u64) -> [u8; 32] {
+pub fn upload_id_for(to_ik: &[u8; 32], name: &str, size: u64, content: &[u8; 32]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"karst-upload-id-v1");
+    h.update(b"karst-upload-id-v2");
     h.update(to_ik);
+    h.update((name.len() as u64).to_le_bytes());
     h.update(name.as_bytes());
     h.update(size.to_le_bytes());
+    // The CONTENT hash, not just its name and length (CRYPTO-31). Without it, "same recipient,
+    // same basename, same size" resumed a DIFFERENT file onto the stored blob_id and key: the
+    // relay then held a blob spliced from two files, and (before the per-chunk salt) two
+    // ciphertexts under one key+nonce. Editing a file now starts its own transfer.
+    h.update(content);
     h.finalize().into()
 }
 

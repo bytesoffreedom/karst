@@ -889,7 +889,7 @@ impl<T: Transport> Peer<T> {
         // Noise layer's buckets hide this from an on-path observer but not from the relay,
         // which sees the payload after decryption. Named, not solved.
         let msg = crate::ratchet::RatchetMessage {
-            header: crate::ratchet::Header { dh: random32(), pn: 0, n: 0 },
+            header: crate::ratchet::Header { dh: random32(), pn: 0, n: 0, salt: [7u8; 16] },
             ciphertext: {
                 let mut c = vec![0u8; 96];
                 use chacha20poly1305::aead::rand_core::RngCore;
@@ -1334,7 +1334,7 @@ mod outbox_state_tests {
 
     fn a_ratchet_envelope() -> SessionEnvelope {
         SessionEnvelope::Ratchet(RatchetMessage {
-            header: Header { dh: [1u8; 32], pn: 0, n: 0 },
+            header: Header { dh: [1u8; 32], pn: 0, n: 0, salt: [7u8; 16] },
             ciphertext: vec![9u8; 16],
         })
     }

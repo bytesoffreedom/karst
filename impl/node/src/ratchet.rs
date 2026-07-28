@@ -34,12 +34,14 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use hmac::{Mac, SimpleHmac};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use sha2::Sha256;
 use x25519_dalek::PublicKey;
 
 use crate::seal::Identity;
 
-const AAD_DOMAIN: &[u8] = b"KARST-ratchet-v1";
+const AAD_DOMAIN: &[u8] = b"KARST-ratchet-v2";
 
 /// Максимум ключей, выводимых за ОДИН шаг приёма (в каждой из до двух цепочек).
 /// Анти-DoS: forged `header.n`/`header.pn` не заставит вывести unbounded KDF.
@@ -71,13 +73,23 @@ struct SkippedKey {
 }
 
 /// Заголовок сообщения: текущий ratchet-pubkey отправителя, длина предыдущей
-/// цепочки (`pn`), номер в текущей цепочке (`n`). Связывается в AEAD-AAD.
+/// цепочки (`pn`), номер в текущей цепочке (`n`), пер-сообщенческая соль.
+/// Связывается целиком в AEAD-AAD.
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     pub dh: [u8; 32],
     pub pn: u32,
     pub n: u32,
+    /// Fresh random per message; the AEAD key and nonce are derived from `(mk, salt)` rather
+    /// than being `mk` with a zero nonce (CRYPTO-01 residual). See [`message_aead`] — this is
+    /// what makes a ratchet-state ROLLBACK non-catastrophic instead of merely unlikely.
+    pub salt: [u8; SALT_LEN],
 }
+
+/// Per-message salt width. 128 bits: a repeat needs ~2^64 messages in ONE chain, while the
+/// cost is 16 bytes per message, which stays inside the current padding bucket (pinned by
+/// `a_full_size_chunk_still_fits_its_padding_bucket`) so the change is invisible on the wire.
+pub const SALT_LEN: usize = 16;
 
 /// Сообщение на проводе.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -217,14 +229,24 @@ impl Session {
     }
 
     /// Зашифровать сообщение. Требует sending-цепочку (Alice — с init; Bob —
-    /// после первого decrypt). Свежий ключ на сообщение → нулевой nonce безопасен.
+    /// после первого decrypt).
+    ///
+    /// The AEAD key/nonce come from `(mk, fresh salt)`, not from `mk` with a zero nonce. A fresh
+    /// message key per message made the zero nonce *safe*, but only for as long as the chain
+    /// never goes backwards — and a chain CAN go backwards: restore a backup, clone the disk,
+    /// roll back the VM. `cks` then re-derives the same `mk` and, with a fixed nonce, encrypts a
+    /// DIFFERENT plaintext under the identical key+nonce: keystream reuse (XOR of the two
+    /// plaintexts) plus a reused Poly1305 key. Rollback cannot be *prevented* by a program that
+    /// keeps its state in files the attacker can restore, so it is made harmless instead.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> RatchetMessage {
         let ck = self.cks.expect("sending chain (получатель должен принять до отправки)");
         let (ck_next, mk) = kdf_ck(&ck);
-        let header = Header { dh: self.dhs.public.to_bytes(), pn: self.pn, n: self.ns };
+        let mut salt = [0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        let header = Header { dh: self.dhs.public.to_bytes(), pn: self.pn, n: self.ns, salt };
         self.cks = Some(ck_next);
         self.ns += 1;
-        let ciphertext = aead_encrypt(&mk, plaintext, &aad(&header));
+        let ciphertext = aead_encrypt(&mk, plaintext, &aad(&header), &header.salt);
         RatchetMessage { header, ciphertext }
     }
 
@@ -233,7 +255,7 @@ impl Session {
     pub fn decrypt(&mut self, msg: &RatchetMessage) -> Result<Vec<u8>, RatchetError> {
         let mut staged = self.clone();
         let mk = staged.advance_for_decrypt(&msg.header)?;
-        let pt = aead_decrypt(&mk, &msg.ciphertext, &aad(&msg.header))
+        let pt = aead_decrypt(&mk, &msg.ciphertext, &aad(&msg.header), &msg.header.salt)
             .map_err(|_| RatchetError::Decrypt)?;
         *self = staged; // коммит только после успешной AEAD
         Ok(pt)
@@ -365,26 +387,47 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 fn aad(header: &Header) -> Vec<u8> {
-    let mut a = Vec::with_capacity(AAD_DOMAIN.len() + 40);
+    let mut a = Vec::with_capacity(AAD_DOMAIN.len() + 40 + SALT_LEN);
     a.extend_from_slice(AAD_DOMAIN);
     a.extend_from_slice(&header.dh);
     a.extend_from_slice(&header.pn.to_le_bytes());
     a.extend_from_slice(&header.n.to_le_bytes());
+    a.extend_from_slice(&header.salt);
     a
 }
 
-fn aead_encrypt(mk: &[u8; 32], pt: &[u8], aad: &[u8]) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
-    cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: pt, aad })
-        .expect("AEAD encryption")
+/// `(AEAD key, nonce)` for ONE message: HKDF-SHA256 over the message key, salted with the
+/// header's per-message salt. Two encryptions under the same `mk` — which is exactly what a
+/// state rollback produces — land on different keys, so neither the keystream nor the Poly1305
+/// key is ever reused. The salt is attacker-VISIBLE (it rides in the header) but not
+/// attacker-CHOSEN on our side, and it is covered by the AAD, so flipping it in transit only
+/// breaks the tag.
+fn message_aead(mk: &[u8; 32], salt: &[u8; SALT_LEN]) -> ([u8; 32], [u8; 12]) {
+    let hk = Hkdf::<Sha256>::new(Some(salt), mk);
+    let mut okm = [0u8; 44];
+    hk.expand(b"KARST-ratchet-msg-v2", &mut okm).expect("44 within HKDF output limit");
+    let mut key = [0u8; 32];
+    let mut nonce = [0u8; 12];
+    key.copy_from_slice(&okm[..32]);
+    nonce.copy_from_slice(&okm[32..]);
+    (key, nonce)
 }
 
-fn aead_decrypt(mk: &[u8; 32], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>, ()> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
-    cipher
-        .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: ct, aad })
-        .map_err(|_| ())
+fn aead_encrypt(mk: &[u8; 32], pt: &[u8], aad: &[u8], salt: &[u8; SALT_LEN]) -> Vec<u8> {
+    let (key, nonce) = message_aead(mk, salt);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: pt, aad }).expect("AEAD encryption")
+}
+
+fn aead_decrypt(
+    mk: &[u8; 32],
+    ct: &[u8],
+    aad: &[u8],
+    salt: &[u8; SALT_LEN],
+) -> Result<Vec<u8>, ()> {
+    let (key, nonce) = message_aead(mk, salt);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad }).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -426,6 +469,78 @@ mod tests {
         assert!(
             !dump.windows(32).any(|w| w == mk),
             "ключ израсходованного сообщения не должен оставаться в состоянии (FS)"
+        );
+    }
+
+    /// CRYPTO-01 residual, THE carrying test. A ratchet state that goes BACKWARDS — restored
+    /// backup, cloned disk, rolled-back VM — re-derives the same message key and encrypts a
+    /// different plaintext with it. Under the old scheme (key = `mk`, nonce = zero) that is a
+    /// two-time pad: `ct1 XOR ct2 == pt1 XOR pt2` recovers the XOR of both plaintexts with no
+    /// key at all, and the Poly1305 key is reused on top.
+    ///
+    /// Rollback cannot be PREVENTED locally — an attacker who can restore one file can restore
+    /// them all — so it is made harmless instead: the per-message salt lands the two encryptions
+    /// on different keys AND different nonces.
+    ///
+    /// Discriminating on purpose: it asserts the XOR relation is BROKEN, so it goes red the
+    /// moment the derivation stops depending on the salt. Asserting merely `ct1 != ct2` would
+    /// have passed under the old scheme too (different plaintexts → different ciphertexts).
+    #[test]
+    fn a_rolled_back_sending_chain_does_not_reuse_the_keystream() {
+        let (alice, _bob) = pair();
+
+        // The SAME pre-send state used twice = exactly what restoring a backup does.
+        let mut original = alice.clone();
+        let mut rolled_back = alice;
+
+        let pt1 = b"transfer 10 to alice............";
+        let pt2 = b"transfer 99 to mallory..........";
+        let m1 = original.encrypt(pt1);
+        let m2 = rolled_back.encrypt(pt2);
+
+        assert_eq!(m1.header.n, m2.header.n, "the rollback must really replay the same message number");
+        assert_ne!(m1.header.salt, m2.header.salt, "each message must carry a FRESH salt");
+
+        let xor_ct: Vec<u8> =
+            m1.ciphertext.iter().zip(&m2.ciphertext).map(|(a, b)| a ^ b).collect();
+        let xor_pt: Vec<u8> = pt1.iter().zip(pt2.iter()).map(|(a, b)| a ^ b).collect();
+        assert_ne!(
+            &xor_ct[..xor_pt.len()],
+            &xor_pt[..],
+            "keystream reuse: XOR of the two ciphertexts leaked the XOR of the two plaintexts — \
+             the AEAD key/nonce must depend on the per-message salt, not on the message key alone"
+        );
+    }
+
+    /// The salt is authenticated, not just carried: flipping it in transit must fail the tag
+    /// rather than silently decrypting under a different key. Guards against someone deriving
+    /// the key from the salt but forgetting to bind the salt into the AAD.
+    #[test]
+    fn a_tampered_salt_fails_the_tag() {
+        let (mut alice, mut bob) = pair();
+        let mut msg = alice.encrypt(b"hello");
+        msg.header.salt[0] ^= 1;
+        assert_eq!(bob.decrypt(&msg), Err(RatchetError::Decrypt));
+    }
+
+    /// The 16-byte salt must not push a full-size message into a bigger padding bucket: the
+    /// on-wire SIZE CLASS is the observable, and a changed size class is itself a tell. Pins
+    /// that a maximum inline chunk (1024 B payload + framing + AEAD tag) still lands in the
+    /// same bucket it did before the salt existed.
+    #[test]
+    fn a_full_size_chunk_still_fits_its_padding_bucket() {
+        let (mut alice, _bob) = pair();
+        // 1024 = client::content::MAX_CHUNK_PAYLOAD (that crate depends on this one, not the
+        // other way round), plus generous room for the Content framing around the chunk.
+        let msg = alice.encrypt(&vec![0u8; 1024 + 64]);
+        let on_wire = postcard::to_stdvec(&msg).expect("serialize");
+
+        let with_salt = crate::session::bucket_for(4 + on_wire.len());
+        let without_salt = crate::session::bucket_for(4 + on_wire.len() - SALT_LEN);
+        assert_eq!(
+            with_salt, without_salt,
+            "the per-message salt moved a full-size message into a different padding bucket \
+             ({without_salt} -> {with_salt}): the change became visible on the wire"
         );
     }
 
@@ -521,7 +636,7 @@ mod tests {
 
         // Валидный header (та же цепочка), n=50, но мусорный ciphertext.
         let forged = RatchetMessage {
-            header: Header { dh: dhr, pn: 0, n: 50 },
+            header: Header { dh: dhr, pn: 0, n: 50, salt: [7u8; 16] },
             ciphertext: vec![0u8; 48],
         };
         assert_eq!(bob.decrypt(&forged), Err(RatchetError::Decrypt));
@@ -543,7 +658,7 @@ mod tests {
         let dhr = bob.dhr.unwrap();
 
         let too_far = RatchetMessage {
-            header: Header { dh: dhr, pn: 0, n: MAX_SKIP + 5 },
+            header: Header { dh: dhr, pn: 0, n: MAX_SKIP + 5, salt: [7u8; 16] },
             ciphertext: vec![0u8; 48],
         };
         assert_eq!(bob.decrypt(&too_far), Err(RatchetError::OutOfOrder));

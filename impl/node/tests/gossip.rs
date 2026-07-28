@@ -45,17 +45,17 @@ fn desc(noise: [u8; 32], fetch: [u8; 32], addr: &str) -> RelayDescriptor {
 fn verify_accepts_real_relay_and_rejects_impostors() {
     let (addr, npub, fpub) = spawn(vec![], true);
 
-    assert!(node::gossip::verify(&desc(npub, fpub, &addr), &addr), "a real self-advertising relay verifies");
+    assert!(node::gossip::verify(&desc(npub, fpub, &addr), &addr, true), "a real self-advertising relay verifies");
     // Wrong noise key: the Noise handshake fails → the reflection defense.
-    assert!(!node::gossip::verify(&desc([0xAB; 32], fpub, &addr), &addr), "wrong noise key must fail");
+    assert!(!node::gossip::verify(&desc([0xAB; 32], fpub, &addr), &addr, true), "wrong noise key must fail");
     // Right noise, WRONG fetch: the relay's self-advertisement doesn't match → refused.
-    assert!(!node::gossip::verify(&desc(npub, [0xCD; 32], &addr), &addr), "wrong fetch key must fail");
+    assert!(!node::gossip::verify(&desc(npub, [0xCD; 32], &addr), &addr, true), "wrong fetch key must fail");
     // Dead address: unreachable → refused (connection refused, fast).
-    assert!(!node::gossip::verify(&desc(npub, fpub, "127.0.0.1:1"), "127.0.0.1:1"), "dead addr must fail");
+    assert!(!node::gossip::verify(&desc(npub, fpub, "127.0.0.1:1"), "127.0.0.1:1", true), "dead addr must fail");
 
     // A relay that does NOT advertise itself can't be verified (no self-entry to match).
     let (a2, n2, f2) = spawn(vec![], false);
-    assert!(!node::gossip::verify(&desc(n2, f2, &a2), &a2), "a non-self-advertising relay can't be confirmed");
+    assert!(!node::gossip::verify(&desc(n2, f2, &a2), &a2, true), "a non-self-advertising relay can't be confirmed");
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn gossip_round_learns_a_verified_relay_from_a_peer() {
     b.add_relay(a.clone());
     let b = Arc::new(Mutex::new(b));
 
-    let added = node::gossip::gossip_round(&b, &bpub);
+    let added = node::gossip::gossip_round(&b, &bpub, true);
     assert!(added >= 1, "B should learn a new relay (C) from peer A");
     let ids: Vec<String> = b.lock().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
     assert!(ids.contains(&c.relay_id_hex()), "B must now know C, verified via a direct dial");
@@ -90,10 +90,44 @@ fn gossip_round_rejects_a_poisoned_descriptor() {
     b.add_relay(a);
     let b = Arc::new(Mutex::new(b));
 
-    node::gossip::gossip_round(&b, &bpub);
+    node::gossip::gossip_round(&b, &bpub, true);
     let ids: Vec<String> = b.lock().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
     assert!(
         !ids.contains(&poison.relay_id_hex()),
         "a poisoned (unverifiable) descriptor must NOT be added — the reflection defense"
     );
+}
+
+/// A3-12 — gossip must not dial into private/loopback space on a peer's say-so.
+///
+/// Verify-before-add stops a hostile descriptor from being RE-SERVED, but the dial happens
+/// first — so without this filter a malicious known peer could make a public relay connect, on a
+/// schedule, to `127.0.0.1:<port>`, an RFC1918 host, or the cloud metadata service at
+/// 169.254.169.254. The Noise handshake bounds what can be exchanged, but the connection attempt
+/// itself is egress SSRF and internal port probing.
+#[test]
+fn gossip_refuses_private_and_loopback_destinations() {
+    use node::gossip::addr_is_dialable;
+
+    for addr in [
+        "127.0.0.1:9000",          // loopback
+        "10.0.0.1:9000",           // RFC1918
+        "192.168.1.1:9000",        // RFC1918
+        "172.16.0.1:9000",         // RFC1918
+        "169.254.169.254:80",      // cloud metadata (link-local)
+        "100.64.0.1:9000",         // CGNAT
+        "0.0.0.0:9000",            // unspecified
+        "[::1]:9000",              // IPv6 loopback
+        "[fe80::1]:9000",          // IPv6 link-local
+        "[fc00::1]:9000",          // IPv6 unique-local
+        "[::ffff:127.0.0.1]:9000", // IPv4-mapped loopback
+    ] {
+        assert!(!addr_is_dialable(addr, false), "{addr} must not be dialable on a public relay");
+    }
+
+    // A real public address still is — the filter must not simply refuse everything.
+    assert!(addr_is_dialable("8.8.8.8:9000", true), "the local-testing escape hatch works");
+    assert!(addr_is_dialable("8.8.8.8:9000", false), "a globally routable address stays dialable");
+    // Local testing keeps working with the escape hatch on (that is how these tests run).
+    assert!(addr_is_dialable("127.0.0.1:9000", true), "loopback allowed only in local testing");
 }

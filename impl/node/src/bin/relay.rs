@@ -743,9 +743,13 @@ fn run_relay(addr: String) -> io::Result<()> {
     if std::env::var("KARST_RELAY_PEERS").map(|s| !s.trim().is_empty()).unwrap_or(false) {
         let handle = server.relay_handle();
         let self_np = noise_pub;
+        // Only a LOCAL-TESTING relay may gossip into private/loopback space. A public or private
+        // deployment refuses those destinations, so a hostile peer cannot use gossip to make us
+        // connect to 127.0.0.1, an RFC1918 host, or the cloud metadata service (A3-12).
+        let allow_private = matches!(role, Role::Dev);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(node::gossip::GOSSIP_INTERVAL_SECS));
-            let added = node::gossip::gossip_round(&handle, &self_np);
+            let added = node::gossip::gossip_round(&handle, &self_np, allow_private);
             if added > 0 {
                 eprintln!("gossip: verified and learned {added} new relay(s)");
             }

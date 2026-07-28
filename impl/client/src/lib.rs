@@ -753,6 +753,14 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
     // matches (e.g. keep files across a restart). The advertisement is operator-declared — for the
     // durable case a client can later PROVE it (`verify_durability`); ephemeral stays a claim.
     let want_persistence = store.load_relay_prefs().map(|p| p.prefer_persistence).unwrap_or(None);
+    // A relay's node-list is attacker-influenceable, and importing it makes US dial the addresses
+    // in it — so a hostile PUBLIC relay could otherwise walk the user's own LAN, or hit loopback
+    // services, one auto-discovery at a time (A3-12, client side). Private destinations are
+    // accepted only when the relay we are importing FROM is itself private/loopback: that is a
+    // local or LAN deployment the user configured deliberately, so its peers being local is
+    // consistent. Relays added explicitly (invite / config) are unaffected — this gates only
+    // AUTO-discovery.
+    let allow_private = !node::gossip::addr_is_dialable(&from.addr.to_string(), false);
     let mut added = 0usize;
     for d in discovered {
         let id_hex = d.relay_id_hex();
@@ -762,7 +770,7 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
         let addr = d.addrs[0].clone();
         // VERIFY-BEFORE-ADD: dial and confirm the relay serves its own full relay-id before
         // trusting it enough to route our mail through it.
-        if !node::gossip::verify(&d, &addr) {
+        if !node::gossip::verify(&d, &addr, allow_private) {
             continue;
         }
         // POLICY PREFERENCE: skip a verified relay whose advertised policy does not match.

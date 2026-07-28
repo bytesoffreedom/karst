@@ -1120,6 +1120,98 @@ pub fn publish_all(
     Ok(primary_resp)
 }
 
+/// Load the pending-send ledger (see `store::PendingSend`), or an empty one if it cannot be
+/// read. Best-effort on purpose: a corrupt or unreadable ledger must not stop a send — it only
+/// degrades attribution of a FUTURE loss to "unknown" instead of a name, which is the honest
+/// residual documented on `queue_and_note`, not a reason to fail an otherwise-good send.
+fn load_ledger_or_empty(store: &Store) -> Vec<store::PendingSend> {
+    store.load_send_ledger().unwrap_or_else(|e| {
+        eprintln!("KARST: could not read the send ledger, starting empty this call: {e}");
+        Vec::new()
+    })
+}
+
+/// Persist the ledger, logging (not propagating) a failure. Same reasoning as
+/// `load_ledger_or_empty`: the send this call was actually doing already succeeded or failed on
+/// its own merits before this runs — a ledger write hiccup is a tracking regression, not a
+/// reason to report a good send as broken.
+fn save_ledger_best_effort(store: &Store, ledger: &[store::PendingSend]) {
+    if let Err(e) = store.save_send_ledger(ledger) {
+        eprintln!("KARST: could not save the send ledger: {e}");
+    }
+}
+
+/// Durably record a lost send, logging (not propagating) a failure — same best-effort reasoning
+/// as `save_ledger_best_effort`.
+fn note_lost(store: &Store, peer_ik: [u8; 32], plaintext: &[u8], queued_at: u64, now: u64, reason: &str) {
+    if let Err(e) = store.park_stranded_send(peer_ik, plaintext, queued_at, now, reason) {
+        eprintln!("KARST: could not record a stranded send ({reason}): {e}");
+    }
+}
+
+/// `Peer::queue` one payload against `to_ik`, returning its id and — if queuing it evicted an
+/// OLDER entry to make room (`node::peer::Peer::queue`'s outbox cap silently drops the oldest
+/// queued entry when full) — the ledger entry that eviction claimed. The caller must not record
+/// that victim as lost until the save that makes the eviction REAL has landed: recording it
+/// earlier could survive a crash that rolls the eviction back, reporting a message lost that is
+/// actually still safely queued (see the call sites; this is why this function returns the
+/// victim rather than parking it itself).
+///
+/// The victim is identified exactly, never by guesswork: outbox ids only ever increase, and
+/// neither `queue` nor `flush_outbox` reorder the entries that survive (`flush_outbox` takes the
+/// whole vec, filters it, and pushes survivors back in the SAME relative order), so whichever
+/// entry the cap evicts is always the ledger's SMALLEST still-open id — PROVIDED the ledger
+/// tracks the same set of ids the real outbox does. It can fall behind: a crash between a
+/// PREVIOUS `queue`'s save and its ledger write leaves an outbox entry the ledger never learned
+/// about, and if THAT untracked entry is what the cap evicts here, the ledger's candidate is
+/// innocent — still safely queued. So the candidate is confirmed with `peer.is_queued` before
+/// ever being named: if it's still there, the true victim is untracked and unidentifiable, and
+/// nothing is reported rather than accusing the wrong message (a false "your message was lost"
+/// is worse than a gap — see `PendingSend`).
+fn queue_and_note(
+    peer: &mut Peer<SocketTransport>,
+    ledger: &[store::PendingSend],
+    to_ik: &[u8; 32],
+    plaintext: &[u8],
+    now: u64,
+) -> Result<(u64, Option<store::PendingSend>), String> {
+    let before = peer.outbox_len();
+    let id = peer.queue(to_ik, plaintext, now)?;
+    let victim = if peer.outbox_len() <= before {
+        ledger.iter().min_by_key(|e| e.id).cloned().filter(|v| !peer.is_queued(v.id))
+    } else {
+        None
+    };
+    Ok((id, victim))
+}
+
+/// Reconcile the pending-send ledger against what a `flush_outbox` pass just did: `delivered`
+/// ids are resolved and dropped; anything else no longer queued (`peer.is_queued`) is gone
+/// without having been delivered. An EVICTION would already have been caught live, at its own
+/// `queue_and_note` call (see there) — so anything reaching here unaccounted for aged out of
+/// `flush_outbox`'s TTL window instead, and is recorded as `"expired"`. Returns the ledger with
+/// only the still-in-flight entries left, ready to save.
+fn reconcile_ledger(
+    store: &Store,
+    peer: &Peer<SocketTransport>,
+    ledger: Vec<store::PendingSend>,
+    delivered: &[u64],
+    now: u64,
+) -> Vec<store::PendingSend> {
+    let mut kept = Vec::with_capacity(ledger.len());
+    for entry in ledger {
+        if delivered.contains(&entry.id) {
+            continue; // delivered — resolved, drop it
+        }
+        if peer.is_queued(entry.id) {
+            kept.push(entry); // still in flight
+            continue;
+        }
+        note_lost(store, entry.peer_ik, &entry.plaintext, entry.queued_at, now, "expired");
+    }
+    kept
+}
+
 /// §2.1: отправить сообщение получателю `to_ik` (его §2.1-IK) по установленной/
 /// новой ratchet-сессии. Всё окно — под flock на сессиях (иначе гонка процессов
 /// → keystream-reuse); persist ПОСЛЕ отправки. Первый контакт забирает bundle
@@ -1162,13 +1254,28 @@ pub fn send_session(
     // outbox still delivers it to the recipient — a false "not sent". (A distinct
     // pending-vs-delivered indicator can read `flush_outbox`'s result / the queue depth; that
     // UI affordance is a follow-up, not correctness.)
-    let id = peer.queue(to_ik, plaintext, now)?;
+    //
+    // Unlike `send_session_batch`, a SINGLE send never refuses on a full outbox — the comment
+    // above already commits to "durably queued ⇒ report Ok", and breaking that here would turn
+    // an ordinary transient outage into a false "not sent" (R2-6 records the loss instead of
+    // pretending it cannot happen; A4-8's all-or-nothing refusal is a BATCH-only guarantee,
+    // because only a batch can make its own manifest the collateral damage of its own chunks).
+    let mut ledger = load_ledger_or_empty(store);
+    let (id, victim) = queue_and_note(&mut peer, &ledger, to_ik, plaintext, now)?;
     store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (pre): {e}"))?;
+    // The eviction (if any) is now real — record its victim before it is forgotten everywhere.
+    if let Some(v) = victim {
+        ledger.retain(|e| e.id != v.id);
+        note_lost(store, v.peer_ik, &v.plaintext, v.queued_at, now, "evicted");
+    }
+    ledger.push(store::PendingSend { id, peer_ik: *to_ik, plaintext: plaintext.to_vec(), queued_at: now });
     // Deliver the whole queue in FIFO order (this message plus any earlier ones a prior
     // transport failure left behind) — exact retransmit, never a re-encrypt.
-    peer.flush_outbox(now);
+    let delivered = peer.flush_outbox(now);
     // Post-save persists the removals (delivered) and any cleared `pending_initial`.
     store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (post): {e}"))?;
+    let ledger = reconcile_ledger(store, &peer, ledger, &delivered, now);
+    save_ledger_best_effort(store, &ledger);
     // `true` = this message reached the relay this call; `false` = the relay was down and it
     // stayed queued (durably) to retransmit on the next send/poll. Either way it is committed;
     // the caller uses this only to show a pending indicator, never as a failure.
@@ -1237,6 +1344,19 @@ pub fn send_session_multi(
 /// avatar ≈ 90 chunks); a huge multi-thousand-chunk file must still stream so it can't overflow the
 /// retransmit queue. Payloads are queued IN ORDER, so a manifest passed first still precedes its
 /// chunks on the FIFO mailbox.
+///
+/// **All-or-nothing (#215/A4-8).** `node::peer::Peer::queue` evicts the OLDEST queued entry
+/// whenever the outbox is already at its cap, one push at a time — it does not know it is in the
+/// middle of a batch, so an unreserved N-payload batch could have its early pushes evict entries
+/// from a completely unrelated conversation and, if the batch itself is larger than the whole
+/// cap, eventually reach its own earlier chunks (or its own manifest). Reserving room is done by
+/// queuing the WHOLE batch into this in-memory `peer` first and watching, after every single
+/// push, whether the outbox actually grew: if it didn't, the cap had to evict something to fit
+/// that push, and the batch does not fit as a whole. Nothing above this point has touched disk —
+/// `peer` was built fresh and `import_state` only mutates memory — so refusing here simply means
+/// letting `peer` (and the ratchet advance + every push it made) drop, unsaved. The batch is
+/// therefore either accepted whole (every payload queued, nothing evicted) or refused whole (an
+/// `Err`, no save, ratchet unmoved) — never a partial batch with silent collateral damage.
 pub fn send_session_batch(
     store: &Store,
     relay: &Relay,
@@ -1260,15 +1380,40 @@ pub fn send_session_batch(
     if !peer.has_session(to_ik) && peer.connect(to_ik, now)? == ForwardSecrecy::NoOneTimePrekey {
         store.mark_reduced_fs(*to_ik).map_err(|e| format!("reduced-FS record: {e}"))?;
     }
-    // Encrypt + enqueue EVERY payload (each advances the ratchet), then commit the advanced state
-    // ONCE — same crash-consistency as `send_session` (envelope N queued ⟺ ratchet ≥ N+1), but for
-    // the whole batch in one atomic save.
-    for p in payloads {
-        peer.queue(to_ik, p, now)?;
+    let mut ledger = load_ledger_or_empty(store);
+    // Encrypt + enqueue EVERY payload (each advances the ratchet), refusing the whole batch the
+    // moment any single push would evict an entry (see the doc comment above) — before any of it
+    // is persisted.
+    let mut ids = Vec::with_capacity(payloads.len());
+    for (i, p) in payloads.iter().enumerate() {
+        let before = peer.outbox_len();
+        let id = peer.queue(to_ik, p, now)?;
+        if peer.outbox_len() <= before {
+            return Err(format!(
+                "outbox has no room for this {}-message batch (only {} of {} would fit without \
+                 evicting an existing queued message); refusing the whole batch — nothing sent, \
+                 ratchet not advanced",
+                payloads.len(),
+                i,
+                payloads.len()
+            ));
+        }
+        ids.push(id);
     }
+    // The whole batch fits: commit the advanced state ONCE — same crash-consistency as
+    // `send_session` (envelope N queued ⟺ ratchet ≥ N+1), but for the whole batch in one atomic
+    // save.
     store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (pre): {e}"))?;
-    peer.flush_outbox(now);
+    // Track every payload this call durably queued, so a LATER loss (cap eviction from some
+    // future send, or TTL expiry) can still be attributed to what it was (R2-6). None of THESE
+    // ids could have just been evicted — the loop above refused rather than let that happen.
+    for (id, p) in ids.iter().zip(payloads) {
+        ledger.push(store::PendingSend { id: *id, peer_ik: *to_ik, plaintext: p.clone(), queued_at: now });
+    }
+    let delivered = peer.flush_outbox(now);
     store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (post): {e}"))?;
+    let ledger = reconcile_ledger(store, &peer, ledger, &delivered, now);
+    save_ledger_best_effort(store, &ledger);
     Ok(())
 }
 
@@ -1295,9 +1440,16 @@ pub fn flush_outbox(store: &Store, relay: &Relay, now: u64) -> Result<usize, Str
     if peer.outbox_len() == 0 {
         return Ok(0);
     }
-    let delivered = peer.flush_outbox(now).len();
+    let delivered = peer.flush_outbox(now);
     store.save_sessions(&peer.export_state()).map_err(|e| format!("saving sessions: {e}"))?;
-    Ok(delivered)
+    // A retry-driven flush can be the pass that finds a PREVIOUSLY-queued message expired past
+    // its TTL (queuing evictions are caught live elsewhere, at their own `queue_and_note` call —
+    // see there — so anything left unaccounted for here is TTL, not the cap). Reconcile so that
+    // loss gets a durable record too, not just the sends this process itself originated.
+    let ledger = load_ledger_or_empty(store);
+    let ledger = reconcile_ledger(store, &peer, ledger, &delivered, now);
+    save_ledger_best_effort(store, &ledger);
+    Ok(delivered.len())
 }
 
 /// How many sent messages are queued awaiting delivery (a transport failure left them). Reads

@@ -115,15 +115,52 @@ fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
 /// single serialized object). This is the Phase-2 bridge — the blob is what `Container::write`
 /// stores for a compartment, so an account lives entirely inside the container with no external
 /// files. Collects every regular file under `dir`, keyed by its `/`-separated relative path.
-pub fn snapshot_dir(dir: &Path) -> io::Result<Vec<u8>> {
+///
+/// **SEC-35 — `max_bytes` bounds the RAM this can consume.** The files under `dir` are not all
+/// ours: attachments and downloads a CORRESPONDENT sent us live in this same account directory,
+/// and their size is entirely their choice, not ours. The old, unbounded version `std::fs::read`
+/// every file it found before ever checking whether the result could go anywhere — a correspondent
+/// who hands us gigabytes of attachments turns the next ordinary save (`ContainerVault::save`,
+/// which every account mutation goes through) into an attempt to buffer all of it into one
+/// `Vec<u8>` in memory, an OOM a remote peer can trigger for free. `Container::write` already
+/// refused an oversized payload loudly — but only AFTER this function had already finished
+/// building it, which is too late to save the memory. So the running total is checked against
+/// `max_bytes` via `metadata().len()` (a stat, not a read) BEFORE each file's bytes are pulled in,
+/// and the walk aborts the instant the budget is blown — the offending path and both sizes are
+/// named in the error, and no file that pushed the total over the line is ever read into memory.
+/// This must fail LOUDLY, never truncate: a snapshot that silently dropped files partway through
+/// would restore into a torn, incomplete account — a destroyed compartment that looks intact.
+/// Pass the compartment's own usable write capacity (see `Container::max_payload_len`) as
+/// `max_bytes` so a snapshot that could never fit its region is refused before the OOM, not after
+/// a doomed multi-gigabyte read; use `usize::MAX` only where there is no container to fit (tests).
+///
+/// **Honest limit — `max_bytes` bounds the sum of raw file lengths, not the final postcard blob
+/// size.** Serializing adds small per-entry overhead (the relative-path string, a couple of
+/// varint length prefixes), so a directory that just clears this check by a handful of bytes can
+/// still — rarely, and only within that narrow margin — trip `Container::write`'s own ceiling.
+/// That is not silent: `write` still refuses loudly in that case, exactly as it always has; this
+/// function's job is only to stop the unbounded READ before it happens, not to be the single
+/// source of truth on what fits. `write`'s check remains the authority either way. Same reasoning
+/// covers the stat-then-read gap below (a file could theoretically grow between the `metadata()`
+/// check and the `std::fs::read()` a few lines later) — the sole writer of an account's own work
+/// dir is this same process, so that race isn't reachable in practice, and `write`'s ceiling is
+/// still there to catch it loudly if it ever were.
+pub fn snapshot_dir(dir: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    fn walk(base: &Path, cur: &Path, out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
+    let mut total: usize = 0;
+    fn walk(
+        base: &Path,
+        cur: &Path,
+        out: &mut Vec<(String, Vec<u8>)>,
+        total: &mut usize,
+        max_bytes: usize,
+    ) -> io::Result<()> {
         for entry in std::fs::read_dir(cur)? {
             let entry = entry?;
             let path = entry.path();
             let ty = entry.file_type()?;
             if ty.is_dir() {
-                walk(base, &path, out)?;
+                walk(base, &path, out, total, max_bytes)?;
             } else if ty.is_file() {
                 let rel = path
                     .strip_prefix(base)
@@ -132,13 +169,29 @@ pub fn snapshot_dir(dir: &Path) -> io::Result<Vec<u8>> {
                     .map(|c| c.as_os_str().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
+                // Stat first, read never — the whole point is to know a file is too big
+                // without ever pulling its bytes into RAM to find out.
+                let len = entry.metadata()?.len() as usize;
+                let new_total = total
+                    .checked_add(len)
+                    .ok_or_else(|| io_err("snapshot size overflowed usize accumulating file lengths"))?;
+                if new_total > max_bytes {
+                    return Err(io_err(format!(
+                        "snapshot exceeds this account's budget: {rel} ({len} bytes) brings the \
+                         running total to {new_total} bytes, over the {max_bytes}-byte cap — \
+                         refusing to buffer it rather than build a snapshot that can never be \
+                         written back (this file is a correspondent-controlled attachment or \
+                         download; its size is not ours to bound at the point it was saved)"
+                    )));
+                }
+                *total = new_total;
                 out.push((rel, std::fs::read(&path)?));
             }
         }
         Ok(())
     }
     if dir.exists() {
-        walk(dir, dir, &mut files)?;
+        walk(dir, dir, &mut files, &mut total, max_bytes)?;
     }
     files.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic order (stable snapshots)
     postcard::to_stdvec(&files).map_err(io_err)
@@ -591,8 +644,9 @@ impl Container {
     /// hidden compartment).
     ///
     /// `region_cap` here is the ping-pong GEOMETRY (same for P1 and P3, see `add_blind_main`),
-    /// not necessarily the write PERMISSION — Blind's permission is wider (derived below from
-    /// the policy) and is exactly the ONLY case that can exceed the geometry and fall to the
+    /// not necessarily the write PERMISSION — Blind's permission is wider (derived from the
+    /// policy in `write_limits`, shared with `max_payload_len`) and is exactly the ONLY case
+    /// that can exceed the geometry and fall to the
     /// non-atomic spill path inside `write_region_at` (CRYPTO-13). Protect's ceiling here MUST
     /// match `write_region_at`'s safe-path boundary (`region_cap / 2`) exactly — checking against
     /// the full `region_cap` instead (an earlier version of this fix did exactly that) let a
@@ -608,20 +662,7 @@ impl Container {
             return Err(io_err("wipe password cannot write"));
         }
         let need = COPY_HDR_LEN + 24 + payload.len() + 16;
-        let (hard_cap, ceiling) = match info.policy {
-            // Blind's write permission is the WHOLE rest of the container, computed fresh here —
-            // never read from `region_cap`, which now always holds the shared geometry instead.
-            // Blind's ceiling for THIS early check is that same wide permission: it may legally
-            // use the non-atomic spill path.
-            Policy::Blind => {
-                let hard_cap = self.buf.len() as u64 - info.region_off;
-                (hard_cap, hard_cap)
-            }
-            // Protect (and Hidden, which has no dual-cap concept at all): the ceiling is HALF the
-            // geometry — the safe-path boundary — not the full region_cap, so this can never be
-            // handed to the spill branch.
-            _ => (info.region_cap, info.region_cap / 2),
-        };
+        let (hard_cap, ceiling) = Self::write_limits(&info, self.buf.len() as u64);
         if need > ceiling as usize {
             return Err(io_err("payload exceeds the write ceiling for this password"));
         }
@@ -639,6 +680,51 @@ impl Container {
         // including the hidden tail under a Protect write, and this region's OTHER copy slot
         // (CRYPTO-13) — are untouched on disk.
         self.persist_range(touched_off, touched_len)
+    }
+
+    /// `(hard_cap, ceiling)` for `info`'s policy — the exact arithmetic `write` itself uses to
+    /// refuse an oversized payload, pulled out so `max_payload_len` (SEC-35, below) can compute
+    /// the SAME number a caller will eventually be checked against, instead of drifting out of
+    /// sync with a second copy of this match.
+    fn write_limits(info: &SlotInfo, buf_len: u64) -> (u64, u64) {
+        match info.policy {
+            // Blind's write permission is the WHOLE rest of the container, computed fresh here —
+            // never read from `region_cap`, which now always holds the shared geometry instead.
+            // Blind's ceiling for THIS early check is that same wide permission: it may legally
+            // use the non-atomic spill path.
+            Policy::Blind => {
+                let hard_cap = buf_len - info.region_off;
+                (hard_cap, hard_cap)
+            }
+            // Protect (and Hidden, which has no dual-cap concept at all): the ceiling is HALF the
+            // geometry — the safe-path boundary — not the full region_cap, so this can never be
+            // handed to the spill branch.
+            _ => (info.region_cap, info.region_cap / 2),
+        }
+    }
+
+    /// The largest payload `write` will accept for `password`'s compartment RIGHT NOW.
+    ///
+    /// **SEC-35.** Exists so a caller building a payload (`ContainerVault::save`, via
+    /// `snapshot_dir`) can pass this as the budget and be refused loudly BEFORE it finishes
+    /// reading a doomed multi-gigabyte account tree into memory, instead of building the whole
+    /// thing first and only THEN discovering `write` will reject it — by which point the memory
+    /// is already spent. Uses the exact same `write_limits` arithmetic `write` itself checks
+    /// against, so the two can never disagree about what fits: a value this function approves is
+    /// guaranteed to pass `write`'s own check (same `need > ceiling` shape, same overhead
+    /// constants), and vice versa.
+    pub fn max_payload_len(&self, password: &[u8]) -> io::Result<usize> {
+        let key = self.key_for(password)?;
+        let info = self
+            .find_slot(&key)
+            .ok_or_else(|| io_err("wrong password or no such compartment"))?;
+        if info.role == Role::Wipe {
+            return Err(io_err("wipe password cannot write"));
+        }
+        let (_, ceiling) = Self::write_limits(&info, self.buf.len() as u64);
+        // Inverse of `write`'s `need = COPY_HDR_LEN + 24 + payload.len() + 16 <= ceiling`.
+        let overhead = (COPY_HDR_LEN + 24 + 16) as u64;
+        Ok(ceiling.saturating_sub(overhead) as usize)
     }
 
     // ---- region primitives (format (b): two ping-pong copy slots, length+generation hidden) ----
@@ -974,8 +1060,14 @@ impl ContainerVault {
     }
 
     /// Snapshot the working directory back into the container (call after account changes).
+    ///
+    /// SEC-35: bounds `snapshot_dir` to this compartment's own usable write capacity, computed
+    /// fresh from the live container geometry — a snapshot bigger than the region it has to fit
+    /// into is already doomed, so `snapshot_dir` refuses it before buffering gigabytes that
+    /// `write` would reject anyway, rather than after.
     pub fn save(&mut self) -> io::Result<()> {
-        let blob = snapshot_dir(&self.work_dir)?;
+        let max = self.container.max_payload_len(&self.password)?;
+        let blob = snapshot_dir(&self.work_dir, max)?;
         self.container.write(&self.password, &blob)
     }
 
@@ -1007,12 +1099,19 @@ impl ContainerVault {
 
     /// Add a HIDDEN account to this container, from an open MAIN session. Reuses the ONE held
     /// container instance (no two-writers-over-one-file hazard): places the hidden region in all
-    /// space remaining after the main region, then calls `build(&region_key)` — the caller builds the
-    /// empty account's files sealed under the hidden region's key (so its own password opens them) and
-    /// returns the snapshot, which is written into the hidden region. The caller wipes its RAM build.
+    /// space remaining after the main region, then calls `build(&region_key, max_payload_len)` —
+    /// the caller builds the empty account's files sealed under the hidden region's key (so its
+    /// own password opens them) and returns the snapshot, which is written into the hidden
+    /// region. The caller wipes its RAM build.
+    ///
+    /// **SEC-35.** `build` gets the hidden slot's own `max_payload_len` handed to it (computed
+    /// AFTER `Container::add_hidden` below creates the slot, so the number is real, not guessed)
+    /// specifically so the caller has no reason to invent a number — passing `usize::MAX` into
+    /// its own `snapshot_dir` call would quietly reopen the unbounded-RAM hole this fix closes,
+    /// just on the hidden-account creation path instead of the main one.
     pub fn add_hidden<F>(&mut self, hidden_password: &[u8], build: F) -> io::Result<()>
     where
-        F: FnOnce(&MasterKey) -> io::Result<Vec<u8>>,
+        F: FnOnce(&MasterKey, usize) -> io::Result<Vec<u8>>,
     {
         if self.role != Role::Main {
             return Err(io_err("a hidden account is added from the main session"));
@@ -1030,7 +1129,8 @@ impl ContainerVault {
             .checked_sub(main_end)
             .ok_or_else(|| io_err("no room for a hidden region"))? as u64;
         let region_key = self.container.add_hidden(&self.password, hidden_password, hidden_cap)?;
-        let snapshot = build(&region_key)?;
+        let max_payload_len = self.container.max_payload_len(hidden_password)?;
+        let snapshot = build(&region_key, max_payload_len)?;
         self.container.write(hidden_password, &snapshot)
     }
 
@@ -1375,7 +1475,7 @@ mod tests {
         std::fs::write(acct.join("feed.dat"), vec![0xABu8; 4096]).unwrap();
         std::fs::write(acct.join("net/proxy3/sessions.dat"), b"ratchet state").unwrap();
 
-        let blob = snapshot_dir(&acct).unwrap();
+        let blob = snapshot_dir(&acct, usize::MAX).unwrap();
 
         let cpath = root.join("container.dat");
         let mut c = Container::create(&cpath, 128 * 1024, b"realpw", 60 * 1024).unwrap();
@@ -1391,7 +1491,80 @@ mod tests {
         assert_eq!(std::fs::read(restored.join("feed.dat")).unwrap(), vec![0xABu8; 4096]);
         assert_eq!(std::fs::read(restored.join("net/proxy3/sessions.dat")).unwrap(), b"ratchet state");
         // And a re-snapshot of the restored tree equals the original snapshot (stable).
-        assert_eq!(snapshot_dir(&restored).unwrap(), blob);
+        assert_eq!(snapshot_dir(&restored, usize::MAX).unwrap(), blob);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SEC-35: `snapshot_dir` must refuse a directory that cannot fit its `max_bytes` budget —
+    /// loudly, naming what overflowed — rather than silently truncating (a truncated container
+    /// image is a destroyed compartment) or buffering the whole oversized tree into memory first
+    /// and failing only later. Control case first: an ordinary small directory well under budget
+    /// still round-trips exactly as before.
+    #[test]
+    fn snapshot_dir_refuses_a_directory_that_cannot_fit_its_byte_budget() {
+        let root = tmp("budget");
+        let _ = std::fs::remove_dir_all(&root);
+        let acct = root.join("acct");
+        std::fs::create_dir_all(&acct).unwrap();
+        std::fs::write(acct.join("small.dat"), vec![0u8; 100]).unwrap();
+
+        // Control: comfortably under budget still works, unchanged behaviour.
+        let blob = snapshot_dir(&acct, 10_000).expect("an ordinary small snapshot must still round-trip");
+        assert!(!blob.is_empty());
+
+        // A correspondent-controlled attachment blows the budget.
+        std::fs::write(acct.join("attachment.bin"), vec![0xAAu8; 5_000]).unwrap();
+        let err = snapshot_dir(&acct, 1_000)
+            .expect_err("a snapshot over its budget must be refused, not truncated or silently accepted");
+        let msg = err.to_string();
+        assert!(msg.contains("attachment.bin"), "the error must name the file that overflowed: {msg}");
+        assert!(msg.contains("1000"), "the error must name the budget it exceeded: {msg}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SEC-35, integration level: pins the WIRING, not the memory bound itself — that is
+    /// `snapshot_dir_refuses_a_directory_that_cannot_fit_its_byte_budget`'s job, and it is the one
+    /// that actually goes red if the budget check is neutered. This test just confirms
+    /// `ContainerVault::save` correctly computes and threads a real budget from the live container
+    /// geometry (`Container::max_payload_len`) end to end, and — regardless of which layer catches
+    /// the oversized save, `snapshot_dir`'s budget or `Container::write`'s own ceiling, both are
+    /// live here — that the container's previously-saved state is left completely intact and a
+    /// later normal-sized save still succeeds. (Confirmed by neutering: with the budget check
+    /// disabled, `write`'s ceiling alone still fails this exact save, so this test does NOT
+    /// discriminate the RAM-bound fix in isolation — only the sharper unit test above does.)
+    #[test]
+    fn container_vault_save_refuses_a_work_dir_too_big_for_its_region_and_leaves_prior_state_intact() {
+        let root = tmp("oversave");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cpath = root.join("container.dat");
+        // A small container: 8 KiB region, so anything past a few KiB cannot fit.
+        Container::create(&cpath, 64 * 1024, b"realpw", 8 * 1024).unwrap();
+
+        let mut cv = ContainerVault::open(&cpath, b"realpw", root.join("w1")).unwrap();
+        std::fs::write(cv.work_dir.join("contacts.dat"), b"first save, fits fine").unwrap();
+        cv.save().unwrap();
+
+        // Now grow the work dir well past what the region can hold.
+        std::fs::write(cv.work_dir.join("huge_attachment.bin"), vec![0x42u8; 64 * 1024]).unwrap();
+        cv.save()
+            .expect_err("a work dir too big for its region must be refused, not truncated into the container");
+
+        // The container still opens and still holds the FIRST save's data — the refused,
+        // too-big save never touched it.
+        drop(cv);
+        let cv2 = ContainerVault::open(&cpath, b"realpw", root.join("w2")).unwrap();
+        assert_eq!(
+            std::fs::read(cv2.work_dir.join("contacts.dat")).unwrap(),
+            b"first save, fits fine",
+            "the container's prior state survives a refused oversized save untouched"
+        );
+        assert!(
+            !cv2.work_dir.join("huge_attachment.bin").exists(),
+            "the oversized file was never actually committed into the container"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1592,13 +1765,13 @@ mod tests {
         let hb = root.join("build");
         std::fs::create_dir_all(&hb).unwrap();
         std::fs::write(hb.join("seed.key"), b"hidden seed material").unwrap();
-        let hidden_snapshot = snapshot_dir(&hb).unwrap();
+        let hidden_snapshot = snapshot_dir(&hb, usize::MAX).unwrap();
 
         {
             let mut cv = ContainerVault::open(&cpath, b"realpw", root.join("mw")).unwrap();
             std::fs::write(cv.work_dir.join("contacts.dat"), b"main contacts").unwrap();
             cv.save().unwrap();
-            cv.add_hidden(b"hiddenpw", |_| Ok(hidden_snapshot.clone())).unwrap();
+            cv.add_hidden(b"hiddenpw", |_, _| Ok(hidden_snapshot.clone())).unwrap();
             cv.save().unwrap(); // a later MAIN flush must NOT clobber the hidden region
         }
 
@@ -1634,10 +1807,10 @@ mod tests {
         let hb = root.join("hb");
         std::fs::create_dir_all(&hb).unwrap();
         std::fs::write(hb.join("seed.key"), b"x").unwrap();
-        let snap = snapshot_dir(&hb).unwrap();
+        let snap = snapshot_dir(&hb, usize::MAX).unwrap();
         {
             let mut cv = ContainerVault::open(&cpath, b"mainpw", root.join("mw")).unwrap();
-            cv.add_hidden(b"hiddenpw", |_| Ok(snap.clone())).unwrap();
+            cv.add_hidden(b"hiddenpw", |_, _| Ok(snap.clone())).unwrap();
             cv.add_blind(b"coverpw").unwrap();
             cv.add_wipe(b"burnpw").unwrap();
         }
@@ -1751,7 +1924,7 @@ mod tests {
             "a hidden account must not open without a verified RAM-backed store"
         );
         // Nothing of the hidden account may have been written anywhere under the vault.
-        let blob = snapshot_dir(&root).unwrap();
+        let blob = snapshot_dir(&root, usize::MAX).unwrap();
         let on_disk: Vec<(String, Vec<u8>)> = postcard::from_bytes(&blob).unwrap();
         let names: Vec<&String> = on_disk.iter().map(|(rel, _)| rel).collect();
         assert!(

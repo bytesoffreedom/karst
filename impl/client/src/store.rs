@@ -2643,9 +2643,31 @@ impl Store {
     /// authenticated session). Updates the contact record's IK, clears `verified` (the safety
     /// number changed with the key — the UI prompts a re-verify), and carries the local
     /// contact→proxy tag across to the new key. Returns whether a contact was actually migrated.
+    ///
+    /// **SEC-36 — refuses a migration onto an identity key another contact already holds.** The
+    /// desktop caller only checks `new != sender`, i.e. "not a no-op onto yourself" — nothing
+    /// upstream stops an already-authenticated contact from naming a *different* contact's IK as
+    /// their "new" one. Without this check `c.ik = new` happily produced two `ContactRecord` rows
+    /// sharing one `ik`; the sidecar carry-over just below is a plain `map.insert(new, …)` into
+    /// `BTreeMap`s keyed by `ik`, so it would then silently overwrite the VICTIM's
+    /// `contact_proxy` routing tag and `peer_profiles` cache with the attacker's — the migrating
+    /// contact's row would win, the victim's would be clobbered with no signal anything happened.
+    /// The check runs first, against the freshly-loaded (unmutated) `cs`, before `contacts.dat`,
+    /// `contact_proxy.dat` or `peer_profiles.dat` are touched — a migration must be all-or-nothing;
+    /// a torn one (say, the contact record moved but the profile carry-over refused, or vice
+    /// versa) would leave the store inconsistent in a way nothing here could later detect.
     pub fn migrate_contact_ik(&self, old: [u8; 32], new: [u8; 32]) -> io::Result<bool> {
         let mut cs = self.load_contacts()?;
-        let Some(c) = cs.iter_mut().find(|c| c.ik == old) else { return Ok(false) };
+        if !cs.iter().any(|c| c.ik == old) {
+            return Ok(false);
+        }
+        if new != old && cs.iter().any(|c| c.ik == new) {
+            return Err(io_err(format!(
+                "channel migration refused: identity key {} already belongs to a different contact",
+                hex::encode(new)
+            )));
+        }
+        let c = cs.iter_mut().find(|c| c.ik == old).expect("just checked above");
         c.ik = new;
         c.verified = false; // new key ⇒ old safety number no longer applies
         self.save_contacts(&cs)?;
@@ -4971,6 +4993,65 @@ mod tests {
         let p = profiles.get(&new).expect("profile carried to new IK");
         assert_eq!(p.avatar, Some(vec![9, 8, 7, 6]), "avatar rode across the migration");
         assert_eq!(p.name, "AliceDemo", "cached name rode across the migration");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-36: an authenticated contact must not be able to hijack a DIFFERENT contact by
+    /// naming their identity key as the migration target. Two contacts, Alice (`old`→migrating)
+    /// and Bob (already sitting at `victim`) — migrating Alice onto Bob's key must be refused
+    /// LOUDLY, and refused BEFORE anything is touched: Alice's own record must stay exactly as
+    /// it was, and Bob's cached proxy tag + profile must be untouched, not silently overwritten
+    /// by Alice's. A legitimate migration onto a key nobody holds yet must still succeed (the
+    /// control case) — this is not "migrations are broken", only "collisions are refused".
+    #[test]
+    fn migrate_contact_ik_refuses_to_collide_with_a_different_contacts_identity_key() {
+        let dir = std::env::temp_dir().join(format!("karst-store-migcollide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        let old = [7u8; 32]; // Alice, migrating
+        let victim = [9u8; 32]; // Bob, already at this key
+        let free = [11u8; 32]; // nobody's key — legitimate target
+
+        s.save_contacts(&[
+            ContactRecord { name: "AliceDemo".into(), ik: old, verified: true },
+            ContactRecord { name: "BobDemo".into(), ik: victim, verified: true },
+        ])
+        .unwrap();
+        s.set_peer_avatar(old, vec![1, 2, 3]).unwrap();
+        s.set_peer_profile(old, "AliceDemo", "alice bio").unwrap();
+        s.set_contact_proxy(old, 0).unwrap();
+        s.set_peer_avatar(victim, vec![9, 9, 9]).unwrap();
+        s.set_peer_profile(victim, "BobDemo", "bob bio").unwrap();
+        s.set_contact_proxy(victim, 1).unwrap();
+
+        // Attempt: migrate Alice (`old`) onto Bob's already-occupied key (`victim`).
+        let err = s
+            .migrate_contact_ik(old, victim)
+            .expect_err("migrating onto another contact's identity key must be refused, not silently applied");
+        assert!(
+            err.to_string().contains("already belongs to a different contact"),
+            "refusal must name what collided: {err}"
+        );
+
+        // Nothing moved: Alice is still at `old`, unverified-flag untouched, still two contacts.
+        let cs = s.load_contacts().unwrap();
+        assert_eq!(cs.len(), 2, "no rows were created or merged by the refused migration");
+        assert!(cs.iter().any(|c| c.ik == old && c.verified), "Alice's record is untouched by the refused migration");
+        assert!(cs.iter().any(|c| c.ik == victim && c.verified), "Bob's record is untouched by the refused migration");
+
+        // Bob's cached profile/avatar/proxy tag were never touched by Alice's attempted migration.
+        let profiles = s.load_peer_profiles().unwrap();
+        assert_eq!(profiles.get(&victim).unwrap().name, "BobDemo", "Bob's profile survives the refused migration");
+        assert_eq!(profiles.get(&victim).unwrap().avatar, Some(vec![9, 9, 9]), "Bob's avatar survives the refused migration");
+        assert_eq!(s.contact_proxy(&victim), Some(1), "Bob's proxy tag survives the refused migration");
+        assert_eq!(s.contact_proxy(&old), Some(0), "Alice's own proxy tag is untouched by the refused migration");
+
+        // Control: a migration onto a FREE identity key (nobody holds it) still works.
+        assert!(s.migrate_contact_ik(old, free).unwrap(), "a legitimate migration onto a free key must still succeed");
+        let cs = s.load_contacts().unwrap();
+        assert!(cs.iter().any(|c| c.ik == free && !c.verified), "legitimate migration re-points the contact and resets verification");
+        assert!(cs.iter().all(|c| c.ik != old), "old key is gone after a legitimate migration");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

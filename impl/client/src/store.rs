@@ -109,6 +109,52 @@ pub struct QuarantinedMessage {
     pub received_at: u64,
 }
 
+/// One message this build durably queued for delivery (`node::peer::Peer::queue`) but has not
+/// yet resolved — delivered, evicted, or expired. `PeerState`'s own outbox holds only ciphertext
+/// keyed by an opaque id; once an entry is gone there, there is no way to ask it "whose message
+/// was that". This is the client's own memory of that mapping, so a LATER loss (see
+/// [`StrandedSend`]) can still be attributed to what it was, not just that it happened (R2-6).
+/// Removed the moment its id resolves — delivered, evicted, or expired — so it never grows
+/// beyond roughly what `node::peer`'s own outbox cap allows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingSend {
+    pub id: u64,
+    pub peer_ik: [u8; 32],
+    pub plaintext: Vec<u8>,
+    pub queued_at: u64,
+}
+
+/// Defensive ceiling on the pending-send ledger. In normal operation it never holds more than
+/// `node::peer`'s own outbox cap (512 as of this writing) — every entry here names one still-
+/// queued outbox id — but that constant is private to `node::peer` and this file cannot see it,
+/// so this is our OWN generous headroom rather than the real number: a loud refusal if
+/// reconciliation ever fell far enough behind to blow through it (a bug, not normal operation).
+const MAX_LEDGER: usize = 4096;
+
+/// A message that was durably queued (ratchet advanced, ciphertext committed to `sessions.dat`)
+/// but will never reach a relay: `node::peer`'s outbox cap evicted it to admit something newer,
+/// or its TTL expired first. Either way the ratchet already moved past this position — there is
+/// nothing to retry, only something to tell the user about instead of the "sent" they would
+/// otherwise see (#215/R2-6). Durably appended by [`Store::park_stranded_send`], read back by
+/// [`Store::load_stranded_sends`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrandedSend {
+    pub peer_ik: [u8; 32],
+    pub plaintext: Vec<u8>,
+    /// When the sender originally queued it.
+    pub queued_at: u64,
+    /// When THIS build noticed it was gone (not when it actually vanished — nothing observes
+    /// that moment directly for an eviction that happens inside another call, or a TTL sweep
+    /// this process never ran).
+    pub lost_at: u64,
+    /// `"evicted"` — this build watched the outbox fail to grow right after queuing a message
+    /// and could name exactly which older id had to make room for it; `"expired"` — a later
+    /// flush found the id gone without ever having witnessed an eviction, so it aged out past
+    /// its TTL instead. Attributed, never guessed at a distance — see `queue_and_note` in
+    /// `lib.rs`.
+    pub reason: String,
+}
+
 /// Channel configuration (`channel.dat`, sealed, LOCAL-ONLY). `enabled` = channel mode: the
 /// account auto-accepts every subscribe request (a public channel) instead of queuing it for
 /// manual approval (a private account). SECURITY INVARIANT: this bit is written ONLY by the
@@ -2538,9 +2584,11 @@ impl Store {
     /// this identity's keys again, including the recovery phrase, because the phrase was never
     /// part of the derivation. That irreversibility is the fix, not a side effect — see the module
     /// note above and `docs/design/proxy-identity.md`. Also removes this proxy's own namespaced
-    /// network files (`net_file`: sessions/OPKs/discovery-key/quarantine/…, best-effort — a proxy
-    /// that never published anything simply has none) and any contact→proxy tags still pointing at
-    /// it, so no trace of a burned identity's channel state lingers on disk. Idempotent: burning an
+    /// network files (`net_file`: sessions/OPKs/discovery-key/quarantine/send-ledger/stranded-
+    /// sends/…, best-effort — a proxy that never published anything simply has none) and any
+    /// contact→proxy tags still pointing at it, so no trace of a burned identity's channel state —
+    /// including any outgoing plaintext parked by R2-6's stranded-send log — lingers on disk.
+    /// Idempotent: burning an
     /// already-absent index is not an error. Deliberately does NOT refuse to burn the account's
     /// last remaining proxy — "you must always keep one reachable channel" is a UX/session policy,
     /// not a data-integrity invariant, and belongs in the caller (see the desktop `burn_proxy`
@@ -2565,6 +2613,8 @@ impl Store {
             victim.net_file("sessions.lock"),
             victim.net_file("sessions.anchor"),
             victim.net_file("quarantine.dat"),
+            victim.net_file("send_ledger.dat"),
+            victim.net_file("stranded_sends.dat"),
         ] {
             if let Err(e) = std::fs::remove_file(&path) {
                 if e.kind() != io::ErrorKind::NotFound {
@@ -2987,6 +3037,104 @@ impl Store {
     /// already tolerate — whereas clearing first would recreate the loss this log exists to stop.
     pub fn clear_quarantine(&self) -> io::Result<()> {
         match std::fs::remove_file(self.quarantine_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Network-scoped (proxy-namespaced, same as `sessions.dat`) — the ledger names outbox ids,
+    /// and outbox ids are only meaningful against ONE proxy's `sessions.dat`.
+    fn ledger_path(&self) -> PathBuf {
+        self.net_file("send_ledger.dat")
+    }
+
+    /// Load the pending-send ledger — see [`PendingSend`]. Empty if the file does not exist
+    /// (nothing queued yet that this build still needs to resolve).
+    pub fn load_send_ledger(&self) -> io::Result<Vec<PendingSend>> {
+        match std::fs::read(self.ledger_path()) {
+            Ok(blob) => {
+                let plain = self.key.open(&self.label(&self.ledger_path()), &blob).map_err(io_err)?;
+                postcard::from_bytes(&plain).map_err(io_err)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Overwrite the ledger with exactly `entries`. Callers load, reconcile (drop resolved ids,
+    /// add newly-queued ones) and save the whole thing back under the SAME `lock_sessions`
+    /// window as the `sessions.dat` write it tracks, so the two never disagree about what is
+    /// still in flight.
+    pub fn save_send_ledger(&self, entries: &[PendingSend]) -> io::Result<()> {
+        if entries.len() > MAX_LEDGER {
+            return Err(io_err("pending-send ledger over its defensive cap — reconciliation fell behind"));
+        }
+        let plain = postcard::to_stdvec(entries).map_err(io_err)?;
+        self.write_sealed(&self.ledger_path(), &plain)
+    }
+
+    fn stranded_path(&self) -> PathBuf {
+        self.net_file("stranded_sends.dat")
+    }
+
+    /// Durably append a message that was queued but will never be delivered — see
+    /// [`StrandedSend`]. Same append-only, length-prefixed-sealed-record shape as
+    /// [`Store::quarantine_incoming`] (O(1) per record, torn-tail tolerant on read).
+    pub fn park_stranded_send(
+        &self,
+        peer_ik: [u8; 32],
+        plaintext: &[u8],
+        queued_at: u64,
+        lost_at: u64,
+        reason: &str,
+    ) -> io::Result<()> {
+        if plaintext.len() > MAX_HISTORY_RECORD {
+            return Err(io_err("stranded payload too large"));
+        }
+        let plain = postcard::to_stdvec(&(peer_ik, plaintext, queued_at, lost_at, reason)).map_err(io_err)?;
+        let blob = self.key.seal(&self.label(&self.stranded_path()), &plain);
+        let len: u32 = blob.len().try_into().map_err(|_| io_err("stranded record too large"))?;
+        let mut f = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(self.stranded_path())?;
+        f.write_all(&len.to_le_bytes())?;
+        f.write_all(&blob)?;
+        f.sync_all()
+    }
+
+    /// Read back every stranded send recorded so far — for a UI "these messages were never
+    /// delivered" indicator. Reading does not consume the log.
+    pub fn load_stranded_sends(&self) -> io::Result<Vec<StrandedSend>> {
+        let bytes = match std::fs::read(self.stranded_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let label = self.label(&self.stranded_path());
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 4 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if len == 0 || len > MAX_HISTORY_RECORD || pos + len > bytes.len() {
+                break; // torn tail: stop, do not guess
+            }
+            let plain = self.key.open(&label, &bytes[pos..pos + len]).map_err(io_err)?;
+            let (peer_ik, plaintext, queued_at, lost_at, reason): ([u8; 32], Vec<u8>, u64, u64, String) =
+                postcard::from_bytes(&plain).map_err(io_err)?;
+            out.push(StrandedSend { peer_ik, plaintext, queued_at, lost_at, reason });
+            pos += len;
+        }
+        Ok(out)
+    }
+
+    /// Drop the stranded-send log once a caller (a UI, or the user dismissing the notice) has
+    /// seen it. Same one-shot shape as [`Store::clear_quarantine`].
+    pub fn clear_stranded_sends(&self) -> io::Result<()> {
+        match std::fs::remove_file(self.stranded_path()) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),

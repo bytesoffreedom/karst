@@ -202,3 +202,39 @@ fn cross_message_serialization_roundtrip() {
     let decoded: RatchetMessage = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(bob.decrypt(&decoded).unwrap(), b"over the wire");
 }
+
+/// A6-9 — skipped message keys must age out, not merely be capped in number.
+///
+/// They were bounded by `MAX_STORE` alone, so a key derived for a message that never arrived
+/// could sit at rest indefinitely, widening the window in which a device compromise yields
+/// plaintext. Age is counted in DH-ratchet GENERATIONS rather than wall-clock, because the local
+/// clock is an unauthenticated input and "several chains ago" is the protocol's own measure of
+/// staleness. Discriminating: a genuinely late message from the CURRENT era still opens.
+#[test]
+fn skipped_keys_expire_after_several_ratchet_generations() {
+    let (mut alice, mut bob) = establish();
+
+    // Alice sends two; Bob receives only the SECOND, so a gap-filler key is stored.
+    let m1 = alice.encrypt(b"gap");
+    let m2 = alice.encrypt(b"seen");
+    assert_eq!(bob.decrypt(&m2).unwrap(), b"seen");
+
+    // The still-fresh gap-filler works — the expiry must not eat live out-of-order mail.
+    let mut bob_fresh = bob.clone();
+    assert_eq!(bob_fresh.decrypt(&m1).unwrap(), b"gap", "a recent skipped key must still open");
+
+    // Now run the conversation forward through several DH steps (each reply from Bob and the
+    // next message from Alice advances the ratchet).
+    for i in 0..6 {
+        let r = bob.encrypt(format!("r{i}").as_bytes());
+        assert!(alice.decrypt(&r).is_ok());
+        let a = alice.encrypt(format!("a{i}").as_bytes());
+        assert!(bob.decrypt(&a).is_ok());
+    }
+
+    // The ancient gap-filler is gone: it belongs to a chain many generations back.
+    assert!(
+        bob.decrypt(&m1).is_err(),
+        "a skipped key many ratchet generations old must no longer be retained"
+    );
+}

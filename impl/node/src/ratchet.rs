@@ -50,6 +50,10 @@ const MAX_SKIP: u32 = 1000;
 /// сработала бы ПОСРЕДИ decrypt и выбросила ровно те gap-filler'ы, что мы кладём.
 const MAX_STORE: usize = 2048;
 
+/// How many DH-ratchet generations a skipped key may outlive. Out-of-order delivery spans at most
+/// a chain boundary or two; anything older is not late mail, it is retention.
+const MAX_SKIPPED_GENERATIONS: u64 = 4;
+
 /// Хранимый пропущенный ключ сообщения: идентифицируется (ratchet-pubkey цепочки,
 /// номер). `mk` — ключ сообщения; ложится at-rest (см. FS-компромисс в доке).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -57,6 +61,13 @@ struct SkippedKey {
     dh: [u8; 32],
     n: u32,
     mk: [u8; 32],
+    /// Which DH-ratchet generation stored this key. Skipped keys were bounded in NUMBER but never
+    /// expired, so one could sit at rest long past any plausible reordering window, widening the
+    /// interval in which a device compromise yields plaintext for messages that may never even
+    /// arrive (A6-9). Age is counted in RATCHET STEPS rather than wall-clock on purpose: the local
+    /// clock is an unauthenticated input, and a chain that is several DH steps behind is stale by
+    /// the protocol's own measure.
+    gen: u64,
 }
 
 /// Заголовок сообщения: текущий ratchet-pubkey отправителя, длина предыдущей
@@ -103,6 +114,9 @@ pub struct Session {
     nr: u32,                 // номер приёма
     pn: u32,                 // длина предыдущей sending-цепочки
     skipped: Vec<SkippedKey>, // пропущенные ключи (out-of-order), FIFO-огранич.
+    /// Counts DH-ratchet steps, so a skipped key can be aged out by protocol progress rather than
+    /// by an unauthenticated wall clock (A6-9).
+    dh_gen: u64,
 }
 
 /// Персистентная форма сессии (для возобновления ratchet между процесс-вызовами
@@ -125,6 +139,7 @@ pub struct SessionSnapshot {
     /// Пропущенные ключи — персистятся ОСОЗНАННО (FS-компромисс, см. доку модуля):
     /// без них out-of-order-фикс не переживает `load→process→save` клиента.
     skipped: Vec<SkippedKey>,
+    dh_gen: u64,
 }
 
 impl Session {
@@ -140,6 +155,7 @@ impl Session {
             nr: self.nr,
             pn: self.pn,
             skipped: self.skipped.clone(),
+            dh_gen: self.dh_gen,
         }
     }
 
@@ -155,6 +171,7 @@ impl Session {
             nr: s.nr,
             pn: s.pn,
             skipped: s.skipped,
+            dh_gen: s.dh_gen,
         }
     }
 
@@ -173,6 +190,7 @@ impl Session {
             nr: 0,
             pn: 0,
             skipped: Vec::new(),
+            dh_gen: 0,
         }
     }
 
@@ -189,6 +207,7 @@ impl Session {
             nr: 0,
             pn: 0,
             skipped: Vec::new(),
+            dh_gen: 0,
         }
     }
 
@@ -259,7 +278,14 @@ impl Session {
         if self.skipped.len() >= MAX_STORE {
             self.skipped.remove(0);
         }
-        self.skipped.push(SkippedKey { dh, n, mk });
+        self.skipped.push(SkippedKey { dh, n, mk, gen: self.dh_gen });
+    }
+
+    /// Drop skipped keys older than `MAX_SKIPPED_GENERATIONS` DH steps — run on every ratchet
+    /// step, so stale message keys stop living at rest indefinitely (A6-9).
+    fn expire_skipped(&mut self) {
+        let cutoff = self.dh_gen.saturating_sub(MAX_SKIPPED_GENERATIONS);
+        self.skipped.retain(|s| s.gen >= cutoff);
     }
 
     /// Продвинуть receiving-цепочку до `until`, СОХРАНЯЯ пропущенные ключи под
@@ -303,6 +329,8 @@ impl Session {
         self.dhs = dhs_new;
         self.ckr = Some(ckr);
         self.cks = Some(cks);
+        self.dh_gen = self.dh_gen.saturating_add(1);
+        self.expire_skipped();
         Ok(())
     }
 }

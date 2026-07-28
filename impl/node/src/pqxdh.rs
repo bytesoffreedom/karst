@@ -273,11 +273,37 @@ impl Account {
     }
 
     /// Принять initial key-agreement: восстановить `root_key` и опознать
-    /// отправителя. `None` — только если KEM-ct невалидной длины (структурная
-    /// ошибка). Аутентификация отправителя проверяется НЕ здесь: неверный IK_A
-    /// даёт ДРУГОЙ root_key → первое ratchet-сообщение не расшифруется (AEAD).
-    /// Возвращает (root_key, заявленный identity отправителя).
+    /// отправителя, СРАЗУ потребив one-time prekey.
+    ///
+    /// Предпочитайте [`Account::prepare_key_agreement`] + [`Account::consume_opk`] на путях,
+    /// где результат ещё может быть отвергнут: здесь OPK сгорает ДО проверки первого AEAD,
+    /// поэтому подделанный opener сжигал бы чужой one-time prekey (CRYPTO-03).
     pub fn accept_key_agreement(&mut self, ka: &KeyAgreement) -> Option<([u8; 32], [u8; 32])> {
+        let accepted = self.prepare_key_agreement(ka)?;
+        self.consume_opk(ka);
+        Some(accepted)
+    }
+
+    /// Потребить one-time prekey, названный в этом agreement. Вызывать ТОЛЬКО после того,
+    /// как первое ratchet-сообщение успешно расшифровано: именно потребление OPK служит
+    /// at-most-once дедупом для повторной доставки opener'а, поэтому сжигать его на
+    /// неаутентифицированном сообщении нельзя. Идемпотентно.
+    pub fn consume_opk(&mut self, ka: &KeyAgreement) {
+        if let Some(opk_pub) = ka.opk_pub {
+            self.opks.remove(&opk_pub);
+        }
+    }
+
+    /// PREPARE-шаг: восстановить `root_key` и опознать заявленного отправителя, НИЧЕГО не
+    /// меняя в аккаунте. `None` — структурная ошибка (кривая длина KEM-ct, неизвестный или
+    /// уже потреблённый OPK, non-contributory DH).
+    ///
+    /// Аутентификация отправителя проверяется НЕ здесь: неверный IK_A даёт ДРУГОЙ root_key →
+    /// первое ratchet-сообщение не расшифруется (AEAD). Поэтому вызывающий обязан проверить
+    /// этот AEAD ПРЕЖДЕ, чем фиксировать что-либо (сессию, потребление OPK) — иначе кто угодно,
+    /// взяв публичный bundle, заставит получателя сохранить мёртвую сессию под чужим IK.
+    /// Возвращает (root_key, заявленный identity отправителя).
+    pub fn prepare_key_agreement(&self, ka: &KeyAgreement) -> Option<([u8; 32], [u8; 32])> {
         let ik_a = PublicKey::from(ka.ik_a_pub);
         let ek_a = PublicKey::from(ka.ek_a_pub);
         // Зеркало DH отправителя (симметрия static-static X25519).
@@ -309,11 +335,10 @@ impl Account {
             &ka.mailbox_a_pub,
         );
         let root_key = derive_root_key(&dh1, &dh2, &dh3, dh4.as_ref(), pq_shared.as_slice(), &transcript);
-        // Consume the one-time prekey: it must never seed a second agreement, or it is not
-        // one-time and the forward-secrecy claim is void.
-        if let Some(opk_pub) = ka.opk_pub {
-            self.opks.remove(&opk_pub);
-        }
+        // NOTE: the one-time prekey is NOT consumed here — that is `consume_opk`, and the caller
+        // must only call it once the first AEAD verified. It must never seed a second agreement
+        // (or it is not one-time and the forward-secrecy claim is void), but burning it on an
+        // unauthenticated message is its own vulnerability (CRYPTO-03).
         Some((root_key, ka.ik_a_pub))
     }
 }

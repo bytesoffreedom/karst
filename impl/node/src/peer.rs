@@ -1265,7 +1265,11 @@ impl<T: Transport> Peer<T> {
                 // NEW agreement (fresh OPK ⇒ a root key no existing session holds), so there is no
                 // "try the existing session" case to handle — an existing session could never
                 // decrypt a message under a brand-new root key.
-                let (root_key, sender_ik) = self.account.accept_key_agreement(ka)?;
+                // PREPARE only: derive the root key WITHOUT consuming the one-time prekey. Nothing
+                // here is authenticated yet — anyone can fetch a public bundle and claim any
+                // `ik_a_pub` — so no durable state may change until the first AEAD verifies below
+                // (CRYPTO-03).
+                let (root_key, sender_ik) = self.account.prepare_key_agreement(ka)?;
                 let drop_seed = crate::drop::drop_seed(&root_key);
                 // The `drop_seed` (derived from the agreed root key) is the identity of THIS
                 // agreement. If a session we already hold for this peer has the SAME drop_seed, this
@@ -1283,7 +1287,15 @@ impl<T: Transport> Peer<T> {
                     }
                 }
                 let mut session = Session::init_receiver(root_key, self.account.prekey().clone());
-                let pt = session.decrypt(msg).ok();
+                // THE authentication step: only a sender who actually holds the claimed identity
+                // key derives this root key, so a forged opener fails here. Bail BEFORE touching
+                // the session maps or the one-time prekey — otherwise a stranger could park a dead
+                // session under any victim's IK (it would become the primary outbound session and
+                // silently swallow the replies) and burn a one-time prekey per attempt.
+                let pt = session.decrypt(msg).ok()?;
+                // Authenticated ⇒ commit. Consuming the OPK here still gives at-most-once dedup on
+                // re-delivery: a genuine duplicate finds the OPK already gone and stops earlier.
+                self.account.consume_opk(ka);
                 // The sender's mailbox point rode the (authenticated) key-agreement — store it as
                 // where I deposit my B→A replies.
                 let peer_mailbox_pub = ka.mailbox_a_pub;
@@ -1304,7 +1316,7 @@ impl<T: Transport> Peer<T> {
                 } else {
                     self.sessions.insert(sender_ik, new_state);
                 }
-                pt.map(|pt| Received { sender: sender_ik, plaintext: pt, msg_id: [0u8; 32] })
+                Some(Received { sender: sender_ik, plaintext: pt, msg_id: [0u8; 32] })
             }
             Payload::Session(SessionEnvelope::Ratchet(msg)) => {
                 // Нет sender-хинта → trial-decryption. Безопасно: decrypt

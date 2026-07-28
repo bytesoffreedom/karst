@@ -69,6 +69,24 @@ const CONN_TOTAL_DEADLINE: Duration = Duration::from_secs(120);
 /// handful of legitimate concurrent clients.
 const MAX_CONNECTIONS: usize = 1024;
 
+/// SEC-41 (#226): ceiling on the PoW difficulty a relay's `PowRequired` challenge may
+/// declare before `join()` refuses to solve it. `admission::pow::solve` is a plain loop
+/// over `WireResponse::PowRequired.difficulty_bits` — nothing bounded what the RELAY could
+/// put in that field, so a hostile or misconfigured relay could declare an arbitrary
+/// difficulty and the client would burn unbounded CPU trying to earn a capability, while
+/// the relay itself spends nothing to issue the challenge. Expected work at `bits` is
+/// `2^bits` hashes (hashcash: average trials to first success at success-probability
+/// `2^-bits`). Measured on this dev machine (release build, single core, `sha2` crate):
+/// ~8.2M hashes/sec, so `admission::params::DEFAULT_POW_BITS` (20 bits, ~1M hashes) solves
+/// in well under a second, matching that constant's own doc comment. This ceiling (26 bits,
+/// ~67M hashes) is 64x the default — on this machine that's ~8s on average; on a device an
+/// order of magnitude slower (~800K h/s, e.g. aging or low-power hardware) it is still only
+/// ~85s on average. That is real headroom for an operator to dial difficulty up under load,
+/// while capping what "a relay declares its number" can cost a client. (Hashcash solve time
+/// is exponentially distributed, so this bounds the AVERAGE case, not a hard worst case —
+/// same caveat the rest of `pow.rs` states plainly for the mechanism as a whole.)
+const MAX_ACCEPTED_POW_BITS: u32 = 26;
+
 /// Bounds live connection handlers. `try_acquire` reserves a slot iff under the cap;
 /// the returned `Permit` releases it on `Drop`, so a handler that errors OR PANICS
 /// on the Noise handshake (the common hostile case) still frees its slot — no manual
@@ -487,6 +505,19 @@ impl SocketTransport {
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on JoinChallenge")),
         };
+        // SEC-41 (#226): refuse a relay-declared difficulty above the ceiling OUTRIGHT — never
+        // silently solve it (that's the unbounded-CPU theft this exists to stop) and never
+        // silently skip the door (that would hand back no capability with no explanation). The
+        // relay is named in the error so the caller can tell which relay to stop trusting.
+        if difficulty_bits > MAX_ACCEPTED_POW_BITS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "relay {} declared PoW difficulty {difficulty_bits} bits, above the accepted ceiling of {MAX_ACCEPTED_POW_BITS} bits — refusing to solve",
+                    hex::encode(relay_id)
+                ),
+            ));
+        }
         let mut client_seed = [0u8; 32];
         OsRng.fill_bytes(&mut client_seed);
         let nonce = admission::pow::solve(&relay_id, bucket, &client_seed, difficulty_bits)

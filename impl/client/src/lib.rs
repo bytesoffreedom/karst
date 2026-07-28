@@ -757,7 +757,9 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
     // Optional policy preference: when set, only multi-home onto relays whose ADVERTISED policy
     // matches (e.g. keep files across a restart). The advertisement is operator-declared — for the
     // durable case a client can later PROVE it (`verify_durability`); ephemeral stays a claim.
-    let want_persistence = store.load_relay_prefs().map(|p| p.prefer_persistence).unwrap_or(None);
+    let prefs = store.load_relay_prefs().unwrap_or_default();
+    let want_persistence = prefs.prefer_persistence;
+    let want_mail = prefs.prefer_mail_durability;
     // A relay's node-list is attacker-influenceable, and importing it makes US dial the addresses
     // in it — so a hostile PUBLIC relay could otherwise walk the user's own LAN, or hit loopback
     // services, one auto-discovery at a time (A3-12, client side). Private destinations are
@@ -779,11 +781,16 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
             continue;
         }
         // POLICY PREFERENCE: skip a verified relay whose advertised policy does not match.
-        if let Some(want) = want_persistence {
+        // ONE fetch covers both knobs — asking twice would double the dial cost and could even
+        // straddle a policy change.
+        if want_persistence.is_some() || want_mail.is_some() {
             let Ok(dest) = Dest::parse(&addr) else { continue };
-            match SocketTransport::new(dest, d.noise_pub).get_policy() {
-                Ok(p) if p.blob_persistence == Some(want) => {}
-                _ => continue, // mismatch, disabled, unknown, or unreachable → skip
+            let Ok(p) = SocketTransport::new(dest, d.noise_pub).get_policy() else { continue };
+            if want_persistence.is_some_and(|want| p.blob_persistence != Some(want)) {
+                continue; // mismatch, disabled, or unknown → skip
+            }
+            if want_mail.is_some_and(|want| p.mailbox_durability != want) {
+                continue; // R2-5: this account wants its queued mail to survive a restart
             }
         }
         extras.push((addr, id_hex.clone()));

@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use admission::capability::{Capability, Quota, Scope};
 use admission::params::DEFAULT_POW_BITS;
-use node::node::{BlobPersistence, RelayDescriptor, RelayNode};
+use node::node::{BlobPersistence, MailboxDurability, RelayDescriptor, RelayNode};
 use node::seal::Identity;
 use node::socket::{generate_noise_keypair, RelayServer};
 
@@ -100,6 +100,27 @@ fn parse_blob_persistence(v: Option<&str>) -> Result<BlobPersistence, String> {
 
 fn blob_persistence_from_env() -> Result<BlobPersistence, String> {
     parse_blob_persistence(std::env::var("KARST_RELAY_BLOB_PERSIST").ok().as_deref())
+}
+
+/// Mailbox restart posture (R2-5, #161), from `KARST_RELAY_MAIL_PERSIST`. `volatile` (default)
+/// keeps queued mail in RAM only — an ordinary restart loses anything not yet fetched; `durable`
+/// fsyncs every accepted message to a log first and replays it on start. Default stays volatile
+/// because durability means opaque ciphertext lingering on the operator's disk, which is a
+/// posture an operator opts into, not one they inherit. Same fail-closed-on-a-typo discipline as
+/// the blob knob. Pure (env passed in) so it is unit-tested.
+fn parse_mail_persistence(v: Option<&str>) -> Result<MailboxDurability, String> {
+    match v {
+        None | Some("") | Some("volatile") => Ok(MailboxDurability::Volatile),
+        Some("durable") => Ok(MailboxDurability::Durable),
+        Some(other) => Err(format!(
+            "unknown KARST_RELAY_MAIL_PERSIST '{other}' — use volatile | durable. Refusing to \
+             start rather than silently defaulting to a posture you did not choose."
+        )),
+    }
+}
+
+fn mail_persistence_from_env() -> Result<MailboxDurability, String> {
+    parse_mail_persistence(std::env::var("KARST_RELAY_MAIL_PERSIST").ok().as_deref())
 }
 
 /// The relay's admission capability, sized like the dev one but with a role-appropriate
@@ -595,6 +616,19 @@ fn run_relay(addr: String) -> io::Result<()> {
         }
     };
     relay.enable_blobs(key_dir().join("blobs"), wall_clock(), persist)?;
+    // R2-5 (#161): the mailbox's own restart posture, independent of the blob store's.
+    let mail_persist = match mail_persistence_from_env() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("karst-relay: config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    if mail_persist == MailboxDurability::Durable {
+        // Fail to start rather than run as a silently volatile relay: a client may have chosen
+        // this relay precisely for the advertised guarantee.
+        relay.enable_durable_mail(key_dir().join("mail"), wall_clock())?;
+    }
     // Fail closed on a misconfigured mode: refuse to start rather than run a role the
     // operator did not choose.
     let role = match Role::from_env() {
@@ -719,6 +753,13 @@ fn run_relay(addr: String) -> io::Result<()> {
             BlobPersistence::Ephemeral => "ephemeral — wiped on restart",
         }
     );
+    eprintln!(
+        "queued mail: {} (KARST_RELAY_MAIL_PERSIST)",
+        match mail_persist {
+            MailboxDurability::Durable => "durable — an accepted message survives a restart",
+            MailboxDurability::Volatile => "volatile — queued mail is lost on restart",
+        }
+    );
     if role == Role::Public {
         eprintln!("admission: {}", describe_pow(Some(pow_bits)));
         eprintln!("  PoW rate-limits fresh capabilities; the per-cap quota bounds each — a spam");
@@ -814,6 +855,7 @@ fn env_from_answers(
     tls_key: &str,
     peers: &str,
     blob: &str,
+    mail: &str,
     quota: &str,
 ) -> Vec<(&'static str, String)> {
     let mut env: Vec<(&'static str, String)> = vec![("KARST_RELAY_MODE", mode.trim().to_string())];
@@ -836,6 +878,7 @@ fn env_from_answers(
     }
     put("KARST_RELAY_PEERS", peers);
     put("KARST_RELAY_BLOB_PERSIST", blob);
+    put("KARST_RELAY_MAIL_PERSIST", mail);
     // Quota ceiling: skip when it is the "unlimited/off" answer (the built-in default is already
     // off, so no env keeps a scripted launch clean) — any other value (preset or custom) is written.
     if !matches!(quota.trim(), "" | "off" | "unlimited" | "none") {
@@ -1005,11 +1048,21 @@ fn run_setup_wizard() -> io::Result<()> {
          \x20 ephemeral  — wipe them on restart. Less data at rest, but an interrupted big file re-sends.",
         "durable",
     )?;
+    let mail = ask(
+        "When the relay RESTARTS, keep queued MESSAGES that nobody has picked up yet?\n\
+         \x20 volatile   — no. Queued mail lives in memory only; a restart loses it and the sender\n\
+         \x20              is never told (least data at rest — the default)\n\
+         \x20 durable    — yes. Each accepted message is written to disk before the relay says\n\
+         \x20              'accepted', so a restart redelivers it. Encrypted either way; this only\n\
+         \x20              changes how long ciphertext sits on your disk.",
+        "volatile",
+    )?;
 
     // Populate the env the shared startup path reads (safe here: single-threaded, before any
     // thread is spawned), then show a readable summary + the exact scriptable equivalent.
     let env = env_from_answers(
-        &mode, &addr, &home, &advertise, &pow_bits, &tls_cert, &tls_key, &peers, &blob, &quota,
+        &mode, &addr, &home, &advertise, &pow_bits, &tls_cert, &tls_key, &peers, &blob, &mail,
+        &quota,
     );
     for (k, v) in &env {
         std::env::set_var(k, v);
@@ -1031,6 +1084,7 @@ fn run_setup_wizard() -> io::Result<()> {
         row("federation", if peers.trim().is_empty() { "(standalone)" } else { peers.trim() });
     }
     row("storage", blob.trim());
+    row("queued mail", mail.trim());
     row("budget", quota.trim());
     let inline: Vec<String> = env.iter().map(|(k, v)| format!("{k}={}", shell_quote(v))).collect();
     eprintln!("\nequivalent non-interactive launch:\n  {} karst-relay\n", inline.join(" "));
@@ -1041,7 +1095,8 @@ fn run_setup_wizard() -> io::Result<()> {
 mod tests {
     use super::{
         apply_admin_command, describe_pow, env_from_answers, is_stop_command, is_yes,
-        no_relay_message, parse_blob_persistence, parse_quota_spec, shell_quote, Role,
+        no_relay_message, parse_blob_persistence, parse_mail_persistence, parse_quota_spec,
+        shell_quote, Role,
     };
     use node::node::{BlobPersistence, RelayNode};
     use std::sync::{Arc, Mutex};
@@ -1185,7 +1240,8 @@ mod tests {
         // env must round-trip through the SAME parsers a normal launch uses.
         let env = env_from_answers(
             "public", "0.0.0.0:9000", "/srv/relay", "relay.example:9000", "22",
-            "/etc/tls/fullchain.pem", "/etc/tls/privkey.pem", "1.2.3.4:9000@aa", "ephemeral", "media-friendly",
+            "/etc/tls/fullchain.pem", "/etc/tls/privkey.pem", "1.2.3.4:9000@aa", "ephemeral", "durable",
+            "media-friendly",
         );
         let get = |k: &str| env.iter().find(|(kk, _)| *kk == k).map(|(_, v)| v.as_str());
         assert_eq!(get("KARST_RELAY_MODE"), Some("public"));
@@ -1197,22 +1253,24 @@ mod tests {
         assert_eq!(get("KARST_RELAY_TLS_KEY"), Some("/etc/tls/privkey.pem"));
         assert_eq!(get("KARST_RELAY_PEERS"), Some("1.2.3.4:9000@aa"));
         assert_eq!(get("KARST_RELAY_BLOB_PERSIST"), Some("ephemeral"));
+        assert_eq!(get("KARST_RELAY_MAIL_PERSIST"), Some("durable"));
+        assert!(parse_mail_persistence(get("KARST_RELAY_MAIL_PERSIST")).is_ok());
         // The values must satisfy the fail-closed parsers (no divergence between wizard + env path).
         assert!(Role::parse(get("KARST_RELAY_MODE")).is_ok());
         assert!(parse_blob_persistence(get("KARST_RELAY_BLOB_PERSIST")).is_ok());
 
         // Private with everything optional blank: ONLY mode is set; PoW bits are dropped even if
         // typed (they are public-only), and blanks never become empty-string env entries.
-        let env = env_from_answers("private", "", "", "", "20", "", "", "", "", "");
+        let env = env_from_answers("private", "", "", "", "20", "", "", "", "", "", "");
         assert_eq!(env, vec![("KARST_RELAY_MODE", "private".to_string())], "blanks omitted; pow dropped for private");
 
         // PoW bits are recorded for a public door.
-        let env = env_from_answers("public", "", "", "", "18", "", "", "", "", "");
+        let env = env_from_answers("public", "", "", "", "18", "", "", "", "", "", "");
         assert!(env.contains(&("KARST_RELAY_POW_BITS", "18".to_string())));
 
         // wss is emitted only as a cert+key PAIR — a lone cert (or lone key) is dropped, never
         // half-configured (that would make the relay refuse to start).
-        let lone = env_from_answers("public", "", "", "", "20", "/c.pem", "", "", "", "");
+        let lone = env_from_answers("public", "", "", "", "20", "/c.pem", "", "", "", "", "");
         assert!(!lone.iter().any(|(k, _)| k.starts_with("KARST_RELAY_TLS")), "lone cert dropped");
     }
 

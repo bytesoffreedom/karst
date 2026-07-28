@@ -22,6 +22,7 @@ pub mod blobstore;
 pub mod discovery;
 pub mod drop;
 pub mod gossip;
+pub mod mailstore;
 pub mod node;
 pub mod peer;
 pub mod pqxdh;

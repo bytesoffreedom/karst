@@ -140,6 +140,32 @@ An unknown value refuses to start. Note the honest asymmetry: a client can **pro
 relay still holds its file (ask for a chunk back — it verifies), but `ephemeral` is a claim no one
 can check remotely, so trust it only as far as you trust the operator.
 
+### Queued messages — do they survive a restart? (`KARST_RELAY_MAIL_PERSIST`)
+
+A message sits in the recipient's mailbox on your relay until they poll for it. What happens to
+it if you restart in that window is your call:
+
+| Value | Behaviour | Use it for |
+|---|---|---|
+| `volatile` (default) | queued mail lives in memory only — a restart loses anything not yet fetched, and the sender is never told | the lower-residue posture: nothing undelivered is ever written to your disk |
+| `durable` | each accepted message is fsynced to a log **before** the relay says "accepted", and replayed on start | reliability — a reboot or deploy no longer drops mail |
+
+The default is deliberately the opposite of the blob knob's: a big file transfer is expensive to
+redo, while a message is small — and the reason to run a relay is often to hold as little as
+possible. Opt in when reliability matters more.
+
+Honest limits, both directions:
+
+* `durable` is single-relay durability, not delivery reliability. If the disk dies or the relay
+  goes away, the message goes with it — nothing replicates it to another relay yet.
+* It is **at-least-once**: a crash can redeliver a message the recipient already had (the app
+  detects the duplicate and drops it). Making that impossible would mean an fsync on every fetch.
+* A relay that is told to be `durable` and cannot write **refuses to start**, and one that cannot
+  write a particular message **rejects** it rather than claiming it was accepted. A promise that
+  quietly stops holding is worse than no promise.
+* Clients can require a match: the relay advertises which mode it runs, and an app set to prefer
+  durable mail will not multi-home onto a volatile relay.
+
 ### Being discovered — the node-list
 
 Relays share a list of **which relays exist** (never *which users exist* — that is a separate,

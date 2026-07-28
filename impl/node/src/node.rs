@@ -128,6 +128,21 @@ pub fn payload_id(payload: &Payload) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Durably record an admitted deposit, if this relay is running with a mail log. A free function
+/// (not a method) so the caller can hold a `&mut` borrow of `mailboxes` across the call — the two
+/// are disjoint fields, and the deposit has to be on disk BEFORE the entry is visible in RAM.
+fn durable_deposit(
+    log: &mut Option<crate::mailstore::MailLog>,
+    mailbox: [u8; 32],
+    now: u64,
+    payload: &Payload,
+) -> std::io::Result<()> {
+    match log {
+        Some(log) => log.deposit(mailbox, now, payload),
+        None => Ok(()),
+    }
+}
+
 /// Свежий случайный ключ cookie-эпохи (для инициализации и ротации).
 fn random_key() -> [u8; 32] {
     let mut k = [0u8; 32];
@@ -285,14 +300,16 @@ pub struct WireMessage {
 pub enum Response {
     /// Первый контакт: relay выдал cookie, клиент повторяет с ним.
     NeedCookie(Cookie),
-    /// Admitted, and the sealed payload is sitting in the recipient's mailbox — **in this
-    /// process's memory only** (R2-5, #161). `mailboxes` (see `RelayNode`) is never written to
-    /// disk, so a crash or restart between this reply and the recipient's fetch loses the message
-    /// with NO resend signal to the sender: there is no queued-vs-durable distinction here to
-    /// report, because there is no durable side at all yet. A sender that retires its outbox
-    /// entry the moment it sees `Accepted` is trusting a guarantee this relay does not make —
-    /// `RelayPolicy::mailbox_durability` is the machine-readable form of this same fact, fetched
-    /// once via `GetPolicy` rather than assumed.
+    /// Admitted, and the sealed payload is sitting in the recipient's mailbox. **How much that
+    /// is worth depends on the relay** (R2-5, #161): on a `Volatile` relay the message lives only
+    /// in this process's memory, so a crash or restart before the recipient's fetch loses it with
+    /// NO resend signal to the sender; on a `Durable` one (`enable_durable_mail`) the deposit was
+    /// fsynced to the mail log BEFORE this reply, so a restart redelivers it. `Accepted` itself
+    /// deliberately does not carry which — a per-message flag would invite a sender to decide
+    /// retention message-by-message on a value the relay can simply lie about. The posture is a
+    /// property of the RELAY, fetched once via `GetPolicy`
+    /// (`RelayPolicy::mailbox_durability`) and used to CHOOSE the relay, which is where the
+    /// decision actually belongs.
     Accepted,
     /// Отклонено конвейером допуска (текст исхода).
     Rejected(String),
@@ -330,11 +347,17 @@ pub enum BlobPersistence {
 
 /// Whether a message sitting in a mailbox survives this relay restarting (R2-5, #161).
 ///
-/// Unlike `BlobPersistence`, this is not yet an operator CHOICE — there is no durable variant to
-/// choose. `RelayNode::mailboxes` (and `bundles`/`opk_batches` alongside it) live only in this
-/// process's memory; nothing here writes them to disk or reads them back on startup, so
-/// `Volatile` is the only value there is to report. The type exists (rather than a bare `bool`)
-/// so a future durable mode is an additive variant, not a wire break.
+/// An operator CHOICE, like `BlobPersistence`: `Volatile` remains the default (nothing is written
+/// to disk), `Durable` is enabled with `RelayNode::enable_durable_mail`. `bundles`/`opk_batches`
+/// stay in RAM in both modes on purpose — a live client republishes its bundle on every launch,
+/// so those self-heal, while a queued message has no such second source.
+///
+/// **What `Durable` is worth, exactly.** It turns "guaranteed loss on an ordinary restart" into
+/// "loss if that relay's disk or the relay itself goes away". It is NOT delivery reliability:
+/// that needs replication across relays (#149) or an end-to-end receipt from the recipient,
+/// neither of which exists. The mode is *provable* by a client (send to yourself, restart is the
+/// operator's business — but a fetched message coming back after downtime self-verifies), while
+/// `Volatile` is, like `BlobPersistence::Ephemeral`, an unverifiable claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MailboxDurability {
     /// In-memory only. A crash or restart between `Accepted` and the recipient's fetch loses the
@@ -342,6 +365,12 @@ pub enum MailboxDurability {
     /// `Accepted` (see that variant's doc comment). Advertised so a client can, at minimum, know
     /// not to trust the guarantee `Accepted` does not make.
     Volatile,
+    /// Deposits are fsynced to a mail log before `Accepted` is answered, and replayed on start.
+    /// At-least-once: deletions are not fsynced, so a crash can redeliver an already-delivered
+    /// message (the client dedups by `payload_id`) — see `crate::mailstore` for why that side of
+    /// the trade is deliberate. The relay holds only E2E ciphertext in either mode; what changes
+    /// is how long opaque bytes linger on the operator's disk.
+    Durable,
 }
 
 /// A relay's advertised policy — the operator-configured knobs a client can inspect (`GetPolicy`)
@@ -525,6 +554,11 @@ pub struct RelayNode {
     /// извне (`with_identity`) для персистентности — `karst-relay` хранит его на
     /// диске, relay-id стабилен между перезапусками.
     relay_identity: Identity,
+    /// R2-5 (#161): the durable side of `mailboxes`. `None` = `Volatile` (the default — an
+    /// accepted message lives only here in RAM). `Some` = every deposit is fsynced before the
+    /// relay answers `Accepted`, and the table above is rebuilt from the log on start. Enabled
+    /// via `enable_durable_mail`; see `crate::mailstore` for the at-least-once contract.
+    mail_log: Option<crate::mailstore::MailLog>,
     /// §15 large-file blob store (disk-backed). `None` = blobs disabled (default; keeps
     /// the in-memory constructors/tests unchanged). Enabled via `enable_blobs`.
     blobs: Option<crate::blobstore::BlobStore>,
@@ -586,6 +620,7 @@ impl RelayNode {
             opk_batches: HashMap::new(),
             gossip_cursor: std::cell::Cell::new(0),
             relay_identity,
+            mail_log: None,
             blobs: None,
             blob_persistence: None,
             pow_issue: None,
@@ -609,6 +644,85 @@ impl RelayNode {
         Ok(())
     }
 
+    /// R2-5 (#161): make this relay's mailboxes SURVIVE a restart, with the log in `dir`.
+    ///
+    /// Replays the log and installs what it holds, then advertises `MailboxDurability::Durable`.
+    /// The replay re-applies the LIVE bounds rather than trusting the file: entries past
+    /// `MAILBOX_TTL_SECS` are dropped, each mailbox is capped at `MAX_FETCH_SEALS` (the invariant
+    /// "a mailbox always fits in one response frame", which a file written before that cap — or
+    /// by anyone with disk access — must not be able to smuggle past), and the table itself at
+    /// `MAX_MAILBOXES`. Anything the bounds reject is dropped from the log by the compaction that
+    /// follows, so it is not re-litigated on every start.
+    ///
+    /// Errors are returned, not swallowed: a relay told to be durable that cannot open its log
+    /// must fail to start rather than run as a silently volatile one.
+    ///
+    /// **Call before serving.** This REPLACES the mailbox table with what the log holds, so
+    /// calling it on a relay already taking traffic would discard whatever is queued.
+    pub fn enable_durable_mail(&mut self, dir: std::path::PathBuf, now: u64) -> std::io::Result<()> {
+        let (mut log, entries) = crate::mailstore::MailLog::open(dir)?;
+        let mut restored: HashMap<[u8; 32], Vec<MailboxEntry>> = HashMap::new();
+        for e in entries {
+            if now.saturating_sub(e.enqueued_at) > MAILBOX_TTL_SECS {
+                continue; // TTL applies to a replayed entry exactly as to a live one
+            }
+            if !restored.contains_key(&e.mailbox) && restored.len() >= MAX_MAILBOXES {
+                continue;
+            }
+            let mbox = restored.entry(e.mailbox).or_default();
+            if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
+                continue;
+            }
+            // A lease is not persisted (see `mailstore`): everything replayed is visible, which
+            // is what a lease timeout would have produced anyway.
+            mbox.push(MailboxEntry { enqueued_at: e.enqueued_at, leased_until: 0, payload: e.payload });
+        }
+        let live: Vec<crate::mailstore::ReplayedEntry> = restored
+            .iter()
+            .flat_map(|(mailbox, mbox)| {
+                mbox.iter().map(move |e| crate::mailstore::ReplayedEntry {
+                    mailbox: *mailbox,
+                    enqueued_at: e.enqueued_at,
+                    payload: e.payload.clone(),
+                })
+            })
+            .collect();
+        log.compact(&live)?;
+        self.mailboxes = restored;
+        self.mail_log = Some(log);
+        Ok(())
+    }
+
+    /// Rewrite the mail log from the live table when it has accumulated enough dead records to be
+    /// worth the rewrite. Called from the epoch sweep — not per request, for the same reason the
+    /// TTL scan is not: an O(n) rewrite on every insert is its own DoS.
+    fn compact_mail_log(&mut self) {
+        let Some(log) = &self.mail_log else { return };
+        let live_count: usize = self.mailboxes.values().map(Vec::len).sum();
+        if !log.should_compact(live_count) {
+            return;
+        }
+        let live: Vec<crate::mailstore::ReplayedEntry> = self
+            .mailboxes
+            .iter()
+            .flat_map(|(mailbox, mbox)| {
+                mbox.iter().map(move |e| crate::mailstore::ReplayedEntry {
+                    mailbox: *mailbox,
+                    enqueued_at: e.enqueued_at,
+                    payload: e.payload.clone(),
+                })
+            })
+            .collect();
+        // A failed compaction is not silently ignored: `MailLog` marks its handle unusable if it
+        // failed anywhere past the rename, so the next deposit fails loudly and the fail-closed
+        // path answers `Rejected` instead of an `Accepted` nobody can honour. A failure BEFORE
+        // the rename leaves the old log live and complete (compaction only ever drops records
+        // already dead), so that case simply retries next epoch.
+        if let Some(log) = &mut self.mail_log {
+            let _ = log.compact(&live);
+        }
+    }
+
     /// This relay's advertised policy — what an operator's config exposes so a client can see (and
     /// prefer) relays matching its preferences. **Operator-declared:** some fields a client can
     /// verify by using the relay (PoW difficulty it solves, size caps it hits), the durable
@@ -620,9 +734,13 @@ impl RelayNode {
             blob_ttl_secs: if self.blobs.is_some() { crate::blobstore::BLOB_TTL_SECS } else { 0 },
             max_blob_size: if self.blobs.is_some() { crate::blobstore::MAX_BLOB_SIZE } else { 0 },
             pow_bits: self.pow_issue,
-            // Not a config read — there is no knob. `mailboxes` has no disk path at all (R2-5,
-            // #161), so this is always true, for every relay, until that changes.
-            mailbox_durability: MailboxDurability::Volatile,
+            // R2-5 (#161): a real operator choice now — `Durable` only when a mail log is
+            // actually open and being fsynced on deposit, never as a bare claim.
+            mailbox_durability: if self.mail_log.is_some() {
+                MailboxDurability::Durable
+            } else {
+                MailboxDurability::Volatile
+            },
         }
     }
 
@@ -1062,10 +1180,20 @@ impl RelayNode {
     /// epoch can't trigger this (the `e > self.epoch` gate), and `saturating_sub`
     /// makes a regressed timestamp look FRESH (kept), never spuriously stale.
     fn sweep_mailboxes(&mut self, now: u64) {
-        self.mailboxes.retain(|_, mbox| {
-            mbox.retain(|e| now.saturating_sub(e.enqueued_at) <= MAILBOX_TTL_SECS);
+        let log = &mut self.mail_log;
+        self.mailboxes.retain(|mailbox, mbox| {
+            mbox.retain(|e| {
+                let keep = now.saturating_sub(e.enqueued_at) <= MAILBOX_TTL_SECS;
+                if !keep {
+                    if let Some(log) = log.as_mut() {
+                        log.delete(*mailbox, &e.payload);
+                    }
+                }
+                keep
+            });
             !mbox.is_empty()
         });
+        self.compact_mail_log();
     }
 
     /// Обработать входящее сообщение. `now` — часы узла.
@@ -1146,6 +1274,13 @@ impl RelayNode {
                         Response::Accepted
                     } else if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
                         Response::Rejected("MailboxFull".into())
+                    } else if let Err(_e) = durable_deposit(&mut self.mail_log, msg.recipient, now, &msg.payload) {
+                        // R2-5 (#161), FAIL-CLOSED. A relay that advertises `Durable` and then
+                        // answers `Accepted` for a message it could not write is worse than a
+                        // volatile one: the sender retires its outbox entry against a guarantee
+                        // that silently stopped holding. A full or broken disk therefore rejects,
+                        // which the sender's outbox already knows how to survive (it retries).
+                        Response::Rejected("MailNotDurable".into())
                     } else {
                         mbox.push(MailboxEntry { enqueued_at: now, leased_until: 0, payload: msg.payload.clone() });
                         Response::Accepted
@@ -1216,7 +1351,10 @@ impl RelayNode {
                 // Legacy delete-on-fetch: remove the served entries now (descending index
                 // keeps the earlier ones valid as we go).
                 for i in served.into_iter().rev() {
-                    mbox.remove(i);
+                    let e = mbox.remove(i);
+                    if let Some(log) = self.mail_log.as_mut() {
+                        log.delete(req.mailbox, &e.payload);
+                    }
                 }
                 if mbox.is_empty() {
                     self.mailboxes.remove(&req.mailbox);
@@ -1260,7 +1398,16 @@ impl RelayNode {
         }
         if let Some(mbox) = self.mailboxes.get_mut(&req.mailbox) {
             let wanted: std::collections::HashSet<[u8; 32]> = req.ids.iter().copied().collect();
-            mbox.retain(|e| !wanted.contains(&payload_id(&e.payload)));
+            let log = &mut self.mail_log;
+            mbox.retain(|e| {
+                let keep = !wanted.contains(&payload_id(&e.payload));
+                if !keep {
+                    if let Some(log) = log.as_mut() {
+                        log.delete(req.mailbox, &e.payload);
+                    }
+                }
+                keep
+            });
             if mbox.is_empty() {
                 self.mailboxes.remove(&req.mailbox);
             }
@@ -2497,6 +2644,143 @@ mod tests {
             MailboxDurability::Volatile,
             "mailboxes have no disk path (see RelayNode::mailboxes) — the policy must say so"
         );
+    }
+
+    /// R2-5 (#161): the fix. A relay running `Durable` must hand an accepted message back after
+    /// a restart — same node identity, same log directory, a brand-new `RelayNode`.
+    ///
+    /// The negative control is the test below it, which is the SAME scenario on a `Volatile`
+    /// relay and still asserts the message is gone: without that pair, this test would also pass
+    /// if `with_identity` had somehow started sharing state, which is not what is being claimed.
+    #[test]
+    fn an_accepted_message_survives_a_relay_restart_when_the_operator_asked_for_durability() {
+        let dir = mail_dir("survives");
+        let identity = Identity::generate();
+        let recipient = PublicKey::from([0x42u8; 32]);
+        {
+            let mut relay = RelayNode::with_identity(NOW, identity.clone());
+            relay.enable_durable_mail(dir.clone(), NOW).expect("open the mail log");
+            let cap = publish_cap();
+            relay.issue_capability(cap.clone());
+            let relay = Rc::new(RefCell::new(relay));
+            let mut sender = Client::new(InMemoryTransport::new(relay.clone()), cap, b"sender");
+            assert!(matches!(sender.send(&recipient, b"hello", NOW), Response::Accepted));
+            assert_eq!(relay.borrow().mailbox_len_for_test(&recipient.to_bytes()), 1);
+        } // the relay process "exits" here
+
+        let mut restarted = RelayNode::with_identity(NOW, identity);
+        restarted.enable_durable_mail(dir.clone(), NOW).expect("reopen the mail log");
+        assert_eq!(
+            restarted.mailbox_len_for_test(&recipient.to_bytes()),
+            1,
+            "an accepted message must come back after a restart on a Durable relay"
+        );
+        assert_eq!(restarted.policy().mailbox_durability, MailboxDurability::Durable);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2-5 (#161): what a restart does to messages a recipient has already SEEN. One leased but
+    /// never ACKed comes back (it may be redelivered — the client dedups); one it ACKed does not,
+    /// because the delete was recorded. This pins the lease/ACK boundary across a restart; the
+    /// at-least-once trade itself — a delete lost to a crash — is pinned one layer down by
+    /// `mailstore::tests::a_delete_lost_to_a_crash_redelivers_the_message`, which is the test an
+    /// exactly-once implementation would fail.
+    #[test]
+    fn a_leased_message_returns_after_a_restart_but_an_acked_one_stays_gone() {
+        let dir = mail_dir("atleastonce");
+        let identity = Identity::generate();
+        let bob = Identity::generate();
+        {
+            let mut relay = RelayNode::with_identity(NOW, identity.clone());
+            relay.enable_durable_mail(dir.clone(), NOW).expect("open the mail log");
+            let cap = publish_cap();
+            relay.issue_capability(cap.clone());
+            let mut relay = {
+                // Two messages through the real client path (cookie + capability + admission):
+                // one will be leased-and-forgotten, one leased-and-acked.
+                let shared = Rc::new(RefCell::new(relay));
+                let mut sender = Client::new(InMemoryTransport::new(shared.clone()), cap, b"sender");
+                for body in [b"one".as_ref(), b"two".as_ref()] {
+                    assert!(matches!(sender.send(&bob.public, body, NOW), Response::Accepted));
+                }
+                drop(sender);
+                Rc::try_unwrap(shared).ok().expect("sole owner").into_inner()
+            };
+                        // Lease both, then ACK only the first.
+            let req = fetch_at(&mut relay, &bob, NOW, true);
+            let got = fetched(relay.handle_fetch(&req, NOW));
+            assert_eq!(got.len(), 2);
+            let ack = ack_at(&mut relay, &bob, NOW, vec![payload_id(&got[0])]);
+            assert!(matches!(relay.handle_ack(&ack, NOW), AckResponse::Acked));
+        }
+
+        let mut restarted = RelayNode::with_identity(NOW, identity);
+        restarted.enable_durable_mail(dir.clone(), NOW).expect("reopen");
+        assert_eq!(
+            restarted.mailbox_len_for_test(&bob.public.to_bytes()),
+            1,
+            "the ACKed message is gone for good; the leased-but-unacked one is redelivered"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2-5 (#161): the replay is not a trapdoor around the live bounds. A log holding an entry
+    /// past `MAILBOX_TTL_SECS` — the shape a relay that was down for a week produces, and equally
+    /// the shape someone with write access to the log would forge — must not reinstate it.
+    #[test]
+    fn a_replayed_log_is_re_bounded_not_trusted() {
+        let dir = mail_dir("rebound");
+        let bob = [0x55u8; 32];
+        {
+            let (mut log, _) = crate::mailstore::MailLog::open(dir.clone()).unwrap();
+            log.deposit(bob, NOW, &test_seal(1)).unwrap(); // stale by the time we reopen
+            log.deposit(bob, NOW + MAILBOX_TTL_SECS, &test_seal(2)).unwrap(); // still fresh
+        }
+        let mut relay = RelayNode::with_identity(NOW, Identity::generate());
+        relay
+            .enable_durable_mail(dir.clone(), NOW + MAILBOX_TTL_SECS + 1)
+            .expect("open the mail log");
+        assert_eq!(
+            relay.mailbox_len_for_test(&bob),
+            1,
+            "the TTL applies to a replayed entry exactly as it does to a live one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2-5 (#161): FAIL-CLOSED. A relay that advertises `Durable` and cannot write must reject,
+    /// not answer `Accepted` — the sender retires its outbox entry on `Accepted`, so a silent
+    /// downgrade to volatile is exactly the loss this whole feature exists to close, except now
+    /// the operator has also promised otherwise.
+    #[test]
+    fn a_durable_relay_that_cannot_write_rejects_instead_of_accepting() {
+        let dir = mail_dir("failclosed");
+        let mut relay = RelayNode::with_identity(NOW, Identity::generate());
+        relay.enable_durable_mail(dir.clone(), NOW).expect("open the mail log");
+        let cap = publish_cap();
+        relay.issue_capability(cap.clone());
+        relay.mail_log.as_mut().unwrap().poison_for_test(); // the disk goes away
+        let relay = Rc::new(RefCell::new(relay));
+        let mut sender = Client::new(InMemoryTransport::new(relay.clone()), cap, b"sender");
+        let recipient = PublicKey::from([0x43u8; 32]);
+        match sender.send(&recipient, b"hello", NOW) {
+            Response::Rejected(r) => assert_eq!(r, "MailNotDurable"),
+            other => panic!("a durable relay that cannot write must reject, got {other:?}"),
+        }
+        assert_eq!(
+            relay.borrow().mailbox_len_for_test(&recipient.to_bytes()),
+            0,
+            "nothing may be queued in RAM that is not on disk"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn mail_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "karst-relaymail-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     /// R2-5 (#161) — CHARACTERIZATION, not a fix. `mailboxes` lives only in `RelayNode`'s own

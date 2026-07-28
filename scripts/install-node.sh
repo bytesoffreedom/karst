@@ -227,6 +227,10 @@ ENVFILE="$RHOME/relay.env"
   # Large-file blobs across a restart: durable (default — a parked upload survives) |
   # ephemeral (wiped on start — the lower-residue posture). Either way: only E2E ciphertext.
   echo "# KARST_RELAY_BLOB_PERSIST=durable"
+  # Queued MESSAGES across a restart: volatile (default — RAM only, an unfetched message is lost
+  # and the sender is never told) | durable (fsynced before the relay says 'accepted', replayed
+  # on start). Encrypted either way; durable just keeps ciphertext on disk until it is picked up.
+  echo "# KARST_RELAY_MAIL_PERSIST=volatile"
   # Per-capability spend CEILING (unset = off/no ceiling). A named preset or REQ,BYTES,WINDOW:
   #   chat-only | media-friendly | bytes-only (meter by volume) | unlimited. Change it live at any
   #   time with `karst-relay quota …` — no restart, no re-install.

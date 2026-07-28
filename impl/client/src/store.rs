@@ -3804,6 +3804,14 @@ pub struct RelayPrefs {
     /// advertisement is operator-declared (durable is provable via `verify_durability`; ephemeral
     /// is a claim), so this is a preference, not a hard guarantee.
     pub prefer_persistence: Option<node::node::BlobPersistence>,
+    /// Prefer relays whose advertised MAILBOX durability matches (R2-5, #161); `None` = don't
+    /// care. This is the knob that makes the durability fix reachable by the code that needed
+    /// it: `Response::Accepted` deliberately does not say whether the message was persisted, so
+    /// the decision belongs here — at relay CHOICE — rather than per message. `Durable` means
+    /// "an accepted message survives that relay restarting"; `Volatile` is the lower-residue
+    /// posture, and (like ephemeral blobs) an unverifiable claim.
+    #[serde(default)]
+    pub prefer_mail_durability: Option<node::node::MailboxDurability>,
 }
 
 // ─── Multi-password keyslots (duress / decoy / dead-man — Tier 1, layout A′) ──────────────

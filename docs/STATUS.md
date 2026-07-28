@@ -387,9 +387,17 @@ actually asked; container regions made crash-atomic; proxies destroyed rather th
   detects a PARTIAL rollback (one file restored from a backup). An adversary who restores
   everything, or deletes the anchor, is not caught: no purely local state survives an
   adversary who controls all local state.
-- **Relay mailbox durability.** An `Accepted` message lives in memory and does not survive a
-  relay restart. The boundary is now explicit (`RelayPolicy::mailbox_durability`) rather than
-  implied.
+- **Delivery, as opposed to storage.** A relay can now be run with DURABLE mailboxes
+  (`KARST_RELAY_MAIL_PERSIST=durable`): every accepted message is fsynced to a mail log before
+  the relay answers `Accepted`, and replayed on start, so an ordinary restart no longer loses
+  queued mail. That is single-relay durability, not delivery reliability — if that relay's disk
+  or the relay itself goes away, the message goes with it, and nothing replicates it (#149).
+  The default stays `Volatile` (RAM only) because durability means opaque ciphertext lingering
+  on the operator's disk, which is a posture to opt into, not inherit; the relay advertises
+  which it runs (`RelayPolicy::mailbox_durability`) and a client can require a match
+  (`RelayPrefs::prefer_mail_durability`). Deliberately **at-least-once**: deposits are fsynced,
+  deletions are not, so a crash can redeliver a message the recipient already had — the client
+  dedups by `payload_id`, and the alternative is an fsync on every fetch.
 - **A withheld one-time prekey.** Signing stops substitution, not withholding, and refusing
   to talk would convert a downgrade into a lockout. The 3-DH case is reported
   (`ForwardSecrecy::NoOneTimePrekey`) and recorded per peer.
@@ -1843,6 +1851,21 @@ deadline with one `BlobStat`, since the public reads answer without looking at a
 credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_leash`
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
+
+**Durable mailboxes are opt-in (R2-5).** `RelayNode::enable_durable_mail(dir, now)` opens an
+append-only `mail.log` (`node::mailstore`): a deposit is written and fsynced BEFORE `Accepted`
+is returned, deletions (fetch drain, ACK, TTL sweep) are appended without an fsync, and the log
+is replayed and compacted on start. The replay re-applies the LIVE bounds — `MAILBOX_TTL_SECS`,
+per-mailbox `MAX_FETCH_SEALS`, table-wide `MAX_MAILBOXES` — so a file written before a bound was
+tightened, or by anyone with disk access, cannot smuggle state past it. Fail-closed in both
+directions: a relay told to be durable that cannot open its log refuses to start, and one that
+cannot write a deposit answers `Rejected("MailNotDurable")` rather than an `Accepted` the
+sender's outbox would retire against. Pinned by
+`an_accepted_message_survives_a_relay_restart_when_the_operator_asked_for_durability` with the
+existing volatile characterization test as its negative control,
+`a_leased_message_returns_after_a_restart_but_an_acked_one_stays_gone` (the at-least-once
+semantics, chosen not inherited), `a_replayed_log_is_re_bounded_not_trusted`, and
+`a_durable_relay_that_cannot_write_rejects_instead_of_accepting`.
 
 **Mailbox cap — no silent loss.** `fetch` drains the box before writing the frame;
 if the queue outgrew `MAX_RESPONSE_FRAME`, the frame would not be written but the

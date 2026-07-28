@@ -1508,6 +1508,12 @@ impl Store {
     /// The credential to present to THIS relay, or `NotFound` if this account holds none for it.
     /// Never falls back to another relay's credential (that is the whole point — see
     /// `save_capability_for`); a caller that cannot get one must skip the relay, not substitute.
+    ///
+    /// An unreadable `capabilities.dat` is an ERROR here and on every save (the save reads first,
+    /// to keep the other relays' entries), so a corrupt file wedges importing too. That is
+    /// deliberate — silently starting a fresh map would drop credentials the user still has and
+    /// cannot tell are gone — and the exit is manual and explicit: delete `capabilities.dat` and
+    /// re-import (`karst import-cap` / `karst join`) for each relay.
     pub fn load_capability_for(&self, relay: &crate::RelayId) -> io::Result<Capability> {
         self.load_capabilities()?.remove(&relay.hex()).ok_or_else(|| {
             io::Error::new(

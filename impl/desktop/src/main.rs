@@ -784,18 +784,37 @@ fn proxy_for_contact(store: &Store, ik: &[u8; 32]) -> u32 {
     }
 }
 
-/// Give every configured relay a credential to present to it.
+/// Write the DEV capability for every configured relay — only when `KARST_DEV_CAP=1` says this
+/// is the local demo, and loudly.
 ///
-/// A capability belongs to ONE relay (CRYPTO-24), so a fresh account holds none until it joins
-/// (PoW) or imports an invite. The reference dev relay accepts the (public-secret, forgeable) dev
-/// capability, and seeding it per relay is what keeps a local dev setup working at all. Never
-/// overwrites a REAL credential: only a missing entry or our own dev id (0xCA..) is written, so an
-/// earned or imported one survives — and it is refreshed so an account made on an older build
-/// picks up quota changes.
+/// A capability belongs to ONE relay (CRYPTO-24), so a fresh account holds none until it joins a
+/// public door (PoW) or imports an invite. The reference DEV relay admits a capability whose
+/// secret is published in this repository, and seeding that is what makes the one-machine demo
+/// work — which is why this used to happen unconditionally, once per account.
+///
+/// Doing it per relay automatically would have been strictly worse than the account-wide slot it
+/// replaced: `set_net` tries `earn_capability` first, and when that fails (a private, invite-only
+/// relay has no open door) an automatic seed would hand that REAL relay a forgeable credential
+/// and make `publish_all`'s "no credential → skip, and say so" branch unreachable. That is the
+/// `unwrap_or(dev_capability())` shape A8-11 removed from the send path, reintroduced one layer
+/// up. The client cannot tell a dev relay from a real one — the policy advertisement does not say
+/// — so it must not guess: the operator states it, the same way `KARST_INSECURE_FAST_KDF` is
+/// stated rather than inferred.
+///
+/// A real credential is never overwritten. With the flag on, our own dev id (0xCA..) IS
+/// refreshed, so a demo account made on an older build picks up quota changes.
 fn seed_dev_capabilities(store: &Store, relays: &[Relay]) {
+    if std::env::var("KARST_DEV_CAP").unwrap_or_default() != "1" {
+        return;
+    }
     for r in relays {
         let held = store.load_capability_for(&r.id).ok();
         if held.map(|c| c.capability_id == [0xCA; 16]).unwrap_or(true) {
+            eprintln!(
+                "KARST: KARST_DEV_CAP=1 — writing the DEV admission capability for relay {}. \
+                 Its secret is public: anyone can forge deposits under it. Local demo only.",
+                &r.id.hex()[..16]
+            );
             let _ = store.save_capability_for(&r.id, &client::dev_capability());
         }
     }

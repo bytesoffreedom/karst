@@ -79,7 +79,14 @@ Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests g
   admitting DIFFERENT credentials (the dev cap deliberately not issued) and covers both halves.
   **What this does NOT do: it does not acquire credentials.** Failover works only for relays the
   account has actually joined or imported an invite for; for the rest it now fails honestly (skip +
-  reason) instead of silently presenting a credential that would be rejected. Auto-earning a
+  reason) instead of silently presenting a credential that would be rejected. The desktop therefore
+  no longer seeds the forgeable DEV capability on its own: seeding it per relay would have handed a
+  REAL relay (one whose `earn_capability` just failed because it is invite-only) a public-secret
+  credential and made the honest skip unreachable — the `unwrap_or(dev_capability())` shape A8-11
+  removed from the send path, one layer up. The client cannot tell a dev relay from a real one, so
+  it does not guess: the demo states it with **`KARST_DEV_CAP=1`** (loud, per relay, never
+  overwriting a real credential), the same way `KARST_INSECURE_FAST_KDF` is stated rather than
+  inferred. Auto-earning a
   capability when a relay is discovered is a deliberate non-goal here — it would make discovery emit
   a PoW admission round trip on its own. Related node-side gap: an invite file (`invite.json`) is a
   bare serialized capability with NO relay-id in it, so the CLI/desktop must be TOLD which relay an

@@ -48,9 +48,16 @@ run it directly (needs the WebKitGTK deps — see the repo README's prerequisite
 
 ```sh
 scripts/karst-up.sh                                 # bring up the relay (once)
-KARST_HOME=/tmp/alice cargo run -p desktop          # Alice's window
-KARST_HOME=/tmp/bob   cargo run -p desktop          # Bob's window (another terminal)
+KARST_DEV_CAP=1 KARST_HOME=/tmp/alice cargo run -p desktop   # Alice's window
+KARST_DEV_CAP=1 KARST_HOME=/tmp/bob   cargo run -p desktop   # Bob's window (another terminal)
 ```
+
+`KARST_DEV_CAP=1` writes the **dev** admission capability for whatever relay the window is
+pointed at. Its secret is published in this repository, so anyone can forge deposits under it —
+it exists so the one-machine demo works against a `dev`-mode relay, and the client refuses to
+guess: without the flag an account holds a credential only for relays it actually joined
+(`karst join`) or imported an invite for, and a relay it has none for is skipped, with a reason,
+instead of being handed a forgeable one. Never set it against a relay you did not start yourself.
 
 `karst-up.sh` does NOT launch the client — it only prints commands and the
 relay-id to paste in. In each window (first run of a profile):

@@ -1855,6 +1855,24 @@ impl Store {
         std::fs::rename(&tmp, self.pulled_path())
     }
 
+    /// Whether `ik`'s feed content belongs to us: an account we SUBSCRIBED to (a `JoinAccept` we
+    /// asked for wrote it into `channel_peers`) or one we live-pulled from (we sent them a
+    /// `PostsRequest`). Both halves are anchored in a LOCAL act — there is no way for a peer to
+    /// put itself in either set unilaterally, which is what makes this a consent gate and not a
+    /// mere acquaintance check.
+    ///
+    /// Deliberately NOT `is_confirmed_contact`: posts are decoupled from the address book here
+    /// (you follow or peek; a contact does not get feed rights for being a contact), so a
+    /// contact-based gate would be wrong in BOTH directions — it would admit a contact you never
+    /// followed and reject a channel you did.
+    ///
+    /// Lives on `Store` rather than in the desktop layer because the receive path (`lib.rs`)
+    /// must apply the same gate BEFORE it commits attacker-supplied work to disk, and it has
+    /// only a `Store`.
+    pub fn is_feed_source(&self, ik: &[u8; 32]) -> bool {
+        self.load_channel_peers().contains(ik) || self.load_pulled().is_ok_and(|s| s.contains(ik))
+    }
+
     // ----- Profile: own (`profile.dat`) + cache of peers' (`peer_profiles.dat`) -----
     //
     // Both are BEST-EFFORT (corrupt/foreign blob -> empty, NOT an error): these are

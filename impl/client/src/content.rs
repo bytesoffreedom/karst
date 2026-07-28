@@ -111,6 +111,23 @@ pub const MAX_GALLERY_BYTES: usize = MAX_GALLERY_PHOTOS * MAX_AVATAR_BYTES + 4 *
 /// `gallery_fits_inline` to the mailbox cap.
 pub const MAX_GALLERY_CHUNKS: u32 = (MAX_GALLERY_BYTES / MAX_CHUNK_PAYLOAD) as u32 + 1;
 
+/// Whether a `PostAttachmentRef`/`GalleryRef`-shaped blob pointer declares a shape an honest
+/// sender could have produced. `max_bytes` is the per-kind plaintext ceiling.
+///
+/// SEC-31: the chunk COUNT is the field that matters, and it was previously only checked for
+/// `!= 0`. A blob pointer's `chunks` drives one relay round trip each, so an unbounded count is
+/// unbounded work — the relay's own ceiling is `blobstore::MAX_BLOB_CHUNKS` (40 000), five orders
+/// of magnitude above anything feed media needs. `chunk_count` is exactly what the sending side
+/// computed (`blob_upload` derives its count the same way), so demanding EQUALITY — not merely an
+/// upper bound — is both the tightest possible check and free of false rejections. At 60 KiB
+/// blob chunks a 96 KiB attachment is two chunks, so this caps the fetch at two round trips.
+///
+/// `size == 0` is rejected because the send side refuses an empty attachment; without that a
+/// zero-byte "attachment" would be a legal way to spend a queue slot.
+pub fn blob_ref_shape_ok(size: u64, chunks: u32, max_bytes: usize) -> bool {
+    size > 0 && size <= max_bytes as u64 && chunks == crate::blob::chunk_count(size)
+}
+
 /// Whether a packed gallery is small enough to send INLINE (its chunks + the manifest fit one
 /// 256-seal mailbox), or must instead ride the blob path. The `+2` leaves the manifest seal plus a
 /// little headroom for other mail queued in the same mailbox.

@@ -2083,8 +2083,12 @@ pub fn download_post_attachment(
     if now.saturating_sub(ppa.queued_at) > node::node::MAILBOX_TTL_SECS {
         return give_up("post attachment expired (blob past TTL)".into());
     }
-    // Bound the manifest before allocating (anti-DoS): chunk count must match the byte cap.
-    if ppa.chunks == 0 || ppa.size as usize > content::MAX_POST_IMAGE_BYTES {
+    // Bound the pointer before allocating or touching the wire (SEC-31). The admission gate in
+    // `persist_incoming_history` already rejects a bad shape, so a pending entry reaching here
+    // with one means it predates that gate or the file was tampered with — either way, refuse
+    // rather than start the round trips. `chunks` is what drives the loop below, and equality
+    // with `chunk_count(size)` caps it at two for a 96 KiB attachment.
+    if !content::blob_ref_shape_ok(ppa.size, ppa.chunks, content::MAX_POST_IMAGE_BYTES) {
         return give_up("post attachment out of limits".into());
     }
     // No "already recorded → skip" short-circuit like `download_blob` has: these are small and
@@ -2127,6 +2131,13 @@ pub fn download_post_attachment(
         hasher.update(&pt);
         buf.extend_from_slice(&pt);
     }
+    // The assembled length must be exactly what the pointer promised. The hash below already
+    // pins the bytes, but only to what the SENDER hashed — `size` is what the queue and the caps
+    // were admitted against, so a ref whose real payload is a different length was not the thing
+    // we agreed to fetch.
+    if buf.len() as u64 != ppa.size {
+        return give_up("post attachment size mismatch".into());
+    }
     let got: [u8; 32] = hasher.finalize().into();
     if got != ppa.hash {
         // A corrupt fetch — a terminal integrity failure, mark it and stop.
@@ -2162,7 +2173,9 @@ pub fn download_gallery(
     if now.saturating_sub(pg.queued_at) > node::node::MAILBOX_TTL_SECS {
         return give_up("gallery expired (blob past TTL)".into());
     }
-    if pg.chunks == 0 || pg.size as usize > content::MAX_GALLERY_BYTES {
+    // SEC-31, same reasoning as `download_post_attachment`: `chunks` is the loop bound, so it must
+    // equal what an honest sender would have computed, not merely be non-zero.
+    if !content::blob_ref_shape_ok(pg.size, pg.chunks, content::MAX_GALLERY_BYTES) {
         return give_up("gallery out of limits".into());
     }
     use sha2::Digest;
@@ -2197,6 +2210,9 @@ pub fn download_gallery(
         }
         hasher.update(&pt);
         buf.extend_from_slice(&pt);
+    }
+    if buf.len() as u64 != pg.size {
+        return give_up("gallery size mismatch".into());
     }
     let got: [u8; 32] = hasher.finalize().into();
     if got != pg.hash {
@@ -2799,24 +2815,47 @@ fn persist_incoming_history(store: &Store, msgs: &[Option<Received>], now: u64) 
             // A post-attachment blob pointer: persist it as a PENDING POST ATTACHMENT (idempotent
             // by blob_id) so a crash mid-fetch retries — same before-ack durability as FileRef. The
             // fetch itself is the caller's (off this path); it drops the entry on success.
+            //
+            // SEC-31: admission happens HERE, before anything attacker-supplied is committed.
+            // Checking only at fetch time would still let a stranger's refs occupy the whole
+            // `MAX_PENDING_POST_ATTACHMENTS` queue and churn a retry on every poll — the queue
+            // slot is the resource, so the gate belongs at the door.
+            //
+            // Two independent conditions, both previously absent:
+            //  * the sender must be a FEED SOURCE — exactly the gate `Publication` itself passes
+            //    through. An attachment decorates a post; a peer whose posts we would refuse has
+            //    no business making us fetch their media. `GalleryRef` three arms down had its
+            //    equivalent gate from the start; this variant simply never got one.
+            //  * the pointer's declared shape must be one an honest sender could produce, which
+            //    for the chunk count means exact equality with `blob::chunk_count(size)`.
+            // Both are cheap and local. What they deliberately do NOT check is that `post_id`
+            // names a post we already hold: the ref is persisted here, during `recv_session_multi`,
+            // while its `Publication` is applied to the feed by the CALLER after this returns — so
+            // within a single poll batch the post legitimately does not exist yet, and that gate
+            // would drop honest media.
             Ok(content::Content::PostAttachmentRef {
                 post_id, index, kind, name, blob_id, key, hash, size, chunks,
             }) => {
-                store
-                    .add_pending_post_attachment(&store::PendingPostAttachment {
-                        blob_id,
-                        key,
-                        hash,
-                        post_id,
-                        index,
-                        kind,
-                        name,
-                        size,
-                        chunks,
-                        sender: m.sender,
-                        queued_at: now,
-                    })
-                    .map_err(|e| format!("recording pending post attachment: {e}"))?;
+                if store.is_feed_source(&m.sender)
+                    && content::blob_ref_shape_ok(size, chunks, content::MAX_POST_IMAGE_BYTES)
+                    && name.len() <= content::MAX_FILENAME
+                {
+                    store
+                        .add_pending_post_attachment(&store::PendingPostAttachment {
+                            blob_id,
+                            key,
+                            hash,
+                            post_id,
+                            index,
+                            kind,
+                            name,
+                            size,
+                            chunks,
+                            sender: m.sender,
+                            queued_at: now,
+                        })
+                        .map_err(|e| format!("recording pending post attachment: {e}"))?;
+                }
                 continue;
             }
             // A gallery blob pointer: persist it as a PENDING GALLERY (keyed by sender, superseding an
@@ -2824,7 +2863,11 @@ fn persist_incoming_history(store: &Store, msgs: &[Option<Received>], now: u64) 
             // a blob download is many relay round-trips, so an unsolicited ref from a stranger is
             // dropped. The fetch itself is the caller's; it drops the entry on success.
             Ok(content::Content::GalleryRef { blob_id, key, hash, size, chunks }) => {
-                if store.is_confirmed_contact(&m.sender).unwrap_or(false) {
+                // SEC-31 applies to this pointer too: being a confirmed contact earns the right to
+                // send us a gallery, not the right to name an arbitrary chunk count.
+                if store.is_confirmed_contact(&m.sender).unwrap_or(false)
+                    && content::blob_ref_shape_ok(size, chunks, content::MAX_GALLERY_BYTES)
+                {
                     store
                         .add_pending_gallery(&store::PendingGallery {
                             sender: m.sender,
@@ -3378,6 +3421,123 @@ mod tests {
         persist_incoming_history(&store, &batch, 42).unwrap();
         let hist = store.load_history().unwrap();
         assert_eq!(hist.iter().filter(|r| r.text == b"ok").count(), 2, "both taps delivered");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Build a `Received` carrying a `PostAttachmentRef` with an attacker's choice of shape.
+    fn attachment_ref(
+        sender: [u8; 32],
+        size: u64,
+        chunks: u32,
+        msg_id: [u8; 32],
+    ) -> node::peer::Received {
+        let plaintext = content::encode(&content::Content::PostAttachmentRef {
+            post_id: [9u8; 16],
+            index: 0,
+            kind: 0,
+            name: "photo.png".into(),
+            blob_id: msg_id, // distinct per ref, which is what the pending queue keys on
+            key: [2u8; 32],
+            hash: [3u8; 32],
+            size,
+            chunks,
+        });
+        node::peer::Received { sender, plaintext, msg_id }
+    }
+
+    /// SEC-31, the AUTHORIZATION half. A `PostAttachmentRef` was written straight into the pending
+    /// fetch queue for ANY sender that could establish a session — no contact status, no
+    /// subscription, nothing. The sibling `GalleryRef` arm, three cases below it in the same match,
+    /// always required a confirmed contact; this variant simply never got its gate. So a stranger
+    /// could park work in a durable queue on a client that would not even display their posts.
+    ///
+    /// Discriminating in BOTH directions: the stranger's ref must be refused AND a subscribed
+    /// channel's identical ref must be admitted. A one-directional test would pass with the whole
+    /// feature disabled.
+    #[test]
+    fn a_post_attachment_ref_is_only_queued_for_a_feed_source() {
+        let (dir, store) = tmp_store("ppa-gate");
+        let stranger = [0x11u8; 32];
+        let channel = [0x22u8; 32];
+        store.set_channel_peer(channel, true).unwrap(); // we subscribed to this one
+
+        persist_incoming_history(
+            &store,
+            &[Some(attachment_ref(stranger, 1000, 1, [0xA1; 32]))],
+            100,
+        )
+        .unwrap();
+        assert!(
+            store.list_pending_post_attachments().unwrap().is_empty(),
+            "a stranger's attachment ref must not reach the pending queue"
+        );
+
+        persist_incoming_history(
+            &store,
+            &[Some(attachment_ref(channel, 1000, 1, [0xB1; 32]))],
+            100,
+        )
+        .unwrap();
+        let q = store.list_pending_post_attachments().unwrap();
+        assert_eq!(q.len(), 1, "a subscribed channel's attachment must still be queued");
+        assert_eq!(q[0].sender, channel);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SEC-31, the COST half. `chunks` was checked only for `!= 0`, and it is the loop bound of
+    /// `download_post_attachment` — one blocking relay round trip per chunk. The relay accepts a
+    /// declared count up to `blobstore::MAX_BLOB_CHUNKS` (40 000), so a pointer whose `size` sat
+    /// comfortably inside the 96 KiB cap could still demand tens of thousands of fetches, and the
+    /// `buf.len()` cap never fired because empty chunks add no bytes. Requiring exact equality
+    /// with `blob::chunk_count(size)` — what the sender's own upload computed — bounds an honest
+    /// 96 KiB attachment at two 60 KiB chunks.
+    ///
+    /// Discriminating in both directions again: the inflated count is refused at the door, the
+    /// truthful count is admitted, and the check is asserted at the exact boundary rather than
+    /// only far from it.
+    #[test]
+    fn a_post_attachment_ref_must_declare_the_chunk_count_its_size_implies() {
+        let (dir, store) = tmp_store("ppa-chunks");
+        let channel = [0x33u8; 32];
+        store.set_channel_peer(channel, true).unwrap();
+
+        // 1000 bytes is one 60 KiB blob chunk; claiming 40 000 is the attack.
+        persist_incoming_history(
+            &store,
+            &[Some(attachment_ref(channel, 1000, 40_000, [0xC1; 32]))],
+            100,
+        )
+        .unwrap();
+        assert!(
+            store.list_pending_post_attachments().unwrap().is_empty(),
+            "an inflated chunk count must be refused before it becomes queued work"
+        );
+
+        // A zero-byte "attachment" is not something the send side can produce either.
+        persist_incoming_history(&store, &[Some(attachment_ref(channel, 0, 1, [0xC2; 32]))], 100)
+            .unwrap();
+        assert!(
+            store.list_pending_post_attachments().unwrap().is_empty(),
+            "an empty attachment must not occupy a queue slot"
+        );
+
+        // The honest shapes: exactly one chunk under the boundary, exactly two over it.
+        let one = blob::BLOB_CHUNK as u64;
+        persist_incoming_history(&store, &[Some(attachment_ref(channel, one, 1, [0xD1; 32]))], 100)
+            .unwrap();
+        persist_incoming_history(
+            &store,
+            &[Some(attachment_ref(channel, one + 1, 2, [0xD2; 32]))],
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            store.list_pending_post_attachments().unwrap().len(),
+            2,
+            "truthful refs on both sides of the chunk boundary must still be queued"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

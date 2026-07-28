@@ -399,6 +399,31 @@ deposits made idempotent; a failed relay's receive rolled back transactionally; 
 content parked before the ACK and replayed afterwards; accepts honoured only from a peer we
 actually asked; container regions made crash-atomic; proxies destroyed rather than flagged.
 
+**Closed since (live-pull amplification and unsolicited feed media).**
+
+- **A `PostsRequest` no longer buys unbounded work.** One inbound control message used to load
+  the whole (sealed) feed, spawn an OS thread and fire up to 30 separate publication sends, with
+  no cooldown and no ceiling — a 1→30 amplifier repeatable by any stranger, able to drain the
+  account's own 100-per-600s request quota and deny the *user* their sends. Replies now pass a
+  global budget (`PostsReplyBudget`): at most 30 sends per 600 s in total across all peers, at
+  most 2 reply jobs at once, admitted **before** the feed is read so a refused request costs a
+  lock and nothing else. An admitted request is charged at least one unit even when the answer is
+  empty, because the two sealed reads that discover "nothing to serve" are the real per-request
+  cost, and an account with no public posts is the common case. The bound is global on purpose —
+  a `PostsRequest` requires no contact status, so an attacker mints a fresh identity key per
+  request and walks past anything keyed per-peer; per-peer state keyed by an attacker-chosen key
+  is itself unbounded memory.
+- **Unsolicited post media can no longer queue work.** A `PostAttachmentRef` was written straight
+  into the durable pending-fetch queue for *any* sender who could open a session, and its `chunks`
+  field — one blocking relay round trip each — was checked only for `!= 0` while the relay accepts
+  a declared count up to 40 000. Refs are now admitted only from a **feed source** (the same
+  consent the `Publication` itself needs) and only when `chunks == blob::chunk_count(size)`
+  exactly, which caps an honest 96 KiB attachment at two 60 KiB chunks. The same shape check now
+  covers `GalleryRef`, both download paths re-check defensively, and both assert the assembled
+  length equals the declared `size`. The inline chunk path to the same sidecar
+  (`PostImageManifest` / `PostAttachmentManifest`) got the identical feed gate — a gate on one of
+  two routes to the same place is not a gate.
+
 **Deliberately NOT fixed, and why — read these before trusting a property:**
 
 - **Snapshot-diff against the Tier-2 container.** A cover-password write touches the same
@@ -426,6 +451,31 @@ actually asked; container regions made crash-atomic; proxies destroyed rather th
   (`ForwardSecrecy::NoOneTimePrekey`) and recorded per peer.
 - **BlobGet request volume.** The size ratio is bounded (~437:1) and the transport rules out
   spoofed-source reflection, but request VOLUME rides the deliberately stateless cookie.
+- **A batched `PostsPage` reply.** The audit asked for one bounded page instead of up to 30
+  separate session messages. Not done: packets are camouflaged to a fixed 1400 B, so 30 posts do
+  not fit one send anyway — it would buy a new content variant, a reassembly path and a
+  receive-side fan-in in exchange for turning 30 sends into several. The budget above bounds the
+  amplification per unit time regardless of how many posts exist, which is the stronger property
+  for far less surface.
+- **Live pull is deniable.** A flood can spend the reply window's budget and make this client stop
+  answering profile views until it refills. That is the deliberate trade: losing "strangers can
+  peek at my public posts right now" is recoverable, losing "I can send" is not.
+- **`ChannelMigrate` re-points a contact's key without asking.** It is deliberately *not* behind
+  SEC-29's outstanding-request ledger, and that is a category difference rather than an omission:
+  the ledger answers "did we ask for this?", and a migration is an unsolicited notification from
+  an already-authenticated contact, with no request to correlate — requiring a ledger entry would
+  require one that can never exist. What does gate it is `migrate_contact_ik`'s own precondition
+  (the sender must already be a contact) plus its refusal of a `new_ik` that belongs to a
+  different contact. The residual is real and is elsewhere: nothing proves the sender holds
+  `new_ik`, and the re-point is applied before the user sees it, so a compromised contact can
+  silently redirect our future mail to a third party's key. `verified` is cleared and the UI
+  prompts a re-verify, but after the fact. Closing it needs a staged migration (persist as
+  pending, apply on explicit user action) — SEC-36's auto-redirect half, tracked separately.
+- **A private account's posts still need a subscribe the recipient records.** `is_feed_source` is
+  "a channel we subscribed to, or an author we pulled from"; a `JoinAccept { is_channel: false }`
+  from an approving private account writes nothing, so its publications are dropped by the
+  recipient. Pre-existing, and unchanged here — the new attachment gates deliberately match the
+  `Publication` gate exactly rather than being wider or narrower than it.
 
 **Cost the user pays.** Recovery-phrase restore brings back the root's network identity
 only: never vault data, and — since proxies became destroyable — never the channels either.

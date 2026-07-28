@@ -340,30 +340,48 @@ fn handle_conn(
         let resp = match req {
         WireRequest::Send(msg) => {
             let now = (clock)(); // время СЕРВЕРА
-            match relay.lock().expect("relay mutex").handle(&msg, now) {
-                Response::NeedCookie(c) => WireResponse::NeedCookie(c),
-                Response::Accepted => WireResponse::Accepted,
-                Response::Rejected(s) => WireResponse::Rejected(s),
+            // #142, same shape as the blob path: ADMISSION under the relay lock, the mail work
+            // after it is released. Admission is in-memory arithmetic; a deposit touches a queue
+            // and, on a durable relay, an fsync. Under one mutex every client's admission queued
+            // behind someone else's write barrier. The `admitted` binding is what forces the
+            // guard to drop before the deposit runs — inlining it would hold the lock across it.
+            let admitted = relay.lock().expect("relay mutex").admit_send(&msg, now);
+            match admitted {
+                Ok(a) => match a.deposit(&msg.payload, now) {
+                    Response::NeedCookie(c) => WireResponse::NeedCookie(c),
+                    Response::Accepted => WireResponse::Accepted,
+                    Response::Rejected(s) => WireResponse::Rejected(s),
+                },
+                Err(Response::NeedCookie(c)) => WireResponse::NeedCookie(c),
+                Err(Response::Rejected(s)) => WireResponse::Rejected(s),
+                Err(Response::Accepted) => WireResponse::Accepted,
             }
         }
         WireRequest::Fetch(freq) => {
             let now = (clock)();
-            match relay.lock().expect("relay mutex").handle_fetch(&freq, now) {
-                FetchResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
+            let admitted = relay.lock().expect("relay mutex").admit_fetch(&freq, now);
+            match admitted {
                 // Serialize the drained seals into a constant-size page: the
                 // response length no longer reveals how much mail was queued.
-                FetchResponse::Fetched(seals) => {
+                Ok(a) => WireResponse::Fetched(crate::wire::FetchPage::pack(&a.serve(now))),
+                Err(FetchResponse::NeedCookie(c)) => WireResponse::NeedCookie(c),
+                Err(FetchResponse::Rejected(s)) => WireResponse::Rejected(s),
+                Err(FetchResponse::Fetched(seals)) => {
                     WireResponse::Fetched(crate::wire::FetchPage::pack(&seals))
                 }
-                FetchResponse::Rejected(s) => WireResponse::Rejected(s),
             }
         }
         WireRequest::Ack(areq) => {
             let now = (clock)();
-            match relay.lock().expect("relay mutex").handle_ack(&areq, now) {
-                AckResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
-                AckResponse::Acked => WireResponse::Acked,
-                AckResponse::Rejected(s) => WireResponse::Rejected(s),
+            let admitted = relay.lock().expect("relay mutex").admit_ack(&areq, now);
+            match admitted {
+                Ok(a) => {
+                    a.apply();
+                    WireResponse::Acked
+                }
+                Err(AckResponse::NeedCookie(c)) => WireResponse::NeedCookie(c),
+                Err(AckResponse::Rejected(s)) => WireResponse::Rejected(s),
+                Err(AckResponse::Acked) => WireResponse::Acked,
             }
         }
         WireRequest::PublishBundle(preq) => {

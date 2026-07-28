@@ -503,3 +503,56 @@ fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
     uploader.join().expect("the parked upload finishes once the store is free");
     std::fs::remove_dir_all(&blob_dir).ok();
 }
+
+/// #142: a slow MAIL write must not stall admission either.
+///
+/// Same shape as the blob test above, one layer in: the relay used to do the deposit — including,
+/// on a durable relay, the fsync that answers `Accepted` — while holding the one mutex that
+/// admission, discovery and bundle lookups all need. So one client's write barrier was every
+/// other client's latency. The mail plane now has its own lock, and the serve loop takes the
+/// relay lock only to ADMIT.
+///
+/// The test thread holds the mail store's lock — an arbitrarily slow disk, deterministically, no
+/// timing threshold — parks a real send against it, and then requires an unrelated request that
+/// needs only relay state (`GetPolicy`) to still be answered. Put the deposit back under the
+/// relay lock and the policy request never returns.
+#[test]
+fn a_mail_write_in_progress_does_not_block_admission() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut relay = node::node::RelayNode::new(NOW);
+    relay.issue_capability(capability([0x33; 32]));
+    let mail = relay.mail_store();
+    let server = RelayServer::new(relay, Arc::new(move || NOW));
+    let noise_pub = server.noise_public();
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+
+    // The stand-in for a slow disk: no deposit can complete until this guard is dropped.
+    let guard = mail.lock().expect("mail mutex");
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let sender = thread::spawn(move || {
+        let mut alice = Client::new(SocketTransport::new(addr, noise_pub), capability([0x33; 32]), b"alice");
+        let _ = started_tx.send(());
+        // Parks inside the relay, past admission, waiting for the mail lock.
+        alice.send(&PublicKey::from([0x77u8; 32]), b"stuck behind a slow disk", NOW)
+    });
+    started_rx.recv().expect("sender started");
+    // Synchronisation, not a measurement (see the blob test): if the send has not arrived yet the
+    // test proves less, never something false — the guard is held throughout the assertion below.
+    thread::sleep(Duration::from_millis(300));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(SocketTransport::new(addr, noise_pub).get_policy().is_ok());
+    });
+    let answered = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("admission-only requests must not wait on a mail write — different locks");
+    assert!(answered, "the relay should have answered its policy");
+
+    drop(guard); // the "slow disk" finishes
+    assert!(matches!(sender.join().expect("sender thread"), Response::Accepted));
+}

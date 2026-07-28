@@ -1962,6 +1962,27 @@ a production build that refuses to start without an audited verifier — meaning
 verifier exists; today the honest statement is that the relay has none and admits nothing on its
 behalf.
 
+**Mail work is off the global relay lock too (#142).** The queues and their durable log moved
+into a `MailStore` behind its own lock, and the serve loop now takes the relay lock only to ADMIT
+a send/fetch/ACK — cookie, replay, capability HMAC, quota, ownership proof, all pure relay state —
+then releases it and does the mail work under the mail lock. On a durable relay that matters a
+lot: the deposit's fsync used to run while holding the mutex every other client's admission
+needed. `handle`/`handle_fetch`/`handle_ack` remain one-step wrappers for callers that are not the
+serve loop. Two consequences handled explicitly rather than discovered later: the mailbox caps are
+re-checked INSIDE the mail lock, because admission now runs under a lock that has been released by
+the time the write happens and two concurrently-admitted deposits must not both claim the last
+slot (pinned by `two_deposits_admitted_at_once_cannot_overfill_one_mailbox` — the one-frame
+invariant from #162 is not allowed to become racy); and `RelayPolicy` reads a cached durability
+flag rather than the mail lock, so answering `GetPolicy` never queues behind an fsync. The epoch's
+TTL sweep uses `try_lock` for the same reason the blob sweep does. Pinned by
+`a_mail_write_in_progress_does_not_block_admission`, which holds the mail lock (an arbitrarily
+slow disk, no timing threshold) and requires an unrelated `GetPolicy` to still be answered — put
+the deposit back under the relay lock and it never returns. **Named residual:** discovery, bundle
+publication and the OPK batches still share the relay lock with admission, and mail operations
+still serialize against each other. Sharding the mail plane by recipient is deliberately NOT done
+yet: it needs either N logs or one shared log lock, which would re-serialize exactly what the
+sharding was for.
+
 **Blob I/O is off the global relay lock (#142).** The relay keeps one `Mutex<RelayNode>`, and
 `handle_blob_put`/`handle_blob_get` used to do their FILE I/O — tens of KiB per chunk — while
 holding it, so a single upload head-of-line-blocked every other client's send, fetch and ACK on

@@ -129,6 +129,47 @@ pub fn payload_id(payload: &Payload) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// A deposit that has PASSED admission and still has to be stored (#142). Holding this means the
+/// relay lock can be — and is — released before the mail work begins.
+pub struct AdmittedDeposit {
+    store: Arc<Mutex<MailStore>>,
+    recipient: [u8; 32],
+}
+
+impl AdmittedDeposit {
+    /// Store the message. Takes only the MAIL lock, so a deposit's fsync blocks other mail work
+    /// and nothing else — no admission, no discovery, no bundle lookup.
+    pub fn deposit(&self, payload: &Payload, now: u64) -> Response {
+        self.store.lock().expect("mail mutex").deposit(self.recipient, payload, now)
+    }
+}
+
+/// A fetch that has passed the cookie + ownership gate and still has to be served.
+pub struct AdmittedFetch {
+    store: Arc<Mutex<MailStore>>,
+    mailbox: [u8; 32],
+}
+
+impl AdmittedFetch {
+    /// Serve one page and lease it.
+    pub fn serve(&self, now: u64) -> Vec<Payload> {
+        self.store.lock().expect("mail mutex").fetch_page(&self.mailbox, now)
+    }
+}
+
+/// An ACK that has passed the cookie + ownership gate and still has to be applied.
+pub struct AdmittedAck {
+    store: Arc<Mutex<MailStore>>,
+    mailbox: [u8; 32],
+    ids: std::collections::HashSet<[u8; 32]>,
+}
+
+impl AdmittedAck {
+    pub fn apply(&self) {
+        self.store.lock().expect("mail mutex").ack(&self.mailbox, &self.ids);
+    }
+}
+
 /// An upload that has PASSED admission and still has to be written (#142). Holding this means
 /// the relay lock can be — and is — released before the file I/O begins.
 pub struct AdmittedBlobPut {
@@ -156,21 +197,6 @@ pub fn blob_get_chunk(
 ) -> BlobResponse {
     let store = store.lock().expect("blob store mutex");
     BlobResponse::Chunk(store.get_chunk(&req.blob_id, req.index))
-}
-
-/// Durably record an admitted deposit, if this relay is running with a mail log. A free function
-/// (not a method) so the caller can hold a `&mut` borrow of `mailboxes` across the call — the two
-/// are disjoint fields, and the deposit has to be on disk BEFORE the entry is visible in RAM.
-fn durable_deposit(
-    log: &mut Option<crate::mailstore::MailLog>,
-    mailbox: [u8; 32],
-    now: u64,
-    payload: &Payload,
-) -> std::io::Result<()> {
-    match log {
-        Some(log) => log.deposit(mailbox, now, payload),
-        None => Ok(()),
-    }
 }
 
 /// Свежий случайный ключ cookie-эпохи (для инициализации и ротации).
@@ -359,10 +385,10 @@ struct BundleSlot {
 /// `leased_until` is the wall-clock time before which a leased-but-unacked message
 /// stays invisible to a fetch (0 = not leased). Leasing never resets `enqueued_at`, so
 /// a client that keeps crashing cannot outlive `MAILBOX_TTL_SECS`.
-struct MailboxEntry {
-    enqueued_at: u64,
-    leased_until: u64,
-    payload: Payload,
+pub struct MailboxEntry {
+    pub(crate) enqueued_at: u64,
+    pub(crate) leased_until: u64,
+    pub(crate) payload: Payload,
 }
 
 /// Operator's choice for the §15 blob store's restart behaviour. `Durable` keeps parked blobs
@@ -554,6 +580,232 @@ impl BlobQuotaTracker {
 
 /// Relay-узел: гоняет admission-конвейер (§7) на входящих capsule и, при
 /// Admit, кладёт ЗАПЕЧАТАННЫЙ (нечитаемый для узла) груз в mailbox получателя.
+/// The mail plane: per-recipient queues plus their optional durable log (#142).
+///
+/// Split out of `RelayNode` so it can live behind its own lock. Everything that decides WHETHER a
+/// message may be deposited (cookie, replay, capability, quota) stays on the relay; everything
+/// that touches a queue or the disk is here. The caps are re-checked INSIDE this type rather than
+/// trusted from the admission step: admission now runs under a different lock that has been
+/// released by the time we get here, so two concurrently-admitted deposits must not both see room
+/// for the same last slot. That invariant — a mailbox always fits in one response frame (#162) —
+/// is not allowed to become racy just because the locking got finer.
+pub struct MailStore {
+    /// Per-recipient queue. `enqueued_at` drives the TTL sweep so undelivered mail for a
+    /// recipient who never comes back doesn't accumulate forever.
+    mailboxes: HashMap<[u8; 32], Vec<MailboxEntry>>,
+    /// R2-5 (#161): the durable side. `None` = `Volatile` (the default — an accepted message
+    /// lives in RAM only). `Some` = every deposit is fsynced before `Accepted` is answered, and
+    /// the table above is rebuilt from the log on start.
+    log: Option<crate::mailstore::MailLog>,
+}
+
+impl MailStore {
+    fn new() -> Self {
+        MailStore { mailboxes: HashMap::new(), log: None }
+    }
+
+    /// Store an ADMITTED message. Returns what the relay answers the sender.
+    pub fn deposit(&mut self, recipient: [u8; 32], payload: &Payload, now: u64) -> Response {
+        // Table-wide cap on NEW keys (see `MAX_MAILBOXES`): a fabricated recipient the relay has
+        // never seen costs a whole HashMap entry that then sits until `MAILBOX_TTL_SECS` sweeps
+        // it, and admission does not bound how many distinct addresses one capability can address
+        // mail to — only how fast. Checked before `entry()` would itself allocate the new slot;
+        // an EXISTING recipient is never blocked by this, only a brand-new one once full.
+        if !self.mailboxes.contains_key(&recipient) && self.mailboxes.len() >= MAX_MAILBOXES {
+            return Response::Rejected("MailboxTableFull".into());
+        }
+        // Cap на ВСТАВКЕ держит инвариант «mailbox всегда влезает в один кадр ответа» по
+        // построению → fetch никогда не упрётся в FrameTooLarge ПОСЛЕ drain'а (иначе — тихая
+        // потеря всей очереди офлайн-получателя). Полный ящик = backpressure отправителю, не
+        // молчаливый сброс. В духе admission-троттлинга.
+        let mbox = self.mailboxes.entry(recipient).or_default();
+        // IDEMPOTENT deposit (R2-7). The transport deliberately does NOT retry a request once it
+        // has been written to the connection: the relay may already have applied it, and a blind
+        // retry would duplicate. But the sender's outbox retries later, retransmitting the EXACT
+        // same ciphertext — with a fresh nonce and capability proof, so admission correctly sees a
+        // new request. The deposit underneath is the same message, and storing it twice cost the
+        // recipient a mailbox slot and the sender quota, and left every content type to implement
+        // its own dedup.
+        //
+        // `payload_id` is already the stable identity of those bytes — it is what an ACK names —
+        // so no new wire field is needed: re-depositing a message that is still in the mailbox is
+        // accepted and ignored. The scan is bounded by the mailbox cap.
+        //
+        // Limit worth naming: this covers the window that actually produces duplicates (response
+        // lost, sender retries), NOT a retry after the recipient has fetched and the entry is
+        // gone. Catching that needs a delivered-ids record with its own retention — a different
+        // trade, not this one. Note also that admission has ALREADY charged quota by the time we
+        // get here, in this design as in the one before it: a retry pays for the request it made,
+        // and only the storage is deduplicated.
+        let deposit_id = payload_id(payload);
+        if mbox.iter().any(|e| payload_id(&e.payload) == deposit_id) {
+            return Response::Accepted;
+        }
+        if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
+            return Response::Rejected("MailboxFull".into());
+        }
+        if let Some(log) = self.log.as_mut() {
+            // R2-5 (#161), FAIL-CLOSED. A relay that advertises `Durable` and then answers
+            // `Accepted` for a message it could not write is worse than a volatile one: the
+            // sender retires its outbox entry against a guarantee that silently stopped holding.
+            // A full or broken disk therefore rejects, which the sender's outbox survives (it
+            // retries). The fsync happens HERE, inside this lock — never while holding the
+            // relay's, which is the whole point of the split.
+            if log.deposit(recipient, now, payload).is_err() {
+                return Response::Rejected("MailNotDurable".into());
+            }
+        }
+        self.mailboxes
+            .entry(recipient)
+            .or_default()
+            .push(MailboxEntry { enqueued_at: now, leased_until: 0, payload: payload.clone() });
+        Response::Accepted
+    }
+
+    /// Serve one fixed-size page and LEASE what it served (#179 — a fetch is never a delete).
+    pub fn fetch_page(&mut self, mailbox: &[u8; 32], now: u64) -> Vec<Payload> {
+        // Fixed-size fetch (§2.2): take at most one page worth of seals (`FETCH_CAP` and within
+        // the page body budget); leave the rest queued for the next poll. The response is later
+        // serialized into a constant-size page, so an on-path observer cannot read the queue
+        // depth from the response length.
+        //
+        // Only VISIBLE entries are served: a message leased by an earlier fetch stays hidden
+        // until its lease expires (`leased_until <= now` again) or an ACK deletes it. Indices are
+        // collected so the lease acts on the exact served entries even when leased and visible
+        // entries are interleaved.
+        let (seals, served): (Vec<Payload>, Vec<usize>) = match self.mailboxes.get(mailbox) {
+            Some(mbox) => {
+                let (idx, payloads): (Vec<usize>, Vec<Payload>) = mbox
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.leased_until <= now)
+                    .map(|(i, e)| (i, e.payload.clone()))
+                    .unzip();
+                let take = crate::wire::FetchPage::fit_prefix(&payloads);
+                (payloads.into_iter().take(take).collect(), idx.into_iter().take(take).collect())
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        if let Some(mbox) = self.mailboxes.get_mut(mailbox) {
+            for i in served {
+                mbox[i].leased_until = now + LEASE_SECS;
+            }
+        }
+        seals
+    }
+
+    /// Delete the named messages (an ACK the caller has already authenticated).
+    pub fn ack(&mut self, mailbox: &[u8; 32], wanted: &std::collections::HashSet<[u8; 32]>) {
+        let log = &mut self.log;
+        if let Some(mbox) = self.mailboxes.get_mut(mailbox) {
+            mbox.retain(|e| {
+                let keep = !wanted.contains(&payload_id(&e.payload));
+                if !keep {
+                    if let Some(log) = log.as_mut() {
+                        log.delete(*mailbox, &e.payload);
+                    }
+                }
+                keep
+            });
+            if mbox.is_empty() {
+                self.mailboxes.remove(mailbox);
+            }
+        }
+    }
+
+    /// Drop undelivered entries older than `MAILBOX_TTL_SECS`, and forget any mailbox left empty.
+    /// Monotonic-clock note: `saturating_sub` makes a regressed timestamp look FRESH (kept),
+    /// never spuriously stale.
+    pub fn sweep(&mut self, now: u64) {
+        let log = &mut self.log;
+        self.mailboxes.retain(|mailbox, mbox| {
+            mbox.retain(|e| {
+                let keep = now.saturating_sub(e.enqueued_at) <= MAILBOX_TTL_SECS;
+                if !keep {
+                    if let Some(log) = log.as_mut() {
+                        log.delete(*mailbox, &e.payload);
+                    }
+                }
+                keep
+            });
+            !mbox.is_empty()
+        });
+        self.compact_if_needed();
+    }
+
+    /// Rewrite the mail log from the live table once it has accumulated enough dead records to be
+    /// worth the rewrite. Called from the sweep — not per request, for the same reason the TTL
+    /// scan is not: an O(n) rewrite on every insert is its own DoS.
+    fn compact_if_needed(&mut self) {
+        let Some(log) = &self.log else { return };
+        let live_count: usize = self.mailboxes.values().map(Vec::len).sum();
+        if !log.should_compact(live_count) {
+            return;
+        }
+        let live: Vec<crate::mailstore::ReplayedEntry> = self
+            .mailboxes
+            .iter()
+            .flat_map(|(mailbox, mbox)| {
+                mbox.iter().map(move |e| crate::mailstore::ReplayedEntry {
+                    mailbox: *mailbox,
+                    enqueued_at: e.enqueued_at,
+                    payload: e.payload.clone(),
+                })
+            })
+            .collect();
+        // A failed compaction is not silently ignored: `MailLog` marks its handle unusable if it
+        // failed anywhere past the rename, so the next deposit fails loudly and the fail-closed
+        // path answers `Rejected` instead of an `Accepted` nobody can honour. A failure BEFORE
+        // the rename leaves the old log live and complete (compaction only ever drops records
+        // already dead), so that case simply retries next epoch.
+        if let Some(log) = &mut self.log {
+            let _ = log.compact(&live);
+        }
+    }
+
+    /// Is this relay writing queued mail to disk?
+    pub fn is_durable(&self) -> bool {
+        self.log.is_some()
+    }
+
+    /// How many messages are queued for one mailbox (diagnostics/tests).
+    pub fn queued_for(&self, mailbox: &[u8; 32]) -> usize {
+        self.mailboxes.get(mailbox).map_or(0, Vec::len)
+    }
+
+    /// Does this mailbox exist at all?
+    pub fn holds(&self, mailbox: &[u8; 32]) -> bool {
+        self.mailboxes.contains_key(mailbox)
+    }
+
+    /// Seed a queue directly — tests only, to build a state the live path would take too long to
+    /// reach (a full table, an entry already past its TTL).
+    pub fn insert_for_test(&mut self, mailbox: [u8; 32], entries: Vec<MailboxEntry>) {
+        self.mailboxes.insert(mailbox, entries);
+    }
+
+    /// Append entries to a queue — tests only (see `insert_for_test`).
+    pub fn append_for_test(&mut self, mailbox: [u8; 32], entries: Vec<MailboxEntry>) {
+        self.mailboxes.entry(mailbox).or_default().extend(entries);
+    }
+
+    /// Make the durable log's next write fail — tests only, to exercise the fail-closed path.
+    #[cfg(test)]
+    pub fn poison_log_for_test(&mut self) {
+        self.log.as_mut().expect("durable mail enabled").poison_for_test();
+    }
+
+    /// How many mailboxes exist (the table cap's view).
+    pub fn table_len(&self) -> usize {
+        self.mailboxes.len()
+    }
+
+    /// Every payload the relay is holding, ignoring which mailbox it sits in.
+    pub fn all_payloads(&self) -> Vec<Payload> {
+        self.mailboxes.values().flat_map(|m| m.iter().map(|e| e.payload.clone())).collect()
+    }
+}
+
 /// Узел никогда не видит открытый текст — ключа у него нет.
 pub struct RelayNode {
     keyring: CookieKeyring,
@@ -575,10 +827,18 @@ pub struct RelayNode {
     /// one tracker.
     blob_cap_quota: BlobQuotaTracker,
     epoch: u32,
-    /// Per-recipient queue of `(enqueued_at, sealed payload)`. The timestamp drives
-    /// the TTL sweep (`sweep_mailboxes`) so undelivered mail for a recipient who never
-    /// comes back doesn't accumulate forever.
-    mailboxes: HashMap<[u8; 32], Vec<MailboxEntry>>,
+    /// Where messages physically live: the per-recipient queues and their optional durable log.
+    ///
+    /// Behind its OWN lock, not the relay's (#142). Admission — cookie, replay, capability HMAC,
+    /// quota — is in-memory arithmetic on relay state; a deposit or a fetch touches a queue and,
+    /// on a durable relay, an fsync. Sharing one mutex meant every client's admission waited
+    /// behind someone else's write barrier. The serve loop now takes the relay lock only to
+    /// ADMIT, releases it, and does the mail work here. Lock ORDER is always relay → mail.
+    mail: Arc<Mutex<MailStore>>,
+    /// Mirrors `MailStore::is_durable`, cached here so `policy()` — which the serve loop answers
+    /// while holding the relay lock — never has to take the mail lock (#142). It is set once, by
+    /// `enable_durable_mail`, before the relay serves anything.
+    mail_durable: bool,
     /// §12 discovery: опубликованные prekey-bundle по IK владельца. Публичный
     /// материал; запись гейтится ownership-proof, чтение открыто. Ограничен
     /// `MAX_BUNDLES` (отказ при полноте, не тихий сброс).
@@ -592,11 +852,6 @@ pub struct RelayNode {
     /// извне (`with_identity`) для персистентности — `karst-relay` хранит его на
     /// диске, relay-id стабилен между перезапусками.
     relay_identity: Identity,
-    /// R2-5 (#161): the durable side of `mailboxes`. `None` = `Volatile` (the default — an
-    /// accepted message lives only here in RAM). `Some` = every deposit is fsynced before the
-    /// relay answers `Accepted`, and the table above is rebuilt from the log on start. Enabled
-    /// via `enable_durable_mail`; see `crate::mailstore` for the at-least-once contract.
-    mail_log: Option<crate::mailstore::MailLog>,
     /// §15 large-file blob store (disk-backed). `None` = blobs disabled (default; keeps
     /// the in-memory constructors/tests unchanged). Enabled via `enable_blobs`.
     ///
@@ -660,12 +915,12 @@ impl RelayNode {
             cap_quota: CapabilityQuotaTracker::new(),
             blob_cap_quota: BlobQuotaTracker::new(),
             epoch,
-            mailboxes: HashMap::new(),
+            mail: Arc::new(Mutex::new(MailStore::new())),
+            mail_durable: false,
             bundles: HashMap::new(),
             opk_batches: HashMap::new(),
             gossip_cursor: std::cell::Cell::new(0),
             relay_identity,
-            mail_log: None,
             blobs: None,
             blob_persistence: None,
             pow_issue: None,
@@ -733,39 +988,12 @@ impl RelayNode {
             })
             .collect();
         log.compact(&live)?;
-        self.mailboxes = restored;
-        self.mail_log = Some(log);
+        let mut mail = self.mail.lock().expect("mail mutex");
+        mail.mailboxes = restored;
+        mail.log = Some(log);
+        drop(mail);
+        self.mail_durable = true;
         Ok(())
-    }
-
-    /// Rewrite the mail log from the live table when it has accumulated enough dead records to be
-    /// worth the rewrite. Called from the epoch sweep — not per request, for the same reason the
-    /// TTL scan is not: an O(n) rewrite on every insert is its own DoS.
-    fn compact_mail_log(&mut self) {
-        let Some(log) = &self.mail_log else { return };
-        let live_count: usize = self.mailboxes.values().map(Vec::len).sum();
-        if !log.should_compact(live_count) {
-            return;
-        }
-        let live: Vec<crate::mailstore::ReplayedEntry> = self
-            .mailboxes
-            .iter()
-            .flat_map(|(mailbox, mbox)| {
-                mbox.iter().map(move |e| crate::mailstore::ReplayedEntry {
-                    mailbox: *mailbox,
-                    enqueued_at: e.enqueued_at,
-                    payload: e.payload.clone(),
-                })
-            })
-            .collect();
-        // A failed compaction is not silently ignored: `MailLog` marks its handle unusable if it
-        // failed anywhere past the rename, so the next deposit fails loudly and the fail-closed
-        // path answers `Rejected` instead of an `Accepted` nobody can honour. A failure BEFORE
-        // the rename leaves the old log live and complete (compaction only ever drops records
-        // already dead), so that case simply retries next epoch.
-        if let Some(log) = &mut self.mail_log {
-            let _ = log.compact(&live);
-        }
     }
 
     /// This relay's advertised policy — what an operator's config exposes so a client can see (and
@@ -781,7 +1009,7 @@ impl RelayNode {
             pow_bits: self.pow_issue,
             // R2-5 (#161): a real operator choice now — `Durable` only when a mail log is
             // actually open and being fsynced on deposit, never as a bare claim.
-            mailbox_durability: if self.mail_log.is_some() {
+            mailbox_durability: if self.mail_durable {
                 MailboxDurability::Durable
             } else {
                 MailboxDurability::Volatile
@@ -905,8 +1133,14 @@ impl RelayNode {
     /// This is deliberately the view PIR would grant: a reader who has NOT proved it owns
     /// any mailbox. Exposed so a test can assert that such a reader learns nothing — the
     /// composition the whole PIR slice rests on.
+    /// The mail plane's own handle — for tests that need to inspect or seed queues directly, and
+    /// for anything that wants mail work off the relay lock.
+    pub fn mail_store(&self) -> Arc<Mutex<MailStore>> {
+        self.mail.clone()
+    }
+
     pub fn all_slots_for_test(&self) -> Vec<Payload> {
-        self.mailboxes.values().flat_map(|m| m.iter().map(|e| e.payload.clone())).collect()
+        self.mail.lock().expect("mail mutex").all_payloads()
     }
 
     /// Number of live capability-quota windows — exposed so a test can prove the periodic
@@ -925,7 +1159,7 @@ impl RelayNode {
     /// How many messages are queued for `recipient` — so a test can prove a re-deposit did not
     /// duplicate, without draining the mailbox (a fetch would remove the evidence).
     pub fn mailbox_len_for_test(&self, recipient: &[u8; 32]) -> usize {
-        self.mailboxes.get(recipient).map_or(0, |m| m.len())
+        self.mail.lock().expect("mail mutex").queued_for(recipient)
     }
 
     /// Issue a cookie the way the request handlers do — so a test can build an admission-gated
@@ -1210,7 +1444,12 @@ impl RelayNode {
             self.epoch = e;
             // Piggyback the periodic sweeps on the (once-per-epoch) advance — no background
             // thread, no extra lock surface.
-            self.sweep_mailboxes(now);
+            // TRY, don't wait (#142): this runs while the relay lock is held, so blocking here
+            // on a deposit's fsync would put the stall right back. A skipped TTL sweep costs a
+            // few minutes of lag, nothing else.
+            if let Ok(mut mail) = self.mail.try_lock() {
+                mail.sweep(now);
+            }
             // Reap idle capability-quota windows. CRITICAL for a PUBLIC relay: every PoW
             // capability has a distinct `cap_id`, so without this the quota map would grow by
             // one permanent entry per solve — an unbounded-memory DoS on the very door slice
@@ -1254,29 +1493,20 @@ impl RelayNode {
         self.discovery.retain(|_, rec| rec.expiry > now);
     }
 
-    /// Drop undelivered mailbox entries older than `MAILBOX_TTL_SECS`, and forget any
-    /// mailbox left empty. Monotonic-clock note: a `now` that regressed within an
-    /// epoch can't trigger this (the `e > self.epoch` gate), and `saturating_sub`
-    /// makes a regressed timestamp look FRESH (kept), never spuriously stale.
-    fn sweep_mailboxes(&mut self, now: u64) {
-        let log = &mut self.mail_log;
-        self.mailboxes.retain(|mailbox, mbox| {
-            mbox.retain(|e| {
-                let keep = now.saturating_sub(e.enqueued_at) <= MAILBOX_TTL_SECS;
-                if !keep {
-                    if let Some(log) = log.as_mut() {
-                        log.delete(*mailbox, &e.payload);
-                    }
-                }
-                keep
-            });
-            !mbox.is_empty()
-        });
-        self.compact_mail_log();
+    /// Обработать входящее сообщение. `now` — часы узла. One-step wrapper for callers that are
+    /// not the serve loop (tests, the in-process transport): admits, then deposits immediately.
+    /// The serve loop uses `admit_send` and does the deposit after releasing the relay lock.
+    pub fn handle(&mut self, msg: &WireMessage, now: u64) -> Response {
+        match self.admit_send(msg, now) {
+            Ok(admitted) => admitted.deposit(&msg.payload, now),
+            Err(refusal) => refusal,
+        }
     }
 
-    /// Обработать входящее сообщение. `now` — часы узла.
-    pub fn handle(&mut self, msg: &WireMessage, now: u64) -> Response {
+    /// The ADMISSION half of a deposit (#142): everything that reads relay state — cookie,
+    /// replay, capability HMAC, quota — and nothing that touches a queue or the disk. Returns the
+    /// handle the caller deposits through once it has released the relay lock.
+    pub fn admit_send(&mut self, msg: &WireMessage, now: u64) -> Result<AdmittedDeposit, Response> {
         self.advance_epoch(now);
 
         // raw_len ≈ размер груза + служебные поля (для Ступени 0).
@@ -1311,62 +1541,10 @@ impl RelayNode {
             Outcome::Challenge(_) => {
                 // Первый контакт: выдать cookie, привязанный к адресу клиента.
                 let cookie = self.keyring.issue(&msg.client_addr, &msg.carrier_id, now as u32);
-                Response::NeedCookie(cookie)
+                Err(Response::NeedCookie(cookie))
             }
-            Outcome::Admit => {
-                // Table-wide cap on NEW keys (see `MAX_MAILBOXES`): a fabricated recipient the
-                // relay has never seen costs a whole HashMap entry that then sits until
-                // `MAILBOX_TTL_SECS` sweeps it, and admission does not bound how many distinct
-                // addresses one capability can address mail to — only how fast. Checked before
-                // `entry()` would itself allocate the new slot; an EXISTING recipient (already
-                // in the table) is never blocked by this, only a brand-new one once the table is
-                // full.
-                if !self.mailboxes.contains_key(&msg.recipient) && self.mailboxes.len() >= MAX_MAILBOXES {
-                    Response::Rejected("MailboxTableFull".into())
-                } else {
-                    // Cap на ВСТАВКЕ держит инвариант «mailbox всегда влезает в один
-                    // кадр ответа» по построению → fetch никогда не упрётся в
-                    // FrameTooLarge ПОСЛЕ drain'а (иначе — тихая потеря всей очереди
-                    // офлайн-получателя). Полный ящик = backpressure отправителю, не
-                    // молчаливый сброс. В духе admission-троттлинга.
-                    let mbox = self.mailboxes.entry(msg.recipient).or_default();
-                    // IDEMPOTENT deposit (R2-7). The transport deliberately does NOT retry a
-                    // request once it has been written to the connection: the relay may already
-                    // have applied it, and a blind retry would duplicate. But the sender's outbox
-                    // retries later, retransmitting the EXACT same ciphertext — with a fresh nonce
-                    // and capability proof, so admission correctly sees a new request. The deposit
-                    // underneath is the same message, and storing it twice cost the recipient a
-                    // mailbox slot and the sender quota, and left every content type to implement
-                    // its own dedup.
-                    //
-                    // `payload_id` is already the stable identity of those bytes — it is what an
-                    // ACK names — so no new wire field is needed: re-depositing a message that is
-                    // still in the mailbox is accepted and ignored. The scan is bounded by the
-                    // mailbox cap.
-                    //
-                    // Limit worth naming: this covers the window that actually produces duplicates
-                    // (response lost, sender retries), NOT a retry after the recipient has fetched
-                    // and the entry is gone. Catching that needs a delivered-ids record with its
-                    // own retention — a different trade, not this one.
-                    let deposit_id = payload_id(&msg.payload);
-                    if mbox.iter().any(|e| payload_id(&e.payload) == deposit_id) {
-                        Response::Accepted
-                    } else if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
-                        Response::Rejected("MailboxFull".into())
-                    } else if let Err(_e) = durable_deposit(&mut self.mail_log, msg.recipient, now, &msg.payload) {
-                        // R2-5 (#161), FAIL-CLOSED. A relay that advertises `Durable` and then
-                        // answers `Accepted` for a message it could not write is worse than a
-                        // volatile one: the sender retires its outbox entry against a guarantee
-                        // that silently stopped holding. A full or broken disk therefore rejects,
-                        // which the sender's outbox already knows how to survive (it retries).
-                        Response::Rejected("MailNotDurable".into())
-                    } else {
-                        mbox.push(MailboxEntry { enqueued_at: now, leased_until: 0, payload: msg.payload.clone() });
-                        Response::Accepted
-                    }
-                }
-            }
-            other => Response::Rejected(format!("{:?}", other)),
+            Outcome::Admit => Ok(AdmittedDeposit { store: self.mail.clone(), recipient: msg.recipient }),
+            other => Err(Response::Rejected(format!("{:?}", other))),
         }
     }
 
@@ -1374,7 +1552,19 @@ impl RelayNode {
     /// (DoS-гейт + свежесть, как send) И доказательство владения приватным
     /// ключом `mailbox`. Без доказательства — `Reject`, **mailbox НЕ трогается**
     /// (иначе кто угодно, зная pubkey-адрес, сливал бы чужую очередь).
+    ///
+    /// One-step wrapper; the serve loop uses `admit_fetch` and serves the page after releasing
+    /// the relay lock (#142).
     pub fn handle_fetch(&mut self, req: &FetchRequest, now: u64) -> FetchResponse {
+        match self.admit_fetch(req, now) {
+            Ok(admitted) => FetchResponse::Fetched(admitted.serve(now)),
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// The ADMISSION half of a fetch: cookie freshness plus the mailbox-ownership proof, both
+    /// pure relay state. Nothing here touches a queue.
+    pub fn admit_fetch(&mut self, req: &FetchRequest, now: u64) -> Result<AdmittedFetch, FetchResponse> {
         self.advance_epoch(now);
 
         // Cookie: нет/невалиден → challenge (как на send).
@@ -1382,7 +1572,7 @@ impl RelayNode {
             Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => c,
             _ => {
                 let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
-                return FetchResponse::NeedCookie(cookie);
+                return Err(FetchResponse::NeedCookie(cookie));
             }
         };
 
@@ -1390,68 +1580,45 @@ impl RelayNode {
         // X25519 key, so it proves knowledge of its fetch secret (Schnorr); the IDENTITY mailbox
         // (an X25519 key) proves via DH. Either failure rejects WITHOUT draining.
         if !mailbox_owner_ok(&self.relay_identity, req.mailbox, &cookie.mac, req.proof, &req.own_proof) {
-            return FetchResponse::Rejected("fetch auth failed".into());
+            return Err(FetchResponse::Rejected("fetch auth failed".into()));
         }
-
-        // Fixed-size fetch (§2.2): take at most one page worth of seals (`FETCH_CAP`
-        // and within the page body budget); leave the rest queued for the next poll.
-        // The response is later serialized into a constant-size page, so an on-path
-        // observer cannot read the queue depth from the response length.
-        //
-        // Only VISIBLE entries are served: a message leased by an earlier `ack`-mode
-        // fetch stays hidden until its lease expires (`leased_until <= now` again) or an
-        // ACK deletes it. Indices are collected so lease/delete acts on the exact served
-        // entries even when leased and visible entries are interleaved.
-        let (seals, served): (Vec<Payload>, Vec<usize>) = match self.mailboxes.get(&req.mailbox) {
-            Some(mbox) => {
-                let (idx, payloads): (Vec<usize>, Vec<Payload>) = mbox
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.leased_until <= now)
-                    .map(|(i, e)| (i, e.payload.clone()))
-                    .unzip();
-                let take = crate::wire::FetchPage::fit_prefix(&payloads);
-                (
-                    payloads.into_iter().take(take).collect(),
-                    idx.into_iter().take(take).collect(),
-                )
-            }
-            None => (Vec::new(), Vec::new()),
-        };
-        if let Some(mbox) = self.mailboxes.get_mut(&req.mailbox) {
-            // ALWAYS a lease (#179). A fetch used to be able to ask for delete-on-read, and the
-            // relay obliged: the message was destroyed the moment it was handed to the socket,
-            // before the recipient had decrypted it, let alone written it down. There is no
-            // caller for whom that is the right trade — a fetcher that never ACKs simply has the
-            // message redelivered when the lease expires, which is strictly better than losing
-            // it — so the choice is gone rather than defaulted. Removing the knob also removes
-            // the class: no future caller can re-select destructive reads by passing a flag.
-            for i in served {
-                mbox[i].leased_until = now + LEASE_SECS;
-            }
-        }
-        FetchResponse::Fetched(seals)
+        Ok(AdmittedFetch { store: self.mail.clone(), mailbox: req.mailbox })
     }
 
     /// Delete leased messages a recipient has durably persisted. Same ownership proof as
-    /// `handle_fetch` (a delete-by-address weaker than the fetch gate would let anyone who
-    /// knows the public mailbox address wipe someone's queue). Unknown / already-swept ids
-    /// are silently ignored — an ACK is idempotent, so a redelivered-then-reacked message
-    /// is not an error. A message not yet acked but whose lease expired is deletable too:
-    /// the id still matches, and deleting it is exactly what a late ACK should do.
+    /// `handle_fetch` (a delete-by-address weaker than the fetch gate would let anyone who knows
+    /// the public mailbox address wipe someone's queue). Unknown / already-swept ids are silently
+    /// ignored — an ACK is idempotent, so a redelivered-then-reacked message is not an error. A
+    /// message not yet acked but whose lease expired is deletable too: the id still matches, and
+    /// deleting it is exactly what a late ACK should do.
+    ///
+    /// One-step wrapper; the serve loop uses `admit_ack` and deletes after releasing the relay
+    /// lock (#142).
     pub fn handle_ack(&mut self, req: &AckRequest, now: u64) -> AckResponse {
+        match self.admit_ack(req, now) {
+            Ok(admitted) => {
+                admitted.apply();
+                AckResponse::Acked
+            }
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// The ADMISSION half of an ACK: cookie, ownership proof, and the bound on how much work one
+    /// ACK may ask for. Nothing here touches a queue.
+    pub fn admit_ack(&mut self, req: &AckRequest, now: u64) -> Result<AdmittedAck, AckResponse> {
         self.advance_epoch(now);
 
         let cookie = match req.cookie {
             Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => c,
             _ => {
                 let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
-                return AckResponse::NeedCookie(cookie);
+                return Err(AckResponse::NeedCookie(cookie));
             }
         };
 
         if !mailbox_owner_ok(&self.relay_identity, req.mailbox, &cookie.mac, req.proof, &req.own_proof) {
-            return AckResponse::Rejected("ack auth failed".into());
+            return Err(AckResponse::Rejected("ack auth failed".into()));
         }
 
         // Bounded work, and each payload hashed ONCE.
@@ -1463,25 +1630,13 @@ impl RelayNode {
         // repeated for free (SEC-28). A recipient can never legitimately ack more than a mailbox
         // can hold, so anything beyond that is refused rather than served.
         if req.ids.len() > MAX_ACK_IDS {
-            return AckResponse::Rejected("too many ids in one ack".into());
+            return Err(AckResponse::Rejected("too many ids in one ack".into()));
         }
-        if let Some(mbox) = self.mailboxes.get_mut(&req.mailbox) {
-            let wanted: std::collections::HashSet<[u8; 32]> = req.ids.iter().copied().collect();
-            let log = &mut self.mail_log;
-            mbox.retain(|e| {
-                let keep = !wanted.contains(&payload_id(&e.payload));
-                if !keep {
-                    if let Some(log) = log.as_mut() {
-                        log.delete(req.mailbox, &e.payload);
-                    }
-                }
-                keep
-            });
-            if mbox.is_empty() {
-                self.mailboxes.remove(&req.mailbox);
-            }
-        }
-        AckResponse::Acked
+        Ok(AdmittedAck {
+            store: self.mail.clone(),
+            mailbox: req.mailbox,
+            ids: req.ids.iter().copied().collect(),
+        })
     }
 
     /// §12 публикация bundle. Cookie-gate (DoS/свежесть, как fetch) + fixed-length check on
@@ -2300,21 +2455,23 @@ mod tests {
     fn sweep_mailboxes_drops_only_entries_past_ttl() {
         // Deterministic with the fake clock (no thread, no timing): a fresh entry
         // survives, an entry past MAILBOX_TTL_SECS is dropped and its empty mailbox
-        // forgotten. Neuter `sweep_mailboxes` to a no-op and the "swept" case reddens.
-        let mut relay = RelayNode::new(NOW);
+        // forgotten. Neuter `MailStore::sweep` to a no-op and the "swept" case reddens.
+        let relay = RelayNode::new(NOW);
         let ik = [9u8; 32];
         let seal = Payload::Skeleton(SkeletonSeal {
             ephemeral_pub: [1u8; 32],
             nonce: [2u8; 12],
             ciphertext: vec![0u8; 8],
         });
-        relay.mailboxes.insert(ik, vec![MailboxEntry { enqueued_at: NOW, leased_until: 0, payload: seal }]);
+        let mail = relay.mail_store();
+        let mut mail = mail.lock().unwrap();
+        mail.insert_for_test(ik, vec![MailboxEntry { enqueued_at: NOW, leased_until: 0, payload: seal }]);
 
-        relay.sweep_mailboxes(NOW + MAILBOX_TTL_SECS - 1);
-        assert_eq!(relay.mailboxes.get(&ik).map(Vec::len), Some(1), "fresh entry kept");
+        mail.sweep(NOW + MAILBOX_TTL_SECS - 1);
+        assert_eq!(mail.queued_for(&ik), 1, "fresh entry kept");
 
-        relay.sweep_mailboxes(NOW + MAILBOX_TTL_SECS + 1);
-        assert!(!relay.mailboxes.contains_key(&ik), "stale entry swept, empty mailbox gone");
+        mail.sweep(NOW + MAILBOX_TTL_SECS + 1);
+        assert!(!mail.holds(&ik), "stale entry swept, empty mailbox gone");
     }
 
     /// Finding #2 (backlog #162, R2-8/9): `recipient` is any 32 bytes the SENDER picks — never
@@ -2323,21 +2480,23 @@ mod tests {
     /// `MAX_MAILBOXES`, nothing bounded how many distinct keys the table could hold short of
     /// `MAILBOX_TTL_SECS` (7 days) passing. The table is pre-filled directly (as
     /// `sweep_mailboxes_drops_only_entries_past_ttl` above does) so the test stays fast — only
-    /// `handle`'s cap check is under test here, not the admission pipeline.
+    /// the mail store's cap check is under test here, not the admission pipeline.
     #[test]
     fn a_flood_of_fabricated_recipients_cannot_grow_the_mailbox_table_without_bound() {
         let relay = Rc::new(RefCell::new(RelayNode::new(NOW)));
         {
-            let mut r = relay.borrow_mut();
+            let r = relay.borrow_mut();
+            let mail = r.mail_store();
+            let mut mail = mail.lock().unwrap();
             for n in 0..MAX_MAILBOXES as u64 {
                 let mut recipient = [0u8; 32];
                 recipient[..8].copy_from_slice(&n.to_le_bytes());
-                r.mailboxes.insert(
+                mail.insert_for_test(
                     recipient,
                     vec![MailboxEntry { enqueued_at: NOW, leased_until: 0, payload: test_seal(1) }],
                 );
             }
-            assert_eq!(r.mailboxes.len(), MAX_MAILBOXES, "table filled to the cap");
+            assert_eq!(mail.table_len(), MAX_MAILBOXES, "table filled to the cap");
         }
 
         let cap = publish_cap();
@@ -2353,7 +2512,11 @@ mod tests {
             matches!(resp, Response::Rejected(_)),
             "a brand-new recipient must be rejected once the mailbox table is at MAX_MAILBOXES, got {resp:?}"
         );
-        assert_eq!(relay.borrow().mailboxes.len(), MAX_MAILBOXES, "the table did not grow past the cap");
+        assert_eq!(
+            relay.borrow().mail_store().lock().unwrap().table_len(),
+            MAX_MAILBOXES,
+            "the table did not grow past the cap"
+        );
 
         // Control: an ALREADY-PRESENT recipient (one of the pre-filled ones) still receives mail
         // — the cap throttles brand-new keys, never delivery to an existing correspondent.
@@ -2579,15 +2742,14 @@ mod tests {
     }
 
     fn deposit(relay: &mut RelayNode, recip: &Identity, at: u64, payload: Payload) {
-        relay
-            .mailboxes
-            .entry(recip.public.to_bytes())
-            .or_default()
-            .push(MailboxEntry { enqueued_at: at, leased_until: 0, payload });
+        relay.mail_store().lock().unwrap().append_for_test(
+            recip.public.to_bytes(),
+            vec![MailboxEntry { enqueued_at: at, leased_until: 0, payload }],
+        );
     }
 
     fn boxed(relay: &RelayNode, recip: &Identity) -> bool {
-        relay.mailboxes.contains_key(&recip.public.to_bytes())
+        relay.mail_store().lock().unwrap().holds(&recip.public.to_bytes())
     }
 
     /// SEC-28 — an ack must not be a cheap way to buy relay work.
@@ -2653,7 +2815,7 @@ mod tests {
         let mut alice = Client::new(InMemoryTransport::new(relay.clone()), cap, b"alice");
         assert!(matches!(alice.send(&bob.public, b"for bob", NOW), Response::Accepted));
         // ...and one session envelope that is not his to read (it is `Peer`'s business).
-        relay.borrow_mut().mailboxes.entry(bob.public.to_bytes()).or_default().push(MailboxEntry {
+        relay.borrow().mail_store().lock().unwrap().append_for_test(bob.public.to_bytes(), vec![MailboxEntry {
             enqueued_at: NOW,
             leased_until: 0,
             payload: Payload::Session(SessionEnvelope::Ratchet(crate::ratchet::RatchetMessage {
@@ -2665,7 +2827,7 @@ mod tests {
                 },
                 ciphertext: vec![9u8; 16],
             })),
-        });
+        }]);
         assert_eq!(relay.borrow().mailbox_len_for_test(&bob.public.to_bytes()), 2);
 
         let mut recip = Recipient::new(InMemoryTransport::new(relay.clone()), bob.clone(), identity.public);
@@ -2677,6 +2839,74 @@ mod tests {
             relay.borrow().mailbox_len_for_test(&bob.public.to_bytes()),
             1,
             "the opened seal is ACKed away; the envelope this receiver could not read is NOT"
+        );
+    }
+
+    /// #142: separating admission from the mail write must not make the mailbox cap racy.
+    ///
+    /// Admission and the deposit now run under DIFFERENT locks, with the relay lock released in
+    /// between. Two senders can therefore both be admitted while the mailbox has exactly one slot
+    /// left. If the cap lived only in the admission half — where it used to be, when both halves
+    /// were one critical section — both would then write and the queue would exceed
+    /// `MAX_FETCH_SEALS`, breaking the invariant #162 established: a mailbox always fits in one
+    /// response frame, so a fetch can never hit `FrameTooLarge` AFTER draining and silently lose
+    /// an offline recipient's whole queue.
+    ///
+    /// Two admissions are taken BEFORE either deposits, which is exactly the interleaving that
+    /// concurrency produces, without threads or timing. Delete the cap check inside
+    /// `MailStore::deposit` and this reddens.
+    #[test]
+    fn two_deposits_admitted_at_once_cannot_overfill_one_mailbox() {
+        let mut relay = RelayNode::new(NOW);
+        let cap = publish_cap();
+        relay.issue_capability(cap.clone());
+        let bob = Identity::generate();
+        let mailbox = bob.public.to_bytes();
+
+        // Fill to one slot short of the cap.
+        let fill: Vec<MailboxEntry> = (0..crate::wire::MAX_FETCH_SEALS - 1)
+            .map(|n| MailboxEntry { enqueued_at: NOW, leased_until: 0, payload: test_seal((n % 251) as u8) })
+            .collect();
+        relay.mail_store().lock().unwrap().append_for_test(mailbox, fill);
+
+        // Both senders get past admission while that last slot is still free.
+        let msg = |n: u8| WireMessage {
+            client_addr: b"s".to_vec(),
+            carrier_id: b"c".to_vec(),
+            cookie: None,
+            request_nonce: vec![n; 16],
+            capability_proof: cap.prove(&[n; 16], 0),
+            recipient: mailbox,
+            // A payload that cannot collide with anything in the fill above — otherwise the
+            // idempotent-deposit path would answer `Accepted` for a DUPLICATE and the test would
+            // be measuring dedup, not the cap.
+            payload: Payload::Skeleton(SkeletonSeal {
+                ephemeral_pub: [n; 32],
+                nonce: [n; 12],
+                ciphertext: vec![n; 9],
+            }),
+        };
+        // One cookie round trip each, then a real admission.
+        let cookie = relay.keyring.issue(b"s", b"c", NOW as u32);
+        let admit = |relay: &mut RelayNode, n: u8| {
+            let mut m = msg(n);
+            m.cookie = Some(cookie);
+            m.capability_proof = cap.prove(&m.request_nonce, 0);
+            relay.admit_send(&m, NOW).map(|a| (a, m))
+        };
+        let first = admit(&mut relay, 1).expect("first sender admitted");
+        let second = admit(&mut relay, 2).expect("second sender admitted while the slot was free");
+
+        // Now they race for the same slot. Exactly one wins; the other is told the box is full.
+        assert!(matches!(first.0.deposit(&first.1.payload, NOW), Response::Accepted));
+        assert!(
+            matches!(second.0.deposit(&second.1.payload, NOW), Response::Rejected(ref r) if r == "MailboxFull"),
+            "the second admitted deposit must be refused by the cap, not squeezed in"
+        );
+        assert_eq!(
+            relay.mail_store().lock().unwrap().queued_for(&mailbox),
+            crate::wire::MAX_FETCH_SEALS,
+            "the queue must sit exactly at the cap — the one-frame invariant is not negotiable"
         );
     }
 
@@ -2789,7 +3019,7 @@ mod tests {
         let req = fetch_at(&mut relay, &bob, NOW);
         let _ = relay.handle_fetch(&req, NOW);
         // ...yet the sweep at deposit + TTL still removes it, lease notwithstanding.
-        relay.sweep_mailboxes(NOW + MAILBOX_TTL_SECS + 1);
+        relay.mail_store().lock().unwrap().sweep(NOW + MAILBOX_TTL_SECS + 1);
         assert!(!boxed(&relay, &bob), "deposit-time TTL reaps a never-acked lease");
     }
 
@@ -2952,7 +3182,7 @@ mod tests {
         relay.enable_durable_mail(dir.clone(), NOW).expect("open the mail log");
         let cap = publish_cap();
         relay.issue_capability(cap.clone());
-        relay.mail_log.as_mut().unwrap().poison_for_test(); // the disk goes away
+        relay.mail_store().lock().unwrap().poison_log_for_test(); // the disk goes away
         let relay = Rc::new(RefCell::new(relay));
         let mut sender = Client::new(InMemoryTransport::new(relay.clone()), cap, b"sender");
         let recipient = PublicKey::from([0x43u8; 32]);

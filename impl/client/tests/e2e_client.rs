@@ -158,7 +158,7 @@ fn blob_upload_download_roundtrips_through_relay() {
         (0..(client::blob::BLOB_CHUNK * 2 + 123)).map(|i| (i.wrapping_mul(7)) as u8).collect();
 
     let (id, key, hash, count) =
-        client::blob_upload(&ctx(addr, &rid), std::io::Cursor::new(&data), data.len() as u64)
+        client::blob_upload(&ctx(addr, &rid), &client::dev_capability(), std::io::Cursor::new(&data), data.len() as u64)
             .expect("upload");
     assert_eq!(count, 3, "two full chunks + a short tail");
 
@@ -182,7 +182,7 @@ fn verify_durability_confirms_a_parked_blob_and_rejects_a_missing_one() {
     let (addr, rid) = spawn_relay_with_blobs();
     let data: Vec<u8> = (0..(client::blob::BLOB_CHUNK * 2 + 5)).map(|i| (i * 3) as u8).collect();
     let (id, key, _hash, count) =
-        client::blob_upload(&ctx(addr, &rid), std::io::Cursor::new(&data), data.len() as u64).expect("upload");
+        client::blob_upload(&ctx(addr, &rid), &client::dev_capability(), std::io::Cursor::new(&data), data.len() as u64).expect("upload");
 
     assert!(client::verify_durability(&ctx(addr, &rid), id, key, count).unwrap(), "the relay holds the blob");
     // An unknown blob id retrieves nothing.
@@ -210,14 +210,14 @@ fn blob_upload_resumes_from_the_relay_watermark() {
     // chunks 0,1 then errors reading chunk 2.
     let partial = std::io::Cursor::new(data[..2 * chunk].to_vec());
     assert!(
-        client::blob_upload_resumable(&r, partial, size, id, key).is_err(),
+        client::blob_upload_resumable(&r, &client::dev_capability(), partial, size, id, key).is_err(),
         "the truncated attempt fails mid-upload"
     );
     assert_eq!(client::blob_stat(&r, id).unwrap(), Some((2, 4, false)), "watermark parked at chunk 2");
 
     // Resume with the FULL file: skips 0,1 (hashes them for the FileRef), uploads only 2,3.
     let (rid2, rkey2, hash, count) =
-        client::blob_upload_resumable(&r, std::io::Cursor::new(&data), size, id, key).expect("resume completes");
+        client::blob_upload_resumable(&r, &client::dev_capability(), std::io::Cursor::new(&data), size, id, key).expect("resume completes");
     assert_eq!((rid2, rkey2, count), (id, key, 4));
     assert_eq!(client::blob_stat(&r, id).unwrap(), Some((4, 4, true)), "blob now complete");
 
@@ -227,7 +227,7 @@ fn blob_upload_resumes_from_the_relay_watermark() {
 
     // Idempotent: re-running a completed upload re-sends nothing and returns the same FileRef.
     let (_, _, hash2, _) =
-        client::blob_upload_resumable(&r, std::io::Cursor::new(&data), size, id, key).expect("re-run is a no-op");
+        client::blob_upload_resumable(&r, &client::dev_capability(), std::io::Cursor::new(&data), size, id, key).expect("re-run is a no-op");
     assert_eq!(hash2, hash, "the hash is stable across a re-run");
 }
 
@@ -242,7 +242,7 @@ fn a_partial_download_resumes_and_completes_byte_identical() {
     let chunk = client::blob::BLOB_CHUNK;
     let data: Vec<u8> = (0..(chunk * 3 + 200)).map(|i| (i * 5) as u8).collect(); // 4 chunks
     let (blob_id, key, hash, count) =
-        client::blob_upload(&ctx(addr, &rid), std::io::Cursor::new(&data), data.len() as u64).unwrap();
+        client::blob_upload(&ctx(addr, &rid), &client::dev_capability(), std::io::Cursor::new(&data), data.len() as u64).unwrap();
 
     let dir = temp_dir("resume-dl");
     let store = Store::unlock(&dir, b"pw").unwrap();
@@ -284,7 +284,7 @@ fn resume_truncates_a_torn_trailing_record() {
     let chunk = client::blob::BLOB_CHUNK;
     let data: Vec<u8> = (0..(chunk * 2 + 10)).map(|i| (i * 7) as u8).collect(); // 3 chunks
     let (blob_id, key, hash, count) =
-        client::blob_upload(&ctx(addr, &rid), std::io::Cursor::new(&data), data.len() as u64).unwrap();
+        client::blob_upload(&ctx(addr, &rid), &client::dev_capability(), std::io::Cursor::new(&data), data.len() as u64).unwrap();
 
     let dir = temp_dir("resume-torn");
     let store = Store::unlock(&dir, b"pw").unwrap();
@@ -408,7 +408,7 @@ fn a_pending_download_survives_a_crash_and_is_idempotent() {
     let (addr, rid) = spawn_relay_with_blobs();
     let data: Vec<u8> = (0..(client::blob::BLOB_CHUNK * 2 + 45)).map(|i| (i * 3) as u8).collect();
     let (blob_id, key, hash, chunks) =
-        client::blob_upload(&ctx(addr, &rid), std::io::Cursor::new(&data), data.len() as u64).unwrap();
+        client::blob_upload(&ctx(addr, &rid), &client::dev_capability(), std::io::Cursor::new(&data), data.len() as u64).unwrap();
 
     let dir = temp_dir("pending-dl");
     let store = Store::unlock(&dir, b"pw").unwrap();
@@ -2143,7 +2143,10 @@ fn file_transfer_roundtrips_through_relay_byte_identical() {
 /// Helper: a minimal (no-cookie) BlobPut — the relay answers `NeedCookie` before any
 /// storage, so a `NeedCookie` proves the round-trip REACHED the relay.
 fn probe_blob_put() -> BlobPutRequest {
+    let nonce = node::node::blob_put_nonce(&[7u8; 32], 0);
     BlobPutRequest {
+        request_nonce: nonce.clone(),
+        capability_proof: client::dev_capability().prove(&nonce, 0),
         client_addr: b"probe".to_vec(),
         carrier_id: b"karst-blob".to_vec(),
         cookie: None,
@@ -2170,7 +2173,10 @@ fn one_session_streams_a_whole_blob() {
     for index in 0..count {
         loop {
             requests += 1;
+            let nonce = node::node::blob_put_nonce(&blob_id, index);
             let req = BlobPutRequest {
+                request_nonce: nonce.clone(),
+                capability_proof: client::dev_capability().prove(&nonce, 0),
                 client_addr: vec![0x11u8; 32], // sender address is a 32-byte pseudonym
                 carrier_id: b"karst-blob".to_vec(),
                 cookie,

@@ -2883,8 +2883,14 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
         let root = vault.account(&id);
         let store = root.as_proxy(proxy_for_contact(&root, &peer)); // the FileRef rides the contact's proxy
         let res = (|| -> Result<(), String> {
+            // The upload presents a capability now (CRYPTO-15): storing bytes on a relay is
+            // metered like every other write, and this path stores the most of them.
+            let cap = store
+                .load_capability()
+                .map_err(|_| "no capability to upload with".to_string())?;
             let (blob_id, key, hash, chunks) = client::blob_upload_with(
                 &relay,
+                &cap,
                 Cursor::new(bytes),
                 size,
                 &cancel,

@@ -51,7 +51,7 @@ fn a_parked_blob_survives_a_relay_restart() {
     let data: Vec<u8> =
         (0..(client::blob::BLOB_CHUNK * 2 + 123)).map(|i| (i.wrapping_mul(31)) as u8).collect();
     let (id, key, hash, count) =
-        client::blob_upload(&ctx(addr1, &rid1), std::io::Cursor::new(&data), data.len() as u64)
+        client::blob_upload(&ctx(addr1, &rid1), &client::dev_capability(), std::io::Cursor::new(&data), data.len() as u64)
             .expect("upload");
     assert_eq!(count, 3);
 

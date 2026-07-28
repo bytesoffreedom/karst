@@ -1693,8 +1693,13 @@ pub fn send_file(
             (b, k)
         }
     };
+    // The upload now presents a capability (CRYPTO-15): storing bytes on a relay is metered like
+    // every other write, and this is the path that stores the most.
+    let cap = store
+        .load_capability()
+        .map_err(|_| "no capability for the blob upload (karst dev-cap / import-cap)".to_string())?;
     let (blob_id, key, hash, count) =
-        blob_upload_resumable(relay, std::io::Cursor::new(bytes), size, blob_id, key)?;
+        blob_upload_resumable(relay, &cap, std::io::Cursor::new(bytes), size, blob_id, key)?;
     let fileref = content::Content::FileRef { blob_id, key, hash, name: name.to_string(), size, chunks: count };
     send_session(store, relay, to_ik, &content::encode(&fileref), now)?;
     let _ = store.remove_pending_upload(&upload_id);
@@ -1773,7 +1778,12 @@ pub fn send_gallery_blob(
         return Err(format!("gallery > {} bytes", content::MAX_GALLERY_BYTES));
     }
     let (blob_id, key, hash, count) =
-        blob_upload(relay, std::io::Cursor::new(&packed), packed.len() as u64)?;
+        blob_upload(
+            relay,
+            &store.load_capability().map_err(|_| "no capability for the blob upload".to_string())?,
+            std::io::Cursor::new(&packed),
+            packed.len() as u64,
+        )?;
     let refc = content::Content::GalleryRef {
         blob_id,
         key,
@@ -1854,7 +1864,12 @@ pub fn send_post_attachment_blob(
         return Err("attachment name too long".into());
     }
     let (blob_id, key, hash, count) =
-        blob_upload(relay, std::io::Cursor::new(bytes), bytes.len() as u64)?;
+        blob_upload(
+            relay,
+            &store.load_capability().map_err(|_| "no capability for the blob upload".to_string())?,
+            std::io::Cursor::new(bytes),
+            bytes.len() as u64,
+        )?;
     let refc = content::Content::PostAttachmentRef {
         post_id,
         index,
@@ -2038,12 +2053,13 @@ pub type UploadedBlob = ([u8; 32], [u8; 32], [u8; 32], u32);
 /// session. `size` is the plaintext length. The relay only ever sees ciphertext.
 pub fn blob_upload<R: std::io::Read>(
     relay: &Relay,
+    cap: &Capability,
     reader: R,
     size: u64,
 ) -> Result<UploadedBlob, String> {
     // The simple path (CLI/tests): no progress, no cancellation.
     let never = std::sync::atomic::AtomicBool::new(false);
-    blob_upload_with(relay, reader, size, &never, |_, _| {})
+    blob_upload_with(relay, cap, reader, size, &never, |_, _| {})
 }
 
 /// Minimum byte delta between `on_progress` calls, so a long transfer does not flood
@@ -2069,6 +2085,7 @@ const CHECKPOINT_EVERY_BYTES: u64 = 2 * 1024 * 1024;
 #[allow(clippy::too_many_arguments)]
 pub fn blob_upload_with<R: std::io::Read>(
     relay: &Relay,
+    cap: &Capability,
     reader: R,
     size: u64,
     cancel: &std::sync::atomic::AtomicBool,
@@ -2077,7 +2094,7 @@ pub fn blob_upload_with<R: std::io::Read>(
     // Every upload runs through the resumable path with a FRESH random id+key, so the relay's
     // watermark is 0 and it uploads the whole file. A caller that persists the id+key resumes from
     // the watermark instead — same code, one function.
-    blob_upload_resumable_with(relay, reader, size, blob::random32(), blob::random32(), cancel, on_progress)
+    blob_upload_resumable_with(relay, cap, reader, size, blob::random32(), blob::random32(), cancel, on_progress)
 }
 
 /// A blob's upload progress on `relay`: `(next, count, complete)` — how many chunks it holds. `None`
@@ -2094,13 +2111,14 @@ pub fn blob_stat(relay: &Relay, blob_id: [u8; 32]) -> Result<Option<(u32, u32, b
 /// needs persisting. Idempotent: a completed blob re-runs to the same `FileRef` without re-uploading.
 pub fn blob_upload_resumable<R: std::io::Read>(
     relay: &Relay,
+    cap: &Capability,
     reader: R,
     size: u64,
     blob_id: [u8; 32],
     key: [u8; 32],
 ) -> Result<UploadedBlob, String> {
     let never = std::sync::atomic::AtomicBool::new(false);
-    blob_upload_resumable_with(relay, reader, size, blob_id, key, &never, |_, _| {})
+    blob_upload_resumable_with(relay, cap, reader, size, blob_id, key, &never, |_, _| {})
 }
 
 /// Like [`blob_upload_resumable`], with cooperative cancellation + a progress callback (as
@@ -2110,6 +2128,7 @@ pub fn blob_upload_resumable<R: std::io::Read>(
 #[allow(clippy::too_many_arguments)]
 pub fn blob_upload_resumable_with<R: std::io::Read>(
     relay: &Relay,
+    cap: &Capability,
     mut reader: R,
     size: u64,
     blob_id: [u8; 32],
@@ -2179,7 +2198,13 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
                                 }
                             }
                         }
+                        // Per-chunk nonce of the required shape, so a proof minted for the
+                        // message path cannot be replayed here (the scope is not folded into the
+                        // MAC, so the nonce shape is what separates the classes).
+                        let nonce = node::node::blob_put_nonce(&blob_id, index);
                         let req = BlobPutRequest {
+                            request_nonce: nonce.clone(),
+                            capability_proof: cap.prove(&nonce, 0),
                             client_addr: relay.pseudonym.to_vec(),
                             carrier_id: BLOB_CARRIER.to_vec(),
                             cookie,

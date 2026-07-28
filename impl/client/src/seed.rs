@@ -114,27 +114,39 @@ pub fn derive(entropy: &[u8; ENTROPY_BYTES]) -> DerivedIdentity {
     DerivedIdentity { seal, account }
 }
 
-/// HKDF-домен вывода ПРОКСИ-личностей — **ОТДЕЛЬНЫЙ замороженный контракт** от `derive`.
-/// Прокси — детерминированные HD-потомки той же фразы (одноразовые каналы связи, см.
-/// `docs/design/proxy-identity.md`): корень адреса не имеет, наружу ходят только прокси.
-const HKDF_PROXY_INFO: &[u8] = b"KARST-proxy-derive-v1";
-
-/// Вывести ПРОКСИ-личность номер `index` из энтропии фразы. Полностью независим от `derive`
-/// (корневая личность): другой HKDF-`info` (`HKDF_PROXY_INFO ‖ le32(index)`), поэтому прокси
-/// никогда не сталкиваются с корнем, а замороженный корневой контракт не тронут. Раскладка
-/// та же (seal ‖ account), что у `derive` — прокси это полноценная сетевая личность.
+/// HKDF-домен вывода ПРОКСИ-личности ИЗ ЕЁ СОБСТВЕННОГО секрета — НЕ из фразы (#207, A6-4).
 ///
-/// **ЗАМОРОЖЕН, как только создан первый реальный прокси:** смена `info`/кодировки индекса
-/// осиротит все розданные прокси-коды. Пинится `frozen_proxy_derivation_vector`.
-pub fn derive_proxy(entropy: &[u8; ENTROPY_BYTES], index: u32) -> DerivedIdentity {
-    let m = mnemonic_of_entropy(entropy);
-    let seed = m.to_seed(""); // тот же BIP39-контракт, что и в `derive`
-    let hk = Hkdf::<Sha256>::new(None, &seed);
-    let mut info = Vec::with_capacity(HKDF_PROXY_INFO.len() + 4);
-    info.extend_from_slice(HKDF_PROXY_INFO);
-    info.extend_from_slice(&index.to_le_bytes()); // little-endian индекс — часть замороженного контракта
+/// История: раньше здесь стоял `derive_proxy(entropy, index)` — прокси были HD-потомками той
+/// же фразы по индексу, а «сжигание» прокси (`Store::set_proxy_active`) только гасило флаг
+/// `active` в реестре. Ключи прокси оставались выводимы из фразы НАВСЕГДА: тот, у кого есть
+/// 12 слов, мог заново вычислить закрытый ключ ЛЮБОГО прошлого индекса, сверить его с историей
+/// relay-логов, перечислить ещё не созданные прокси наперёд и связать личности, которые UI
+/// показывал как независимо уничтоженные. «Сжигание» было эксплуатационной пометкой, а не
+/// уничтожением — то есть ничем не отличалось от простого «перестать пользоваться».
+///
+/// Фикс: у каждого прокси — свой случайный 32-байтный секрет, который минтится
+/// (`OsRng`) при создании и живёт ТОЛЬКО в запечатанном реестре (`Store::create_proxy`,
+/// `store.rs`), никогда не выводится из фразы. Сжигание удаляет запись и секрет из
+/// реестра целиком — после этого личность не восстановит НИКТО, включая владельца фразы,
+/// потому что взять её неоткуда. Отсюда честное следствие: фраза восстанавливает КОРЕНЬ
+/// (`derive`, выше), но НЕ прокси — «recoverable» и «destroyable» это один и тот же вопрос,
+/// и это дизайн, не баг (см. `docs/design/proxy-identity.md`).
+const HKDF_PROXY_SECRET_INFO: &[u8] = b"KARST-proxy-secret-derive-v1";
+
+/// Вывести прокси-личность из её собственного случайного секрета (см. `HKDF_PROXY_SECRET_INFO`
+/// выше). Раскладка та же (seal ‖ account), что у `derive` — прокси остаётся полноценной сетевой
+/// личностью, — но домен HKDF свой, отдельный и от корневого `derive`, и от старого (удалённого)
+/// `derive_proxy(entropy, index)`, так что вывод прокси никогда не совпадёт ни с корнем, ни со
+/// значением, которое давал прежний HD-контракт.
+///
+/// НЕ заморожен как контракт совместимости, в отличие от `derive`: секрет — сам по себе
+/// единственная резервная копия (он живёт только в сожжённом виде в `proxies.dat`), никто не
+/// записывает его на бумаге вручную, поэтому смена этой функции в будущем осиротит только те
+/// секреты, которые ещё не были подставлены сюда — не миллион розданных фраз.
+pub fn derive_proxy_from_secret(secret: &[u8; 32]) -> DerivedIdentity {
+    let hk = Hkdf::<Sha256>::new(None, secret);
     let mut okm = [0u8; 160];
-    hk.expand(&info, &mut okm).expect("160 ≤ 255*32");
+    hk.expand(HKDF_PROXY_SECRET_INFO, &mut okm).expect("160 ≤ 255*32");
     let seal = Identity::from_secret_bytes(okm[0..32].try_into().expect("32"));
     let account = Account::from_secret_bytes(okm[32..160].try_into().expect("128"));
     DerivedIdentity { seal, account }
@@ -169,34 +181,40 @@ mod tests {
         );
     }
 
-    /// **Контракт совместимости прокси — НЕ МЕНЯТЬ значения** (как `frozen_derivation_vector`).
-    /// Фиксирует `известная фраза + индекс → точный IK прокси`. Как только кто-то создал прокси
-    /// и раздал его код, эти значения заморожены навсегда — иначе прокси осиротеют. Также пинит,
-    /// что прокси отличаются друг от друга и от корня (разные HKDF-домены/индексы).
+    /// Прокси-личность зависит ТОЛЬКО от её случайного секрета, не от фразы: тот же секрет (даже
+    /// под другим корнем) → тот же IK/seal, разные секреты → разные личности, и ни один прокси не
+    /// совпадает с корневой личностью, выведенной из этой же фразы. Это ровно то поведение, на
+    /// котором держится #207 — если бы вывод прокси хоть как-то зависел от `entropy`, секрет можно
+    /// было бы восстановить по фразе, и сжигание перестало бы что-либо уничтожать.
     #[test]
-    fn frozen_proxy_derivation_vector() {
-        let entropy = [0u8; 16]; // та же нулевая тест-энтропия
-        let p0 = derive_proxy(&entropy, 0);
-        let p1 = derive_proxy(&entropy, 1);
-        let ik0 = hex::encode(p0.account.identity_public());
-        let ik1 = hex::encode(p1.account.identity_public());
-        let seal0 = hex::encode(p0.seal.public.to_bytes());
+    fn proxy_identity_depends_only_on_its_own_secret_not_on_the_phrase() {
+        let secret_a = [11u8; 32];
+        let secret_b = [22u8; 32];
 
-        // Прокси ≠ корень (отдельный домен) и ≠ друг другу (разные индексы).
-        let root = derive(&entropy);
-        assert_ne!(ik0, hex::encode(root.account.identity_public()), "прокси != корень");
-        assert_ne!(ik0, ik1, "разные индексы → разные личности");
+        let a1 = derive_proxy_from_secret(&secret_a);
+        let a2 = derive_proxy_from_secret(&secret_a);
+        assert_eq!(
+            a1.account.identity_public(),
+            a2.account.identity_public(),
+            "тот же секрет → та же личность (иначе прокси нельзя было бы переоткрыть)"
+        );
+        assert_eq!(a1.seal.public.to_bytes(), a2.seal.public.to_bytes());
 
-        // ЗАМОРОЖЕНО — эти значения не должны меняться никогда.
-        assert_eq!(
-            ik0, "e1c1c0f0317a31ee6171335758114701954c1230f330eec82be32bc3b3469939",
-            "прокси-IK[0] изменился — розданные прокси-коды сломаны"
+        let b = derive_proxy_from_secret(&secret_b);
+        assert_ne!(
+            a1.account.identity_public(),
+            b.account.identity_public(),
+            "разные секреты → разные личности"
         );
-        assert_eq!(
-            ik1, "2e2e1f0b84c8de2c6057169f7426fe0741d574806721adf0c508de03a6f7c736",
-            "прокси-IK[1] изменился — розданные прокси-коды сломаны"
+
+        // Корень, выведенный из фразы (ЛЮБОЙ фразы), никогда не совпадает с прокси: секрет
+        // прокси не зависит от энтропии фразы вообще, домены полностью разделены.
+        let root = derive(&[0u8; 16]);
+        assert_ne!(
+            a1.account.identity_public(),
+            root.account.identity_public(),
+            "прокси != корень, даже случайно"
         );
-        let _ = seal0;
     }
 
     #[test]

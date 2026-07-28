@@ -799,19 +799,39 @@ mod tests {
         assert_eq!(s.put_chunk(a, b, MAX_BLOB_CHUNKS - 1, MAX_BLOB_CHUNKS, b"last", 0), BlobPut::Ok);
         assert_eq!(s.stat(&b), Some((1, MAX_BLOB_CHUNKS, false)), "only index 0 is contiguous");
 
-        let started = std::time::Instant::now();
-        for _ in 0..20_000 {
-            // A re-send (idempotent, net-zero byte delta) exercises put_chunk's completion check;
-            // stat() exercises the watermark. Neither adds a chunk, so any cost here is pure
-            // per-declared-count overhead, not real upload work.
-            assert_eq!(s.put_chunk(a, b, 0, MAX_BLOB_CHUNKS, b"first", 0), BlobPut::Ok);
-            assert_eq!(s.stat(&b), Some((1, MAX_BLOB_CHUNKS, false)));
-        }
-        let elapsed = started.elapsed();
+        // A re-send (idempotent, net-zero byte delta) exercises put_chunk's completion check;
+        // stat() exercises the watermark. Neither adds a chunk, so any cost here is pure
+        // per-declared-count overhead, not real upload work.
+        let hammer = |s: &mut BlobStore, b: [u8; 32], count: u32, watermark: u32| {
+            let started = std::time::Instant::now();
+            for _ in 0..20_000 {
+                assert_eq!(s.put_chunk(a, b, 0, count, b"first", 0), BlobPut::Ok);
+                assert_eq!(s.stat(&b), Some((watermark, count, false)));
+            }
+            started.elapsed()
+        };
+        let sparse = hammer(&mut s, b, MAX_BLOB_CHUNKS, 1);
+
+        // The BASELINE: identical work on a blob declaring a TINY count. If the hot path is
+        // proportional to what ARRIVED, the two are within noise; if an O(count) scan is back,
+        // the first is thousands of times the second.
+        //
+        // Measured against a same-machine baseline rather than an absolute millisecond budget.
+        // This test previously asserted "under 500 ms" and went red on a loaded CI runner while
+        // the fix was perfectly intact — an absolute bound tests the machine, not the code, and
+        // it fails in whichever direction the machine leans. Its two sibling tests were already
+        // converted for exactly this reason; leaving this one behind is what let it bite.
+        let small = id(10);
+        assert_eq!(s.put_chunk(a, small, 0, 4, b"first", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(a, small, 3, 4, b"last", 0), BlobPut::Ok);
+        let dense = hammer(&mut s, small, 4, 1);
+
+        let floor = std::time::Duration::from_millis(1); // timer noise on a fast box
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "20_000 ops on a sparse {MAX_BLOB_CHUNKS}-count blob (2 real chunks) took {elapsed:?} \
-             — looks like an O(count) scan is back on the put/stat hot path"
+            sparse < dense.max(floor) * 50,
+            "20_000 ops on a blob DECLARING {MAX_BLOB_CHUNKS} chunks took {sparse:?} against \
+             {dense:?} for the same work declaring 4 — an O(count) scan is back on the put/stat \
+             hot path"
         );
     }
 

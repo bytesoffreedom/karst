@@ -5,5 +5,18 @@ members = ["admission", "node", "client", "desktop"]
 # Deterministic codegen for reproducible release builds: parallel codegen units can reorder
 # output, so pin to one. Slower to compile, but a release must be byte-reproducible.
 # (See docs/design/reproducible-builds.md for the remaining sources — build paths, Tauri.)
+# Debug builds carry LINE TABLES only, not full DWARF. Panics and backtraces still name the
+# file and line — which is all the test suite ever uses debug info for — while the object files
+# shrink several-fold and, more to the point, LINKING gets much faster. Every test binary in the
+# workspace is linked on every `cargo test`, so link time is what a local CI run actually spends
+# its wall clock on.
+[profile.dev]
+debug = "line-tables-only"
+
+# Test/bench targets inherit from `dev`, but say it explicitly: this is the profile that builds
+# the dozens of integration-test binaries, and it is the one whose link time we are cutting.
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 codegen-units = 1

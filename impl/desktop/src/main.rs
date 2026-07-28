@@ -562,9 +562,13 @@ fn build_relays(store: &Store) -> Vec<Relay> {
 }
 
 /// Announce our bundle to every relay (best-effort; a dead relay is not fatal).
-/// Active proxy indices (channels currently offered), lowest first. Empty if none yet.
+/// Live proxy indices (channels currently offered), lowest first. Empty if none yet.
+///
+/// No `active` filter any more: burning a proxy now DELETES its entry and its secret (A6-4), so
+/// presence in the registry IS liveness. A flag would have to be backed by keys that still exist,
+/// which is exactly what "burned" must no longer mean.
 fn active_proxies(store: &Store) -> Vec<u32> {
-    let mut v: Vec<u32> = store.load_proxies().into_iter().filter(|p| p.active).map(|p| p.index).collect();
+    let mut v: Vec<u32> = store.load_proxies().into_iter().map(|p| p.index).collect();
     v.sort_unstable();
     v
 }
@@ -572,15 +576,26 @@ fn active_proxies(store: &Store) -> Vec<u32> {
 /// The default proxy (lowest active index), provisioning proxy 0 if the account has none. The
 /// proxy-identity model NEVER puts the root on the wire, so there must always be ≥1 proxy — a new
 /// or pre-proxy account gets one here at first publish/send.
-fn default_proxy(store: &Store) -> u32 {
-    active_proxies(store).first().copied().unwrap_or_else(|| {
-        store.create_proxy("default", now_secs()).map(|e| e.index).unwrap_or(0)
-    })
+fn default_proxy(store: &Store) -> Result<u32, String> {
+    if let Some(i) = active_proxies(store).first().copied() {
+        return Ok(i);
+    }
+    // Propagated, not defaulted. This used to `unwrap_or(0)`, which was harmless only while index
+    // 0 was always derivable from the phrase: now a proxy's keys live in its registry entry, so
+    // naming an index with no entry gives an identity that cannot be derived at all, and every
+    // later call fails somewhere less obvious than here (A6-4).
+    store.create_proxy("default", now_secs()).map(|e| e.index).map_err(|e| e.to_string())
 }
 
 /// The proxy that reaches a contact — their tag if set, else the default proxy.
 fn proxy_for_contact(store: &Store, ik: &[u8; 32]) -> u32 {
-    store.contact_proxy(ik).unwrap_or_else(|| default_proxy(store))
+    // A contact with no recorded channel falls back to the default one. If provisioning that
+    // default fails there is no channel to send on at all, so index 0 is reported rather than
+    // guessed: `as_proxy(0)` with no registry entry now fails loudly at the call site.
+    match store.contact_proxy(ik) {
+        Some(i) => i,
+        None => default_proxy(store).unwrap_or(0),
+    }
 }
 
 /// Announce presence. ROOT-NEVER-PUBLISHES INVARIANT: publish each ACTIVE PROXY's bundle via
@@ -595,7 +610,15 @@ fn do_publish(store: &Store, relays: &[Relay], offline: bool) {
     }
     let mut proxies = active_proxies(store);
     if proxies.is_empty() {
-        proxies.push(default_proxy(store));
+        // Nothing to publish under if provisioning fails — say so and return rather than
+        // publishing under an index with no registry entry (A6-4).
+        match default_proxy(store) {
+            Ok(i) => proxies.push(i),
+            Err(e) => {
+                eprintln!("warning: no channel to publish under: {e}");
+                return;
+            }
+        }
     }
     for pidx in proxies {
         let p = store.as_proxy(pidx);
@@ -613,9 +636,8 @@ fn me_of(store: &Store, id: &str) -> Me {
     let prof = store.load_profile().unwrap_or_default();
     // Proxy-identity model: "your address" is your DEFAULT PROXY's IK, never the root (which has
     // no address on the wire). This is the address others reach you at.
-    let ik = store
-        .as_proxy(default_proxy(store))
-        .load_account()
+    let ik = default_proxy(store)
+        .and_then(|i| store.as_proxy(i).load_account().map_err(|e| e.to_string()))
         .map(|a| hex::encode(a.identity_public()))
         .unwrap_or_else(|_| id.to_string());
     Me { ik, name: prof.name, bio: prof.bio, avatar: avatar_uri(&prof.avatar) }
@@ -1505,7 +1527,6 @@ fn reconnect_peer(app: State<App>, peer_ik: String) -> Result<bool, String> {
 struct Proxy {
     index: u32,
     label: String,
-    active: bool,
     created_at: u64,
     /// The proxy's derived identity key, hex — the disposable address for this channel.
     ik: String,
@@ -1516,7 +1537,7 @@ fn proxy_of(store: &Store, e: &client::store::ProxyEntry) -> Proxy {
         .proxy_identity(e.index)
         .map(|d| hex::encode(d.account.identity_public()))
         .unwrap_or_default();
-    Proxy { index: e.index, label: e.label.clone(), active: e.active, created_at: e.created_at, ik }
+    Proxy { index: e.index, label: e.label.clone(), created_at: e.created_at, ik }
 }
 
 /// Every connection proxy (active + burned), newest first.
@@ -1556,7 +1577,10 @@ fn burn_proxy(app: State<App>, index: u32) -> Result<(), String> {
     if active == [index] {
         return Err("this is your only active channel — create another one first, then burn this".into());
     }
-    store.set_proxy_active(index, false).map_err(|e| e.to_string())
+    // Burn now DESTROYS: the entry, its secret, and the proxy's namespaced network state go, so
+    // the identity cannot be reproduced by anyone — including the holder of the recovery phrase.
+    // That is the whole point of A6-4, and it is why this is not undoable.
+    store.burn_proxy(index).map_err(|e| e.to_string())
 }
 
 /// Contacts currently reached through proxy `index` — the migration picker's default set.
@@ -1565,7 +1589,7 @@ fn contacts_on_proxy(app: State<App>, index: u32) -> Result<Vec<Contact>, String
     let (store, _) = app.snapshot()?;
     let profiles = store.load_peer_profiles().unwrap_or_default();
     let channels = store.load_channel_peers();
-    let dflt = default_proxy(&store);
+    let dflt = default_proxy(&store).map_err(|e| e.to_string())?;
     Ok(store
         .load_contacts()
         .map_err(|e| e.to_string())?
@@ -1623,7 +1647,7 @@ struct DiscoveryStatus {
 fn discovery_status(app: State<App>) -> Result<DiscoveryStatus, String> {
     let (store, _) = app.snapshot()?;
     // A contact code binds to a PROXY identity (never the root) — operate on the default proxy.
-    let dp = store.as_proxy(default_proxy(&store));
+    let dp = store.as_proxy(default_proxy(&store).map_err(|e| e.to_string())?);
     let code = client::discovery_code(&dp)?;
     Ok(DiscoveryStatus { on: code.is_some(), code })
 }
@@ -1633,7 +1657,7 @@ fn discovery_status(app: State<App>) -> Result<DiscoveryStatus, String> {
 fn discovery_on(app: State<App>) -> Result<String, String> {
     let (store, relays) = app.snapshot()?;
     let relay = relays.into_iter().next().ok_or("configure a relay first")?;
-    client::discovery_publish(&store.as_proxy(default_proxy(&store)), &relay, now_secs())
+    client::discovery_publish(&store.as_proxy(default_proxy(&store)?), &relay, now_secs())
 }
 
 /// Rotate the persistent contact code (old one stops resolving); returns the fresh code.
@@ -1641,14 +1665,14 @@ fn discovery_on(app: State<App>) -> Result<String, String> {
 fn discovery_rotate(app: State<App>) -> Result<String, String> {
     let (store, relays) = app.snapshot()?;
     let relay = relays.into_iter().next().ok_or("configure a relay first")?;
-    client::discovery_rotate(&store.as_proxy(default_proxy(&store)), &relay, now_secs())
+    client::discovery_rotate(&store.as_proxy(default_proxy(&store)?), &relay, now_secs())
 }
 
 /// Turn discovery OFF: delete the relay record (best-effort) and clear the local key.
 #[tauri::command]
 fn discovery_off(app: State<App>) -> Result<(), String> {
     let (store, relays) = app.snapshot()?;
-    let dp = store.as_proxy(default_proxy(&store));
+    let dp = store.as_proxy(default_proxy(&store).map_err(|e| e.to_string())?);
     match relays.into_iter().next() {
         Some(relay) => {
             client::discovery_off(&dp, &relay)?;
@@ -1666,7 +1690,7 @@ fn discovery_off(app: State<App>) -> Result<(), String> {
 fn create_invite(app: State<App>) -> Result<String, String> {
     let (store, relays) = app.snapshot()?;
     let relay = relays.into_iter().next().ok_or("configure a relay first")?;
-    client::discovery_one_time(&store.as_proxy(default_proxy(&store)), &relay, now_secs())
+    client::discovery_one_time(&store.as_proxy(default_proxy(&store)?), &relay, now_secs())
 }
 
 /// Add a contact by a CONTACT CODE (persistent or one-time): resolve it to an IK at the relay
@@ -1687,7 +1711,10 @@ fn add_by_code(app: State<App>, code: String, name: String, via_proxy: Option<u3
     // name/posts as they arrive), not a mere conversation.
     let _ = store.set_unconfirmed(ik, false);
     // The channel of OURS they'll see us on — chosen, else default (never the root).
-    let proxy = via_proxy.unwrap_or_else(|| default_proxy(&store));
+    let proxy = match via_proxy {
+        Some(p) => p,
+        None => default_proxy(&store).map_err(|e| e.to_string())?,
+    };
     let _ = store.set_contact_proxy(ik, proxy);
     Ok(hex::encode(ik))
 }
@@ -2856,7 +2883,7 @@ async fn cover_tick(app: State<'_, App>) -> Result<(), String> {
     let Some(relay) = relays.into_iter().next() else { return Ok(()) };
     let mut proxies = active_proxies(&root);
     if proxies.is_empty() {
-        proxies.push(default_proxy(&root));
+        proxies.push(default_proxy(&root)?);
     }
     // A cover deposit from ONE random proxy this tick (not all — that would itself be a pattern).
     let idx = proxies[(now_secs() as usize) % proxies.len()];
@@ -2885,7 +2912,7 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     let primary = relays.first().cloned();
     let mut proxies = active_proxies(&root);
     if proxies.is_empty() {
-        proxies.push(default_proxy(&root));
+        proxies.push(default_proxy(&root)?);
     }
     // SEC-43: reap idle in-flight reassemblies on EVERY poll tick, whether or not this pass
     // drains any messages — the finding was that the only trigger was the SAME stalled sender

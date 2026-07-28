@@ -1106,7 +1106,7 @@ fn container_add_hidden(app: State<App>, hidden_password: String) -> Result<Vec<
     // Build the empty hidden account in RAM, sealed under the HIDDEN region's key (so its own
     // password opens it — NOT a password-derived key, which would break P3-style aliases), snapshot
     // it, then wipe the plaintext build. `add_hidden` gives us the region key inside the closure.
-    let res = cv.add_hidden(hidden_password.as_bytes(), |region_key| {
+    let res = cv.add_hidden(hidden_password.as_bytes(), |region_key, max_payload| {
         let _ = std::fs::remove_dir_all(&build);
         std::fs::create_dir_all(&build)?;
         let out = (|| -> std::io::Result<Vec<u8>> {
@@ -1122,7 +1122,10 @@ fn container_add_hidden(app: State<App>, hidden_password: String) -> Result<Vec<
             if !store.has_capability() {
                 let _ = store.save_capability(&client::dev_capability());
             }
-            client::container::snapshot_dir(&build)
+            // The REAL usable capacity of the hidden region, threaded in from `add_hidden`.
+            // Passing `usize::MAX` here would reopen SEC-35 on this exact path: the snapshot is
+            // read into RAM before anything can refuse it, so the ceiling has to bind the READ.
+            client::container::snapshot_dir(&build, max_payload)
         })();
         let _ = std::fs::remove_dir_all(&build); // wipe the RAM plaintext regardless of outcome
         out
@@ -3440,8 +3443,13 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
             // surface it for a re-verify. Future mail to/from them uses the new address.
             Content::ChannelMigrate { new_ik } => {
                 if new_ik != r.sender {
-                    if let Ok(true) = root.migrate_contact_ik(r.sender, new_ik) {
-                        out.push(Incoming::migrate(r.sender, new_ik));
+                    match root.migrate_contact_ik(r.sender, new_ik) {
+                        Ok(true) => out.push(Incoming::migrate(r.sender, new_ik)),
+                        Ok(false) => {}
+                        // A refused migration is an attempted hijack: an authenticated contact
+                        // naming ANOTHER contact's address to collapse the two onto one key
+                        // (SEC-36). Swallowing the error would make the attempt invisible.
+                        Err(e) => eprintln!("KARST: refusing a contact migration: {e}"),
                     }
                 }
                 continue;

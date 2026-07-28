@@ -278,6 +278,10 @@ type QuotaWindow = std::collections::VecDeque<(u64, u64, [u8; 16])>;
 pub struct CapabilityQuotaTracker {
     /// capability_id → окно расхода.
     windows: std::collections::HashMap<[u8; 16], QuotaWindow>,
+    /// capability_id → ЕГО `window_secs`, запомненный при расходе. `reap` раньше применял ОДНО
+    /// значение по умолчанию ко всем capability, хотя окно — свойство конкретной quota: держатель
+    /// более длинного окна терял записи расхода раньше срока и получал больше своей квоты (A4-6).
+    window_of: std::collections::HashMap<[u8; 16], u64>,
 }
 
 impl CapabilityQuotaTracker {
@@ -310,6 +314,7 @@ impl CapabilityQuotaTracker {
     ) -> QuotaDecision {
         let window = quota.window_secs as u64;
         let horizon = now.saturating_sub(window);
+        self.window_of.insert(cap_id, window);
         let dq = self.windows.entry(cap_id).or_default();
         // Prune: убрать всё старше окна.
         while let Some(&(ts, _, _)) = dq.front() {
@@ -341,8 +346,12 @@ impl CapabilityQuotaTracker {
     /// памяти. Возвращает число убранных записей.
     pub fn reap(&mut self, now: u64, default_window_secs: u64) -> usize {
         let before = self.windows.len();
-        self.windows.retain(|_, dq| {
-            let horizon = now.saturating_sub(default_window_secs);
+        let window_of = std::mem::take(&mut self.window_of);
+        self.windows.retain(|id, dq| {
+            // Each capability is reaped against ITS OWN window, remembered at consume time; the
+            // caller's value is only a fallback for an id we have never metered (A4-6).
+            let window = window_of.get(id).copied().unwrap_or(default_window_secs);
+            let horizon = now.saturating_sub(window);
             while let Some(&(ts, _, _)) = dq.front() {
                 if ts <= horizon {
                     dq.pop_front();
@@ -352,6 +361,8 @@ impl CapabilityQuotaTracker {
             }
             !dq.is_empty()
         });
+        // Keep the remembered windows for the ids that survived.
+        self.window_of = window_of.into_iter().filter(|(id, _)| self.windows.contains_key(id)).collect();
         before - self.windows.len()
     }
 }

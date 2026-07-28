@@ -186,3 +186,28 @@ fn pipeline_rejects_when_quota_exhausted() {
         Outcome::Reject(RejectReason::CapabilityQuota)
     );
 }
+
+/// A4-6 — each capability must be reaped against ITS OWN window, not one default for all.
+///
+/// `reap` applied a single caller-supplied window to every capability. A holder whose quota window
+/// is LONGER than that default had its spend records dropped early, so the next `consume` saw a
+/// nearly empty window and granted more than the quota allows — the limit silently stopped binding.
+#[test]
+fn reap_uses_each_capabilitys_own_window_not_one_default() {
+    let mut t = CapabilityQuotaTracker::new();
+    // A capability with a LONG window (1 hour), metered once at NOW.
+    let long = Quota { max_requests: 2, max_bytes: 1 << 20, window_secs: 3600 };
+    let id = [0xAA; 16];
+    assert!(matches!(t.consume(id, &long, [1u8; 16], 10, NOW), QuotaDecision::Ok));
+
+    // A reap run with the SHORT default (600s) must not discard a record that is still inside the
+    // capability's own hour-long window.
+    t.reap(NOW + 700, 600);
+
+    // The spend is still counted: a second request fits (max_requests = 2), a third does not.
+    assert!(matches!(t.consume(id, &long, [2u8; 16], 10, NOW + 700), QuotaDecision::Ok));
+    assert!(
+        matches!(t.consume(id, &long, [3u8; 16], 10, NOW + 700), QuotaDecision::Exceeded),
+        "the early reap must not have erased the spend and handed back extra quota"
+    );
+}

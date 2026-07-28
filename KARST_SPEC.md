@@ -64,13 +64,14 @@ from one phone must not destroy the whole network.
 
 ### 2.1 End-to-end encryption, forward secrecy, and post-quantum protection
 
-> **Direction (in progress):** throughout this spec an identity is a single permanent key (IK)
-> that is also your address. The [proxy-identity model](docs/design/proxy-identity.md) is
-> changing that — the root identity gets no address at all, and every key that appears on the
-> wire belongs to a **disposable, HD-derived proxy** you can rotate or burn. The key-agreement
-> and ratchet below are unchanged (a proxy is still a full identity for a session); what changes
-> is *which* identity is exposed and that it is throwaway. This spec still describes the
-> single-IK behaviour that ships today.
+> **Identity model — implemented (see [`docs/STATUS.md`](docs/STATUS.md)):** the
+> [proxy-identity model](docs/design/proxy-identity.md) is live in the shipping desktop client.
+> The root identity gets **no address at all**; every key that appears on the wire belongs to a
+> **disposable, HD-derived proxy** you can rotate or burn. The key-agreement and ratchet
+> described below are unchanged and apply **per proxy** — a proxy is a full identity for a
+> session; what the proxy layer adds is *which* identity is exposed (a throwaway one) and that
+> the root never appears on the wire. So wherever this spec writes "identity (IK)" or "address",
+> read it as **one proxy's** IK and address, not the root's.
 
 The "contact key" above gives the right to send a message to a specific person,
 but the scheme for key agreement and obtaining forward secrecy was nowhere

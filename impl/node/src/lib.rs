@@ -14,8 +14,9 @@
 //! Границы честно: `seal::SkeletonSeal` — НЕ §2.1 (нет FS/ratchet/PQ), это
 //! отложено по выбору, не внешняя стена. Подробности — в doc модуля `seal`.
 
-/// SPIKE — mailbox deposit/fetch key separation via Ristretto point-blinding. Not wired into
-/// the live drop-box path; proves the primitive + measures integration cost (see the module).
+/// Mailbox deposit/fetch key separation via Ristretto point-blinding — wired into the live
+/// drop-box path for established sessions (reference construction; the Schnorr fetch proof is
+/// unaudited, first-contact openers keep the identity mailbox + DH proof). See the module.
 pub mod blind;
 pub mod blobstore;
 pub mod discovery;

@@ -63,8 +63,9 @@ pub struct PreKeyBundle {
     #[serde(default)]
     pub prekey_sig: Vec<u8>,
     /// The account's public mailbox point `M = m·G` for blinded deposit/fetch key separation
-    /// (`crate::blind`). Bound by `prekey_sig` (a relay cannot swap it undetected). **Groundwork:
-    /// published, but the live drop-box path does not derive from it yet.** Appended last.
+    /// (`crate::blind`). Bound by `prekey_sig` (a relay cannot swap it undetected). The live
+    /// drop-box path derives the blinded deposit address from it for established sessions
+    /// (`peer.rs` → `blind::deposit_address`). Appended last.
     #[serde(default)]
     pub mailbox_pub: [u8; 32],
 }
@@ -115,8 +116,8 @@ pub struct Account {
     /// Per-account mailbox secret `m` (Ristretto scalar bytes) for deposit/fetch key SEPARATION
     /// (`crate::blind`). Derived deterministically from the account's own secret material, so it
     /// re-derives from the seed (no separate persistence) and a sender — who lacks that material
-    /// — cannot recompute it. Its public `M = m·G` is published in the bundle. **Groundwork:
-    /// present, but the live drop-box path does not use it yet.**
+    /// — cannot recompute it. Its public `M = m·G` is published in the bundle, and the live
+    /// drop-box path fetches blinded boxes with the derived fetch secret for established sessions.
     mailbox_secret: [u8; 32],
 }
 
@@ -504,7 +505,7 @@ mod tests {
 
     /// The per-account mailbox point `M` is published in the bundle, equals `m·G`, and — like the
     /// rest of the identity — is STABLE across a re-derive from the seed bytes (so it needs no
-    /// separate persistence). Groundwork for blinded deposit/fetch key separation.
+    /// separate persistence). Backs the live blinded deposit/fetch key separation.
     #[test]
     fn mailbox_point_is_published_and_seed_stable() {
         let acct = Account::generate();

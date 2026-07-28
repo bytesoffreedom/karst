@@ -238,7 +238,7 @@ its own"); ECH/domain-fronting, uTLS fingerprint, the full Path Manager + rich
 **connect-level path failover AND client multi-homing across several relays (§15) ARE
 implemented** (a request tries a path list; receive polls the whole relay set, and a dead relay
 no longer costs the healthy ones their mail); rendezvous discovery without a global list (§12;
-publish/fetch bundle already exists), signed prekeys (XEd25519) and one-time prekeys (§2.1),
+publish/fetch bundle already exists),
 mix/mailbox routing (§10), erasure coding (§13), calls (§21), the economic layer
 (§19), duress/panic (§20), the **Android client** (the `client` core is ready to
 be reused via JNI, the JNI itself is a separate slice). The **shipping desktop GUI is now the Tauri
@@ -1883,17 +1883,18 @@ implementation. NOT feature-gated (E2E is the core of the product, unlike tring)
 - **no forward secrecy / per-message keys** at THIS layer — those are given by
   Double Ratchet (`node::ratchet`, below), seeded by this `root_key`;
 - **directional authentication** Alice→Bob GIVEN an authentic IK_B (out of
-  band/§12); NOT mutual — the prekey is UNSIGNED. **Severity, stated precisely
-  (audit follow-up 2026-07-17):** an unsigned prekey is NOT a MITM/confidentiality
-  hole. `root_key` includes `dh2 = EK_A × IK_B`, and the relay has neither Alice's
-  ephemeral secret nor Bob's IK secret, so it cannot derive the key by swapping the
-  prekey — a swap only makes Bob compute a DIFFERENT key, i.e. DoS-by-swap (silent
-  delivery failure). Signing (XEd25519 on the IK) would buy fail-FAST on a swap and
-  safe prekey rotation — hardening, not a fix. **Deferred**, not built: it needs a
-  vetted XEdDSA primitive (the `xeddsa` crate is thin/unaudited → gate or await
-  audit, do NOT hand-roll and do NOT add a second Ed25519 identity key) plus
-  downgrade protection (the sender must KNOW the recipient signs, or the relay
-  strips the signature). Recorded alongside the RLN/PIR walls;
+  band/§12); NOT mutual. The long-lived prekey **is signed** (`prekey_sig`): XEd25519 on the
+  SAME X25519 IK (Signal's XEdDSA — no second key, no safety-number change), covering
+  `prekey_pub ‖ kem_ek ‖ M`. A sender rejects a bundle whose prekey / KEM key / mailbox point a
+  relay substituted (`verify_prekey_sig`, enforced before a fetched bundle is used in
+  `Peer::connect`), turning the old DoS-by-swap into fail-FAST. **Downgrade is handled:** an
+  empty or wrong-length signature fails verification, so a stripped signature is REJECTED, not
+  silently accepted. **Honest boundary:** even unsigned this was never a MITM/confidentiality
+  hole — `root_key` includes `dh2 = EK_A × IK_B`, which the relay cannot derive, so a swap only
+  ever made Bob compute a DIFFERENT key (silent delivery failure), never key recovery; the
+  signature buys fail-fast + safe prekey rotation, not confidentiality. The XEdDSA primitive is
+  the `xeddsa` crate — a REFERENCE, **unaudited** (not hand-rolled, not a second Ed25519 key).
+  The one-time prekey is NOT signed (its swap is likewise only DoS, and it is consumed once);
 - **one-time prekeys — COMPLETE end-to-end (three increments, 2026-07-17):** the initial
   agreement takes a fourth DH term `dh4 = EK_A × OPK_B` against a **consumed** one-time
   prekey, so a later compromise of the long-lived prekey secret no longer exposes the first

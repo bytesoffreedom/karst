@@ -88,7 +88,7 @@ A Rust workspace of five crates:
 
 ### Security properties and their maturity
 
-Each claim is hedged to match [`docs/STATUS.md`](docs/STATUS.md) — the source of truth. "Reference, unaudited" means real, working code using vendored primitives, with a hand-written protocol composition that has **not** been through an independent audit.
+Each claim is hedged to match [`docs/STATUS.md`](docs/STATUS.md) — the authoritative record of what is actually implemented (the protocol design itself lives in `KARST_SPEC.md`). "Reference, unaudited" means real, working code using vendored primitives, with a hand-written protocol composition that has **not** been through an independent audit.
 
 | Property | How | Maturity |
 |----------|-----|----------|
@@ -198,10 +198,13 @@ See `docs/RELEASING.md` and `docs/design/reproducible-builds.md` for the full st
 
 ### 3. Run a relay node
 
-A relay is a **dumb, untrusted mailbox** — it never sees plaintext and keeps no
-record of who talks to whom: it holds only the sealed messages waiting to be
-picked up and the prekey bundles people publish to be reachable. Anyone can run
-one; running your own removes reliance on someone else's.
+A relay is a **dumb, untrusted mailbox**: it does not receive plaintext and is not
+intended to maintain a persistent social graph, but it can observe transport and
+protocol metadata (described in [`docs/STATUS.md`](docs/STATUS.md) — IP, timing, the
+deposit/fetch of a single drop-box, blob IDs, and, on a live profile fetch, who views
+whose profile). It holds only the sealed messages waiting to be picked up and the
+prekey bundles people publish to be reachable. Anyone can run one; running your own
+removes reliance on someone else's.
 
 ```sh
 karst-relay                     # listens on 127.0.0.1:9000 (default)
@@ -302,10 +305,10 @@ See [`docs/RUNNING.md`](docs/RUNNING.md) for the full local walkthrough and the
 impl/            Rust workspace: admission, node, client, gui
 docs/            STATUS.md (maturity map) · RUNNING.md (local run)
 scripts/         local-run helpers
-KARST_SPEC.md   protocol specification — source of truth
+KARST_SPEC.md   protocol specification — normative protocol design
 ```
 
-> The specification is the source of truth and code must conform to it.
+> `KARST_SPEC.md` is the normative protocol design and code must conform to it; [`docs/STATUS.md`](docs/STATUS.md) is authoritative on what is actually implemented, stubbed, or blocked so far. Where the spec describes a design the code has not reached yet, STATUS says so.
 
 ## How it's built
 

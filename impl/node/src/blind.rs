@@ -1,15 +1,18 @@
-//! **SPIKE — not wired into anything.** Mailbox deposit/fetch key separation via per-epoch
-//! point-blinding (the Tor v3 key-blinding pattern), proving the primitive works before any
-//! decision to change the live drop-box path.
+//! **Wired into the live drop-box path (reference construction — the Schnorr fetch proof is
+//! unaudited).** Mailbox deposit/fetch key separation via per-epoch point-blinding (the Tor v3
+//! key-blinding pattern). Established sessions deposit into and fetch from a blinded box
+//! (`peer.rs` → `deposit_address` / `FetchOwnershipProof`, gated by `node::mailbox_owner_ok`);
+//! first-contact openers and the self loop-box still use the identity mailbox + DH proof.
 //!
 //! # The gap this closes (see docs/design/mailbox-fetch-key-separation.md)
 //!
-//! Today both parties derive the FULL mailbox keypair per direction from the shared
+//! Without this, both parties derive the FULL mailbox keypair per direction from the shared
 //! `drop_seed` (`crate::drop`), so a sender can also derive the recipient's *fetch* secret —
-//! "can deposit" implicitly confers "can read". Bounded to two-party defence-in-depth (each
-//! side only reaches a box holding data it is already party to), which is why shipping it was
-//! deferred. This module is the viable construction for when that bound must break (group
-//! mailboxes, deposit delegation).
+//! "can deposit" implicitly confers "can read" (still the case for the identity mailbox used by
+//! first-contact openers, bounded to two-party defence-in-depth: each side only reaches a box
+//! holding data it is already party to). This module breaks that for established sessions, and
+//! is the construction that also generalizes when the bound must break further (group mailboxes,
+//! deposit delegation).
 //!
 //! # The construction
 //!
@@ -33,16 +36,17 @@
 //! construction is not even expressible there (the landmine that deferred it). Ristretto255
 //! is prime-order, so there is no cofactor to leak and `h·(m·G) = (h·m)·G` holds exactly.
 //!
-//! # The remaining relay-side piece — DOCUMENTED, NOT BUILT
+//! # The relay-side ownership proof — BUILT AND WIRED (reference, unaudited)
 //!
-//! The live relay gates a fetch with `fetch_proof = DH(mailbox_secret, relay_x25519_identity)`
+//! The identity mailbox is gated by `fetch_proof = DH(mailbox_secret, relay_x25519_identity)`
 //! — a DH against the relay's X25519 Noise key. A Ristretto fetch secret shares no DH with an
-//! X25519 key, so wiring this in ALSO requires replacing that proof with an in-group one: a
-//! Schnorr proof of knowledge of `fetch_secret` (the discrete log of the deposit address),
-//! verified by the relay in the Ristretto group. That is a SECOND primitive (un-CI-able the
-//! same way a signature is), plus a wire-format change touching every client. It is the cost
-//! that keeps this a spike; if it is ever built, it needs a vetted construction + known-answer
-//! vectors, and it does not self-merge.
+//! X25519 key, so a blinded box is gated instead by an in-group proof: a Schnorr proof of
+//! knowledge of `fetch_secret` (the discrete log of the deposit address), verified by the relay
+//! in the Ristretto group (`FetchOwnershipProof`, checked in `node::mailbox_owner_ok`, shared by
+//! `handle_fetch`/`handle_ack`; the client builds it in `peer.rs`). This is a SECOND primitive,
+//! un-CI-able the same way a signature is (a broken construction verifies against itself) and
+//! **UNAUDITED** — it wants a vetted construction + known-answer vectors before any production
+//! claim, the same discipline as the XEdDSA prekey signature.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use curve25519_dalek::ristretto::CompressedRistretto;
@@ -124,16 +128,16 @@ pub fn public_of_secret(secret: &[u8; 32]) -> Option<[u8; 32]> {
     Some((&s * RISTRETTO_BASEPOINT_TABLE).compress().to_bytes())
 }
 
-/// The relay-side ownership proof for a blinded mailbox — **the second half of the spike, also
-/// unwired.** The live relay gates a fetch with `DH(mailbox_secret, relay_x25519_identity)`; a
-/// Ristretto fetch secret shares no DH with the relay's X25519 key, so a blinded mailbox needs an
-/// in-group ownership proof instead. This is a Schnorr proof of knowledge of the fetch secret `s`
-/// — the discrete log of the deposit address `P = s·G` — that the relay could verify to grant a
-/// fetch, without ever learning `s`.
+/// The relay-side ownership proof for a blinded mailbox — **wired into the live fetch/ack gate
+/// (`node::mailbox_owner_ok`).** The identity mailbox is gated by
+/// `DH(mailbox_secret, relay_x25519_identity)`; a Ristretto fetch secret shares no DH with the
+/// relay's X25519 key, so a blinded mailbox is gated by this in-group ownership proof instead: a
+/// Schnorr proof of knowledge of the fetch secret `s` — the discrete log of the deposit address
+/// `P = s·G` — that the relay verifies to grant a fetch, without ever learning `s`.
 ///
-/// **STILL A SPIKE — un-CI-able the way a signature is** (a broken construction verifies against
-/// itself). Before it could ship it needs a vetted construction + known-answer vectors, the same
-/// discipline as the XEdDSA prekey signature. What the tests below CAN pin: a valid proof
+/// **REFERENCE / UNAUDITED — un-CI-able the way a signature is** (a broken construction verifies
+/// against itself). Before any production claim it needs a vetted construction + known-answer
+/// vectors, the same discipline as the XEdDSA prekey signature. What the tests below CAN pin: a valid proof
 /// verifies; a wrong secret / a tampered proof / a wrong context / a wrong statement do not.
 ///
 /// Fiat–Shamir Schnorr over Ristretto255:

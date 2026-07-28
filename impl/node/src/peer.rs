@@ -111,6 +111,33 @@ struct SessionState {
 /// (it is the least likely to still be decryptable — see the DH-step bound on `flush_outbox`).
 const MAX_OUTBOX: usize = 512;
 
+/// Ceiling on DISTINCT peer identity keys held in `sessions` — checked only where a BRAND-NEW
+/// stranger's first-contact opener would otherwise insert a new entry (see `process_opener`).
+///
+/// Without this, `sessions` grows without bound from unauthenticated strangers: anyone who
+/// fetches our published bundle can complete a valid PQXDH agreement against it with NO
+/// one-time prekey of ours at all (`pqxdh::prepare_key_agreement`'s `opk_pub: None` branch
+/// agrees fine against our reusable signed prekey — see CRYPTO-03/the 3-DH fallback), so the
+/// attacker's cost per accepted session is just their own key generation, not a resource of
+/// ours. Each accepted stranger becomes a PERMANENT `SessionState` (unbounded RAM) and, before
+/// `process_for_peer` routed ordinary per-session traffic straight to its own box, an
+/// unbounded per-message trial-decryption cost too — a small amount of attacker traffic buying
+/// a large, and growing, amount of victim CPU (SEC-33).
+///
+/// Set to match the client layer's own `MAX_CONTACTS` (`client::store`, 10_000, SEC-44): a real
+/// account's live session count tracks its contact count (one session per correspondent), plus
+/// incidental churn from strangers who message once and are never added as a contact — the same
+/// headroom the client already accepts for its own contact-flood cap. `inbound_sessions` can
+/// hold at most one entry per `peer_ik` ALREADY counted here (the `inbound implies outbound`
+/// invariant enforced below), so total `SessionState` entries across both maps top out at 2×
+/// this, never more.
+///
+/// Honest residual, same shape as `MAX_MAILBOXES`'s: once `sessions` is completely full, a
+/// GENUINE new correspondent's first contact is refused exactly like a hostile flood's — this
+/// cap cannot tell them apart. `Peer::take_refused_sessions` makes that refusal loud (a counter
+/// the caller can surface) rather than a message silently vanishing with no trace at all.
+const MAX_SESSIONS: usize = 10_000;
+
 /// Drop an undelivered queued message after this long (wall-clock, from queue time). The
 /// recipient's mailbox TTL bounds how long a deposit could survive anyway, and a ratchet
 /// step likely made the exact ciphertext undeliverable well before — so retrying past this
@@ -399,6 +426,20 @@ pub struct Peer<T: Transport> {
     /// accepted by a relay, retransmitted verbatim by [`Peer::flush_outbox`].
     outbox: Vec<OutboxEntry>,
     outbox_next_id: u64,
+    /// Count of brand-new strangers' first-contact attempts refused since the last
+    /// [`Peer::take_refused_sessions`] because `sessions` was already at `MAX_SESSIONS`. Never
+    /// persisted (like `lease`/`pending_ack`) — this is a live "something is flooding you"
+    /// signal for the caller, not session state that has to survive a restart. Existing
+    /// signalling paths hand back only `None` for a payload that could not be delivered
+    /// (indistinguishable from ordinary cover traffic / a miss); this is what makes a capacity
+    /// refusal LOUD instead.
+    sessions_refused: u64,
+    /// Count of real `Session::decrypt` attempts made while routing an inbound `Ratchet`
+    /// payload. Test-only bookkeeping (never read or reset by production code): it is what
+    /// lets a test prove, by COUNTING rather than timing, that `process_for_peer`'s per-session
+    /// routing costs O(1) regardless of how many sessions are held, unlike the generic
+    /// `process_ratchet` sweep it replaces on the real per-session-box path (SEC-33).
+    decrypt_attempts_for_test: u64,
 }
 
 /// A self-contained instruction to delete one mailbox's leased messages: the address, the
@@ -496,6 +537,8 @@ impl<T: Transport> Peer<T> {
             pending_ack: Vec::new(),
             outbox: Vec::new(),
             outbox_next_id: 0,
+            sessions_refused: 0,
+            decrypt_attempts_for_test: 0,
         }
     }
 
@@ -1187,10 +1230,17 @@ impl<T: Transport> Peer<T> {
             .collect();
         let mut box_err: Option<String> = None;
         for (auth, handle) in boxes {
+            // Which peer this SPECIFIC box belongs to — known from the handle we minted it
+            // under, before `fetch_mailbox` consumes `handle`. `process_for_peer` (SEC-33)
+            // uses it to try only that peer's session(s) instead of every session held.
+            let owner = match &handle {
+                Handle::Box(ik, _) => *ik,
+                _ => unreachable!("`boxes` is built only from Handle::Box entries above"),
+            };
             match self.fetch_mailbox(auth, handle, now) {
                 Ok(payloads) => {
                     for p in &payloads {
-                        out.push(self.process(p).map(|mut r| { r.msg_id = payload_id(p); r }));
+                        out.push(self.process_for_peer(&owner, p).map(|mut r| { r.msg_id = payload_id(p); r }));
                     }
                 }
                 Err(e) => box_err = Some(e),
@@ -1312,6 +1362,51 @@ impl<T: Transport> Peer<T> {
         std::mem::take(&mut self.pending_ack)
     }
 
+    /// Take (reset to 0) the count of brand-new strangers' first-contact attempts refused
+    /// since the last call because `sessions` was at `MAX_SESSIONS` capacity — SEC-33's LOUD
+    /// counterpart to the silent `None` those attempts otherwise return from `receive`. A
+    /// caller (CLI/GUI) can poll this after every receive and surface a warning ("N connection
+    /// attempts refused: too many open conversations") instead of a flood of strangers vanishing
+    /// with no trace whatsoever.
+    pub fn take_refused_sessions(&mut self) -> u64 {
+        std::mem::take(&mut self.sessions_refused)
+    }
+
+    /// SEC-33: handle a payload known to have arrived at ONE SPECIFIC peer's own inbound
+    /// drop-box (`Handle::Box(peer_ik, _)`) — never the identity mailbox. `route_for` only
+    /// ever deposits a `Ratchet` envelope at the recipient's blinded PER-SESSION box, whose
+    /// address is MY mailbox point blinded by THAT peer's own `drop_seed` (see `receive`) —
+    /// an independently-derived value nobody else's session shares. So anything landing in
+    /// this specific box could only ever belong to `peer_ik`'s session(s); trying every OTHER
+    /// session held (`process_ratchet`'s generic sweep) buys nothing legitimate and IS the
+    /// per-message cost SEC-33 multiplies by session count. This path stays O(1) regardless
+    /// of how many sessions are held — which is what ordinary, ongoing conversation traffic
+    /// actually needs; `process`/`process_ratchet` remain the fallback for payloads whose
+    /// owning session genuinely isn't known ahead of time (the identity mailbox).
+    fn process_for_peer(&mut self, peer_ik: &[u8; 32], payload: &Payload) -> Option<Received> {
+        match payload {
+            Payload::Session(SessionEnvelope::Ratchet(msg)) => {
+                if let Some(st) = self.sessions.get_mut(peer_ik) {
+                    self.decrypt_attempts_for_test += 1;
+                    if let Ok(pt) = st.session.decrypt(msg) {
+                        return Some(Received { sender: *peer_ik, plaintext: pt, msg_id: [0u8; 32] });
+                    }
+                }
+                if let Some(st) = self.inbound_sessions.get_mut(peer_ik) {
+                    self.decrypt_attempts_for_test += 1;
+                    if let Ok(pt) = st.session.decrypt(msg) {
+                        return Some(Received { sender: *peer_ik, plaintext: pt, msg_id: [0u8; 32] });
+                    }
+                }
+                None
+            }
+            // Openers/skeletons never legitimately arrive on a per-session box (`route_for`
+            // never sends them there) — handled generically for defense-in-depth; unreachable
+            // from the honest client, harmless if it ever isn't.
+            _ => self.process(payload),
+        }
+    }
+
     /// Обработать один входящий груз, продвинув соответствующую сессию. Атрибутит
     /// отправителя: Initial несёт `sender_ik` в KA; для Ratchet отправитель = ключ
     /// сессии, которая расшифровала (trial-decryption).
@@ -1385,6 +1480,19 @@ impl<T: Transport> Peer<T> {
                 // session under any victim's IK (it would become the primary outbound session and
                 // silently swallow the replies) and burn a one-time prekey per attempt.
                 let pt = session.decrypt(msg).ok()?;
+                // SEC-33: refuse a BRAND-NEW stranger once `sessions` is at `MAX_SESSIONS`,
+                // BEFORE `consume_opk` — a refused attempt must not burn a real one-time prekey
+                // on a peer we are about to discard anyway (that would degrade forward secrecy
+                // for the NEXT genuine contact, who'd fall back to 3-DH for no reason). Checked
+                // AFTER authentication (so this never short-circuits before the AEAD proves the
+                // sender holds the claimed IK) but only against a sender NOT already in
+                // `sessions` — the re-delivery loop above and an already-known peer's
+                // `inbound_sessions` entry (simultaneous first contact) are never refused by
+                // this; only growth of the table itself is capped.
+                if !self.sessions.contains_key(&sender_ik) && self.sessions.len() >= MAX_SESSIONS {
+                    self.sessions_refused = self.sessions_refused.saturating_add(1);
+                    return None;
+                }
                 // Authenticated ⇒ commit. Consuming the OPK here still gives at-most-once dedup on
                 // re-delivery: a genuine duplicate finds the OPK already gone and stops earlier.
                 self.account.consume_opk(ka);
@@ -1418,16 +1526,32 @@ impl<T: Transport> Peer<T> {
     /// after a simultaneous first contact rides `inbound_sessions`.
     fn process_ratchet(&mut self, msg: &RatchetMessage) -> Option<Received> {
         for (ik, st) in self.sessions.iter_mut() {
+            self.decrypt_attempts_for_test += 1;
             if let Ok(pt) = st.session.decrypt(msg) {
                 return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
             }
         }
         for (ik, st) in self.inbound_sessions.iter_mut() {
+            self.decrypt_attempts_for_test += 1;
             if let Ok(pt) = st.session.decrypt(msg) {
                 return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
             }
         }
         None
+    }
+
+    /// Test-only: how many real `Session::decrypt` attempts have run since the last
+    /// [`Peer::reset_decrypt_attempts_for_test`] — see `session_cap_tests` for how this proves,
+    /// by counting rather than timing, that `process_for_peer` costs O(1) where the generic
+    /// `process_ratchet` sweep it replaces on the hot path costs O(sessions) (SEC-33).
+    #[cfg(test)]
+    pub fn decrypt_attempts_for_test(&self) -> u64 {
+        self.decrypt_attempts_for_test
+    }
+
+    #[cfg(test)]
+    pub fn reset_decrypt_attempts_for_test(&mut self) {
+        self.decrypt_attempts_for_test = 0;
     }
 }
 
@@ -1618,5 +1742,198 @@ mod outbox_state_tests {
             Response::Rejected(e) => assert!(e.contains("re-establish"), "loud, actionable error: {e}"),
             other => panic!("a stale session must fail loud, not silently drop mail: {other:?}"),
         }
+    }
+}
+
+/// SEC-33: unbounded session growth as a trial-decryption DoS amplifier.
+#[cfg(test)]
+mod session_cap_tests {
+    use crate::node::{InMemoryTransport, Payload, RelayNode, SessionEnvelope};
+    use crate::pqxdh::Account;
+    use crate::ratchet::{Header, RatchetMessage, Session};
+    use admission::capability::{Capability, Quota, Scope};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use x25519_dalek::PublicKey;
+
+    fn dev_cap() -> Capability {
+        Capability {
+            capability_id: [0xCC; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 100_000, max_bytes: 1 << 30, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x35; 32],
+        }
+    }
+
+    fn shared() -> (InMemoryTransport, PublicKey) {
+        let mut relay = RelayNode::new(0);
+        relay.issue_capability(dev_cap());
+        let relay_pub = relay.relay_public();
+        (InMemoryTransport::new(Rc::new(RefCell::new(relay))), relay_pub)
+    }
+
+    fn mk_peer(transport: &InMemoryTransport, relay_pub: PublicKey) -> super::Peer<InMemoryTransport> {
+        super::Peer::new(transport.clone(), Account::generate(), dev_cap(), relay_pub)
+    }
+
+    /// A cheap synthetic session under a distinct fabricated `peer_ik` — for filling `sessions`
+    /// toward `MAX_SESSIONS` without paying for a real PQXDH agreement per entry (that would make
+    /// the test itself pay the CPU cost SEC-33 is about). Only table MEMBERSHIP is under test
+    /// here, never this session's cryptographic history.
+    fn dummy_ik(i: u64) -> [u8; 32] {
+        let mut ik = [0u8; 32];
+        ik[..8].copy_from_slice(&i.to_le_bytes());
+        ik
+    }
+    /// One real `Session::init_sender` (X25519 keygen + a DH), CLONED into every dummy entry
+    /// instead of re-run per entry: `MAX_SESSIONS` real key generations would make filling the
+    /// table itself slow enough to risk starving unrelated timing-sensitive tests running in
+    /// parallel, for no benefit — a cheap struct clone proves table membership just as well.
+    fn dummy_session_template() -> Session {
+        Session::init_sender([1u8; 32], [2u8; 32])
+    }
+
+    fn insert_dummy(peer: &mut super::Peer<InMemoryTransport>, ik: [u8; 32], template: &Session) {
+        peer.sessions.insert(
+            ik,
+            super::SessionState {
+                session: template.clone(),
+                pending_initial: None,
+                drop_seed: [3u8; 32],
+                peer_mailbox_pub: [4u8; 32],
+            },
+        );
+    }
+
+    /// A flood of distinct strangers, each capable of a genuine PQXDH agreement against our
+    /// published bundle with NO one-time prekey of ours required (3-DH always succeeds against
+    /// our reusable signed prekey), must not grow `sessions` past `MAX_SESSIONS` — otherwise
+    /// nothing bounds how much RAM (and, before `process_for_peer`, how much per-message
+    /// trial-decryption CPU) a remote party can force us to hold. Drives the FINAL, over-the-cap
+    /// stranger through the real `process_opener` path with a genuine PQXDH-derived opener; the
+    /// rest of the table is filled with cheap synthetic entries (see `insert_dummy`) so the test
+    /// doesn't itself pay for `MAX_SESSIONS` real handshakes.
+    #[test]
+    fn a_flood_of_first_contact_openers_cannot_grow_the_session_table_past_the_cap() {
+        let (transport, relay_pub) = shared();
+        let mut victim = mk_peer(&transport, relay_pub);
+        victim.publish(0);
+        let template = dummy_session_template();
+        for i in 0..super::MAX_SESSIONS as u64 {
+            insert_dummy(&mut victim, dummy_ik(i), &template);
+        }
+        assert_eq!(victim.sessions.len(), super::MAX_SESSIONS, "set up at exactly the cap");
+
+        let mut mallory = mk_peer(&transport, relay_pub);
+        let victim_ik = victim.identity();
+        mallory.connect(&victim_ik, 0).expect("mallory can fetch the bundle and PQXDH-agree freely");
+        let opener = mallory.encrypt_next(&victim_ik, b"let me in").expect("encrypt mallory's opener");
+
+        assert!(
+            victim.open_for_test(&Payload::Session(opener)).is_none(),
+            "a stranger past the cap must not be admitted"
+        );
+        assert_eq!(
+            victim.sessions.len(),
+            super::MAX_SESSIONS,
+            "the session table must not grow past the cap"
+        );
+        assert_eq!(victim.take_refused_sessions(), 1, "the refusal must be LOUD, not silent");
+    }
+
+    /// Control: an ALREADY-established contact must keep receiving even while `sessions` sits at
+    /// the cap — the cap refuses only a BRAND-NEW stranger (`process_opener`); an existing
+    /// session is never touched by it, and `process_for_peer` routes its traffic directly. This
+    /// is what stops the fix from "passing" by refusing everything.
+    #[test]
+    fn an_established_contact_still_receives_after_the_session_cap_is_reached() {
+        let (transport, relay_pub) = shared();
+        let mut victim = mk_peer(&transport, relay_pub);
+        let mut alice = mk_peer(&transport, relay_pub);
+        victim.publish(0);
+        let victim_ik = victim.identity();
+        let alice_ik = alice.identity();
+
+        // Alice's REAL first contact, accepted before the table fills.
+        alice.connect(&victim_ik, 0).unwrap();
+        let opener = alice.encrypt_next(&victim_ik, b"hi, it's alice").unwrap();
+        let received = victim
+            .open_for_test(&Payload::Session(opener))
+            .expect("alice's genuine opener must be accepted");
+        assert_eq!(received.plaintext.as_slice(), b"hi, it's alice");
+
+        // Fill the REST of the table (alice already occupies one slot).
+        let template = dummy_session_template();
+        for i in 0..(super::MAX_SESSIONS as u64 - 1) {
+            insert_dummy(&mut victim, dummy_ik(i), &template);
+        }
+        assert_eq!(victim.sessions.len(), super::MAX_SESSIONS, "at the cap, alice included");
+
+        // Alice's NEXT message, continuing the SAME live session, must still decrypt.
+        let next = alice.encrypt_next(&victim_ik, b"still here?").unwrap();
+        let got = victim
+            .process_for_peer(&alice_ik, &Payload::Session(next))
+            .expect("an established contact must keep receiving once the table is at the cap");
+        assert_eq!(got.plaintext.as_slice(), b"still here?");
+    }
+
+    /// SEC-33's core claim, made structural: on a garbage `Ratchet` message that matches NO
+    /// held session, the generic `process_ratchet` sweep (still used for the identity mailbox,
+    /// where the sender genuinely isn't known ahead of time) pays one `decrypt` attempt PER
+    /// session held — attacker-controlled, since `sessions` holds one entry per accepted
+    /// stranger. `process_for_peer` (the real per-session-box path, used for ordinary,
+    /// ongoing traffic) pays exactly ONE, because the box the payload arrived on already
+    /// identifies the owning peer. Counts real `decrypt` calls rather than timing anything, so
+    /// this cannot flake on a loaded CI box.
+    ///
+    /// Uses a REPRESENTATIVE session count, not the full `MAX_SESSIONS` — the cap tests above
+    /// already prove the boundary itself at negligible cost; this test's `decrypt` calls are
+    /// each a REAL DH-ratchet step (2 X25519 DHs + 2 HKDF expansions — see `ratchet::dh_ratchet`),
+    /// so running it at `MAX_SESSIONS` would spend several real seconds proving a ratio that a
+    /// few hundred sessions already demonstrate just as conclusively.
+    const REPRESENTATIVE_SESSION_COUNT: u64 = 300;
+
+    #[test]
+    fn process_for_peer_pays_one_decrypt_attempt_where_the_generic_sweep_pays_one_per_session() {
+        let (transport, relay_pub) = shared();
+        let mut victim = mk_peer(&transport, relay_pub);
+        let template = dummy_session_template();
+        for i in 0..REPRESENTATIVE_SESSION_COUNT {
+            insert_dummy(&mut victim, dummy_ik(i), &template);
+        }
+        assert_eq!(victim.sessions.len(), REPRESENTATIVE_SESSION_COUNT as usize);
+
+        // A well-formed but GARBAGE `Ratchet` message: its `dh`/ciphertext match no session's
+        // state, so every trial decrypt this drives is guaranteed to fail the AEAD.
+        let garbage = RatchetMessage {
+            header: Header { dh: [0x77; 32], pn: 0, n: 0, salt: [7u8; 16] },
+            ciphertext: vec![0x11; 48],
+        };
+
+        victim.reset_decrypt_attempts_for_test();
+        assert!(
+            victim.open_for_test(&Payload::Session(SessionEnvelope::Ratchet(garbage.clone()))).is_none(),
+            "garbage must not decrypt against anything"
+        );
+        assert_eq!(
+            victim.decrypt_attempts_for_test(),
+            REPRESENTATIVE_SESSION_COUNT,
+            "the generic sweep must try every session held — this is the O(sessions) cost SEC-33 is about"
+        );
+
+        victim.reset_decrypt_attempts_for_test();
+        assert!(
+            victim
+                .process_for_peer(&dummy_ik(0), &Payload::Session(SessionEnvelope::Ratchet(garbage)))
+                .is_none(),
+            "still garbage, still must not decrypt"
+        );
+        assert_eq!(
+            victim.decrypt_attempts_for_test(),
+            1,
+            "routing by the box's own peer identifies the ONLY session that could ever match — O(1), not O(sessions)"
+        );
     }
 }

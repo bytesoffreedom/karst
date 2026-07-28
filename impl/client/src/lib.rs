@@ -1154,7 +1154,13 @@ pub fn send_session_batch(
 /// to send again. Returns how many were delivered this pass.
 pub fn flush_outbox(store: &Store, relay: &Relay, now: u64) -> Result<usize, String> {
     let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
-    let cap = store.load_capability().unwrap_or_else(|_| dev_capability());
+    // NOT `unwrap_or(dev_capability())`. The dev capability's secret is published in this
+    // repository, so falling back to it sends real mail under a credential anyone can forge —
+    // while the sender believes the message passed normal admission (A8-11). A capability we
+    // cannot read is a reason to stop retrying, not to downgrade silently.
+    let cap = store
+        .load_capability()
+        .map_err(|e| format!("cannot read this account's admission capability: {e}"))?;
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);

@@ -599,7 +599,12 @@ fn do_publish(store: &Store, relays: &[Relay], offline: bool) {
     }
     for pidx in proxies {
         let p = store.as_proxy(pidx);
-        let cap = p.load_capability().unwrap_or_else(|_| client::dev_capability());
+        // Never fall back to the DEV capability: its secret is public, so publishing under it
+        // would advertise this identity with a forgeable credential (A8-11).
+        let Ok(cap) = p.load_capability() else {
+            eprintln!("warning: proxy {pidx} has no readable capability — not publishing it");
+            continue;
+        };
         let _ = client::publish_all(&p, relays, cap, now_secs());
     }
 }
@@ -1528,7 +1533,9 @@ fn create_proxy(app: State<App>, label: String) -> Result<Proxy, String> {
     // immediately. Without this the channel is unreachable ("bundle not published") until the next
     // unlock re-runs do_publish — the exact "send failed: bundle not published" you hit.
     let np = store.as_proxy(e.index);
-    let cap = np.load_capability().unwrap_or_else(|_| client::dev_capability());
+    let cap = np
+        .load_capability()
+        .map_err(|err| format!("cannot read the new proxy's capability: {err}"))?;
     let _ = client::publish_all(&np, &relays, cap, now_secs());
     Ok(proxy_of(&store, &e))
 }
@@ -1582,7 +1589,9 @@ fn migrate_channel(app: State<App>, old_index: u32, contacts: Vec<String>, new_l
     // Mint + publish the new channel so contacts can open a session to it.
     let new_e = store.create_proxy(new_label.trim(), now_secs()).map_err(|e| format!("creating channel: {e}"))?;
     let np = store.as_proxy(new_e.index);
-    let cap = np.load_capability().unwrap_or_else(|_| client::dev_capability());
+    let cap = np
+        .load_capability()
+        .map_err(|e| format!("cannot read the new channel's capability: {e}"))?;
     let _ = client::publish_all(&np, &relays, cap, now_secs());
     let new_ik = np.load_account().map_err(|e| e.to_string())?.identity_public();
     // Over the OLD channel's authenticated session, tell each chosen contact to move; re-tag locally.

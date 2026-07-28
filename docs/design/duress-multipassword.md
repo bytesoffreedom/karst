@@ -167,14 +167,43 @@ user giving the decoy password does not keep the real data alive).
 
 ## Wipe semantics
 
-**Tier-2 container caveat (CRYPTO-12), stated before the Tier-1 description below:**
-`Container::wipe()` randomises the buffer and persists it — but `persist` writes a NEW
-file and renames over the old name, so the previous inode (keyslots, wrapped region
-keys, ciphertext) is UNLINKED, not overwritten. Those blocks can survive in free space,
-the journal, a CoW snapshot, the SSD FTL or a backup, and reopen if a P1/P2 password is
-later obtained — even for an adversary who imaged the disk only *after* the wipe.
-In-place overwriting would not fix it either. Call it best-effort; a real guarantee needs
-an independently erasable KEK (OS/hardware keystore) that wipe destroys.
+**Tier-2 container fix (CRYPTO-12/#184), stated before the Tier-1 description below:**
+`Container::wipe()` used to only randomise the buffer and persist it via the whole-file
+swap — but `persist` writes a NEW file and renames over the old name, so the previous
+inode (keyslots, wrapped region keys, ciphertext) was UNLINKED, not overwritten. Those
+blocks could survive in free space, the journal, a CoW snapshot, the SSD FTL or a
+backup, and reopen if a P1/P2 password was later obtained — even for an adversary who
+imaged the disk only *after* the wipe.
+
+**Fix:** every key in the container reduces to one small value — the `SALT_LEN`-byte
+salt prefix, since every slot's opening key is `Argon2id(password, salt)` and every
+region key is only reachable through a slot. That salt already plays the
+"independently erasable KEK" role this note used to say we'd need to add — nothing new
+had to be introduced. `wipe()` now overwrites JUST the salt's bytes IN PLACE on the
+*current, still-live* inode (a real `seek`+`write`+`fsync` to the existing file, via
+`persist_range`, not a new file) BEFORE doing anything else, and only afterward runs
+the general randomise-and-swap to also scrub the ciphertext. On an ordinary, non-CoW
+filesystem this closes the gap completely: the moment that first `fsync` returns, the
+true original salt is gone from every location that filesystem will ever report, so a
+forensic image taken any time afterward — even immediately after a crash — recovers
+only the fresh salt, never the one any password could still be checked against.
+
+**What remains open, honestly, because it cannot be closed inside `container.rs`:**
+- **CoW filesystems, wear-levelling SSDs, snapshots.** An "in-place" write there does
+  not guarantee the same physical medium is touched — this was already conceded above
+  and nothing in a pure file-level fix can reach it.
+- **Any copy of `container.dat` taken BEFORE the wipe** (backup, cloud sync, a second
+  disk image) still has the true original salt sitting in it — destroying the live
+  file cannot reach bytes that are not in that file. Moving the salt to a small sidecar
+  file *outside* `container.dat` was considered and rejected: it would put the
+  erasable secret somewhere `account_snapshot_round_trips_with_zero_external_artifacts`
+  already pins must not exist (a hidden account's directory holds ONLY
+  `container.dat`), and a pre-wipe backup would still contain that sidecar too. So the
+  erasable root cannot leave the file, which means this specific residual is not
+  fixable from inside this module at all — call it best-effort against a live disk, not
+  a guarantee against a stale copy. A real close still needs an independently erasable
+  root that lives somewhere a backup never reaches: an OS keyring or hardware
+  keystore, exactly what this note already named as the eventual fix.
 
 `wipe()` (Tier 1) = crypto-erase: remove `salt`, `slots.dat`, `deadman.dat`, and
 `accounts/` (real and decoy dirs). Because every sealed file's key is

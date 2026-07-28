@@ -18,8 +18,9 @@
 //! - `open()` derives the password key once and trial-opens all 8 slots; a wrong
 //!   password (or a compartment that isn't there) fails AEAD on every slot — "no such
 //!   compartment" and "wrong password" are the same answer, which is the whole point.
-//! - P1 (protect) and P3 (blind) wrap the SAME main region key, differing only by a
-//!   policy flag + write ceiling; revealing P3 cannot expose P1 or P2.
+//! - P1 (protect) and P3 (blind) wrap the SAME main region key and, since CRYPTO-10 (below),
+//!   the SAME policy byte and the SAME write ceiling too — revealing P3 cannot expose P1 or P2,
+//!   and can no longer be distinguished from an ordinary account by its write behaviour either.
 //!
 //! **CRYPTO-14 — honest limit: P3 does NOT mask hidden writes against a snapshot-diff
 //! adversary, and this is not fixable at this layer.** Checked against all three things such an
@@ -47,6 +48,38 @@
 //!   single filesystem-wide timestamp with no per-region granularity. The changed-bytes leak
 //!   above is strictly more informative than mtime and is the one that actually distinguishes
 //!   compartments.
+//!
+//! **CRYPTO-10 — the cover password used to prove a duress setup exists; retracts
+//! `docs/design/duress-multipassword.md` §"Overwrite decision (settled)"'s "we keep BOTH
+//! mechanisms".** A slot used to carry a `Policy` (Protect for P1, Blind for P3) that changed
+//! `write`'s ceiling: Protect refused past `region_cap / 2`, Blind was allowed the whole rest of
+//! the container. That is a coercer-visible tell with nothing but the password they were handed:
+//! every vanilla, never-configured-anything account has exactly ONE password and it is always
+//! Protect, so it ALWAYS refuses past `region_cap / 2` — that is the universal baseline, not an
+//! edge case. A cover password that keeps accepting well past that point is therefore, by itself,
+//! proof a second (Blind) password was deliberately added to this account — which is exactly the
+//! one fact a duress feature must never let the cover password prove. The fix (see
+//! `Container::write_limits`): EVERY Main write, P1 or P3, gets the identical ceiling now — the
+//! Policy byte is still recorded per slot (for anything Phase 2 may need later) but `Policy::Blind`
+//! no longer exists as a value ANY code path can produce, and the one place that used to branch on
+//! it does not anymore. Net effect, stated plainly because it is a real capability loss: a Blind
+//! write can no longer spill into the hidden tail at all. CRYPTO-14 above already showed that
+//! capability never bought any masking benefit (a spill only ever destroyed the hidden
+//! compartment, it never hid anything from a snapshot-diff adversary) — so closing it costs
+//! nothing it was actually providing, and a Blind save is crash-atomic for the first time (it can
+//! no longer reach `write_region_at`'s non-atomic spill path via the public API at all).
+//!
+//! **Honest residual — management OPERATIONS still betray a second password, only READING an
+//! account never does.** `add_hidden`/`add_blind_main`/`add_wipe` all require reading the
+//! management directory (`read_dir`), which only the P1 key can open — that is what makes P3 safe
+//! to reveal (`revealing_p3_cannot_enumerate_the_other_passwords`, pinned below). A coercer handed
+//! the cover password who tries to configure ANOTHER duress password through it gets refused where
+//! the real password would have succeeded, and that refusal is itself informative: it says "this
+//! is not the password that manages slots," which is already evidence something else does. This
+//! cannot be closed without either letting P3 read the directory (directly defeating the property
+//! the directory exists for) or removing the directory (reopening A3-1, a silently-clobbered
+//! second hidden account). It is a real, accepted limit, not a settled one to reopen — document
+//! it in the UI as "do not attempt to add passwords from the cover session."
 
 use crate::secretbox::MasterKey;
 use std::io;
@@ -260,12 +293,17 @@ pub enum Role {
     Wipe,
 }
 
+/// CRYPTO-10: this used to have a THIRD value, `Blind` (P3), whose only effect was a wider write
+/// ceiling than `Protect` — see the module doc. That value has been removed rather than left
+/// unused: the whole point is that no code path can produce it anymore, not merely that nothing
+/// currently reads it. Every Main slot (P1 and P3 alike) now seals `Protect`; the byte is kept
+/// (rather than dropped) only so a Phase-2 caller has somewhere to put a future distinction that
+/// does NOT reintroduce a P1/P3 behavioural difference.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
-    /// P1: main confined to its A-cap; never writes the hidden tail.
+    /// Every main slot, P1 and P3 alike: confined to half the region's ping-pong geometry, same
+    /// as a completely vanilla single-password account. Never writes the hidden tail.
     Protect,
-    /// P3: main allowed the whole container; may overwrite the hidden tail (accepted risk).
-    Blind,
     /// Non-main roles.
     None,
 }
@@ -291,14 +329,12 @@ impl Policy {
     fn to_byte(self) -> u8 {
         match self {
             Policy::Protect => 1,
-            Policy::Blind => 2,
             Policy::None => 0,
         }
     }
     fn from_byte(b: u8) -> Policy {
         match b {
             1 => Policy::Protect,
-            2 => Policy::Blind,
             _ => Policy::None,
         }
     }
@@ -532,19 +568,22 @@ impl Container {
             .find(|i| !used.contains(i))
     }
 
-    /// Add the P3 (blind) alias for the main account: give an existing main password to
+    /// Add the P3 (cover) alias for the main account: give an existing main password to
     /// learn the shared region key, then seal a new slot with the SAME region and the SAME
     /// `region_cap` (CRYPTO-13: `region_cap` is the ping-pong GEOMETRY of the region — where its
     /// two copy slots live — and P1/P3 write the same physical bytes, so they must agree on it
-    /// byte-for-byte. Storing `blind_cap` there instead — as this used to — would make P3 alone
-    /// compute a different split point than P1, so a small P3 save could land its copy inside
-    /// what P1 thinks is empty tail (or the hidden region) instead of alternating in place).
-    /// The actual wider write PERMISSION for Blind (the "A+B that may spill into the hidden
-    /// tail") is derived from the `Blind` policy byte at write time instead, see `Container::write`.
-    /// `blind_cap` is kept as a caller-checked parameter, not silently ignored: it must equal
-    /// "the rest of the container after this region" (what `ContainerVault::add_blind` already
-    /// computes) or this errors — a smaller value would silently promise P3 less reach than the
-    /// design gives it; a bigger one would silently exceed the buffer.
+    /// byte-for-byte).
+    ///
+    /// **CRYPTO-10 retraction.** P3 used to be sealed `Policy::Blind`, which `write_limits` gave a
+    /// wider ceiling than P1's `Policy::Protect` — the ONLY purpose of the distinction. That made
+    /// the write ceiling itself a coercer-visible proof that a second password existed (see the
+    /// module doc). P3 is now sealed with the IDENTICAL `Policy::Protect` byte P1 gets, so it is
+    /// not merely unreadable to a coercer (the mgmt-directory property below already gave us that)
+    /// but behaviourally indistinguishable too. `blind_cap` is kept as a caller-checked parameter
+    /// even though it no longer changes any write permission — it is what
+    /// `ContainerVault::add_blind` already computes as "the rest of the container after the main
+    /// region," and keeping the check catches a caller whose understanding of the region geometry
+    /// has drifted, rather than silently accepting whatever it happens to compute.
     pub fn add_blind_main(&mut self, existing_main_password: &[u8], p3_password: &[u8], blind_cap: u64) -> io::Result<()> {
         let key = self.key_for(existing_main_password)?;
         let info = self.find_slot(&key).ok_or_else(|| io_err("wrong main password"))?;
@@ -561,7 +600,8 @@ impl Container {
         }
         let mut used = self.read_dir(&key)?;
         let idx = self.free_slot(&used).ok_or_else(|| io_err("no free slot"))?;
-        self.seal_slot(idx, Role::Main, Policy::Blind, p3_password, info.region_off, info.region_cap, &info.region_key)?;
+        // CRYPTO-10: `Policy::Protect`, NOT a distinct `Blind` value — see the doc above.
+        self.seal_slot(idx, Role::Main, Policy::Protect, p3_password, info.region_off, info.region_cap, &info.region_key)?;
         used.push(idx);
         self.write_dir(&key, &used)?;
         self.persist()
@@ -637,22 +677,23 @@ impl Container {
     }
 
     /// Write the account-state payload for the compartment this password opens. Honors the
-    /// slot's write ceiling: Protect refuses to exceed HALF its cap (CRYPTO-13 — that half is
-    /// exactly the atomic ping-pong budget; a Protect payload bigger than that has nowhere safe
-    /// to land and must be refused loudly, never silently handed to the non-atomic spill path).
-    /// Blind may spill past the main region into the hidden tail (accepted risk — corrupts the
-    /// hidden compartment).
+    /// slot's write ceiling: EVERY Main write — P1 or P3 alike, since CRYPTO-10 — refuses to
+    /// exceed HALF its cap (CRYPTO-13 — that half is exactly the atomic ping-pong budget; a
+    /// payload bigger than that has nowhere safe to land and must be refused loudly, never
+    /// silently handed to the non-atomic spill path). Neither can reach the hidden tail through an
+    /// ordinary write anymore.
     ///
-    /// `region_cap` here is the ping-pong GEOMETRY (same for P1 and P3, see `add_blind_main`),
-    /// not necessarily the write PERMISSION — Blind's permission is wider (derived from the
-    /// policy in `write_limits`, shared with `max_payload_len`) and is exactly the ONLY case
-    /// that can exceed the geometry and fall to the
-    /// non-atomic spill path inside `write_region_at` (CRYPTO-13). Protect's ceiling here MUST
-    /// match `write_region_at`'s safe-path boundary (`region_cap / 2`) exactly — checking against
-    /// the full `region_cap` instead (an earlier version of this fix did exactly that) let a
-    /// completely ordinary Protect save in the `(region_cap/2, region_cap]` band silently fall
-    /// through to the spill branch: no atomicity, no error, the same brick CRYPTO-13 exists to
-    /// prevent, just moved to happen only sometimes instead of always.
+    /// `region_cap` here is the ping-pong GEOMETRY (identical for P1 and P3, see
+    /// `add_blind_main`), and — post CRYPTO-10 — it is now also the write PERMISSION for every
+    /// Main slot: `write_limits` no longer branches on `Policy` at all, so `hard_cap` and
+    /// `region_cap` are always equal here and `write_region_at`'s non-atomic spill branch is
+    /// unreachable from this call site (it remains a general primitive, still exercised directly
+    /// by tests, see CRYPTO-14's tests below). The ceiling MUST match `write_region_at`'s safe-path
+    /// boundary (`region_cap / 2`) exactly — checking against the full `region_cap` instead (an
+    /// earlier version of this fix did exactly that) let a completely ordinary save in the
+    /// `(region_cap/2, region_cap]` band silently fall through to the spill branch: no atomicity,
+    /// no error, the same brick CRYPTO-13 exists to prevent, just moved to happen only sometimes
+    /// instead of always.
     pub fn write(&mut self, password: &[u8], payload: &[u8]) -> io::Result<()> {
         let key = self.key_for(password)?;
         let info = self
@@ -662,7 +703,7 @@ impl Container {
             return Err(io_err("wipe password cannot write"));
         }
         let need = COPY_HDR_LEN + 24 + payload.len() + 16;
-        let (hard_cap, ceiling) = Self::write_limits(&info, self.buf.len() as u64);
+        let (hard_cap, ceiling) = Self::write_limits(&info);
         if need > ceiling as usize {
             return Err(io_err("payload exceeds the write ceiling for this password"));
         }
@@ -677,30 +718,23 @@ impl Container {
         )?;
         // Hot path (called on every message save): write ONLY the touched copy slot's bytes in
         // place, so a 10 GB container doesn't get fully rewritten per save. Other regions —
-        // including the hidden tail under a Protect write, and this region's OTHER copy slot
-        // (CRYPTO-13) — are untouched on disk.
+        // including the hidden tail, now unreachable from ANY Main write, and this region's OTHER
+        // copy slot (CRYPTO-13) — are untouched on disk.
         self.persist_range(touched_off, touched_len)
     }
 
-    /// `(hard_cap, ceiling)` for `info`'s policy — the exact arithmetic `write` itself uses to
-    /// refuse an oversized payload, pulled out so `max_payload_len` (SEC-35, below) can compute
-    /// the SAME number a caller will eventually be checked against, instead of drifting out of
-    /// sync with a second copy of this match.
-    fn write_limits(info: &SlotInfo, buf_len: u64) -> (u64, u64) {
-        match info.policy {
-            // Blind's write permission is the WHOLE rest of the container, computed fresh here —
-            // never read from `region_cap`, which now always holds the shared geometry instead.
-            // Blind's ceiling for THIS early check is that same wide permission: it may legally
-            // use the non-atomic spill path.
-            Policy::Blind => {
-                let hard_cap = buf_len - info.region_off;
-                (hard_cap, hard_cap)
-            }
-            // Protect (and Hidden, which has no dual-cap concept at all): the ceiling is HALF the
-            // geometry — the safe-path boundary — not the full region_cap, so this can never be
-            // handed to the spill branch.
-            _ => (info.region_cap, info.region_cap / 2),
-        }
+    /// `(hard_cap, ceiling)` for `info` — pulled out so `max_payload_len` (SEC-35, below) computes
+    /// the SAME number `write` itself checks against, instead of drifting out of sync with a
+    /// second copy of this arithmetic.
+    ///
+    /// **CRYPTO-10 — no longer branches on `Policy`.** This used to give `Policy::Blind` a wider
+    /// ceiling (the whole rest of the container) than `Policy::Protect` (half the region's
+    /// ping-pong geometry) — that was the ONLY behavioural difference between P1 and P3, and it
+    /// was a coercer-visible one: see the module doc's CRYPTO-10 section for why a distinguishable
+    /// write ceiling is itself proof a duress setup exists. Every Main slot now gets the identical
+    /// ceiling unconditionally.
+    fn write_limits(info: &SlotInfo) -> (u64, u64) {
+        (info.region_cap, info.region_cap / 2)
     }
 
     /// The largest payload `write` will accept for `password`'s compartment RIGHT NOW.
@@ -721,7 +755,7 @@ impl Container {
         if info.role == Role::Wipe {
             return Err(io_err("wipe password cannot write"));
         }
-        let (_, ceiling) = Self::write_limits(&info, self.buf.len() as u64);
+        let (_, ceiling) = Self::write_limits(&info);
         // Inverse of `write`'s `need = COPY_HDR_LEN + 24 + payload.len() + 16 <= ceiling`.
         let overhead = (COPY_HDR_LEN + 24 + 16) as u64;
         Ok(ceiling.saturating_sub(overhead) as usize)
@@ -732,11 +766,15 @@ impl Container {
     // CRYPTO-13: `atomic_cap` splits `[off, off+atomic_cap)` into two equal copy slots (0 at
     // `off`, 1 at `off + atomic_cap/2`); a write always targets whichever slot is NOT the current
     // newest, so the other slot — a complete earlier save — is never touched by this write and
-    // survives a crash mid-write untouched. `hard_cap` (>= atomic_cap) is the actual write
-    // PERMISSION, wider only for a Blind write that spills past `atomic_cap`; a spill writes
-    // directly at `off` the same way this module always did before this fix — genuinely NOT
-    // atomic, and already an accepted risk (it can stomp the whole ping-pong pair and the hidden
-    // tail beyond it). Protect's `hard_cap == atomic_cap`, so it can never reach the spill path.
+    // survives a crash mid-write untouched. `hard_cap` (>= atomic_cap) is the parameter that widens
+    // the write PERMISSION past the safe geometry, taking the non-atomic SPILL PATH below — a
+    // capability this function still offers as a general primitive (and CRYPTO-14's tests below
+    // still exercise it directly), but which CRYPTO-10 made unreachable from `Container::write`:
+    // every caller through the public API now passes `hard_cap == atomic_cap`, because Blind no
+    // longer gets a wider ceiling than Protect (see the module doc's CRYPTO-10 section for why —
+    // the ceiling difference was itself a coercer-visible tell). A spill, if ever reached, writes
+    // directly at `off` — genuinely NOT atomic, and stomps the whole ping-pong pair and whatever
+    // comes after in the container; nothing in the live code paths can trigger that anymore.
 
     /// One copy slot's header: `(generation, ciphertext length)`, or `Err` if this slot doesn't
     /// authenticate (absent, torn by a crash, or plain random padding — all the same to us).
@@ -807,17 +845,19 @@ impl Container {
             Ok((toff, COPY_HDR_LEN + ct.len()))
         } else if hard_cap > atomic_cap && COPY_HDR_LEN + ct.len() <= hard_cap {
             // SPILL PATH — reachable ONLY when the caller's write permission (`hard_cap`) is
-            // WIDER than the ping-pong geometry (`atomic_cap`), which today means Blind (Protect
-            // and Hidden always call this with `hard_cap == atomic_cap`, see `Container::write`).
-            // This is an explicit gate, not just a comment: `Container::write` is SUPPOSED to
-            // refuse a Protect payload in this band before it ever reaches here, but a caller bug
-            // there must not silently degrade into an unwitnessed non-atomic write — it falls
-            // through to the capacity error below instead. The pre-CRYPTO-13 behaviour, unchanged
-            // and still explicitly non-atomic: writes directly at `off`, which — since it's bigger
-            // than one copy slot — necessarily overwrites BOTH ping-pong slots and, past
-            // `atomic_cap`, whatever comes after in the container (accepted risk: this is exactly
-            // the write that is allowed to corrupt the hidden tail; see
-            // `docs/design/duress-tier2-container.md` §2).
+            // WIDER than the ping-pong geometry (`atomic_cap`). Since CRYPTO-10, `Container::write`
+            // NEVER constructs such a call (Protect, Hidden, and now Blind too all call this with
+            // `hard_cap == atomic_cap` — see `write_limits`): the whole reason Blind used to be
+            // wider (a coercer-visible write-ceiling difference from Protect) was itself the
+            // CRYPTO-10 tell, so that permission was removed. This branch remains a general
+            // capability of the primitive (still exercised directly by CRYPTO-14's tests below,
+            // which construct a wide `hard_cap` by hand to pin what a spill would do IF one ever
+            // reached here) and a defensive fallback — a caller bug upstream must not silently
+            // degrade into an unwitnessed non-atomic write, so an out-of-band `hard_cap` still
+            // takes this explicit, still-non-atomic path rather than falling through to the
+            // capacity error below. Writes directly at `off`, which — since it's bigger than one
+            // copy slot — necessarily overwrites BOTH ping-pong slots and, past `atomic_cap`,
+            // whatever comes after in the container.
             let gen = [Self::read_copy_header(buf, off, region_key).ok(), {
                 if half > 0 {
                     Self::read_copy_header(buf, off + half, region_key).ok()
@@ -991,7 +1031,8 @@ impl Container {
     /// where a whole-file rewrite would be ruinous at multi-GB sizes. Honest tradeoff: this is
     /// not crash-atomic — a crash mid-write can lose that single save (the region reads corrupt
     /// until the next successful save), the same "last write didn't finish" risk any app has.
-    /// Structural changes (create/add_*/wipe) still go through the crash-safe whole-file swap.
+    /// Structural changes (create/add_*/wipe) mostly still go through the crash-safe whole-file
+    /// swap; `wipe` is the one exception, and only for the single small range described there.
     fn persist_range(&self, off: usize, len: usize) -> io::Result<()> {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new().write(true).open(&self.path)?;
@@ -1000,21 +1041,65 @@ impl Container {
         f.sync_all()
     }
 
-    /// The wipe password's effect: replace the whole buffer with fresh random, so every region and
-    /// slot becomes unopenable and no password works afterwards.
+    /// The wipe password's effect: destroy the salt IN PLACE on the current inode first, then
+    /// replace the whole buffer with fresh random, so every region and slot becomes unopenable and
+    /// no password works afterwards.
     ///
-    /// **Best-effort, NOT a guaranteed crypto-erase — say it plainly (CRYPTO-12).** This does not
-    /// overwrite the existing file: `persist` writes a NEW file and renames over the old name, so
-    /// the previous inode — holding the keyslots, wrapped region keys and ciphertext — is
-    /// UNLINKED, not destroyed. Its blocks can survive in free space, the filesystem journal, a
-    /// CoW/filesystem snapshot, the SSD's flash translation layer, or backup history, and become
-    /// openable again if a P1/P2 password is later obtained — even for an adversary who imaged the
-    /// disk only AFTER the wipe. In-place overwriting would not fix this either (CoW, wear
-    /// levelling and snapshots all keep old blocks).
+    /// **CRYPTO-12/#184 — what changed and why.** Every key in this file — every slot's opening
+    /// key, and transitively every region key those slots wrap — is `Argon2id(password, salt)` or
+    /// derived from a slot only reachable via that key. The salt is therefore the ONE small value
+    /// this whole file's confidentiality reduces to: an adversary who has the correct password but
+    /// NOT the exact original salt bytes cannot rederive the key that sealed anything, full stop.
+    /// It plays exactly the "independently erasable KEK" role the design note asked for — nothing
+    /// new needs to be introduced, and introducing one would fail anyway (see the residual below).
+    /// The bug this fixes: the OLD `wipe` only ever randomised the salt as part of a whole-buffer
+    /// `persist()`, which writes a NEW file and renames over the old name — the previous inode
+    /// (old salt included) is UNLINKED, not overwritten, so its blocks can survive in free space, a
+    /// filesystem journal, or a snapshot and still show the TRUE original salt to whoever recovers
+    /// them. This version overwrites JUST the salt's `SALT_LEN` bytes IN PLACE on the CURRENT,
+    /// still-live inode via `persist_range` — a real `seek`+`write`+`fsync` to the existing file,
+    /// not a new one — BEFORE doing anything else. `persist_range`'s own doc already states the
+    /// tradeoff for hot writes (not crash-atomic); here that is exactly the point: even a crash
+    /// immediately after this line leaves the vault already unopenable by ANY password (every slot
+    /// now needs a salt that no longer exists anywhere), which is the wipe's entire purpose — there
+    /// is no partially-wiped state where recovery is easier than fully-wiped. The general
+    /// randomise-and-swap below still runs afterward, to also scrub the ciphertext bytes and keep
+    /// the "looks like a container.dat" file present.
     ///
-    /// A real guarantee needs an independently erasable root: keep an extra random KEK in an OS or
-    /// hardware keystore, encrypt the region keys under it, and destroy THAT on wipe.
+    /// **What this closes.** On an ordinary, non-CoW filesystem (ext4/xfs without snapshots, a
+    /// plain disk image, most VM/container overlays) an in-place `pwrite` really does land on the
+    /// same physical blocks: the moment step one's `fsync` returns, the true original salt is gone
+    /// from every location that filesystem will ever report — a forensic image taken any time
+    /// after the wipe recovers the same random salt this call just wrote, never the original. That
+    /// is a genuine crypto-erase for that class of storage, which the old whole-file-swap-only
+    /// version never provided (it left the WHOLE original inode, salt included, sitting in free
+    /// space).
+    ///
+    /// **What this does NOT close (stated plainly, not papered over).** Two residuals remain, and
+    /// neither can be fixed inside this file:
+    /// - **Copy-on-write filesystems, wear-levelling SSDs, and snapshots.** An "in-place" `pwrite`
+    ///   there does not guarantee the same physical medium gets overwritten — CoW allocates a new
+    ///   block and frees the old one (recoverable from a prior generation/snapshot); an SSD's FTL
+    ///   may remap the logical write to a different NAND cell and leave the old one queued for
+    ///   erase. This is the same limit `docs/design/duress-multipassword.md`'s CRYPTO-12 note
+    ///   already names for the OLD scheme, and no purely-in-file overwrite defeats it — verified,
+    ///   not merely asserted, by checking there is no code path here that controls block placement.
+    /// - **Any copy of `container.dat` taken BEFORE the wipe** (a backup, a cloud sync, a second
+    ///   disk image) still has the true original salt sitting in plain sight inside that copy —
+    ///   destroying the live file's salt cannot reach bytes that were never modified because they
+    ///   are not IN this file anymore. Moving the salt to a small sidecar file would not help
+    ///   either: it would put the "independently erasable" secret outside `container.dat`, but
+    ///   `account_snapshot_round_trips_with_zero_external_artifacts` pins that a hidden account's
+    ///   directory holds ONLY `container.dat` — a second file is a tell in its own right (and would
+    ///   still be inside the SAME pre-wipe backup regardless). So the erasable root cannot leave
+    ///   this file, which means it cannot be made safe against a pre-wipe copy from inside this
+    ///   module at all: closing that gap needs the salt (or a KEK wrapping it) to live somewhere a
+    ///   backup never reaches — an OS keyring or hardware keystore, exactly what the design note
+    ///   already named as the real fix and what this module cannot provide by itself.
     pub fn wipe(&mut self) -> io::Result<()> {
+        let fresh_salt = random_bytes(SALT_LEN);
+        self.buf[..SALT_LEN].copy_from_slice(&fresh_salt);
+        self.persist_range(0, SALT_LEN)?;
         self.buf = random_bytes(self.buf.len());
         self.persist()
     }
@@ -1306,11 +1391,13 @@ mod tests {
             _ => panic!("realpw must open the main compartment"),
         }
 
-        // 3) P3 opens the SAME main account (same data), but Blind policy.
+        // 3) P3 opens the SAME main account (same data). CRYPTO-10: the policy byte is now
+        //    IDENTICAL to P1's — a distinct `Policy::Blind` used to exist here and gave P3 a wider
+        //    write ceiling, which was itself a coercer-visible proof a second password existed.
         match c.open(b"blindpw").unwrap() {
             Opened::Compartment { role, policy, payload, .. } => {
                 assert_eq!(role, Role::Main);
-                assert_eq!(policy, Policy::Blind);
+                assert_eq!(policy, Policy::Protect, "P3 must be behaviourally identical to P1, not a distinguishable Blind policy");
                 assert_eq!(payload, b"MAIN account state v1", "P3 sees the same main data as P1");
             }
             _ => panic!("blindpw must open main"),
@@ -1338,9 +1425,15 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// P1 (protect) never corrupts the hidden tail; P3 (blind) spilling past A does.
+    /// CRYPTO-10 retraction, replacing the old `protect_preserves_hidden_blind_may_corrupt`: P3
+    /// (blind) used to be ALLOWED to spill past the main region and destroy the hidden tail as an
+    /// "accepted risk" — this test used to pin that a big enough blind write corrupted hidden. It
+    /// no longer can: Blind's write ceiling collapsed to the identical `region_cap / 2` Protect has
+    /// always had (see the module doc's CRYPTO-10 section for why the DIFFERENCE, not the
+    /// capability itself, was the coercer-visible bug). So both P1 and P3 now refuse the exact
+    /// same oversized payload, and the hidden compartment survives EITHER one.
     #[test]
-    fn protect_preserves_hidden_blind_may_corrupt() {
+    fn neither_protect_nor_blind_can_reach_the_hidden_tail_anymore() {
         let p = tmp("spill");
         let _ = std::fs::remove_file(&p);
         let total = 256 * 1024;
@@ -1355,17 +1448,19 @@ mod tests {
         c.write(b"realpw", &vec![7u8; 20 * 1024]).unwrap();
         assert!(matches!(c.open(b"hiddenpw").unwrap(), Opened::Compartment { .. }), "protect kept hidden intact");
 
-        // P1 refuses to exceed its A cap (so it can never reach the tail).
+        // P1 refuses to exceed its A cap (so it can never reach the tail) — unchanged from before.
         assert!(c.write(b"realpw", &vec![7u8; main_cap]).is_err(), "protect refuses to exceed A");
 
-        // P3 blind write big enough to spill past A and cover the ENTIRE hidden region → hidden
-        // corrupts. (CRYPTO-13: hidden's live generation could be sitting in EITHER of its two
-        // ping-pong copy slots, so a spill has to reach past both — hidden_cap worth past A, not
-        // just "a bit past A" — to guarantee destruction; a smaller spill can land only on the
-        // stale copy and leave the live one, which is still an accepted-risk write, just a less
-        // predictable one than the single-copy model used to give.)
-        c.write(b"blindpw", &vec![9u8; main_cap + hidden_cap]).unwrap();
-        assert!(c.open(b"hiddenpw").is_err(), "blind spill overwrote the hidden compartment");
+        // The exact payload that USED to spill past A and destroy the entire hidden region under
+        // the old Blind policy is now REFUSED under blindpw too — same ceiling as realpw.
+        assert!(
+            c.write(b"blindpw", &vec![9u8; main_cap + hidden_cap]).is_err(),
+            "blind must refuse this payload exactly like protect does — it can no longer reach the hidden tail"
+        );
+        assert!(
+            matches!(c.open(b"hiddenpw").unwrap(), Opened::Compartment { .. }),
+            "the hidden compartment must survive an oversized blind write attempt, since it was refused, not spilled"
+        );
 
         let _ = std::fs::remove_file(&p);
     }
@@ -1459,6 +1554,87 @@ mod tests {
 
         // A coercer given P3 opens main and sees nothing that proves a hidden compartment.
         assert!(matches!(c.open(b"blindpw").unwrap(), Opened::Compartment { role: Role::Main, .. }));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// CRYPTO-10 — DISCRIMINATING test for the write-ceiling fix. Compares a totally vanilla,
+    /// single-password container (A) against one that also has a hidden account AND a cover
+    /// password configured (B): if the cover password's write ceiling on B differs from what an
+    /// ordinary account's ONLY password gets on A, that difference is — by itself, with no other
+    /// information — proof B has more than one password configured. `max_payload_len` must
+    /// therefore report the IDENTICAL number for both, and a payload sized just over
+    /// `region_cap / 2` (comfortably inside the OLD Blind ceiling, which spanned nearly the whole
+    /// container) must be refused under the cover password exactly like it would be under an
+    /// ordinary Protect password.
+    ///
+    /// Neutered by re-introducing the old `Policy::Blind => (wide, wide)` arm in `write_limits`:
+    /// `max_payload_len` on B then reports a number far larger than A's, and the oversized write
+    /// below SUCCEEDS instead of erroring — RED. Restoring the collapsed ceiling turns it GREEN.
+    #[test]
+    fn the_cover_password_write_ceiling_is_identical_to_an_ordinary_accounts() {
+        let vanilla = tmp("crypto10-vanilla");
+        let with_cover = tmp("crypto10-cover");
+        let _ = std::fs::remove_file(&vanilla);
+        let _ = std::fs::remove_file(&with_cover);
+        let total = 256 * 1024u64;
+        let main_cap = 96 * 1024u64;
+
+        // A: one password, nothing else configured — the universal non-duress baseline.
+        let a = Container::create(&vanilla, total, b"onlypw", main_cap).unwrap();
+
+        // B: main + hidden + cover — the duress setup a coercer must not be able to detect.
+        let mut b = Container::create(&with_cover, total, b"realpw", main_cap).unwrap();
+        b.add_hidden(b"realpw", b"hiddenpw", total - DATA_OFF as u64 - main_cap).unwrap();
+        b.add_blind_main(b"realpw", b"coverpw", total - DATA_OFF as u64).unwrap();
+
+        // The P1 and P3 slots must carry the SAME policy byte — no distinguishing value exists.
+        let p1_policy = b.find_slot(&b.key_for(b"realpw").unwrap()).unwrap().policy;
+        let p3_policy = b.find_slot(&b.key_for(b"coverpw").unwrap()).unwrap().policy;
+        assert_eq!(p1_policy, p3_policy, "P1 and P3 must be sealed with the identical policy byte");
+
+        // The write ceiling itself must match A's ordinary single password, byte for byte.
+        let a_max = a.max_payload_len(b"onlypw").unwrap();
+        let b_max = b.max_payload_len(b"coverpw").unwrap();
+        assert_eq!(
+            a_max, b_max,
+            "the cover password's write ceiling must be identical to a vanilla account's — any \
+             difference is, by itself, proof a duress setup was configured"
+        );
+
+        // A payload comfortably inside the OLD Blind ceiling (nearly the whole container) but past
+        // the shared region_cap/2 boundary must now be refused under the cover password too.
+        let oversized = vec![9u8; b_max + 1024];
+        assert!(
+            b.write(b"coverpw", &oversized).is_err(),
+            "the cover password must refuse this payload exactly like an ordinary account would"
+        );
+
+        let _ = std::fs::remove_file(&vanilla);
+        let _ = std::fs::remove_file(&with_cover);
+    }
+
+    /// CRYPTO-10 — the honest residual that survives the fix above: management OPERATIONS
+    /// (`add_hidden`/`add_blind_main`/`add_wipe`) still require the P1 (management) key, so
+    /// attempting one under the cover password still fails distinctively where the real password
+    /// would have succeeded. This is NOT a bug to fix — it is the direct, unavoidable consequence
+    /// of `revealing_p3_cannot_enumerate_the_other_passwords` above (P3 must NOT be able to read
+    /// the directory, or it could enumerate P1/P2 itself), so this test demonstrates the asymmetry
+    /// on the record rather than implying CRYPTO-10 is fully closed.
+    #[test]
+    fn managing_slots_under_the_cover_password_still_fails_distinctively() {
+        let p = tmp("crypto10-residual");
+        let _ = std::fs::remove_file(&p);
+        let mut c = Container::create(&p, 256 * 1024, b"realpw", 96 * 1024).unwrap();
+        c.add_blind_main(b"realpw", b"coverpw", 256 * 1024 - DATA_OFF as u64).unwrap();
+
+        // The real (management) password can configure a new duress password...
+        assert!(c.add_wipe(b"realpw", b"burnpw").is_ok(), "the management password can add a wipe slot");
+        // ...but the SAME operation attempted with the cover password fails, betraying that the
+        // cover password is not the one that manages this container.
+        assert!(
+            c.add_wipe(b"coverpw", b"anotherpw").is_err(),
+            "the cover password must not be able to add slots — and this refusal is itself informative"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1890,7 +2066,9 @@ mod tests {
             _ => panic!("hiddenpw → hidden (tmpfs work dir)"),
         }
         match open_container(&cpath, b"blindpw", main_w.clone(), Some(hid_w.clone())).unwrap() {
-            Unlocked::Account(cv) => { assert_eq!(cv.role, Role::Main); assert_eq!(cv.policy, Policy::Blind); }
+            // CRYPTO-10: no separate Blind policy anymore — the cover password's slot is sealed
+            // identically to the real password's, so the two are behaviourally indistinguishable.
+            Unlocked::Account(cv) => { assert_eq!(cv.role, Role::Main); assert_eq!(cv.policy, Policy::Protect); }
             _ => panic!("blindpw → main/blind"),
         }
         // Wipe erases the whole container.
@@ -2052,6 +2230,14 @@ mod tests {
     /// coincidentally equal its own previous value, silently shrinking a value-diff's apparent
     /// range by a byte or two at either end with nothing to do with the code under test. The real
     /// leak is not in this write — see the next test.
+    ///
+    /// **Post-CRYPTO-10 note.** This test calls `write_region_at` directly with a hand-built wide
+    /// `hard_cap`, deliberately bypassing `Container::write`/`write_limits` — which, since
+    /// CRYPTO-10, never constructs a wide `hard_cap` for ANY password anymore (Blind's ceiling
+    /// collapsed to match Protect's). The property this test pins is still true of the underlying
+    /// primitive and worth keeping — if a future caller ever DOES hand `write_region_at` a wide
+    /// `hard_cap` again, this is the test that would catch a regression back to
+    /// offset-dependent behaviour — but nothing in today's live code path reaches this branch.
     #[test]
     fn a_p3_write_touches_the_same_range_whether_or_not_a_hidden_compartment_exists() {
         let no_hidden = tmp("p3-no-hidden");
@@ -2233,6 +2419,46 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         c.wipe().unwrap();
         let c = Container::load(&p).unwrap();
         assert!(c.open(b"realpw").is_err(), "wipe erased the real compartment");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// CRYPTO-12/#184 — DISCRIMINATING test for the crypto claim `wipe()`'s fix relies on:
+    /// destroying ONLY the `SALT_LEN`-byte salt, with every other byte of the container left
+    /// completely untouched, is already sufficient to make the real password open nothing. This is
+    /// what makes an in-place, small-range overwrite (rather than rewriting the whole multi-KB/MB
+    /// file) a meaningful fix at all — if some OTHER byte also had to change, overwriting just the
+    /// salt wouldn't be enough and the "small independently erasable value" framing would be false.
+    ///
+    /// This test pins the CRYPTO claim only, not the write-ORDERING half of the fix (in-place
+    /// before the whole-buffer swap) — that half is about which physical disk blocks a `pwrite`
+    /// lands on, which is not observable by reading the file back through this same process, so no
+    /// test in this suite can honestly claim to cover it; the doc comment on `wipe` states that
+    /// limit rather than implying a test proves it.
+    ///
+    /// Neutered by skipping the salt replacement (leaving the original salt bytes in place): the
+    /// real password still opens the compartment fine — RED. Restoring the replacement turns it
+    /// GREEN.
+    #[test]
+    fn destroying_only_the_salt_bytes_makes_the_real_password_open_nothing() {
+        let p = tmp("salt-erase");
+        let _ = std::fs::remove_file(&p);
+        let mut c = Container::create(&p, 128 * 1024, b"realpw", 60 * 1024).unwrap();
+        c.write(b"realpw", b"data that must become unrecoverable").unwrap();
+
+        // Control: before touching anything, the real password opens fine.
+        assert!(c.open(b"realpw").is_ok(), "control: the real password must open before any erasure");
+
+        // The exact operation `wipe()` performs first: overwrite JUST the salt, nothing else.
+        let fresh_salt = random_bytes(SALT_LEN);
+        c.buf[..SALT_LEN].copy_from_slice(&fresh_salt);
+
+        // Every byte OTHER than the salt is still the original ciphertext — this is not a general
+        // "corrupt the file" test, it isolates the salt as the one thing that changed.
+        assert!(
+            c.open(b"realpw").is_err(),
+            "replacing ONLY the salt must already be enough to make the real password open nothing, \
+             even though every slot/region byte is completely untouched"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

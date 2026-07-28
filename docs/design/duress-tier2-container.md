@@ -51,10 +51,12 @@ slot table **inside** the container (no separate `slots.dat` base file). Roles:
   writes the hidden tail. Hidden stays intact. (This is the old disjoint‑partition
   safety, now a per‑login choice.)
 - **P2 — hidden.** Opens the hidden account (its own region key).
-- **P3 — main, BLIND.** Opens the **same** main account (same main key + a policy
-  flag in the slot), allocator allowed the **whole** container → may overwrite the
-  hidden tail. Two purposes: (a) it is the *cover* you reveal under duress ("just my
-  account, writes across the disk, nothing hidden").
+- **P3 — main, BLIND.** Opens the **same** main account (same main key). It is the
+  *cover* you reveal under duress. **Retracted by CRYPTO-10 (below): it no longer gets
+  a wider write allocator than P1.** The original design gave P3 the whole container as
+  its write ceiling, on the theory that "just my account, writes across the disk,
+  nothing hidden" was itself a plausible cover story. It wasn't a safe one — see
+  CRYPTO-10.
 
   **CORRECTION.** This note used to claim a second purpose: that main activity churning
   the tail *masks* hidden writes against snapshot diffing. It does not, and the code
@@ -74,17 +76,48 @@ slot table **inside** the container (no separate `slots.dat` base file). Roles:
   snapshots of the file.** File size and mtime are likewise unchanged by the presence of
   a hidden compartment, but changed‑byte *offsets* are not, and that is the leak.
 
-P1 and P3 wrap the **same** main data key, differing only by the protect/blind flag.
-Revealing P3 under coercion does not expose P1 or P2: each slot is sealed under its
-own password‑key, wrapped contents are untestable without it, and unused slots are
-random — so the "8 slots" cover holds and a coercer cannot prove P1/P2 exist.
+P1 and P3 wrap the **same** main data key and, since CRYPTO-10, the **same** policy
+byte too. Revealing P3 under coercion does not expose P1 or P2: each slot is sealed
+under its own password‑key, wrapped contents are untestable without it, and unused
+slots are random — so the "8 slots" cover holds and a coercer cannot prove P1/P2 exist.
 
-**Overwrite decision (settled):** blind writes are an *accepted risk*, not a bug.
-Under P3 a growing main account may clobber the hidden tail — "повезёт — жив, нет —
-хуй с ним." P1 is the safe mode for when durability matters. We keep BOTH mechanisms.
-Corruption‑avoidance without leaking the hidden extent is provably impossible on one
-key (anything the main allocator can read to avoid, a coercer with the main password
-can read to detect), so we do not pretend to solve it — we expose the choice.
+**CRYPTO-10 (#166) — retraction of the "Overwrite decision (settled)" below.** The
+original decision was: blind writes are an *accepted risk*, not a bug — under P3 a
+growing main account may clobber the hidden tail, P1 is the safe mode for when
+durability matters, "we keep BOTH mechanisms." That decision didn't weigh a fact the
+audit surfaced: **the ceiling difference between P1 and P3 is itself observable by
+anyone holding only the cover password.** Every vanilla, never-configured-anything
+account has exactly one password, and it is always Protect — so it *always* refuses a
+write past half its region's ping-pong cap. A cover password that keeps accepting well
+past that point is, by itself and with nothing else, proof a second (Blind) password
+was deliberately added — the one fact a duress feature must never let the cover
+password prove. Combined with CRYPTO-14 (above) already showing the wider ceiling
+bought no masking benefit — a spill only ever destroyed the hidden compartment, it
+never hid a write from a snapshot-diff adversary — keeping the differentiated ceiling
+cost real privacy for a benefit it was never actually providing. **Fix (shipped in
+`container.rs`): P1 and P3 now get the IDENTICAL write ceiling, unconditionally.**
+Net effect, stated plainly because it is a real capability loss and not a free
+lunch: a Blind write can no longer overwrite the hidden tail through an ordinary
+save — "повезёт — жив, нет — хуй с ним" no longer applies, because there is no path
+left that reaches the hidden tail at all. This also makes a Blind save crash-atomic
+for the first time (CRYPTO-13's non-atomic spill path is now unreachable from any
+password). Corruption‑avoidance without leaking the hidden extent is still provably
+impossible on one key in the general case (unchanged reasoning: anything the main
+allocator can read to avoid, a coercer with the main password can read to detect) —
+but that reasoning no longer needs an escape hatch, because there is nothing left for
+P3 to corrupt.
+
+**Honest residual that CRYPTO-10 does NOT close.** Management *operations* —
+adding a hidden/blind/wipe password — still require the P1 (management) key, because
+the slot directory is deliberately unreadable by P3 (that unreadability is what makes
+P3 safe to reveal in the first place — see `revealing_p3_cannot_enumerate_the_other_passwords`
+in `container.rs`). So a coercer handed the cover password who tries to *configure*
+another duress password through it gets refused where the real password would have
+succeeded, and that refusal is itself informative. This cannot be closed without either
+letting P3 read the directory (which directly defeats the property the directory
+exists for) or removing the directory (reopening A3-1: a second hidden account
+silently clobbering the first). Accepted limit: the UI must say "do not attempt to
+add passwords from the cover session."
 
 Optional later: a generic "re‑randomize the reserve region" duress password (panic
 burn of the tail; harmless no‑op when empty, so its presence implies nothing), and a
@@ -292,7 +325,8 @@ toggle emits zero packets, crash‑safety of the atomic swap, full‑image entro
 ## 10. Open decisions
 
 None blocking — all forks resolved with the user (hidden = account not note; three
-passwords; blind‑write accepted; format (b); media inside=metadata/hidden=zero‑
-external + no‑media toggle; offline‑default + circuit isolation + timing settings;
-D1 dead‑man; wipe = whole container; no migration). Remaining are implementation
-details settled in‑phase.
+passwords; format (b); media inside=metadata/hidden=zero‑external + no‑media toggle;
+offline‑default + circuit isolation + timing settings; D1 dead‑man; wipe = whole
+container; no migration). **"Blind‑write accepted" is RETRACTED by CRYPTO‑10 (§2) —
+P1 and P3 now share one write ceiling and neither can reach the hidden tail.**
+Remaining are implementation details settled in‑phase.

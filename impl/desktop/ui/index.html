@@ -2696,7 +2696,15 @@ if(TA){
    if(av&&ai){av.style.cursor='pointer';av.title=t('Change photo');av.onclick=()=>ai.click();
     ai.onchange=async()=>{const f=ai.files&&ai.files[0];ai.value='';if(f)await uploadAvatar(f);};}}
   // Account management
-  const doLock=async()=>{try{await inv('lock');}catch(e){}_hiddenSession=false;scheduleCover();go('unlock');document.getElementById('unlock-pw').value='';};
+  // Locking can legitimately FAIL: a hidden account lives only in its RAM work dir between saves,
+  // so if the save into the container fails the backend refuses to lock (and keeps the session and
+  // the data). Swallowing that error and navigating away anyway told the user "locked" while the
+  // session was still open — show it and stay put instead.
+  const doLock=async()=>{
+    try{await inv('lock');}
+    catch(e){toast(String(e&&e.message?e.message:e));return;}
+    _hiddenSession=false;scheduleCover();go('unlock');document.getElementById('unlock-pw').value='';
+  };
   document.getElementById('btn-lock').onclick=doLock;
   document.querySelectorAll('.rail-lock').forEach(b=>b.onclick=doLock);
   document.getElementById('btn-add-account').onclick=()=>go('welcome');

@@ -739,6 +739,26 @@ impl ContainerVault {
         self.container.write(&self.password, &blob)
     }
 
+    /// Save, then release the session's plaintext work dir — in that order, and ONLY in that order.
+    ///
+    /// A HIDDEN account exists nowhere but its RAM work dir between saves, so deleting that dir
+    /// after a FAILED save destroys everything since the last successful one. The lock path used
+    /// to do exactly that (`let _ = cv.save(); remove_dir_all(work_dir)`), discarding the error
+    /// and then the only copy (A3-6). Here a failed save propagates and the work dir is left
+    /// untouched, so the caller can report it and the user can retry with their data still there.
+    ///
+    /// A main (disk-backed) account's work dir is never removed — it is the account's own storage.
+    /// Takes `&mut self` rather than consuming, so a FAILED save leaves the caller still holding
+    /// a fully usable session to retry with. On success the work dir is gone and the vault must
+    /// be dropped.
+    pub fn save_and_release(&mut self) -> io::Result<()> {
+        self.save()?;
+        if self.role == Role::Hidden {
+            std::fs::remove_dir_all(&self.work_dir)?;
+        }
+        Ok(())
+    }
+
     /// The container's random salt prefix — use it to derive the account's at-rest key, so that key
     /// has a PER-CONTAINER random salt (not a fixed, precomputation-friendly one shared across installs).
     pub fn salt(&self) -> Vec<u8> {
@@ -1515,6 +1535,52 @@ mod tests {
         let got = Container::read_region_at(&c.buf, slot.region_off as usize, &hidden_key)
             .expect("the first hidden region must still decrypt");
         assert_eq!(got, b"the hidden account payload", "the first hidden account lost its data");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A3-6 — a FAILED save must never be followed by deleting the work dir. A hidden account
+    /// lives only in that (RAM) directory between saves, so the old `let _ = cv.save();
+    /// remove_dir_all(work_dir)` threw away the error and then the only copy of everything since
+    /// the last successful save — silent, total data loss on an ordinary lock.
+    ///
+    /// The container's directory is made read-only so `save` fails while writing its temp file;
+    /// the WORK dir stays writable on purpose, so a deletion would genuinely succeed if the code
+    /// still attempted it. That is what makes this discriminating rather than accidental.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_save_does_not_delete_the_hidden_work_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmp("save-fail");
+        let cdir = root.join("cdir");
+        let work = root.join("work");
+        std::fs::create_dir_all(&cdir).unwrap();
+        let cpath = cdir.join("container.dat");
+        Container::create(&cpath, 512 * 1024, b"realpw", 128 * 1024).unwrap();
+        {
+            let mut c = Container::load(&cpath).unwrap();
+            c.add_hidden(b"realpw", b"hiddenpw", 128 * 1024).unwrap();
+        }
+        let cv = ContainerVault::open(&cpath, b"hiddenpw", work.clone()).expect("hidden opens");
+        assert_eq!(cv.role, Role::Hidden);
+        std::fs::write(work.join("unsaved.dat"), b"messages since the last save").unwrap();
+
+        // Make the CONTAINER FILE read-only → the save fails (a hot save writes into this file
+        // in place, so file permissions are what stops it, not the directory's). `work` stays
+        // writable on purpose, so nothing but the fix prevents the deletion.
+        let orig = std::fs::metadata(&cpath).unwrap().permissions();
+        std::fs::set_permissions(&cpath, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut cv = cv;
+        let outcome = cv.save_and_release();
+        std::fs::set_permissions(&cpath, orig).unwrap();
+
+        assert!(outcome.is_err(), "the save could not have succeeded here");
+        assert!(work.exists(), "the work dir was deleted after a FAILED save — that is the data loss");
+        assert_eq!(
+            std::fs::read(work.join("unsaved.dat")).unwrap(),
+            b"messages since the last save",
+            "unsaved data must still be there to retry with"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

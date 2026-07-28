@@ -1176,18 +1176,27 @@ fn safety_number(app: State<App>, peer_ik: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn lock(app: State<App>) {
-    // Persist a container-backed account before locking (no-op for the file-tree path), then drop it.
-    // For a HIDDEN account the work dir is RAM/tmpfs plaintext — delete it on lock.
-    if let Some(cv) = app.container.lock().unwrap().as_mut() {
-        let _ = cv.save();
-        if cv.role == client::container::Role::Hidden {
-            let _ = std::fs::remove_dir_all(&cv.work_dir);
+fn lock(app: State<App>) -> Result<(), String> {
+    // Persist a container-backed account before locking (no-op for the file-tree path), then drop
+    // it. For a HIDDEN account the work dir is RAM/tmpfs plaintext and is deleted on lock — but
+    // ONLY after the save actually succeeded. It used to discard the save error and delete
+    // anyway, which threw away every message received since the last successful save (A3-6).
+    // On failure we keep the session OPEN so the user still has their data and can retry.
+    let mut guard = app.container.lock().unwrap();
+    if let Some(cv) = guard.as_mut() {
+        if let Err(e) = cv.save_and_release() {
+            // Leave the vault and the session exactly as they were: still open, data still there.
+            return Err(format!(
+                "could not save this session into the container: {e}. NOT locking — the unsaved \
+                 data exists only in this session. Fix the problem and lock again."
+            ));
         }
     }
+    *guard = None;
+    drop(guard);
     app.reset_transient();
     *app.session.lock().unwrap() = None;
-    *app.container.lock().unwrap() = None;
+    Ok(())
 }
 
 /// One entry for the account switcher.
@@ -3191,7 +3200,12 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     // batches a burst into one save). No-op for the file-tree path.
     if !out.is_empty() {
         if let Some(cv) = app.container.lock().unwrap().as_mut() {
-            let _ = cv.save();
+            // Not fatal here (unlike `lock`): nothing is deleted, the work dir still holds the
+            // data and the next poll's save retries. But it must not be SILENT, or a container
+            // that has quietly stopped persisting looks identical to one that is fine.
+            if let Err(e) = cv.save() {
+                eprintln!("warning: could not persist this batch into the container: {e}");
+            }
         }
     }
     Ok(PollOut { messages: out, reachable: reach_any })

@@ -1669,8 +1669,9 @@ fn create_proxy(app: State<App>, label: String) -> Result<Proxy, String> {
     Ok(proxy_of(&store, &e))
 }
 
-/// Burn a proxy: stop offering it (its contacts can no longer be reached through it). Reversible
-/// flag flip; the keys stay derivable so any last in-flight mail still decrypts.
+/// Burn a proxy: stop offering it (its contacts can no longer be reached through it). NOT
+/// reversible — the entry and its secret are deleted outright (#207, A6-4), so no in-flight mail
+/// still addressed to it can ever be decrypted again once it's gone; see `Store::burn_proxy`.
 #[tauri::command]
 fn burn_proxy(app: State<App>, index: u32) -> Result<(), String> {
     let (store, _) = app.snapshot()?;
@@ -1683,7 +1684,10 @@ fn burn_proxy(app: State<App>, index: u32) -> Result<(), String> {
     }
     // Burn now DESTROYS: the entry, its secret, and the proxy's namespaced network state go, so
     // the identity cannot be reproduced by anyone — including the holder of the recovery phrase.
-    // That is the whole point of A6-4, and it is why this is not undoable.
+    // That is the whole point of A6-4, and it is why this is not undoable. `Store::burn_proxy`
+    // also refuses outright (CRYPTO-27) while this proxy still has anything undelivered queued in
+    // its outbox — that error surfaces to the user here verbatim, telling them to retry the send
+    // (or wait for the relay) before burning.
     store.burn_proxy(index).map_err(|e| e.to_string())
 }
 

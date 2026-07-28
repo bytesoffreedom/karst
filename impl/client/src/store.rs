@@ -2602,11 +2602,15 @@ impl Store {
     /// sends/…, best-effort — a proxy that never published anything simply has none) and any
     /// contact→proxy tags still pointing at it, so no trace of a burned identity's channel state —
     /// including any outgoing plaintext parked by R2-6's stranded-send log — lingers on disk.
-    /// Idempotent: burning an
-    /// already-absent index is not an error. Deliberately does NOT refuse to burn the account's
-    /// last remaining proxy — "you must always keep one reachable channel" is a UX/session policy,
-    /// not a data-integrity invariant, and belongs in the caller (see the desktop `burn_proxy`
-    /// command, which enforces exactly that before calling this).
+    /// Idempotent: burning an already-absent index is not an error.
+    ///
+    /// Refuses (CRYPTO-27) while this proxy's outbox still has anything undelivered queued in it —
+    /// see the check just below — because that queue can hold the only authenticated proof of an
+    /// in-progress migration, and this is the one place that actually deletes it. That is a DATA-
+    /// INTEGRITY refusal and lives here, not in the caller. By contrast, "you must always keep one
+    /// reachable channel" is a UX/session POLICY, not a data-integrity invariant, and deliberately
+    /// does NOT live here — it belongs in the caller (see the desktop `burn_proxy` command, which
+    /// enforces exactly that before calling this).
     pub fn burn_proxy(&self, index: u32) -> io::Result<()> {
         // CRYPTO-27: this proxy's outbox (in `sessions.dat`, removed a few lines down) can hold the
         // ONLY authenticated copy of a message it ever sent — most dangerously a `ChannelMigrate`,

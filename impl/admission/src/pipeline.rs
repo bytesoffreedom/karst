@@ -143,11 +143,21 @@ impl ReplayFilter {
         }
     }
 
+    /// Дешёвый READ-ONLY-взгляд: видели ли тег. Ничего не занимает — используется на
+    /// Ступени 3, чтобы отбить очевидный replay ДО дорогой крипты, не отдавая
+    /// неаутентифицированному запросу слот в фильтре (R2-1).
+    fn contains(&self, tag: &[u8; 16]) -> bool {
+        self.seen.contains(tag)
+    }
+
     /// Пытается зафиксировать тег. Возвращает:
     /// - `Ok(true)`  — свежий, принят;
     /// - `Ok(false)` — уже видели (replay);
     /// - `Err(())`   — фильтр полон (переполнение → backpressure/PoW).
-    fn check_and_insert(&mut self, tag: [u8; 16]) -> Result<bool, ()> {
+    ///
+    /// Вызывается ТОЛЬКО после успешной верификации credential — иначе мусорный proof
+    /// занимает ёмкость и валит отправку всему relay (R2-1; DTN-ветка так делала всегда).
+    fn commit(&mut self, tag: [u8; 16]) -> Result<bool, ()> {
         if self.seen.contains(&tag) {
             return Ok(false);
         }
@@ -257,14 +267,18 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
             return Outcome::DropNoReply(DropReason::MalformedCredential);
         }
 
-        // --- Ступень 3: replay/freshness ---
+        // --- Ступень 3: replay/freshness — ТОЛЬКО read-only CHECK ---
+        // Порядок здесь критичен и теперь совпадает с DTN-веткой (см. `process_dtn`).
+        // Тег для capability — это `proof.mac`, поле С ПРОВОДА: если фиксировать его ДО
+        // проверки HMAC, любой обладатель обычной cookie заливает фильтр мусорными MAC'ами,
+        // и после переполнения КАЖДЫЙ новый уникальный запрос получает BackpressurePow до
+        // смены эпохи — дешёвый отказ отправки для всего relay (R2-1). Поэтому здесь только
+        // дешёвый взгляд (настоящий replay отбивается сразу), а вставка — после Ступени 4.
         replay.roll_epoch(epoch_id);
         let replay_tag = credential_replay_tag(&req.credential);
         if let Some(tag) = replay_tag {
-            match replay.check_and_insert(tag) {
-                Ok(true) => {}
-                Ok(false) => return Outcome::Reject(RejectReason::Replay),
-                Err(()) => return Outcome::BackpressurePow,
+            if replay.contains(&tag) {
+                return Outcome::Reject(RejectReason::Replay);
             }
         }
 
@@ -312,6 +326,17 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
             // Шаг 3: RLN zk-proof — не реализован (§7.4), путь честно не проходит.
             Credential::RlnQuota => {
                 return Outcome::Reject(RejectReason::RlnNotImplemented)
+            }
+        }
+
+        // Фиксация replay-тега — ТОЛЬКО теперь, когда credential ВЕРИФИЦИРОВАН (R2-1).
+        // Неаутентифицированный запрос сюда не доходит, поэтому ёмкость фильтра тратят лишь
+        // те, кто реально предъявил валидный credential (а их дополнительно держит квота).
+        if let Some(tag) = replay_tag {
+            match replay.commit(tag) {
+                Ok(true) => {}
+                Ok(false) => return Outcome::Reject(RejectReason::Replay), // гонка
+                Err(()) => return Outcome::BackpressurePow,
             }
         }
 
@@ -437,12 +462,12 @@ mod tests {
     fn roll_epoch_clears_replay_filter() {
         let mut f = ReplayFilter::new(0, 16);
         let tag = [7u8; 16];
-        assert_eq!(f.check_and_insert(tag), Ok(true)); // свежий
-        assert_eq!(f.check_and_insert(tag), Ok(false)); // replay в той же эпохе
+        assert_eq!(f.commit(tag), Ok(true)); // свежий
+        assert_eq!(f.commit(tag), Ok(false)); // replay в той же эпохе
         f.roll_epoch(1); // смена эпохи
-        assert_eq!(f.check_and_insert(tag), Ok(true), "смена эпохи должна очистить фильтр");
+        assert_eq!(f.commit(tag), Ok(true), "смена эпохи должна очистить фильтр");
         // Тот же номер эпохи повторно — идемпотентно, НЕ очищает.
         f.roll_epoch(1);
-        assert_eq!(f.check_and_insert(tag), Ok(false), "тот же epoch_id не должен сбрасывать");
+        assert_eq!(f.commit(tag), Ok(false), "тот же epoch_id не должен сбрасывать");
     }
 }

@@ -364,3 +364,95 @@ fn live_real_ring_token_journey() {
         Outcome::Reject(RejectReason::Token(_))
     ));
 }
+
+// ============================================================================
+// R2-1 — an UNAUTHENTICATED request must not be able to burn replay capacity.
+// ============================================================================
+
+/// The live path used to commit the replay tag at Stage 3, BEFORE Stage 4 verified the
+/// capability HMAC — and for a capability the tag is the client-supplied `proof.mac`. So anyone
+/// holding an ordinary cookie could send `capacity` structurally valid requests carrying random
+/// MACs: each is rejected later at Stage 4, but had already taken a filter slot. Once full, every
+/// NEW unique request gets `BackpressurePow` until the epoch rolls — a cheap relay-wide denial of
+/// message delivery, from a party that never proved it holds any capability.
+///
+/// The DTN path in the same module already documents the correct order (read-only check at
+/// Stage 3, insert only after a successful HMAC); this pins the live path to the same rule.
+/// Discriminating: restore the early insert and the final genuine request returns
+/// `BackpressurePow` instead of `Admit`.
+#[test]
+fn an_invalid_capability_does_not_consume_replay_capacity() {
+    let kr = keyring();
+    let cap = Capability {
+        capability_id: [0xB0; 16],
+        scope: Scope::MessageDelivery,
+        quota: Quota { max_requests: 100, max_bytes: 1 << 20, window_secs: 600 },
+        not_before: 0,
+        not_after: u32::MAX,
+        secret: [0x44; 32],
+    };
+    let mut caps = CapabilityTable::new();
+    caps.insert(cap.clone());
+    let ring = dummy_ring();
+    let verifier = MockRingVerifier;
+    let pipe = AdmissionPipeline {
+        keyring: &kr,
+        capabilities: &caps,
+        token_verifier: &verifier,
+        issuer_ring: &ring,
+    };
+
+    let client = b"198.51.100.7:9000";
+    let carrier = b"c";
+    let cookie = kr.issue(client, carrier, NOW as u32);
+    let capacity = 8;
+    let mut replay = ReplayFilter::new(0, capacity);
+    let mut quota = admission::capability::CapabilityQuotaTracker::new();
+
+    // The attacker holds a cookie but NO valid capability: `capacity` requests, each with a
+    // distinct junk MAC, so every one would claim its own filter slot under the old order.
+    for i in 0..capacity as u8 {
+        let mut junk = cap.prove(b"nonce-junk", 0);
+        junk.mac = [i; 16]; // fails the HMAC check at Stage 4
+        let req = Request {
+            raw_len: 200,
+            client_addr: client,
+            carrier_id: carrier,
+            cookie: Some(cookie),
+            request_nonce: b"nonce-junk",
+            requested_scope: Scope::MessageDelivery,
+            credential: Credential::Capability(junk),
+        };
+        assert!(
+            matches!(
+                pipe.process(&req, NOW, 0, [0; 64], &mut replay, &mut quota),
+                Outcome::Reject(RejectReason::Capability(_))
+            ),
+            "a junk MAC must be rejected at the capability stage"
+        );
+    }
+
+    // A genuine, fully authenticated request must still be admitted: the junk must never have
+    // reached the filter.
+    let good = Request {
+        raw_len: 200,
+        client_addr: client,
+        carrier_id: carrier,
+        cookie: Some(cookie),
+        request_nonce: b"nonce-good",
+        requested_scope: Scope::MessageDelivery,
+        credential: Credential::Capability(cap.prove(b"nonce-good", 0)),
+    };
+    assert_eq!(
+        pipe.process(&good, NOW, 0, [0; 64], &mut replay, &mut quota),
+        Outcome::Admit,
+        "unauthenticated junk filled the replay filter — that is a relay-wide DoS"
+    );
+
+    // And a genuine replay is STILL cheaply rejected (the read-only check must remain).
+    assert_eq!(
+        pipe.process(&good, NOW, 0, [0; 64], &mut replay, &mut quota),
+        Outcome::Reject(RejectReason::Replay),
+        "replay detection must survive the reorder"
+    );
+}

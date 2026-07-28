@@ -167,7 +167,7 @@ fn pipeline_first_contact_gets_challenge() {
     let keyring = CookieKeyring::new(EPOCH_DURATION_SECS, now, RELAY_KEY_CUR, RELAY_KEY_PREV);
     let caps = CapabilityTable::new();
     let ring = issuer_ring();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &keyring,
         capabilities: &caps,
@@ -198,7 +198,7 @@ fn pipeline_capability_admits_then_replay_rejects() {
     let mut caps = CapabilityTable::new();
     caps.insert(cap.clone());
     let ring = issuer_ring();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &keyring,
         capabilities: &caps,
@@ -239,7 +239,7 @@ fn pipeline_token_threshold_enforced() {
     let keyring = CookieKeyring::new(EPOCH_DURATION_SECS, now, RELAY_KEY_CUR, RELAY_KEY_PREV);
     let caps = CapabilityTable::new();
     let ring = issuer_ring(); // threshold 2
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &keyring,
         capabilities: &caps,
@@ -290,7 +290,7 @@ fn pipeline_oversize_dropped_silently() {
     let keyring = CookieKeyring::new(EPOCH_DURATION_SECS, now, RELAY_KEY_CUR, RELAY_KEY_PREV);
     let caps = CapabilityTable::new();
     let ring = issuer_ring();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &keyring,
         capabilities: &caps,

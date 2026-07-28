@@ -88,13 +88,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      # Fail on any RustSec advisory affecting the locked dependency graph.
+      # Fail on any RustSec advisory affecting the locked dependency graph. NO IGNORES.
       #
-      # RUSTSEC-2026-0194 / -0195 (quick-xml DoS) are ignored with justification, NOT
-      # hidden: quick-xml is a deep TRANSITIVE BUILD dependency (wayland-scanner, a
-      # compile-time proc-macro, parses the fixed/trusted Wayland protocol XML to generate
-      # bindings). The DoS needs attacker-controlled XML, which never reaches it — it runs
-      # at build time on shipped protocol files, not on runtime input. The fix requires a
-      # major eframe/winit bump; revisit and drop these ignores when that lands.
+      # RUSTSEC-2026-0194 / -0195 (quick-xml DoS) used to be ignored here with a
+      # justification that has since expired twice over: the eframe/winit path that pulled
+      # quick-xml in (via wayland-scanner) left with the egui GUI crate, and the copy that
+      # remains — a Tauri build dependency, through plist — is 0.41.0, which is the PATCHED
+      # version both advisories name. A justified ignore is fine; a stale one is a place a
+      # real advisory can hide, so it is gone rather than re-explained.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+        run: cargo audit

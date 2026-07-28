@@ -760,6 +760,10 @@ fn run_relay(addr: String) -> io::Result<()> {
             MailboxDurability::Volatile => "volatile — queued mail is lost on restart",
         }
     );
+    // #145: say what admission actually rests on, at startup, every time. The capability HMAC
+    // and the PoW door are real; the threshold-ring token path has no audited verifier, so this
+    // relay refuses token credentials outright rather than falling back to a structural stub.
+    eprintln!("admission: capability HMAC (real) + PoW door; token credentials refused (no audited verifier)");
     if role == Role::Public {
         eprintln!("admission: {}", describe_pow(Some(pow_bits)));
         eprintln!("  PoW rate-limits fresh capabilities; the per-cap quota bounds each — a spam");

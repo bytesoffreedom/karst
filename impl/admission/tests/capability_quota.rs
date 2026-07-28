@@ -119,7 +119,7 @@ fn captured_proof_replay_caught_across_epoch() {
     let mut caps = CapabilityTable::new();
     caps.insert(cap.clone());
     let (kr, ring) = pipeline_env();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &kr,
         capabilities: &caps,
@@ -157,7 +157,7 @@ fn pipeline_rejects_when_quota_exhausted() {
     let mut caps = CapabilityTable::new();
     caps.insert(cap.clone());
     let (kr, ring) = pipeline_env();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &kr,
         capabilities: &caps,
@@ -252,7 +252,7 @@ fn cookie_mac_binds_address_and_carrier_unambiguously() {
 #[test]
 fn an_operator_quota_ceiling_binds_a_stateless_capability_too() {
     let (kr, ring) = pipeline_env();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let client = b"203.0.113.40:9000";
     let carrier = b"c";
     let cookie = kr.issue(client, carrier, NOW as u32);

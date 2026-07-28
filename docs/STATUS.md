@@ -1852,6 +1852,23 @@ credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_l
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
 
+**The relay cannot admit a token credential (#145).** The token-verifier field used to be
+`MockRingVerifier`, the non-cryptographic structural stub the pipeline tests compose against. It
+was never live — no wire request carries a `Credential::Token`; every relay path builds
+`Credential::Capability` — but "unreachable" was a property of the current wire, not of the
+relay, and the type was hardcoded, so the day some future request class carried a token, a check
+of the signature's SHAPE would have been the whole of admission. The field now holds
+`NoTokenVerifier`, which refuses every token, so introducing an audited verifier is a deliberate
+type change visible in review rather than a config or feature-flag flip. `MockRingVerifier` also
+lost its unit-struct constructor: it can only be built via `MockRingVerifier::for_tests_only()`,
+so any use has to name what it is at the call site. `karst-relay` prints what admission rests on
+at startup. Pinned behaviourally by
+`the_relay_refuses_a_token_the_structural_stub_would_accept`, whose control arm shows the stub
+itself accepting the same token. **Still open from #145:** separate demo/production binaries and
+a production build that refuses to start without an audited verifier — meaningful once such a
+verifier exists; today the honest statement is that the relay has none and admits nothing on its
+behalf.
+
 **Blob I/O is off the global relay lock (#142).** The relay keeps one `Mutex<RelayNode>`, and
 `handle_blob_put`/`handle_blob_get` used to do their FILE I/O — tens of KiB per chunk — while
 holding it, so a single upload head-of-line-blocked every other client's send, fetch and ACK on

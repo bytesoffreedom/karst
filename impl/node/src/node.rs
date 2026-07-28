@@ -15,7 +15,7 @@ use admission::params::{
     cookie_epoch_id, EPOCH_DURATION_SECS, ISSUED_CAP_TTL_SECS, POW_BUCKET_SKEW, POW_WINDOW_SECS,
 };
 use admission::pipeline::{AdmissionPipeline, Credential, Outcome, ReplayFilter, Request};
-use admission::token::{IssuerRing, MockRingVerifier};
+use admission::token::{IssuerRing, NoTokenVerifier};
 use hkdf::Hkdf;
 use hmac::{Mac, SimpleHmac};
 use rand::rngs::OsRng;
@@ -558,7 +558,15 @@ impl BlobQuotaTracker {
 pub struct RelayNode {
     keyring: CookieKeyring,
     capabilities: CapabilityTable,
-    verifier: MockRingVerifier,
+    /// Token-credential verifier. `NoTokenVerifier` — it REFUSES every admission token (#145).
+    ///
+    /// Today no wire request can carry a `Credential::Token` at all (every relay path builds
+    /// `Credential::Capability`), so this branch is unreachable — but "unreachable" is a property
+    /// of the current wire, not of the relay, and the field used to hold `MockRingVerifier`, a
+    /// structural-only stub that would ADMIT any well-shaped token the day some future request
+    /// class carried one. Refusing by default makes that future a compile-time decision: swapping
+    /// in an audited verifier is a type change here, visible in review, not a config flip.
+    verifier: NoTokenVerifier,
     issuer_ring: IssuerRing,
     replay: ReplayFilter,
     cap_quota: CapabilityQuotaTracker,
@@ -646,7 +654,7 @@ impl RelayNode {
         RelayNode {
             keyring: CookieKeyring::new(EPOCH_DURATION_SECS, now, random_key(), random_key()),
             capabilities: CapabilityTable::new(),
-            verifier: MockRingVerifier,
+            verifier: NoTokenVerifier,
             issuer_ring: IssuerRing { issuer_pubkeys: vec![[1u8; 32]], threshold_t: 1 },
             replay: ReplayFilter::new(epoch, 4096),
             cap_quota: CapabilityQuotaTracker::new(),
@@ -2714,6 +2722,38 @@ mod tests {
             relay.policy().mailbox_durability,
             MailboxDurability::Volatile,
             "mailboxes have no disk path (see RelayNode::mailboxes) — the policy must say so"
+        );
+    }
+
+    /// #145: the relay must not be able to admit a token credential on the strength of a
+    /// structural stub.
+    ///
+    /// The finding as filed was "mock and production verifiers share one build/config path, so a
+    /// feature-flag mistake could silently run a relay with no admission security". Reading the
+    /// code sharpens it in both directions: no wire request can carry a `Credential::Token` at
+    /// all today (every relay path builds `Credential::Capability`), so this was never live —
+    /// but the relay did not merely DEFAULT to the mock, it hardcoded the type, so the day a
+    /// request class carried a token, a stub that checks only the shape of the signature would
+    /// have been the whole of admission.
+    ///
+    /// This pins the fix behaviourally, not by type name: a token the stub itself accepts must
+    /// be REFUSED by whatever verifier the relay actually holds. Put `MockRingVerifier` back in
+    /// that field and this reddens.
+    #[test]
+    fn the_relay_refuses_a_token_the_structural_stub_would_accept() {
+        use admission::token::{AdmissionTokenVerifier, MockRingVerifier};
+        let ring = IssuerRing { issuer_pubkeys: vec![[1u8; 32]; 5], threshold_t: 2 };
+        let token = MockRingVerifier::mock_token([0x77; 32], 0, 2);
+        // Control: the token is "valid" in the only sense the stub knows — 2 of 5, right epoch,
+        // well-formed signature blob. Without this arm the test could pass on a malformed token.
+        assert!(
+            MockRingVerifier::for_tests_only().verify(&token, &ring, 0).is_ok(),
+            "control: the structural stub accepts this token"
+        );
+        let relay = RelayNode::new(NOW);
+        assert!(
+            relay.verifier.verify(&token, &ring, 0).is_err(),
+            "the relay's verifier must refuse a token no audited verifier has checked"
         );
     }
 

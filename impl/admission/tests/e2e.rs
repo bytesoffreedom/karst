@@ -46,7 +46,7 @@ fn live_session_journey() {
     let mut caps = CapabilityTable::new();
     caps.insert(cap.clone());
     let ring = dummy_ring();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &kr,
         capabilities: &caps,
@@ -133,7 +133,7 @@ fn dtn_full_lifecycle_carrier_then_ingress() {
     caps.insert(cap.clone());
     let kr = keyring();
     let ring = dummy_ring();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let live_caps = CapabilityTable::new();
     let pipe = AdmissionPipeline {
         keyring: &kr,
@@ -261,7 +261,7 @@ fn rln_layer_works_but_pipeline_branch_not_implemented() {
     let kr = keyring();
     let caps = CapabilityTable::new();
     let ring = dummy_ring();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &kr,
         capabilities: &caps,
@@ -400,7 +400,7 @@ fn an_invalid_capability_does_not_consume_replay_capacity() {
     let mut caps = CapabilityTable::new();
     caps.insert(cap.clone());
     let ring = dummy_ring();
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &kr,
         capabilities: &caps,

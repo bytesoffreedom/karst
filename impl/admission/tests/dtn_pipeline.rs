@@ -49,7 +49,7 @@ fn run_dtn(
     let kr = keyring();
     let live_caps = CapabilityTable::new();
     let ring = IssuerRing { issuer_pubkeys: vec![[1u8; 32]], threshold_t: 1 };
-    let verifier = MockRingVerifier;
+    let verifier = MockRingVerifier::for_tests_only();
     let pipe = AdmissionPipeline {
         keyring: &kr,
         capabilities: &live_caps,

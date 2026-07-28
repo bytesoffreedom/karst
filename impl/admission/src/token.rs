@@ -93,7 +93,41 @@ pub trait AdmissionTokenVerifier {
 /// совпала, подпись непустая и её длина закодирована ожидаемо). НИКОГДА не
 /// должна использоваться в бою — единственная её задача — дать конвейеру
 /// объект нужного типа, пока настоящий BSS-verifier не портирован.
-pub struct MockRingVerifier;
+/// Constructible only through `for_tests_only()`, whose name is the point: the private field
+/// makes `MockRingVerifier` impossible to write by accident (`MockRingVerifier` as a unit value
+/// no longer compiles), so any use of it has to name what it is at the call site and survive
+/// review saying that out loud (#145).
+pub struct MockRingVerifier {
+    _not_constructible_by_accident: (),
+}
+
+impl MockRingVerifier {
+    /// The only way to build one. NOT cryptography — see the type's doc comment.
+    pub fn for_tests_only() -> Self {
+        MockRingVerifier { _not_constructible_by_accident: () }
+    }
+}
+
+/// The ABSENCE of a token verifier, expressed as a type (#145).
+///
+/// Refuses every admission token, always. A relay that has no audited threshold-ring verifier
+/// available should be structurally incapable of accepting a token credential, rather than
+/// leaning on the fact that no wire request happens to carry one today — that is the kind of
+/// property a future protocol change silently revokes. `RelayNode` holds this, so wiring up a
+/// real verifier is a deliberate TYPE change in the relay, not a config or feature-flag flip
+/// that a mistake could make for you.
+pub struct NoTokenVerifier;
+
+impl AdmissionTokenVerifier for NoTokenVerifier {
+    fn verify(
+        &self,
+        _token: &AdmissionToken,
+        _ring: &IssuerRing,
+        _expected_epoch: u32,
+    ) -> Result<(), TokenError> {
+        Err(TokenError::BadRingSignature)
+    }
+}
 
 /// Формат mock-«подписи»: первый байт — заявленное число подписантов,
 /// далее это число 32-байтовых «пустых» слотов. Ровно достаточно, чтобы

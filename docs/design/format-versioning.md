@@ -3,6 +3,36 @@
 How KARST handles format change, so a future breaking change does not silently
 mis-parse. This is the discipline behind backlog item #6.
 
+## The mechanism that governs at-rest data: `STATE_VERSION`
+
+Every at-rest blob is written by `MasterKey::seal(label, plain)` in the format-v2
+envelope:
+
+```
+MAGIC("KRS2") ‖ state_version(u16 LE) ‖ nonce(24) ‖ AEAD(key = HKDF(master, label),
+                                                        aad = MAGIC ‖ version ‖ len(label) ‖ label)
+```
+
+`secretbox::STATE_VERSION` is the version of the **state schema**, not of the
+envelope. The rule is short:
+
+> **Change any struct that is persisted under this envelope → bump `STATE_VERSION`.**
+
+`open` refuses any other version with a message that names the direction ("written
+by a newer/older KARST … upgrade the client"), distinct from both "not our format"
+and "wrong password". An older binary therefore cannot read a newer file, fill the
+fields it does not know with defaults, and write that loss straight back (A6-5).
+
+The cost is deliberate and stated plainly: bumping the version makes existing local
+data unreadable. There are no users and no migrations (see `docs/POSITIONING.md`);
+that window is worth more than the shims it replaces.
+
+The `label` half of the envelope is the at-rest context — `acct:<id>/contacts.dat`,
+`vault/accounts.dat`, `keyslot` — so a sealed file is bound to the account and the
+name it lives under, not merely to the device key (CRYPTO-05). Labels are LOGICAL:
+they never contain a real filesystem path, so moving the vault directory does not
+break decryption.
+
 ## The reality: postcard is positional, `#[serde(default)]` is inert
 
 Persisted and wire formats are `postcard` (compact, non-self-describing). Fields
@@ -22,13 +52,11 @@ consequences that are easy to get wrong:
 
 ## Three real mechanisms in use
 
-1. **Try-new-then-fallback (at-rest, positional).** `PeerState::from_bytes_compat`
-   tries the current layout, then a mirror of the previous one on `UnexpectedEnd`,
-   filling new fields with a chosen default. Same per-record for the history log
-   (`StoredHistory` → bare `HistoryRecord`) and the received-files index
-   (`ReceivedFile` → `ReceivedFileV0`). **Order matters:** try NEW first — postcard
-   *ignores trailing bytes*, so trying OLD first would silently drop the new field
-   from new data. This is correct but does not scale past a couple of versions.
+1. **~~Try-new-then-fallback~~ — REMOVED.** `PeerState::from_bytes_compat` and the
+   at-rest `#[serde(default)]` trailing fields are gone. They existed to let a new
+   binary read old data, and their mirror image — an old binary reading new data
+   lossily — is exactly A6-5. `STATE_VERSION` replaces both: one loud refusal
+   instead of two silent guesses.
 
 2. **Explicit version envelope (`Store::seal_versioned` / `open_versioned`).** For
    formats where a clean version tag is worth it, the sealed plaintext is prefixed
@@ -54,8 +82,9 @@ one layer up) — tracked here so it is a deliberate step, not a silent assumpti
 
 ## Rule of thumb
 
-- New at-rest format, or a format likely to change again → **`seal_versioned`**.
-- One-off field append to an existing positional struct → **try-new-fallback**,
-  append-only, new-first.
+- Changed a persisted struct → **bump `secretbox::STATE_VERSION`**. Always.
+- New at-rest format that will keep evolving on its own cadence → **`seal_versioned`**
+  (a per-file version inside the envelope, on top of the global one).
+- Never add a compat shim so an old binary can read new data; that is the bug.
 - A value that is hashed, not parsed → **a `VERSION` constant in the digest**.
 - Never trust `#[serde(default)]` to migrate postcard data.

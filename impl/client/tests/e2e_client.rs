@@ -1321,49 +1321,35 @@ fn at_rest_wrong_passphrase_cannot_load_and_disk_is_encrypted() {
 }
 
 #[test]
-fn vault_migrates_legacy_single_account_without_reseal() {
-    // Legacy одиночный аккаунт (секреты прямо в базе) → Vault мигрирует его в
-    // accounts/<ik>/ БЕЗ перешифрования. Дискриминирующий: если бы Vault выводил
-    // ДРУГОЙ ключ (новая соль), перемещённые файлы не расшифровались бы —
-    // load_account/contacts/history упали бы. Все три сверяются.
+fn a_pre_vault_single_account_layout_is_not_silently_adopted() {
+    // The vault used to MIGRATE a legacy single-account directory (secrets straight in the base)
+    // into `accounts/<ik>/` on unlock, reusing the same key so the moved files opened unchanged.
+    // Format v2 killed that path outright: at-rest keys are now derived per (account, file), so
+    // moving a file between scopes changes its key by design — a migration would have had to
+    // re-seal everything, and this is pre-alpha with no users to migrate.
+    //
+    // What must NOT happen is the silent middle ground: a vault adopting the old layout and then
+    // presenting an account it cannot actually read. Absent registry = no accounts, full stop.
     use client::store::{ContactRecord, Vault};
-    let dir = temp_dir("migrate");
+    let dir = temp_dir("prevault");
     let pass = b"devpw";
     let entropy = client::seed::entropy_of(&client::seed::generate_mnemonic());
-    let ik = client::seed::derive(&entropy).account.identity_public();
     {
         let s = Store::unlock(&dir, pass).unwrap();
         s.save_seed(&entropy).unwrap();
         s.save_contacts(&[ContactRecord { name: "Bob".into(), ik: [9u8; 32], verified: true }])
             .unwrap();
-        s.append_history(&client::store::HistoryRecord {
-            from_me: true,
-            peer_ik: [9u8; 32],
-            text: b"hi".to_vec(),
-            ts: 1,
-        })
-        .unwrap();
     }
 
-    // Открыть Vault на той же базе → миграция при unlock.
     let vault = Vault::unlock(&dir, pass).unwrap();
-    let reg = vault.load_registry().unwrap();
-    assert_eq!(reg.len(), 1, "один мигрированный аккаунт в реестре");
-    assert_eq!(reg[0].ik, ik, "IK сохранён в реестре");
-
-    let acc = vault.account(&reg[0].id);
-    assert_eq!(acc.load_account().unwrap().identity_public(), ik, "account читается тем же ключом");
-    assert_eq!(acc.load_entropy().unwrap(), entropy, "корень цел");
-    let contacts = acc.load_contacts().unwrap();
-    assert_eq!(contacts[0].name, "Bob", "контакт цел");
-    assert!(contacts[0].verified, "флаг сверки цел");
-    assert_eq!(acc.load_history().unwrap()[0].text, b"hi", "история цела");
-
-    // Legacy-файл больше не в базе (перемещён).
-    assert!(!dir.join("seed.key").exists(), "seed.key перемещён из базы");
-    // Идемпотентность: повторный unlock не мигрирует снова.
-    let v2 = Vault::unlock(&dir, pass).unwrap();
-    assert_eq!(v2.load_registry().unwrap().len(), 1, "повторная миграция не происходит");
+    assert!(
+        vault.load_registry().unwrap().is_empty(),
+        "a pre-vault layout must not be adopted as a vault account — it would be listed but \
+         unreadable under per-account key derivation"
+    );
+    // The old files are left exactly where they are, for the standalone reader that wrote them.
+    assert!(dir.join("seed.key").exists(), "nothing is moved or destroyed behind the user's back");
+    assert_eq!(Store::unlock(&dir, pass).unwrap().load_entropy().unwrap(), entropy);
 
     std::fs::remove_dir_all(&dir).ok();
 }

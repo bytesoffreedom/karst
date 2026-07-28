@@ -81,6 +81,11 @@ pub struct FeedRecord {
 /// name (empty for an image). Bytes are the already-encoded, bounded payload (same size gate as a
 /// post image), inline like `feed_images` — no relay blob.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// NOTE: no field here carries `serde(default)`. Trailing-field defaults let an OLDER binary read
+/// a NEWER record, silently drop the fields it does not know and write the loss straight back
+/// (A6-5). `secretbox::STATE_VERSION` replaced that: change this struct, bump the version, and an
+/// older build refuses the file out loud instead.
 pub struct StoredAttachment {
     pub index: u32,
     pub kind: u8,
@@ -89,9 +94,7 @@ pub struct StoredAttachment {
     /// A terminal FAILURE marker (blob-transport path): the fetch gave up (blob swept, hash
     /// mismatch, past TTL) so the bytes will never arrive. Kept as a zero-byte marker (not silently
     /// dropped) so the feed can show an error tile instead of the attachment just vanishing. A later
-    /// successful fetch at the same index replaces it. Appended field → `serde(default)` so older
-    /// sidecars (which never carry a failure) load as `false`.
-    #[serde(default)]
+    /// successful fetch at the same index replaces it.
     pub failed: bool,
 }
 
@@ -142,9 +145,7 @@ pub struct ReceivedFile {
     pub sender: [u8; 32],
     pub ts: u64,
     /// The source blob id, so a crash-safe download can tell "already completed" from
-    /// "retry me" idempotently. Zero for a legacy record / the inline (non-blob) path.
-    /// postcard-positional: appended last; old records load via the scan fallback.
-    #[serde(default)]
+    /// "retry me" idempotently. Zero for the inline (non-blob) path.
     pub blob_id: [u8; 32],
 }
 
@@ -168,7 +169,6 @@ pub struct PendingDownload {
     /// created it — so a retry RESUMES the same partial (skipping already-fetched chunks)
     /// instead of restarting. `None` before the first attempt. On any inconsistency the
     /// download degrades gracefully to a fresh start (the orphan sweep cleans the stale one).
-    #[serde(default)]
     pub container_id: Option<String>,
 }
 
@@ -228,9 +228,7 @@ pub struct PendingUpload {
     pub size: u64,
     pub queued_at: u64,
     /// The source file path, so a GUI resume-on-restart can re-read it (the CLI re-reads via the
-    /// re-run command, so it stores `None`). postcard-positional: appended last, `serde(default)`
-    /// so an older record loads.
-    #[serde(default)]
+    /// re-run command, so it stores `None`).
     pub path: Option<String>,
 }
 
@@ -327,6 +325,14 @@ pub struct Store {
     /// state (the relay capability, blob transfer queues) and all DATA (contacts/history/feed/
     /// profile/…) stay on the root paths, one copy — a proxy is a channel, not a persona.
     proxy: Option<u32>,
+    /// At-rest CONTEXT prefix for this store (CRYPTO-05): `acct:<id>` inside a vault, `vault`
+    /// for the vault's own files, `store` for a standalone single-account directory. Combined
+    /// with the file's path relative to `dir` it forms the seal label, so one account's file
+    /// cannot be swapped in for another's, nor one file for another.
+    ///
+    /// Deliberately NOT derived from `dir`: the on-disk path is the user's to move or rename,
+    /// and binding to it would turn "I moved ~/.config to a bigger drive" into "wrong password".
+    scope: String,
 }
 
 /// Plaintext bytes sealed per record before hitting disk. 64 KiB keeps the streaming
@@ -357,12 +363,25 @@ const _: () = assert!(crate::blob::BLOB_CHUNK < FILE_CHUNK);
 pub struct SealedFileWriter {
     file: std::fs::File,
     key: MasterKey,
+    /// The at-rest label every record in THIS file is sealed under (CRYPTO-05): the file's own
+    /// path, so records cannot be spliced in from another received file. Carried on the writer
+    /// rather than passed per record — the two must never disagree.
+    ///
+    /// NAMED LIMIT: this binds records to the FILE, not to their position within it. Reordering
+    /// records inside one container is still undetected here; the download's end-to-end
+    /// plaintext hash is what catches that.
+    label: String,
     buf: Vec<u8>,
 }
 
 impl SealedFileWriter {
-    fn record(file: &mut std::fs::File, key: &MasterKey, plain: &[u8]) -> io::Result<()> {
-        let sealed = key.seal(plain);
+    fn record(
+        file: &mut std::fs::File,
+        key: &MasterKey,
+        label: &str,
+        plain: &[u8],
+    ) -> io::Result<()> {
+        let sealed = key.seal(label, plain);
         let len: u32 = sealed.len().try_into().map_err(|_| io_err("sealed record too large"))?;
         file.write_all(&len.to_le_bytes())?;
         file.write_all(&sealed)
@@ -373,7 +392,7 @@ impl SealedFileWriter {
     pub fn finish(mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
             let buf = std::mem::take(&mut self.buf);
-            Self::record(&mut self.file, &self.key, &buf)?;
+            Self::record(&mut self.file, &self.key, &self.label, &buf)?;
         }
         self.file.sync_all()
     }
@@ -386,7 +405,7 @@ impl SealedFileWriter {
     pub fn seal(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
             let buf = std::mem::take(&mut self.buf);
-            Self::record(&mut self.file, &self.key, &buf)?;
+            Self::record(&mut self.file, &self.key, &self.label, &buf)?;
         }
         Ok(())
     }
@@ -415,7 +434,7 @@ impl Write for SealedFileWriter {
         while self.buf.len() >= FILE_CHUNK {
             let rest = self.buf.split_off(FILE_CHUNK);
             let chunk = std::mem::replace(&mut self.buf, rest);
-            Self::record(&mut self.file, &self.key, &chunk)?;
+            Self::record(&mut self.file, &self.key, &self.label, &chunk)?;
         }
         Ok(data.len())
     }
@@ -449,20 +468,24 @@ fn read_or_create_salt(dir: &std::path::Path) -> io::Result<Vec<u8>> {
     }
 }
 
+/// At-rest label of the password verifier. A literal, not a path: the verifier is the ONE
+/// file read before we know which store/account we are in, so it cannot be scoped by one.
+const VERIFY_LABEL: &str = "verify";
+
 /// Верификатор пароля: при первом разе запечатать известную константу, далее
 /// сверять. Ловит НЕВЕРНЫЙ пароль СРАЗУ (fail-fast), до любой записи секрета.
 fn check_or_seal_verify(dir: &std::path::Path, key: &MasterKey) -> io::Result<()> {
     let verify_path = dir.join("verify");
     match std::fs::read(&verify_path) {
         Ok(blob) => {
-            let ok = key.open(&blob).map(|p| p == VERIFY_CONST).unwrap_or(false);
+            let ok = key.open(VERIFY_LABEL, &blob).map(|p| p == VERIFY_CONST).unwrap_or(false);
             if !ok {
                 return Err(io_err("неверный пароль"));
             }
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let blob = key.seal(VERIFY_CONST);
+            let blob = key.seal(VERIFY_LABEL, VERIFY_CONST);
             let mut f =
                 OpenOptions::new().write(true).create_new(true).mode(0o600).open(&verify_path)?;
             f.write_all(&blob)
@@ -483,21 +506,49 @@ impl Store {
         let salt = read_or_create_salt(&dir)?;
         let key = MasterKey::derive(passphrase, &salt).map_err(io_err)?;
         check_or_seal_verify(&dir, &key)?;
-        Ok(Store { dir, key, proxy: None })
+        Ok(Store { dir, key, proxy: None, scope: "store".into() })
     }
 
     /// Store поверх УЖЕ выведенного vault-ключа (salt/verify проверены на уровне
     /// базы). Не трогает salt/verify — их у аккаунт-подкаталога нет. Переключение
     /// аккаунтов = сменить `dir`, переиспользовать тот же `key` (без Argon2).
     pub fn at(dir: impl Into<PathBuf>, key: MasterKey) -> Self {
-        Store { dir: dir.into(), key, proxy: None }
+        Store { dir: dir.into(), key, proxy: None, scope: "store".into() }
+    }
+
+    /// The same store bound to an explicit at-rest `scope` (see [`Store::scope`]). Used by
+    /// `Vault` to give every account its own key derivation, so account A's sealed file cannot
+    /// be dropped in over account B's and still open.
+    pub(crate) fn scoped(dir: impl Into<PathBuf>, key: MasterKey, scope: String) -> Self {
+        Store { dir: dir.into(), key, proxy: None, scope }
+    }
+
+    /// The at-rest label for `path`: `<scope>/<path relative to this store's dir>`, with
+    /// separators normalised so the label is identical on every platform. Derived from where
+    /// the bytes actually LIVE, so it cannot drift from the file it protects the way a
+    /// hand-passed string would.
+    ///
+    /// `path` must be the FINAL path, never a `.tmp` staging name — [`Store::write_sealed`]
+    /// exists so that no caller has to remember this.
+    pub(crate) fn label(&self, path: &std::path::Path) -> String {
+        let rel = path.strip_prefix(&self.dir).unwrap_or(path);
+        let rel: Vec<String> =
+            rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        format!("{}/{}", self.scope, rel.join("/"))
+    }
+
+    /// Seal `plain` FOR `path` and write it atomically (temp 0600 → fsync → rename). The label
+    /// comes from `path` itself, so seal and open can never disagree about the context.
+    pub(crate) fn write_sealed(&self, path: &std::path::Path, plain: &[u8]) -> io::Result<()> {
+        let bytes = self.key.seal(&self.label(path), plain);
+        self.write_atomic(path, &bytes)
     }
 
     /// A handle onto the SAME vault dir + key that acts AS proxy `index` (proxy-identity model):
     /// `load_account`/`load_identity` return that proxy's HD-derived identity, and the network
     /// files are namespaced by index. Data files are unchanged (root-owned). Cheap clone.
     pub fn as_proxy(&self, index: u32) -> Store {
-        Store { dir: self.dir.clone(), key: self.key.clone(), proxy: Some(index) }
+        Store { dir: self.dir.clone(), key: self.key.clone(), proxy: Some(index), scope: self.scope.clone() }
     }
 
     /// The proxy index this store is acting as, if any (`None` = root).
@@ -547,7 +598,7 @@ impl Store {
     pub fn load_net(&self) -> io::Result<NetSettings> {
         match std::fs::read(self.net_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.net_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(NetSettings::default()),
@@ -559,7 +610,7 @@ impl Store {
     /// encrypted — same handling as the rest of the account's state.
     pub fn save_net(&self, net: &NetSettings) -> io::Result<()> {
         let plain = postcard::to_stdvec(net).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.net_path()), &plain);
         let tmp = self.dir.join("net.dat.tmp");
         {
             let mut f = OpenOptions::new()
@@ -583,7 +634,7 @@ impl Store {
     pub fn load_relay_prefs(&self) -> io::Result<RelayPrefs> {
         match std::fs::read(self.relay_prefs_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.relay_prefs_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RelayPrefs::default()),
@@ -594,7 +645,7 @@ impl Store {
     /// Atomically save the relay-selection preferences (temp 0600 → fsync → rename), encrypted.
     pub fn save_relay_prefs(&self, prefs: &RelayPrefs) -> io::Result<()> {
         let plain = postcard::to_stdvec(prefs).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.relay_prefs_path()), &plain);
         let tmp = self.dir.join("relay_prefs.dat.tmp");
         {
             let mut f =
@@ -615,7 +666,7 @@ impl Store {
     pub fn load_prefs(&self) -> io::Result<Prefs> {
         match std::fs::read(self.prefs_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.prefs_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Prefs::default()),
@@ -626,7 +677,7 @@ impl Store {
     /// Atomically save the privacy preferences (temp 0600 → fsync → rename), encrypted.
     pub fn save_prefs(&self, prefs: &Prefs) -> io::Result<()> {
         let plain = postcard::to_stdvec(prefs).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.prefs_path()), &plain);
         let tmp = self.dir.join("prefs.dat.tmp");
         {
             let mut f =
@@ -657,8 +708,9 @@ impl Store {
             .create_new(true)
             .mode(0o600)
             .open(self.file_path(&id))?;
-        SealedFileWriter::record(&mut file, &self.key, name.as_bytes())?;
-        Ok((id, SealedFileWriter { file, key: self.key.clone(), buf: Vec::new() }))
+        let label = self.label(&self.file_path(&id));
+        SealedFileWriter::record(&mut file, &self.key, &label, name.as_bytes())?;
+        Ok((id, SealedFileWriter { file, key: self.key.clone(), label, buf: Vec::new() }))
     }
 
     /// Save a small received file in one go (the inline path); returns its id.
@@ -701,7 +753,7 @@ impl Store {
     }
 
     /// Read one sealed record at `pos`; `Ok(None)` at clean EOF.
-    fn read_record(f: &mut File, key: &MasterKey) -> io::Result<Option<Vec<u8>>> {
+    fn read_record(f: &mut File, key: &MasterKey, label: &str) -> io::Result<Option<Vec<u8>>> {
         use io::Read;
         let mut len = [0u8; 4];
         match f.read_exact(&mut len) {
@@ -716,13 +768,13 @@ impl Store {
         }
         let mut sealed = vec![0u8; n];
         f.read_exact(&mut sealed)?;
-        key.open(&sealed).map(Some).map_err(io_err)
+        key.open(label, &sealed).map(Some).map_err(io_err)
     }
 
     /// The (sealed) original name of a received file.
     pub fn received_file_name(&self, id: &str) -> io::Result<String> {
         let mut f = File::open(self.file_path(id))?;
-        let rec = Self::read_record(&mut f, &self.key)?.ok_or_else(|| io_err("empty file record"))?;
+        let rec = Self::read_record(&mut f, &self.key, &self.label(&self.file_path(id)))?.ok_or_else(|| io_err("empty file record"))?;
         String::from_utf8(rec).map_err(io_err)
     }
 
@@ -741,10 +793,10 @@ impl Store {
     pub fn export_received_file(&self, id: &str, dest: &std::path::Path) -> io::Result<()> {
         let mut f = File::open(self.file_path(id))?;
         // First record is the name — skip it.
-        Self::read_record(&mut f, &self.key)?.ok_or_else(|| io_err("empty file record"))?;
+        Self::read_record(&mut f, &self.key, &self.label(&self.file_path(id)))?.ok_or_else(|| io_err("empty file record"))?;
         let mut out =
             OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(dest)?;
-        while let Some(chunk) = Self::read_record(&mut f, &self.key)? {
+        while let Some(chunk) = Self::read_record(&mut f, &self.key, &self.label(&self.file_path(id)))? {
             out.write_all(&chunk)?;
         }
         out.sync_all()
@@ -765,9 +817,9 @@ impl Store {
     pub fn read_received_file(&self, id: &str) -> io::Result<Vec<u8>> {
         let mut f = File::open(self.file_path(id))?;
         // First record is the name — skip it.
-        Self::read_record(&mut f, &self.key)?.ok_or_else(|| io_err("empty file record"))?;
+        Self::read_record(&mut f, &self.key, &self.label(&self.file_path(id)))?.ok_or_else(|| io_err("empty file record"))?;
         let mut out = Vec::new();
-        while let Some(chunk) = Self::read_record(&mut f, &self.key)? {
+        while let Some(chunk) = Self::read_record(&mut f, &self.key, &self.label(&self.file_path(id)))? {
             out.extend_from_slice(&chunk);
         }
         Ok(out)
@@ -804,7 +856,7 @@ impl Store {
     /// this ever fails, so callers may ignore the error.
     pub fn record_received_file(&self, rec: &ReceivedFile) -> io::Result<()> {
         let plain = postcard::to_stdvec(rec).map_err(io_err)?;
-        let blob = self.key.seal(&plain);
+        let blob = self.key.seal(&self.label(&self.files_index_path()), &plain);
         let len: u32 = blob.len().try_into().map_err(|_| io_err("index record too large"))?;
         let _lock = self.lock_files_index()?;
         let mut f = OpenOptions::new()
@@ -839,7 +891,7 @@ impl Store {
                 Some(e) if e <= bytes.len() => e,
                 _ => break,
             };
-            let plain = match self.key.open(&bytes[start..end]) {
+            let plain = match self.key.open(&self.label(&self.files_index_path()), &bytes[start..end]) {
                 Ok(p) => p,
                 Err(_) => break,
             };
@@ -874,18 +926,18 @@ impl Store {
     /// mistaken for versioned data), and it sits INSIDE the seal so the version is
     /// authenticated. New at-rest formats should use this instead of growing another
     /// try-new-fallback mirror (see docs/design/format-versioning.md).
-    fn seal_versioned(&self, version: u8, plain: &[u8]) -> Vec<u8> {
+    fn seal_versioned(&self, path: &std::path::Path, version: u8, plain: &[u8]) -> Vec<u8> {
         let mut framed = Vec::with_capacity(5 + plain.len());
         framed.extend_from_slice(FORMAT_MAGIC);
         framed.push(version);
         framed.extend_from_slice(plain);
-        self.key.seal(&framed)
+        self.key.seal(&self.label(path), &framed)
     }
 
     /// Open a version-enveloped blob → `(version, inner)`. `None` if it does not decrypt or
     /// lacks the magic (e.g. a pre-versioning blob), so the caller can fall back / reset.
-    fn open_versioned(&self, blob: &[u8]) -> Option<(u8, Vec<u8>)> {
-        let plain = self.key.open(blob).ok()?;
+    fn open_versioned(&self, path: &std::path::Path, blob: &[u8]) -> Option<(u8, Vec<u8>)> {
+        let plain = self.key.open(&self.label(path), blob).ok()?;
         if plain.len() < 5 || &plain[..4] != FORMAT_MAGIC {
             return None;
         }
@@ -898,7 +950,7 @@ impl Store {
         match std::fs::read(self.downloads_path()) {
             // Version-dispatched: only v1 is known. A pre-versioning or unknown blob → empty
             // (these are transient retry hints, safe to reset).
-            Ok(blob) => Ok(match self.open_versioned(&blob) {
+            Ok(blob) => Ok(match self.open_versioned(&self.downloads_path(), &blob) {
                 Some((DOWNLOADS_VERSION, inner)) => postcard::from_bytes(&inner).unwrap_or_default(),
                 _ => Default::default(),
             }),
@@ -910,7 +962,7 @@ impl Store {
     /// Persist the pending-downloads map under the current version envelope.
     fn save_pending_downloads(&self, map: &std::collections::BTreeMap<[u8; 32], PendingDownload>) -> io::Result<()> {
         let plain = postcard::to_stdvec(map).map_err(io_err)?;
-        self.write_atomic(&self.downloads_path(), &self.seal_versioned(DOWNLOADS_VERSION, &plain))
+        self.write_atomic(&self.downloads_path(), &self.seal_versioned(&self.downloads_path(), DOWNLOADS_VERSION, &plain))
     }
 
     /// Every pending download, for the retry driver.
@@ -968,7 +1020,7 @@ impl Store {
                 let mut records = 0u32;
                 let mut last_good = 0u64;
                 // Stop at the first non-clean record (Ok(None) = clean EOF, Err = torn tail).
-                while let Ok(Some(_)) = Self::read_record(&mut f, &self.key) {
+                while let Ok(Some(_)) = Self::read_record(&mut f, &self.key, &self.label(&self.file_path(id))) {
                     records += 1;
                     last_good = f.stream_position()?;
                 }
@@ -977,7 +1029,12 @@ impl Store {
                     // never hashes and the download is stuck forever.
                     OpenOptions::new().write(true).open(&path)?.set_len(last_good)?;
                     let file = OpenOptions::new().append(true).mode(0o600).open(&path)?;
-                    let writer = SealedFileWriter { file, key: self.key.clone(), buf: Vec::new() };
+                    let writer = SealedFileWriter {
+                        file,
+                        key: self.key.clone(),
+                        label: self.label(&self.file_path(id)),
+                        buf: Vec::new(),
+                    };
                     return Ok((id.to_string(), writer, records - 1)); // minus the name record
                 }
             }
@@ -997,7 +1054,7 @@ impl Store {
         let mut f = File::open(self.file_path(id))?;
         let mut hasher = Sha256::new();
         let mut first = true; // the first record is the file name, not content
-        while let Some(rec) = Self::read_record(&mut f, &self.key)? {
+        while let Some(rec) = Self::read_record(&mut f, &self.key, &self.label(&self.file_path(id)))? {
             if first {
                 first = false;
             } else {
@@ -1027,7 +1084,7 @@ impl Store {
         &self,
     ) -> io::Result<std::collections::BTreeMap<[u8; 32], PendingPostAttachment>> {
         match std::fs::read(self.post_attachments_path()) {
-            Ok(blob) => Ok(match self.open_versioned(&blob) {
+            Ok(blob) => Ok(match self.open_versioned(&self.post_attachments_path(), &blob) {
                 Some((POST_ATTACH_VERSION, inner)) => postcard::from_bytes(&inner).unwrap_or_default(),
                 _ => Default::default(),
             }),
@@ -1041,7 +1098,7 @@ impl Store {
         map: &std::collections::BTreeMap<[u8; 32], PendingPostAttachment>,
     ) -> io::Result<()> {
         let plain = postcard::to_stdvec(map).map_err(io_err)?;
-        self.write_atomic(&self.post_attachments_path(), &self.seal_versioned(POST_ATTACH_VERSION, &plain))
+        self.write_atomic(&self.post_attachments_path(), &self.seal_versioned(&self.post_attachments_path(), POST_ATTACH_VERSION, &plain))
     }
 
     /// Every pending post-attachment fetch, for the download driver.
@@ -1080,7 +1137,7 @@ impl Store {
 
     fn load_pending_galleries(&self) -> io::Result<std::collections::BTreeMap<[u8; 32], PendingGallery>> {
         match std::fs::read(self.pending_galleries_path()) {
-            Ok(blob) => Ok(match self.open_versioned(&blob) {
+            Ok(blob) => Ok(match self.open_versioned(&self.pending_galleries_path(), &blob) {
                 Some((PENDING_GALLERY_VERSION, inner)) => postcard::from_bytes(&inner).unwrap_or_default(),
                 _ => Default::default(),
             }),
@@ -1094,7 +1151,7 @@ impl Store {
         map: &std::collections::BTreeMap<[u8; 32], PendingGallery>,
     ) -> io::Result<()> {
         let plain = postcard::to_stdvec(map).map_err(io_err)?;
-        self.write_atomic(&self.pending_galleries_path(), &self.seal_versioned(PENDING_GALLERY_VERSION, &plain))
+        self.write_atomic(&self.pending_galleries_path(), &self.seal_versioned(&self.pending_galleries_path(), PENDING_GALLERY_VERSION, &plain))
     }
 
     /// Every pending gallery fetch, for the download driver.
@@ -1141,7 +1198,7 @@ impl Store {
             // opks.dat and the proxy sidecars.
             Ok(blob) => {
                 let (ver, inner) = self
-                    .open_versioned(&blob)
+                    .open_versioned(&self.uploads_path(), &blob)
                     .ok_or_else(|| io_err("pending uploads fail authentication"))?;
                 if ver != UPLOADS_VERSION {
                     return Err(io_err(format!(
@@ -1158,7 +1215,7 @@ impl Store {
 
     fn save_pending_uploads(&self, map: &std::collections::BTreeMap<[u8; 32], PendingUpload>) -> io::Result<()> {
         let plain = postcard::to_stdvec(map).map_err(io_err)?;
-        self.write_atomic(&self.uploads_path(), &self.seal_versioned(UPLOADS_VERSION, &plain))
+        self.write_atomic(&self.uploads_path(), &self.seal_versioned(&self.uploads_path(), UPLOADS_VERSION, &plain))
     }
 
     /// Every pending upload (for a resume driver).
@@ -1248,7 +1305,7 @@ impl Store {
     /// старую личность и все сессии. Права 0600 при СОЗДАНИИ. Provisioning
     /// (create/restore) кладёт сюда энтропию свежей/введённой фразы.
     pub fn save_seed(&self, entropy: &[u8; crate::seed::ENTROPY_BYTES]) -> io::Result<()> {
-        let blob = self.key.seal(entropy);
+        let blob = self.key.seal(&self.label(&self.seed_path()), entropy);
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1260,7 +1317,7 @@ impl Store {
     /// Прочитать корень (для показа фразы / provisioning-проверок).
     pub fn load_entropy(&self) -> io::Result<[u8; crate::seed::ENTROPY_BYTES]> {
         let blob = std::fs::read(self.seed_path())?;
-        let secret = self.key.open(&blob).map_err(io_err)?;
+        let secret = self.key.open(&self.label(&self.seed_path()), &blob).map_err(io_err)?;
         secret
             .as_slice()
             .try_into()
@@ -1295,7 +1352,7 @@ impl Store {
     /// и настоящую — единый режим, без исключения.
     pub fn save_capability(&self, cap: &Capability) -> io::Result<()> {
         let json = serde_json::to_vec(cap).map_err(io_err)?;
-        let blob = self.key.seal(&json);
+        let blob = self.key.seal(&self.label(&self.capability_path()), &json);
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
@@ -1307,7 +1364,7 @@ impl Store {
 
     pub fn load_capability(&self) -> io::Result<Capability> {
         let blob = std::fs::read(self.capability_path())?;
-        let json = self.key.open(&blob).map_err(io_err)?;
+        let json = self.key.open(&self.label(&self.capability_path()), &blob).map_err(io_err)?;
         serde_json::from_slice(&json).map_err(io_err)
     }
 
@@ -1329,7 +1386,7 @@ impl Store {
     /// Write (or rotate) the discovery secret. Overwrite is intentional: rotating retires the old
     /// contact code. 0600, sealed at-rest like the other secrets.
     pub fn save_discovery(&self, secret: &[u8; 32]) -> io::Result<()> {
-        let blob = self.key.seal(secret);
+        let blob = self.key.seal(&self.label(&self.discovery_path()), secret);
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
@@ -1342,7 +1399,7 @@ impl Store {
     /// Read the discovery secret, or `NotFound` if discovery is off.
     pub fn load_discovery(&self) -> io::Result<[u8; 32]> {
         let blob = std::fs::read(self.discovery_path())?;
-        let secret = self.key.open(&blob).map_err(io_err)?;
+        let secret = self.key.open(&self.label(&self.discovery_path()), &blob).map_err(io_err)?;
         secret.as_slice().try_into().map_err(|_| io_err("discovery: not 32 bytes"))
     }
 
@@ -1365,7 +1422,7 @@ impl Store {
     pub fn load_contacts(&self) -> io::Result<Vec<ContactRecord>> {
         match std::fs::read(self.contacts_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.contacts_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -1379,7 +1436,7 @@ impl Store {
     /// keystream-reuse; тут максимум — потеря последнего переименования контакта).
     pub fn save_contacts(&self, contacts: &[ContactRecord]) -> io::Result<()> {
         let plain = postcard::to_stdvec(contacts).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.contacts_path()), &plain);
         let tmp = self.dir.join("contacts.dat.tmp");
         {
             let mut f = OpenOptions::new()
@@ -1407,7 +1464,7 @@ impl Store {
     pub fn load_blocked(&self) -> io::Result<BTreeSet<[u8; 32]>> {
         match std::fs::read(self.blocked_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.blocked_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
@@ -1432,7 +1489,7 @@ impl Store {
             return Ok(());
         }
         let plain = postcard::to_stdvec(&set).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.blocked_path()), &plain);
         let tmp = self.dir.join("blocked.dat.tmp");
         {
             let mut f = OpenOptions::new()
@@ -1465,7 +1522,7 @@ impl Store {
     pub fn load_unconfirmed(&self) -> io::Result<BTreeSet<[u8; 32]>> {
         match std::fs::read(self.unconfirmed_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.unconfirmed_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
@@ -1491,7 +1548,7 @@ impl Store {
             return Ok(());
         }
         let plain = postcard::to_stdvec(&set).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.unconfirmed_path()), &plain);
         let tmp = self.dir.join("unconfirmed.dat.tmp");
         {
             let mut f = OpenOptions::new()
@@ -1531,7 +1588,7 @@ impl Store {
     pub fn load_public_posts(&self) -> io::Result<BTreeSet<[u8; 16]>> {
         match std::fs::read(self.public_posts_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.public_posts_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
@@ -1548,7 +1605,7 @@ impl Store {
         let live: BTreeSet<[u8; 16]> = self.load_feed()?.into_iter().map(|f| f.id).collect();
         set.retain(|id2| *id2 == id || live.contains(id2));
         let plain = postcard::to_stdvec(&set).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.public_posts_path()), &plain);
         let tmp = self.dir.join("public_posts.dat.tmp");
         {
             let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
@@ -1573,7 +1630,7 @@ impl Store {
     pub fn load_pulled(&self) -> io::Result<BTreeSet<[u8; 32]>> {
         match std::fs::read(self.pulled_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.pulled_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
@@ -1588,7 +1645,7 @@ impl Store {
             return Ok(());
         }
         let plain = postcard::to_stdvec(&set).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.pulled_path()), &plain);
         let tmp = self.dir.join("pulled.dat.tmp");
         {
             let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
@@ -1629,7 +1686,7 @@ impl Store {
     /// Persist the in-flight inline transfers, sealed. Called after a receive batch so a crash
     /// cannot lose chunks whose carrier messages were already acked (the relay drops those).
     pub fn save_partials(&self, blob: &[u8]) -> io::Result<()> {
-        self.write_atomic(&self.partials_path(), &self.key.seal(blob))
+        self.write_sealed(&self.partials_path(), blob)
     }
 
     /// Load the in-flight inline transfers. Absent = nothing was in flight; a file that EXISTS but
@@ -1637,7 +1694,7 @@ impl Store {
     /// silent loss this state was added to prevent.
     pub fn load_partials(&self) -> io::Result<Vec<u8>> {
         match std::fs::read(self.partials_path()) {
-            Ok(blob) => self.key.open(&blob).map_err(|e| {
+            Ok(blob) => self.key.open(&self.label(&self.partials_path()), &blob).map_err(|e| {
                 io_err(format!("in-flight transfers unreadable ({e}) — refusing to treat them as absent"))
             }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -1656,7 +1713,7 @@ impl Store {
             Ok(blob) => {
                 let plain = self
                     .key
-                    .open(&blob)
+                    .open(&self.label(&self.opks_path()), &blob)
                     .map_err(|e| io_err(format!("one-time prekeys unreadable ({e}) — refusing to \
                          treat a corrupt sidecar as 'no keys'; restore it or re-provision")))?;
                 postcard::from_bytes(&plain).map_err(|e| {
@@ -1673,7 +1730,7 @@ impl Store {
     /// changes as a whole on top-up/consumption). **Private keys in the clear** — 0600.
     pub fn save_opks(&self, opks: &[[u8; 32]]) -> io::Result<()> {
         let plain = postcard::to_stdvec(opks).map_err(io_err)?;
-        self.write_atomic(&self.opks_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.opks_path(), &plain)
     }
 
     fn extra_relays_path(&self) -> PathBuf {
@@ -1689,7 +1746,7 @@ impl Store {
         match std::fs::read(self.extra_relays_path()) {
             Ok(blob) => Ok(self
                 .key
-                .open(&blob)
+                .open(&self.label(&self.extra_relays_path()), &blob)
                 .ok()
                 .and_then(|b| postcard::from_bytes(&b).ok())
                 .unwrap_or_default()),
@@ -1701,7 +1758,7 @@ impl Store {
     /// Atomically persist the secondary relay list (full rewrite).
     pub fn save_extra_relays(&self, relays: &[(String, String)]) -> io::Result<()> {
         let plain = postcard::to_stdvec(relays).map_err(io_err)?;
-        self.write_atomic(&self.extra_relays_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.extra_relays_path(), &plain)
     }
 
     /// Own profile (empty by default / best-effort on corruption).
@@ -1709,7 +1766,7 @@ impl Store {
         match std::fs::read(self.profile_path()) {
             Ok(blob) => Ok(self
                 .key
-                .open(&blob)
+                .open(&self.label(&self.profile_path()), &blob)
                 .ok()
                 .and_then(|b| postcard::from_bytes(&b).ok())
                 .unwrap_or_default()),
@@ -1735,7 +1792,7 @@ impl Store {
             photos_ts: p.photos_ts,
         };
         let plain = postcard::to_stdvec(&clamped).map_err(io_err)?;
-        self.write_atomic(&self.profile_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.profile_path(), &plain)
     }
 
     /// Cache of contacts' profiles (empty by default / best-effort on corruption).
@@ -1743,7 +1800,7 @@ impl Store {
         match std::fs::read(self.peer_profiles_path()) {
             Ok(blob) => Ok(self
                 .key
-                .open(&blob)
+                .open(&self.label(&self.peer_profiles_path()), &blob)
                 .ok()
                 .and_then(|b| postcard::from_bytes(&b).ok())
                 .unwrap_or_default()),
@@ -1765,7 +1822,7 @@ impl Store {
         entry.name = clamp_str(name, crate::content::MAX_PROFILE_NAME);
         entry.bio = clamp_str(bio, crate::content::MAX_PROFILE_BIO);
         let plain = postcard::to_stdvec(&map).map_err(io_err)?;
-        self.write_atomic(&self.peer_profiles_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.peer_profiles_path(), &plain)
     }
 
     /// Forget a peer's cached profile (on removing a contact). Idempotent.
@@ -1775,7 +1832,7 @@ impl Store {
             return Ok(());
         }
         let plain = postcard::to_stdvec(&map).map_err(io_err)?;
-        self.write_atomic(&self.peer_profiles_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.peer_profiles_path(), &plain)
     }
 
     /// Set (or clear, with `None`) OUR avatar bytes, preserving name/bio. Rejects
@@ -1803,7 +1860,7 @@ impl Store {
         }
         map.entry(ik).or_default().avatar = Some(avatar);
         let plain = postcard::to_stdvec(&map).map_err(io_err)?;
-        self.write_atomic(&self.peer_profiles_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.peer_profiles_path(), &plain)
     }
 
     /// Set OUR gallery photos (beyond the avatar), preserving name/bio/avatar. Bounds count +
@@ -1837,7 +1894,7 @@ impl Store {
         entry.photos = photos;
         entry.photos_ts = ts;
         let plain = postcard::to_stdvec(&map).map_err(io_err)?;
-        self.write_atomic(&self.peer_profiles_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.peer_profiles_path(), &plain)
     }
 
     // ----- Feed: publications ("posts"), own + received (`feed.dat`) -----
@@ -1856,7 +1913,7 @@ impl Store {
         match std::fs::read(self.feed_path()) {
             Ok(blob) => Ok(self
                 .key
-                .open(&blob)
+                .open(&self.label(&self.feed_path()), &blob)
                 .ok()
                 .and_then(|b| postcard::from_bytes(&b).ok())
                 .unwrap_or_default()),
@@ -1895,7 +1952,7 @@ impl Store {
             feed.drain(0..drop); // oldest fall off the end of the window
         }
         let plain = postcard::to_stdvec(&feed).map_err(io_err)?;
-        self.write_atomic(&self.feed_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.feed_path(), &plain)
     }
 
     /// Remove a publication from the feed by (author, id). Used both for "delete for me" (our own
@@ -1909,7 +1966,7 @@ impl Store {
             return Ok(false);
         }
         let plain = postcard::to_stdvec(&feed).map_err(io_err)?;
-        self.write_atomic(&self.feed_path(), &self.key.seal(&plain))?;
+        self.write_sealed(&self.feed_path(), &plain)?;
         // A retracted/deleted post takes its image + attachments with it (no orphan in the sidecars).
         let _ = self.remove_feed_image(author, id);
         let _ = self.remove_feed_attachments(author, id);
@@ -1932,14 +1989,14 @@ impl Store {
     pub fn load_feed_images(&self) -> BTreeMap<([u8; 32], [u8; 16]), Vec<u8>> {
         std::fs::read(self.feed_images_path())
             .ok()
-            .and_then(|b| self.key.open(&b).ok())
+            .and_then(|b| self.key.open(&self.label(&self.feed_images_path()), &b).ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default()
     }
 
     fn write_feed_images(&self, map: &BTreeMap<([u8; 32], [u8; 16]), Vec<u8>>) -> io::Result<()> {
         let plain = postcard::to_stdvec(map).map_err(io_err)?;
-        self.write_atomic(&self.feed_images_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.feed_images_path(), &plain)
     }
 
     /// The image attached to a post, if any.
@@ -1995,14 +2052,14 @@ impl Store {
     pub fn load_feed_attachments(&self) -> BTreeMap<([u8; 32], [u8; 16]), Vec<StoredAttachment>> {
         std::fs::read(self.feed_attachments_path())
             .ok()
-            .and_then(|b| self.key.open(&b).ok())
+            .and_then(|b| self.key.open(&self.label(&self.feed_attachments_path()), &b).ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default()
     }
 
     fn write_feed_attachments(&self, map: &BTreeMap<([u8; 32], [u8; 16]), Vec<StoredAttachment>>) -> io::Result<()> {
         let plain = postcard::to_stdvec(map).map_err(io_err)?;
-        self.write_atomic(&self.feed_attachments_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.feed_attachments_path(), &plain)
     }
 
     /// A post's attachments, ordered by index.
@@ -2098,7 +2155,7 @@ impl Store {
     pub fn load_channel(&self) -> ChannelConfig {
         std::fs::read(self.channel_path())
             .ok()
-            .and_then(|b| self.key.open(&b).ok())
+            .and_then(|b| self.key.open(&self.label(&self.channel_path()), &b).ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default()
     }
@@ -2109,7 +2166,7 @@ impl Store {
     /// gated caller (the receive handlers touch subscribers/pending, never this).
     pub fn save_channel(&self, cfg: &ChannelConfig) -> io::Result<()> {
         let plain = postcard::to_stdvec(cfg).map_err(io_err)?;
-        self.write_atomic(&self.channel_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.channel_path(), &plain)
     }
 
     fn subscribers_path(&self) -> PathBuf {
@@ -2120,7 +2177,7 @@ impl Store {
     pub fn load_subscribers(&self) -> Vec<Subscriber> {
         std::fs::read(self.subscribers_path())
             .ok()
-            .and_then(|b| self.key.open(&b).ok())
+            .and_then(|b| self.key.open(&self.label(&self.subscribers_path()), &b).ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default()
     }
@@ -2137,7 +2194,7 @@ impl Store {
         }
         subs.push(Subscriber { ik, since: now });
         let plain = postcard::to_stdvec(&subs).map_err(io_err)?;
-        self.write_atomic(&self.subscribers_path(), &self.key.seal(&plain))?;
+        self.write_sealed(&self.subscribers_path(), &plain)?;
         Ok(true)
     }
 
@@ -2146,7 +2203,7 @@ impl Store {
         let mut subs = self.load_subscribers();
         subs.retain(|s| s.ik != ik);
         let plain = postcard::to_stdvec(&subs).map_err(io_err)?;
-        self.write_atomic(&self.subscribers_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.subscribers_path(), &plain)
     }
 
     fn contact_requests_path(&self) -> PathBuf {
@@ -2158,7 +2215,7 @@ impl Store {
     pub fn load_contact_requests(&self) -> Vec<[u8; 32]> {
         std::fs::read(self.contact_requests_path())
             .ok()
-            .and_then(|b| self.key.open(&b).ok())
+            .and_then(|b| self.key.open(&self.label(&self.contact_requests_path()), &b).ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default()
     }
@@ -2172,7 +2229,7 @@ impl Store {
         }
         p.push(ik);
         let plain = postcard::to_stdvec(&p).map_err(io_err)?;
-        self.write_atomic(&self.contact_requests_path(), &self.key.seal(&plain))?;
+        self.write_sealed(&self.contact_requests_path(), &plain)?;
         Ok(true)
     }
 
@@ -2181,7 +2238,7 @@ impl Store {
         let mut p = self.load_contact_requests();
         p.retain(|x| *x != ik);
         let plain = postcard::to_stdvec(&p).map_err(io_err)?;
-        self.write_atomic(&self.contact_requests_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.contact_requests_path(), &plain)
     }
 
     fn pending_subs_path(&self) -> PathBuf {
@@ -2192,7 +2249,7 @@ impl Store {
     pub fn load_pending_subs(&self) -> Vec<[u8; 32]> {
         std::fs::read(self.pending_subs_path())
             .ok()
-            .and_then(|b| self.key.open(&b).ok())
+            .and_then(|b| self.key.open(&self.label(&self.pending_subs_path()), &b).ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default()
     }
@@ -2205,7 +2262,7 @@ impl Store {
         }
         p.push(ik);
         let plain = postcard::to_stdvec(&p).map_err(io_err)?;
-        self.write_atomic(&self.pending_subs_path(), &self.key.seal(&plain))?;
+        self.write_sealed(&self.pending_subs_path(), &plain)?;
         Ok(true)
     }
 
@@ -2214,7 +2271,7 @@ impl Store {
         let mut p = self.load_pending_subs();
         p.retain(|x| *x != ik);
         let plain = postcard::to_stdvec(&p).map_err(io_err)?;
-        self.write_atomic(&self.pending_subs_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.pending_subs_path(), &plain)
     }
 
     fn channel_peers_path(&self) -> PathBuf {
@@ -2226,7 +2283,7 @@ impl Store {
     pub fn load_channel_peers(&self) -> Vec<[u8; 32]> {
         std::fs::read(self.channel_peers_path())
             .ok()
-            .and_then(|b| self.key.open(&b).ok())
+            .and_then(|b| self.key.open(&self.label(&self.channel_peers_path()), &b).ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default()
     }
@@ -2243,7 +2300,7 @@ impl Store {
             return Ok(());
         }
         let plain = postcard::to_stdvec(&v).map_err(io_err)?;
-        self.write_atomic(&self.channel_peers_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.channel_peers_path(), &plain)
     }
 
     // ----- Connection proxies: disposable HD-derived channels (proxy-identity model) -----
@@ -2276,7 +2333,7 @@ impl Store {
             Ok(b) => {
                 let plain = self
                     .key
-                    .open(&b)
+                    .open(&self.label(&self.proxies_path()), &b)
                     .map_err(|e| io_err(format!("proxy list fails authentication: {e}")))?;
                 let mut v: Vec<ProxyEntry> = postcard::from_bytes(&plain)
                     .map_err(|e| io_err(format!("proxy list malformed: {e}")))?;
@@ -2290,7 +2347,7 @@ impl Store {
 
     fn save_proxies(&self, list: &[ProxyEntry]) -> io::Result<()> {
         let plain = postcard::to_stdvec(list).map_err(io_err)?;
-        self.write_atomic(&self.proxies_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.proxies_path(), &plain)
     }
 
     /// Mint a new proxy: the next unused index gets a registry entry. Keys are NOT stored (they
@@ -2341,7 +2398,7 @@ impl Store {
         match std::fs::read(self.contact_proxy_path()) {
             Ok(b) => self
                 .key
-                .open(&b)
+                .open(&self.label(&self.contact_proxy_path()), &b)
                 .map_err(|e| format!("fails authentication: {e}"))
                 .and_then(|plain| {
                     postcard::from_bytes(&plain).map_err(|e| format!("malformed: {e}"))
@@ -2378,7 +2435,7 @@ impl Store {
             map.remove(&old);
             map.insert(new, idx);
             let plain = postcard::to_stdvec(&map).map_err(io_err)?;
-            self.write_atomic(&self.contact_proxy_path(), &self.key.seal(&plain))?;
+            self.write_sealed(&self.contact_proxy_path(), &plain)?;
         }
         // Carry the peer's cached profile (display name / bio / avatar) onto the new IK.
         // These live in peer_profiles.dat keyed by IK; without this, a migration would
@@ -2389,7 +2446,7 @@ impl Store {
         if let Some(p) = profiles.remove(&old) {
             profiles.insert(new, p);
             let plain = postcard::to_stdvec(&profiles).map_err(io_err)?;
-            self.write_atomic(&self.peer_profiles_path(), &self.key.seal(&plain))?;
+            self.write_sealed(&self.peer_profiles_path(), &plain)?;
         }
         Ok(true)
     }
@@ -2402,7 +2459,7 @@ impl Store {
         }
         map.insert(ik, index);
         let plain = postcard::to_stdvec(&map).map_err(io_err)?;
-        self.write_atomic(&self.contact_proxy_path(), &self.key.seal(&plain))
+        self.write_sealed(&self.contact_proxy_path(), &plain)
     }
 
     /// Shared atomic blob write (temp 0600 -> fsync -> rename). The sole writer is
@@ -2457,7 +2514,7 @@ impl Store {
     pub fn load_sessions(&self) -> io::Result<PeerState> {
         match std::fs::read(self.sessions_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.sessions_path()), &blob).map_err(io_err)?;
                 // Tolerate a state file written before the outbox field: never brick an
                 // in-flight ratchet to add a field (see `PeerState::from_bytes_compat`).
                 PeerState::from_bytes_compat(&bytes).map_err(io_err)
@@ -2473,7 +2530,7 @@ impl Store {
     /// в пределах ФС). Ratchet-ключи шифруются at-rest перед записью.
     pub fn save_sessions(&self, state: &PeerState) -> io::Result<()> {
         let plain = postcard::to_stdvec(state).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.sessions_path()), &plain);
         let tmp = self.net_file("sessions.dat.tmp");
         {
             let mut f = OpenOptions::new()
@@ -2537,7 +2594,7 @@ impl Store {
 
     fn append_history_with_id(&self, rec: &HistoryRecord, msg_id: [u8; 32]) -> io::Result<()> {
         let plain = postcard::to_stdvec(&StoredHistory { rec: rec.clone(), msg_id }).map_err(io_err)?;
-        let blob = self.key.seal(&plain);
+        let blob = self.key.seal(&self.label(&self.history_path()), &plain);
         let len: u32 =
             blob.len().try_into().map_err(|_| io_err("запись истории слишком велика"))?;
         let _lock = self.lock_history()?;
@@ -2571,7 +2628,7 @@ impl Store {
                 Some(e) if e <= bytes.len() => e,
                 _ => break, // запись не помещается → рваный хвост
             };
-            let plain = match self.key.open(&bytes[start..end]) {
+            let plain = match self.key.open(&self.label(&self.history_path()), &bytes[start..end]) {
                 Ok(p) => p,
                 Err(_) => break, // не расшифровалась → граница
             };
@@ -2679,7 +2736,7 @@ impl Store {
             // Re-seal the WHOLE stored record (rec + msg_id) so a rewrite (deletion / expiry)
             // preserves the dedup id of the records it keeps.
             let plain = postcard::to_stdvec(stored).map_err(io_err)?;
-            let blob = self.key.seal(&plain);
+            let blob = self.key.seal(&self.label(&self.history_path()), &plain);
             let len: u32 =
                 blob.len().try_into().map_err(|_| io_err("запись истории слишком велика"))?;
             out.extend_from_slice(&len.to_le_bytes());
@@ -2756,7 +2813,7 @@ impl Store {
             Ok(b) => b,
             Err(_) => return MetaMap::new(),
         };
-        let plain = match self.key.open(&blob) {
+        let plain = match self.key.open(&self.label(&self.meta_path()), &blob) {
             Ok(p) => p,
             Err(_) => return MetaMap::new(), // не наш/битый → пусто, не паника
         };
@@ -2780,7 +2837,7 @@ impl Store {
             return Ok(());
         }
         let plain = postcard::to_stdvec(map).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.meta_path()), &plain);
         let tmp = self.dir.join("meta.dat.tmp");
         {
             let mut f = OpenOptions::new()
@@ -3013,8 +3070,6 @@ pub struct NetSettings {
     /// Extra §15 failover routes, unified syntax (`ip:port` | `kind@ip:port`).
     pub routes: String,
     /// The `socks5` proxy is a mixnet (Nym) SOCKS client, so the carrier reads `mixnet`.
-    /// `serde(default)` so configs written before this field still load.
-    #[serde(default)]
     pub mixnet: bool,
 }
 
@@ -3052,8 +3107,10 @@ pub struct RelayPrefs {
 const SLOT_COUNT: usize = 8;
 /// Fixed plaintext: `role(1) ‖ compartment_id(16) ‖ reserved(15)`.
 const SLOT_PLAIN: usize = 32;
-/// Sealed slot length: `MAGIC(4) ‖ nonce(24) ‖ ct(SLOT_PLAIN + 16 tag)`.
-const SLOT_LEN: usize = 4 + 24 + SLOT_PLAIN + 16;
+/// Sealed slot length: `MAGIC(4) ‖ state_version(2) ‖ nonce(24) ‖ ct(SLOT_PLAIN + 16 tag)`.
+/// Fixed on purpose — every slot is the same size whether used or not, so `slots.dat` never
+/// reveals how many passwords are configured. Pinned by `multipassword_create_open_and_wrong_password`.
+const SLOT_LEN: usize = 4 + 2 + 24 + SLOT_PLAIN + 16;
 
 /// What a matching keyslot means for the password just entered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3127,8 +3184,6 @@ pub struct Deadman {
     /// forward jump (wrong RTC, restored VM snapshot, manual date change) would otherwise wipe a
     /// perfectly live vault on the next launch, and setting the clock BACK would postpone the
     /// wipe indefinitely. Comparing against this mark bounds both directions (A3-11).
-    /// Appended field → `serde(default)`, so an older file reads as "never observed".
-    #[serde(default)]
     pub last_check: u64,
 }
 
@@ -3230,11 +3285,17 @@ fn ensure_hidden(base: &std::path::Path) -> io::Result<()> {
     write_fixed_0600(&p, &buf)
 }
 
+/// At-rest label of the Tier-1 hidden region. Fixed, like the keyslots: this file must look like
+/// random bytes to anyone without the hidden password, so nothing about it may be path-derived.
+const HIDDEN_LABEL: &str = "hidden-region";
+/// At-rest label of the slot directory (sealed under the REAL key).
+const SLOTDIR_LABEL: &str = "slotmap";
+
 /// Try to open the hidden container with `key` (the password just entered IS the hidden password).
 /// `None` = wrong key or no hidden volume (indistinguishable). `Some(payload)` on success.
 fn open_hidden_container(base: &std::path::Path, key: &MasterKey) -> Option<Vec<u8>> {
     let blob = std::fs::read(hidden_path(base)).ok()?;
-    let plain = key.open_raw(&blob).ok()?;
+    let plain = key.open_raw(HIDDEN_LABEL, &blob).ok()?;
     if plain.len() != HIDDEN_PLAIN {
         return None;
     }
@@ -3284,7 +3345,7 @@ pub fn set_hidden_container(
     let hkey = MasterKey::derive(hidden_password, &salt).map_err(io_err)?;
     // A hidden password must not collide with the real/decoy/wipe passwords (that slot would win).
     if let Some(slots) = slots_load(base)? {
-        if slots.iter().any(|s| hkey.open(s).is_ok()) {
+        if slots.iter().any(|s| hkey.open(SLOT_LABEL, s).is_ok()) {
             return Err(io_err("that password is already in use"));
         }
     }
@@ -3293,7 +3354,7 @@ pub fn set_hidden_container(
     fill_random(&mut plain);
     plain[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     plain[4..4 + payload.len()].copy_from_slice(payload);
-    let blob = hkey.seal_raw(&plain);
+    let blob = hkey.seal_raw(HIDDEN_LABEL, &plain);
     debug_assert_eq!(blob.len(), HIDDEN_LEN);
     write_fixed_0600(&hidden_path(base), &blob)?;
     slot_write_hidden(base, real_key, &hkey)
@@ -3383,11 +3444,16 @@ fn slots_save(base: &std::path::Path, slots: &[[u8; SLOT_LEN]]) -> io::Result<()
     rename_durable(&tmp, &slots_path(base))
 }
 
+/// At-rest label for a keyslot record. Fixed rather than path-derived: slots are trial-opened by
+/// password before any account is known, and every slot in the file must derive the same key or
+/// the trial would leak which slot belongs where.
+const SLOT_LABEL: &str = "keyslot";
+
 /// Trial-open every slot with `key`; return the first that authenticates as a valid payload.
 fn slot_find(base: &std::path::Path, key: &MasterKey) -> io::Result<Option<(SlotRole, [u8; 16])>> {
     let Some(slots) = slots_load(base)? else { return Ok(None) };
     for s in &slots {
-        if let Ok(plain) = key.open(s) {
+        if let Ok(plain) = key.open(SLOT_LABEL, s) {
             if let Some(hit) = slot_unpack(&plain) {
                 return Ok(Some(hit));
             }
@@ -3399,12 +3465,12 @@ fn slot_find(base: &std::path::Path, key: &MasterKey) -> io::Result<Option<(Slot
 /// The slot INDEX currently held by `key`, if any (used to overwrite in place rather than leak a
 /// second slot for the same password).
 fn slot_index_of(slots: &[[u8; SLOT_LEN]], key: &MasterKey) -> Option<usize> {
-    slots.iter().position(|s| key.open(s).ok().and_then(|p| slot_unpack(&p)).is_some())
+    slots.iter().position(|s| key.open(SLOT_LABEL, s).ok().and_then(|p| slot_unpack(&p)).is_some())
 }
 
 /// Seal `(role, id)` under `key` into a fixed-length slot record.
 fn slot_seal(key: &MasterKey, role: SlotRole, id: &[u8; 16]) -> [u8; SLOT_LEN] {
-    let blob = key.seal(&slot_pack(role, id));
+    let blob = key.seal(SLOT_LABEL, &slot_pack(role, id));
     debug_assert_eq!(blob.len(), SLOT_LEN);
     let mut s = [0u8; SLOT_LEN];
     s.copy_from_slice(&blob);
@@ -3432,7 +3498,7 @@ fn slotdir_path(base: &std::path::Path) -> PathBuf {
 fn slotdir_load(base: &std::path::Path, real_key: &MasterKey) -> io::Result<Vec<SlotEntry>> {
     match std::fs::read(slotdir_path(base)) {
         Ok(blob) => {
-            let bytes = real_key.open(&blob).map_err(io_err)?;
+            let bytes = real_key.open(SLOTDIR_LABEL, &blob).map_err(io_err)?;
             postcard::from_bytes(&bytes).map_err(io_err)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -3442,7 +3508,7 @@ fn slotdir_load(base: &std::path::Path, real_key: &MasterKey) -> io::Result<Vec<
 
 fn slotdir_save(base: &std::path::Path, real_key: &MasterKey, dir: &[SlotEntry]) -> io::Result<()> {
     let plain = postcard::to_stdvec(dir).map_err(io_err)?;
-    let blob = real_key.seal(&plain);
+    let blob = real_key.seal(SLOTDIR_LABEL, &plain);
     let tmp = base.join("slotmap.dat.tmp");
     {
         let mut f =
@@ -3574,6 +3640,17 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// At-rest label for one of the VAULT's own files (registry, dead-man record): `vault/<name
+    /// relative to the compartment dir>`. Deliberately a different scope from any account's, so
+    /// an account file can never be dropped in over a vault-level one and still open (CRYPTO-05).
+    fn label(&self, path: &std::path::Path) -> String {
+        let rel = path.strip_prefix(&self.dir).or_else(|_| path.strip_prefix(&self.base));
+        let rel = rel.unwrap_or(path);
+        let parts: Vec<String> =
+            rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        format!("vault/{}", parts.join("/"))
+    }
+
     /// Открыть vault под паролем устройства. `salt`/`verify` на уровне базы. При
     /// первом мультиаккаунтном запуске мигрирует legacy одиночный аккаунт (файлы
     /// прямо в базе) в `accounts/<ik>/` — БЕЗ перешифрования (соль та же → ключ
@@ -3595,13 +3672,19 @@ impl Vault {
         }
     }
 
-    /// True when nothing has been provisioned yet (no slot table, no compartment, no pre-migration
-    /// root account) — the create-account path.
+    /// True when no VAULT has been provisioned yet (no slot table, no compartment, no
+    /// pre-multipassword registry) — the create-account path.
+    ///
+    /// A bare `seed.key` at the root used to count as "not fresh" so the legacy single-account
+    /// MIGRATION could pick it up. That migration is gone: at-rest keys are now derived per
+    /// (account, file), so moving a file into an account directory changes its key by design and
+    /// a migration would have to re-seal everything — which pre-alpha, with no users, is not
+    /// worth carrying. Such a directory is now simply a standalone store that `Store::unlock`
+    /// still reads; a vault provisioned over it starts empty and leaves those files alone.
     fn is_fresh(base: &std::path::Path) -> bool {
         !slots_path(base).exists()
             && !base.join("accounts.dat").exists()
             && !base.join("accounts").exists()
-            && !base.join("seed.key").exists()
     }
 
     /// Provision (or re-open) the REAL compartment for this password. Idempotent: if a real slot
@@ -3618,7 +3701,6 @@ impl Vault {
         let _ = ensure_hidden(&base);
         // If this vault predates multipassword, migrate it first, then reuse the real compartment.
         let root = Vault { base: base.clone(), dir: base.clone(), key: key.clone() };
-        root.migrate_legacy()?;
         if base.join("accounts.dat").exists() && root.load_registry().is_ok() {
             let id = Self::migrate_to_compartment(&base, &key)?;
             return Ok(Vault { base: base.clone(), dir: compartment_dir(&base, &id), key });
@@ -3650,7 +3732,6 @@ impl Vault {
 
         // Legacy single-account (secrets directly at base root) → base/accounts/<ik>/ (unchanged).
         let root = Vault { base: base.clone(), dir: base.clone(), key: key.clone() };
-        root.migrate_legacy()?;
 
         // Pre-multipassword multi-account layout: a registry sits at the base root. Only the REAL
         // password opens it (extras can't exist yet — adding one needs a logged-in real session).
@@ -3873,12 +3954,12 @@ impl Vault {
     /// forged by anyone who merely has the directory. `None` = absent or undecryptable.
     fn deadman_sealed(&self) -> Option<Deadman> {
         let blob = std::fs::read(self.base.join("deadman.sealed")).ok()?;
-        let plain = self.key.open(&blob).ok()?;
+        let plain = self.key.open(&self.label(&self.base.join("deadman.sealed")), &blob).ok()?;
         postcard::from_bytes(&plain).ok()
     }
 
     fn deadman_seal(&self, dm: &Deadman) -> io::Result<()> {
-        let blob = self.key.seal(&postcard::to_stdvec(dm).map_err(io_err)?);
+        let blob = self.key.seal(&self.label(&self.base.join("deadman.sealed")), &postcard::to_stdvec(dm).map_err(io_err)?);
         write_fixed_0600(&self.base.join("deadman.sealed"), &blob)
     }
 
@@ -3944,27 +4025,6 @@ impl Vault {
         self.dir.join("accounts.dat")
     }
 
-    /// LEGACY path: the network config used to live at the VAULT root, one config for
-    /// every account. That made accounts share a relay, so a relay linked all of a
-    /// person's identities by IP+timing no matter how different their keys were — the
-    /// opposite of a compartment. It is now per-account (`Store::load_net`); this reader
-    /// exists only to migrate an old profile, and nothing writes here any more.
-    fn legacy_net_path(&self) -> PathBuf {
-        self.base.join("net.dat")
-    }
-
-    /// Read a pre-compartment (vault-level) network config, if one is still lying
-    /// around. `None` = nothing to migrate.
-    pub fn legacy_net(&self) -> Option<NetSettings> {
-        let blob = std::fs::read(self.legacy_net_path()).ok()?;
-        let bytes = self.key.open(&blob).ok()?;
-        postcard::from_bytes(&bytes).ok()
-    }
-
-    /// Drop the migrated legacy config so it cannot come back or confuse a later read.
-    pub fn remove_legacy_net(&self) {
-        let _ = std::fs::remove_file(self.legacy_net_path());
-    }
 
     pub fn account_dir(&self, id: &str) -> PathBuf {
         self.accounts_dir().join(id)
@@ -3983,7 +4043,7 @@ impl Vault {
     /// Store поверх аккаунта `id` (общий vault-ключ). Каталог должен существовать
     /// для записи (провижининг создаёт его через `create_account_dir`).
     pub fn account(&self, id: &str) -> Store {
-        Store::at(self.account_dir(id), self.key.clone())
+        Store::scoped(self.account_dir(id), self.key.clone(), format!("acct:{id}"))
     }
 
     /// Создать каталог аккаунта `id` (перед первым `save_seed`).
@@ -3996,7 +4056,7 @@ impl Vault {
     pub fn load_registry(&self) -> io::Result<Vec<AccountEntry>> {
         match std::fs::read(self.registry_path()) {
             Ok(blob) => {
-                let bytes = self.key.open(&blob).map_err(io_err)?;
+                let bytes = self.key.open(&self.label(&self.registry_path()), &blob).map_err(io_err)?;
                 postcard::from_bytes(&bytes).map_err(io_err)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -4008,7 +4068,7 @@ impl Vault {
     /// каталоге компартмента, что и цель, чтобы rename был атомарным (одна ФС).
     pub fn save_registry(&self, entries: &[AccountEntry]) -> io::Result<()> {
         let plain = postcard::to_stdvec(entries).map_err(io_err)?;
-        let bytes = self.key.seal(&plain);
+        let bytes = self.key.seal(&self.label(&self.registry_path()), &plain);
         let tmp = self.dir.join("accounts.dat.tmp");
         {
             let mut f = OpenOptions::new()
@@ -4023,51 +4083,118 @@ impl Vault {
         std::fs::rename(&tmp, self.registry_path())
     }
 
-    /// Мигрировать legacy одиночный аккаунт (секреты прямо в базе) в
-    /// `accounts/<ik>/`. Идемпотентно: срабатывает лишь если в базе есть `seed.key`
-    /// И ещё нет реестра. Реестр пишется ПОСЛЕДНИМ — это commit point (крах
-    /// посреди перемещения → реестра нет → миграция повторится). Соль остаётся в
-    /// базе, поэтому перемещённые файлы читаются тем же ключом без перешифрования.
-    fn migrate_legacy(&self) -> io::Result<()> {
-        let legacy_seed = self.base.join("seed.key");
-        if !legacy_seed.exists() || self.registry_path().exists() {
-            return Ok(());
-        }
-        // IK читаем ДО перемещения (id = ik-hex, стабилен и уникален).
-        let ik = Store::at(&self.base, self.key.clone())
-            .load_account()
-            .map(|a| a.identity_public())
-            .map_err(|e| io_err(format!("миграция: чтение account: {e}")))?;
-        let id = hex::encode(ik);
-        let acc = self.account_dir(&id);
-        std::fs::create_dir_all(&acc)?;
-        for name in [
-            "seed.key",
-            "contacts.dat",
-            "history.dat",
-            "history.lock",
-            "meta.dat",
-            "meta.lock",
-            "blocked.dat",
-            "profile.dat",
-            "peer_profiles.dat",
-            "sessions.dat",
-            "sessions.lock",
-            "capability.dat",
-        ] {
-            let src = self.base.join(name);
-            if src.exists() {
-                std::fs::rename(&src, acc.join(name))?;
-            }
-        }
-        // Реестр — последним (commit point).
-        self.save_registry(&[AccountEntry { id, label: "Account 1".into(), ik }])
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRYPTO-05, THE carrying test. Two accounts in ONE vault share the device key, so before
+    /// per-context derivation an attacker with disk write access could drop account A's
+    /// `contacts.dat` into account B's directory and B would open it as its own — with no
+    /// tampering detectable, because the ciphertext was bound to nothing but the key.
+    ///
+    /// Discriminating: it asserts the SPLICED file fails while B's own file still opens, so it
+    /// cannot pass by breaking decryption in general. Neuter `Store::label` to return a constant
+    /// and it goes red.
+    #[test]
+    fn one_accounts_sealed_file_does_not_open_in_another_account() {
+        let dir = std::env::temp_dir().join(format!("karst-splice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = Vault::create(&dir, b"pw").unwrap();
+        vault.create_account_dir("aaa").unwrap();
+        vault.create_account_dir("bbb").unwrap();
+        let (a, b) = (vault.account("aaa"), vault.account("bbb"));
+
+        a.save_contacts(&[ContactRecord { name: "Alice's contact".into(), ik: [1u8; 32], verified: true }])
+            .unwrap();
+        b.save_contacts(&[ContactRecord { name: "Bob's contact".into(), ik: [2u8; 32], verified: false }])
+            .unwrap();
+
+        // The attack: A's sealed bytes, byte for byte, dropped into B's slot.
+        std::fs::copy(a.contacts_path(), b.contacts_path()).unwrap();
+
+        assert!(
+            b.load_contacts().is_err(),
+            "account B opened account A's sealed file — at-rest ciphertext must be bound to the \
+             account it belongs to, not merely to the shared device key"
+        );
+        // ...and the binding is not just "everything fails now": A still reads its own file.
+        assert_eq!(a.load_contacts().unwrap()[0].name, "Alice's contact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same binding one level down: within ONE account, a sealed file must not open under a
+    /// different NAME. Otherwise an attacker can swap one sidecar in for another and the client
+    /// acts on the wrong list.
+    ///
+    /// `blocked.dat` and `unconfirmed.dat` are chosen deliberately: both hold `BTreeSet<[u8;32]>`,
+    /// so a spliced file decodes PERFECTLY once decrypted. A pair with different schemas would
+    /// have made this test pass on the postcard error alone — green for the wrong reason, and
+    /// still green with the binding removed.
+    #[test]
+    fn a_sealed_file_does_not_open_under_a_different_name() {
+        let dir = std::env::temp_dir().join(format!("karst-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        s.set_blocked([7u8; 32], true).unwrap();
+        s.set_unconfirmed([8u8; 32], true).unwrap();
+
+        // The attack: the block list, byte for byte, presented as the unconfirmed list.
+        std::fs::copy(s.blocked_path(), s.unconfirmed_path()).unwrap();
+
+        let err = s.load_unconfirmed().unwrap_err().to_string();
+        assert!(
+            err.contains("не из этого места") || err.contains("повреждённый"),
+            "a sealed blob opened under another file's name — the label must be part of the \
+             derivation, not decoration; got: {err}"
+        );
+        assert!(s.load_blocked().unwrap().contains(&[7u8; 32]), "its own file still opens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6-5. A file written by a build with a HIGHER `STATE_VERSION` must be refused, loudly and
+    /// distinguishably — not read with defaults for the fields this build does not know and then
+    /// written back with those fields dropped. Forges the version byte in place (the AAD covers
+    /// it, so this is also a tamper test).
+    #[test]
+    fn a_state_file_from_a_newer_format_version_is_refused_out_loud() {
+        let key = MasterKey::derive(b"pw", b"0123456789abcdef").unwrap();
+        let mut blob = key.seal("acct:x/prefs.dat", b"state");
+        let bumped = crate::secretbox::STATE_VERSION + 1;
+        blob[4..6].copy_from_slice(&bumped.to_le_bytes());
+
+        let err = key.open("acct:x/prefs.dat", &blob).unwrap_err();
+        assert!(
+            err.contains("newer") && err.contains("upgrade"),
+            "a newer state format must say so and tell the user to upgrade, not look like a \
+             wrong password or load with defaults; got: {err}"
+        );
+    }
+
+    /// The label is LOGICAL, not the path on disk: moving the whole vault directory (a bigger
+    /// drive, a restored backup) must not turn every file into "wrong password". Guards the
+    /// obvious wrong implementation of the fix above.
+    #[test]
+    fn moving_the_vault_directory_does_not_break_decryption() {
+        let dir = std::env::temp_dir().join(format!("karst-move-a-{}", std::process::id()));
+        let moved = std::env::temp_dir().join(format!("karst-move-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&moved);
+        {
+            let vault = Vault::create(&dir, b"pw").unwrap();
+            vault.create_account_dir("aaa").unwrap();
+            vault
+                .account("aaa")
+                .save_contacts(&[ContactRecord { name: "Carol".into(), ik: [3u8; 32], verified: false }])
+                .unwrap();
+        }
+        std::fs::rename(&dir, &moved).unwrap();
+
+        let vault = Vault::unlock(&moved, b"pw").unwrap();
+        assert_eq!(vault.account("aaa").load_contacts().unwrap()[0].name, "Carol");
+        let _ = std::fs::remove_dir_all(&moved);
+    }
 
     /// A text-only profile update must NOT wipe an already-received avatar (the
     /// avatar arrives on a separate control message; Phase 2 relies on this). Seeds a
@@ -4089,7 +4216,7 @@ mod tests {
             Profile { name: "old".into(), bio: "old bio".into(), avatar: Some(vec![1, 2, 3, 4]), photos: vec![], photos_ts: 0 },
         );
         let plain = postcard::to_stdvec(&map).unwrap();
-        s.write_atomic(&s.peer_profiles_path(), &s.key.seal(&plain)).unwrap();
+        s.write_sealed(&s.peer_profiles_path(), &plain).unwrap();
 
         // Text-only update.
         s.set_peer_profile(ik, "new", "new bio").unwrap();
@@ -4390,7 +4517,7 @@ mod tests {
 
         // Write ONE record in the OLD format: [len][seal(postcard(HistoryRecord))] — no msg_id.
         let old = HistoryRecord { from_me: false, peer_ik: [3u8; 32], text: b"legacy".to_vec(), ts: 9 };
-        let blob = s.key.seal(&postcard::to_stdvec(&old).unwrap());
+        let blob = s.key.seal(&s.label(&s.history_path()), &postcard::to_stdvec(&old).unwrap());
         let mut framed = (blob.len() as u32).to_le_bytes().to_vec();
         framed.extend_from_slice(&blob);
         std::fs::write(s.history_path(), &framed).unwrap();
@@ -4446,10 +4573,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::unlock(&dir, b"pw").unwrap();
 
-        let sealed = s.seal_versioned(7, b"payload");
-        assert_eq!(s.open_versioned(&sealed), Some((7, b"payload".to_vec())));
+        let sealed = s.seal_versioned(&s.downloads_path(), 7, b"payload");
+        assert_eq!(s.open_versioned(&s.downloads_path(), &sealed), Some((7, b"payload".to_vec())));
         // A bare (unversioned) seal has no magic → None.
-        assert_eq!(s.open_versioned(&s.key.seal(b"payload")), None);
+        assert_eq!(s.open_versioned(&s.downloads_path(), &s.key.seal(&s.label(&s.downloads_path()), b"payload")), None);
 
         // A pending-downloads file written in the OLD (unversioned) way loads as empty.
         let pd = PendingDownload {
@@ -4458,7 +4585,7 @@ mod tests {
         };
         let mut map = std::collections::BTreeMap::new();
         map.insert(pd.blob_id, pd);
-        s.write_atomic(&s.downloads_path(), &s.key.seal(&postcard::to_stdvec(&map).unwrap())).unwrap();
+        s.write_sealed(&s.downloads_path(), &postcard::to_stdvec(&map).unwrap()).unwrap();
         assert!(s.list_pending_downloads().unwrap().is_empty(), "legacy unversioned file resets");
 
         let _ = std::fs::remove_dir_all(&dir);

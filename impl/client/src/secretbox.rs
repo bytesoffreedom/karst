@@ -12,15 +12,42 @@
 //! `/proc/<pid>/environ` живого хоста → дыру «живая принимающая цепочка на диске»
 //! при ГОРЯЧЕЙ компрометации это НЕ закрывает. Заявляем только cold-disk.
 //!
-//! Формат blob: `MAGIC(4) ‖ nonce(24) ‖ AEAD-ciphertext`. Версионный magic: файл
-//! без него → явная ошибка «нужен re-init» (без тихой авто-миграции).
+//! # Формат v2: контекст, а не один ключ на всё
+//!
+//! Blob: `MAGIC(4) ‖ state_version(2 LE) ‖ nonce(24) ‖ AEAD-ciphertext`, где ключ —
+//! НЕ мастер-ключ, а `HKDF(master, label)`, и `label` (логическое имя файла внутри
+//! аккаунта) плюс версия входят в AAD.
+//!
+//! Раньше все файлы всех аккаунтов шифровались ОДНИМ ключом без AAD (CRYPTO-05):
+//! противник с доступом к диску мог подложить `contacts.dat` одного аккаунта вместо
+//! другого или `sessions.dat` вместо `net.dat` — всё расшифровывалось штатно, потому
+//! что шифртекст ничем не был связан с местом, где лежит. Теперь связан дважды:
+//! разные `label` → разные ключи (чужой файл просто не откроется), и AAD ловит
+//! случай, если ключевой вывод когда-нибудь совпадёт.
+//!
+//! `state_version` — это версия СХЕМЫ состояния, а не magic (A6-5). Magic ловит смену
+//! формата конверта один раз; версия обязана расти при каждом изменении структур,
+//! которые сюда сериализуются, и старый бинарник, встретив бо́льшую версию, ОТКАЖЕТ
+//! громко вместо того чтобы «дочитать с дефолтами» и записать обратно с потерей полей.
 
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
 
-/// Версионный префикс: меняем при смене формата/AEAD. `MSC1` = v1.
-pub(crate) const MAGIC: &[u8; 4] = b"KRS1";
+/// Версионный префикс: меняем при смене формата КОНВЕРТА (не схемы состояния). `KRS2` = v2.
+pub(crate) const MAGIC: &[u8; 4] = b"KRS2";
+
+/// Версия СХЕМЫ состояния. Поднимать при ЛЮБОМ изменении структур, которые сериализуются
+/// под этот конверт (`Prefs`, `ContactRecord`, `SessionSnapshot`, `PendingUpload`, …).
+///
+/// Зачем отдельно от magic: postcard позиционен, и `serde(default)` на хвостовом поле
+/// заставляет старый бинарник ПРИНЯТЬ новый файл, подставить дефолты и записать обратно —
+/// новые поля тихо исчезают (A6-5). Теперь такой файл не читается вовсе: «written by a newer
+/// KARST». Обратная сторона — осознанная: поднятие версии ЛОМАЕТ существующие локальные
+/// данные. Пользователей нет, миграций нет (см. docs/POSITIONING.md), ломать сейчас дёшево.
+pub const STATE_VERSION: u16 = 1;
 
 /// The pinned Argon2id cost parameters (see [`MasterKey::derive`]). Owned by KARST, not by the
 /// `argon2` crate's defaults, so a dependency bump cannot silently change key derivation.
@@ -28,7 +55,8 @@ pub const KDF_M_COST: u32 = 19_456; // KiB
 pub const KDF_T_COST: u32 = 2;
 pub const KDF_P_COST: u32 = 1;
 const NONCE_LEN: usize = 24;
-const HEADER_LEN: usize = 4 + NONCE_LEN;
+/// `MAGIC(4) ‖ state_version(2) ‖ nonce(24)`.
+const HEADER_LEN: usize = 4 + 2 + NONCE_LEN;
 
 /// Свежая 16-байтная соль (не секрет; уникальна на установку, пишется plaintext).
 pub fn random_salt() -> [u8; 16] {
@@ -83,13 +111,45 @@ impl MasterKey {
         self.0
     }
 
-    /// Зашифровать секрет. СВЕЖИЙ random 24-байтный nonce на каждый вызов.
-    pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new((&self.0).into());
+    /// Ключ ИМЕННО для `label` — не мастер-ключ. Чужой файл, подложенный под это имя,
+    /// выводит другой ключ и не открывается (CRYPTO-05). `label` — логический путь файла
+    /// внутри аккаунта (`acct:<id>/net/sessions.dat`), а НЕ путь на диске: перенос каталога
+    /// не должен ничего ломать.
+    fn subkey(&self, label: &str) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, &self.0);
+        let mut info = Vec::with_capacity(20 + label.len());
+        info.extend_from_slice(b"KARST-at-rest-v2");
+        info.extend_from_slice(&(label.len() as u32).to_be_bytes());
+        info.extend_from_slice(label.as_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(&info, &mut key).expect("32 within HKDF output limit");
+        key
+    }
+
+    /// AAD конверта: длино-префиксованный `label` + версии. Второй пояс поверх subkey —
+    /// и ровно то, что делает `state_version` неподделываемым.
+    fn context_aad(label: &str, version: u16) -> Vec<u8> {
+        let mut a = Vec::with_capacity(10 + label.len());
+        a.extend_from_slice(MAGIC);
+        a.extend_from_slice(&version.to_le_bytes());
+        a.extend_from_slice(&(label.len() as u32).to_be_bytes());
+        a.extend_from_slice(label.as_bytes());
+        a
+    }
+
+    /// Зашифровать секрет ДЛЯ КОНКРЕТНОГО МЕСТА (`label`). СВЕЖИЙ random 24-байтный nonce
+    /// на каждый вызов (192 бита — случайной свежести достаточно без счётчика).
+    pub fn seal(&self, label: &str, plaintext: &[u8]) -> Vec<u8> {
+        let key = self.subkey(label);
+        let cipher = XChaCha20Poly1305::new((&key).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng); // 192-бит, свежий
-        let ct = cipher.encrypt(&nonce, plaintext).expect("XChaCha20-Poly1305 encryption");
+        let aad = Self::context_aad(label, STATE_VERSION);
+        let ct = cipher
+            .encrypt(&nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad: &aad })
+            .expect("XChaCha20-Poly1305 encryption");
         let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
         out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&STATE_VERSION.to_le_bytes());
         out.extend_from_slice(nonce.as_slice());
         out.extend_from_slice(&ct);
         out
@@ -99,10 +159,14 @@ impl MasterKey {
     /// magic prefix — so the whole blob is indistinguishable from random (a random nonce + an AEAD
     /// ciphertext is computationally random). The caller pads the plaintext to a FIXED length so the
     /// output size never varies, and treats an `open_raw` failure as "no such volume".
-    pub(crate) fn seal_raw(&self, plaintext: &[u8]) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new((&self.0).into());
+    pub(crate) fn seal_raw(&self, label: &str, plaintext: &[u8]) -> Vec<u8> {
+        let key = self.subkey(label);
+        let cipher = XChaCha20Poly1305::new((&key).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ct = cipher.encrypt(&nonce, plaintext).expect("XChaCha20-Poly1305 encryption");
+        let aad = Self::context_aad(label, STATE_VERSION);
+        let ct = cipher
+            .encrypt(&nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad: &aad })
+            .expect("XChaCha20-Poly1305 encryption");
         let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
         out.extend_from_slice(nonce.as_slice());
         out.extend_from_slice(&ct);
@@ -111,28 +175,43 @@ impl MasterKey {
 
     /// Open a `seal_raw` blob. `Err` = wrong key OR this region holds no hidden volume (just random) —
     /// the two are indistinguishable, which is the whole point.
-    pub(crate) fn open_raw(&self, blob: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn open_raw(&self, label: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
         if blob.len() < NONCE_LEN + 16 {
             return Err("no hidden volume".into());
         }
+        let key = self.subkey(label);
         let nonce = XNonce::from_slice(&blob[..NONCE_LEN]);
-        let cipher = XChaCha20Poly1305::new((&self.0).into());
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let aad = Self::context_aad(label, STATE_VERSION);
         cipher
-            .decrypt(nonce, &blob[NONCE_LEN..])
+            .decrypt(nonce, chacha20poly1305::aead::Payload { msg: &blob[NONCE_LEN..], aad: &aad })
             .map_err(|_| "no hidden volume / wrong key".to_string())
     }
 
-    /// Расшифровать. `Err` — не наш формат (нужен re-init) ИЛИ неверный пароль/
-    /// повреждение (AEAD не сошёлся). Оба различимы по тексту.
-    pub fn open(&self, blob: &[u8]) -> Result<Vec<u8>, String> {
+    /// Расшифровать содержимое `label`. Три РАЗЛИЧИМЫХ отказа:
+    /// не наш формат (нужен re-init); файл написан другой версией схемы (нужен другой
+    /// бинарник, а не «дочитаем с дефолтами»); неверный пароль / порча / файл не отсюда.
+    pub fn open(&self, label: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
         if blob.len() < HEADER_LEN || &blob[..4] != MAGIC {
             return Err("не KARST-шифр at-rest (несовместимый формат — нужен re-init?)".into());
         }
-        let nonce = XNonce::from_slice(&blob[4..HEADER_LEN]);
-        let cipher = XChaCha20Poly1305::new((&self.0).into());
+        let version = u16::from_le_bytes([blob[4], blob[5]]);
+        if version != STATE_VERSION {
+            // Обе стороны громкие НАМЕРЕННО. Больше — файл новее нас (тихо дочитать = потерять
+            // поля при обратной записи, A6-5); меньше — старый формат, а миграций у нас нет.
+            let side = if version > STATE_VERSION { "newer" } else { "older" };
+            return Err(format!(
+                "state file written by a {side} KARST (format v{version}, this build speaks \
+                 v{STATE_VERSION}) — upgrade the client instead of reading it with defaults"
+            ));
+        }
+        let key = self.subkey(label);
+        let nonce = XNonce::from_slice(&blob[6..HEADER_LEN]);
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let aad = Self::context_aad(label, version);
         cipher
-            .decrypt(nonce, &blob[HEADER_LEN..])
-            .map_err(|_| "неверный пароль или повреждённый файл".to_string())
+            .decrypt(nonce, chacha20poly1305::aead::Payload { msg: &blob[HEADER_LEN..], aad: &aad })
+            .map_err(|_| "неверный пароль, повреждённый файл или файл не из этого места".to_string())
     }
 }
 
@@ -164,12 +243,14 @@ mod tests {
     use super::*;
 
     const SALT: &[u8] = b"unique-install-salt";
+    /// A representative at-rest label; the context binding itself is tested separately.
+    const L: &str = "acct:test/contacts.dat";
 
     #[test]
     fn roundtrip_with_correct_passphrase() {
         let k = MasterKey::derive(b"correct horse", SALT).unwrap();
-        let blob = k.seal(b"secret key material");
-        assert_eq!(k.open(&blob).unwrap(), b"secret key material");
+        let blob = k.seal(L, b"secret key material");
+        assert_eq!(k.open(L, &blob).unwrap(), b"secret key material");
     }
 
     /// Несущее: неверный пароль → AEAD-ОТКАЗ, не тихий мусор.
@@ -177,8 +258,8 @@ mod tests {
     fn wrong_passphrase_fails_not_garbage() {
         let good = MasterKey::derive(b"correct horse", SALT).unwrap();
         let bad = MasterKey::derive(b"wrong horse", SALT).unwrap();
-        let blob = good.seal(b"secret key material");
-        assert!(bad.open(&blob).is_err(), "неверный пароль должен ОТКАЗАТЬ, не вернуть мусор");
+        let blob = good.seal(L, b"secret key material");
+        assert!(bad.open(L, &blob).is_err(), "неверный пароль должен ОТКАЗАТЬ, не вернуть мусор");
     }
 
     /// Несущее (не no-op): на диске нет открытых байтов секрета. Та же форма, что
@@ -187,7 +268,7 @@ mod tests {
     fn ciphertext_does_not_contain_plaintext() {
         let k = MasterKey::derive(b"pw", SALT).unwrap();
         let secret = b"BOBS-PRIVATE-RATCHET-KEY-32bytes";
-        let blob = k.seal(secret);
+        let blob = k.seal(L, secret);
         assert!(
             !blob.windows(secret.len()).any(|w| w == secret),
             "открытый секрет не должен присутствовать в blob"
@@ -200,7 +281,7 @@ mod tests {
     fn missing_magic_is_reinit_error_not_aead() {
         let k = MasterKey::derive(b"pw", SALT).unwrap();
         let plaintext_era = b"raw pre-at-rest secret bytes with no MSC1 header";
-        let err = k.open(plaintext_era).unwrap_err();
+        let err = k.open(L, plaintext_era).unwrap_err();
         assert!(err.contains("re-init"), "чужой формат → явная ошибка re-init, дано: {err}");
     }
 
@@ -209,8 +290,8 @@ mod tests {
     #[test]
     fn identical_plaintext_yields_fresh_nonce() {
         let k = MasterKey::derive(b"pw", SALT).unwrap();
-        let a = k.seal(b"same session state");
-        let b = k.seal(b"same session state");
+        let a = k.seal(L, b"same session state");
+        let b = k.seal(L, b"same session state");
         assert_ne!(&a[4..HEADER_LEN], &b[4..HEADER_LEN], "nonce должен быть свежим на каждую запись");
         assert_ne!(a, b, "шифртекст не должен повторяться при одинаковом plaintext");
     }

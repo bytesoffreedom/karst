@@ -239,6 +239,15 @@ fn random_key() -> MasterKey {
     MasterKey::from_bytes(k)
 }
 
+/// At-rest labels for the container's four kinds of record. Fixed strings, never paths: the
+/// container is ONE opaque file whose regions must stay indistinguishable from random, so a
+/// label can only name the ROLE of a record, never its offset. Distinct roles mean a length
+/// header can never be opened as a payload, or a slot as a directory (CRYPTO-05).
+const SLOT_LABEL: &str = "container:slot";
+const DIR_LABEL: &str = "container:dir";
+const LEN_LABEL: &str = "container:len";
+const BODY_LABEL: &str = "container:body";
+
 impl Container {
     fn slot_span(i: usize) -> (usize, usize) {
         let off = SALT_LEN + i * SLOT_LEN;
@@ -300,7 +309,7 @@ impl Container {
     fn find_slot(&self, key: &MasterKey) -> Option<SlotInfo> {
         for i in 0..SLOT_COUNT {
             let (a, b) = Self::slot_span(i);
-            let Ok(plain) = key.open_raw(&self.buf[a..b]) else {
+            let Ok(plain) = key.open_raw(SLOT_LABEL, &self.buf[a..b]) else {
                 continue;
             };
             if plain.len() != SLOT_PLAIN {
@@ -340,7 +349,7 @@ impl Container {
         plain.extend_from_slice(&region_off.to_le_bytes());
         plain.extend_from_slice(&region_cap.to_le_bytes());
         plain.extend_from_slice(&region_key.as_bytes());
-        let sealed = key.seal_raw(&plain);
+        let sealed = key.seal_raw(SLOT_LABEL, &plain);
         debug_assert_eq!(sealed.len(), SLOT_LEN);
         let (a, b) = Self::slot_span(index);
         self.buf[a..b].copy_from_slice(&sealed);
@@ -364,7 +373,7 @@ impl Container {
     /// The used slots with their hidden marker: `(slot index, is_hidden)`.
     fn read_dir_entries(&self, mgmt_key: &MasterKey) -> io::Result<Vec<(usize, bool)>> {
         let plain = mgmt_key
-            .open_raw(&self.buf[DIR_OFF..DIR_OFF + DIR_LEN])
+            .open_raw(DIR_LABEL, &self.buf[DIR_OFF..DIR_OFF + DIR_LEN])
             .map_err(|_| io_err("wrong management password"))?;
         Ok(plain
             .iter()
@@ -390,7 +399,7 @@ impl Container {
         for (i, &idx) in used.iter().take(SLOT_COUNT).enumerate() {
             plain[i] = idx as u8 | if hidden == Some(idx) { Self::HIDDEN_FLAG } else { 0 };
         }
-        let sealed = mgmt_key.seal_raw(&plain);
+        let sealed = mgmt_key.seal_raw(DIR_LABEL, &plain);
         debug_assert_eq!(sealed.len(), DIR_LEN);
         self.buf[DIR_OFF..DIR_OFF + DIR_LEN].copy_from_slice(&sealed);
         Ok(())
@@ -533,11 +542,11 @@ impl Container {
     /// Returns the number of bytes changed at `off` (`LEN_HDR + ciphertext`), so the caller can
     /// persist ONLY that range instead of the whole file.
     fn write_region_at(buf: &mut [u8], off: usize, cap: usize, region_key: &MasterKey, payload: &[u8]) -> io::Result<usize> {
-        let ct = region_key.seal_raw(payload);
+        let ct = region_key.seal_raw(BODY_LABEL, payload);
         if LEN_HDR + ct.len() > cap {
             return Err(io_err("payload exceeds region capacity"));
         }
-        let len_hdr = region_key.seal_raw(&(ct.len() as u64).to_le_bytes());
+        let len_hdr = region_key.seal_raw(LEN_LABEL, &(ct.len() as u64).to_le_bytes());
         debug_assert_eq!(len_hdr.len(), LEN_HDR);
         if off + LEN_HDR + ct.len() > buf.len() {
             return Err(io_err("region write out of bounds"));
@@ -553,7 +562,7 @@ impl Container {
             return Err(io_err("region out of bounds"));
         }
         let len_bytes = region_key
-            .open_raw(&buf[off..off + LEN_HDR])
+            .open_raw(LEN_LABEL, &buf[off..off + LEN_HDR])
             .map_err(|_| io_err("region length header corrupt / wrong key"))?;
         if len_bytes.len() != 8 {
             return Err(io_err("bad region length header"));
@@ -564,7 +573,7 @@ impl Container {
             return Err(io_err("region payload out of bounds (corrupt?)"));
         }
         region_key
-            .open_raw(&buf[start..start + ct_len])
+            .open_raw(BODY_LABEL, &buf[start..start + ct_len])
             .map_err(|_| io_err("region payload corrupt / wrong key"))
     }
 
@@ -587,7 +596,7 @@ impl Container {
         if off + LEN_HDR > buf.len() {
             return Err(io_err("sealed u64 out of bounds"));
         }
-        let b = key.open_raw(&buf[off..off + LEN_HDR]).map_err(|_| io_err("wrong key / corrupt"))?;
+        let b = key.open_raw(LEN_LABEL, &buf[off..off + LEN_HDR]).map_err(|_| io_err("wrong key / corrupt"))?;
         if b.len() != 8 {
             return Err(io_err("bad sealed u64"));
         }
@@ -596,7 +605,7 @@ impl Container {
 
     #[allow(dead_code)]
     fn write_sealed_u64(buf: &mut [u8], off: usize, key: &MasterKey, v: u64) {
-        let sealed = key.seal_raw(&v.to_le_bytes());
+        let sealed = key.seal_raw(LEN_LABEL, &v.to_le_bytes());
         debug_assert_eq!(sealed.len(), LEN_HDR);
         buf[off..off + LEN_HDR].copy_from_slice(&sealed);
     }
@@ -615,8 +624,8 @@ impl Container {
         let hw = Self::read_sealed_u64(buf, off, key)? as usize;
         let chunk_area = off + LEN_HDR; // superblock occupies the first LEN_HDR bytes
         let pos = chunk_area + hw;
-        let ct = key.seal_raw(payload);
-        let lh = key.seal_raw(&(ct.len() as u64).to_le_bytes());
+        let ct = key.seal_raw(BODY_LABEL, payload);
+        let lh = key.seal_raw(LEN_LABEL, &(ct.len() as u64).to_le_bytes());
         let end = pos + LEN_HDR + ct.len();
         if end > off + cap {
             return Err(io_err("append-log region full"));
@@ -642,7 +651,7 @@ impl Container {
                 return Err(io_err("append-log chunk out of bounds (corrupt?)"));
             }
             let payload = key
-                .open_raw(&buf[cstart..cstart + ct_len])
+                .open_raw(BODY_LABEL, &buf[cstart..cstart + ct_len])
                 .map_err(|_| io_err("append-log chunk corrupt / wrong key"))?;
             out.push(payload);
             p += LEN_HDR + ct_len;

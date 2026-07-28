@@ -362,6 +362,43 @@ against our no-anchor ethos). Accountability for the unverifiable claim comes fr
 reputation layer, not crypto. Confidentiality never rested on ephemerality anyway: blobs are E2E
 ciphertext + capped + TTL-swept regardless.
 
+## Hardening pass, 2026-07-28 (what changed and what did not)
+
+A full sweep of the external audit findings. Recorded here because several of them turned
+out to be different from their description, and that is worth as much as the fixes.
+
+**Closed.** Per-message and per-chunk AEAD derivation (a rolled-back ratchet or a reused
+file key can no longer produce a two-time pad); at-rest sealing bound to (account, file,
+state version); Argon2 raised to 128 MiB/t=3; one-time prekeys signed and their handout
+put behind admission; bundle-slot creation metered with a 30-day TTL; per-class request
+frame and admission ceilings; session table capped and drop-box mail routed to its owner;
+deposits made idempotent; a failed relay's receive rolled back transactionally; unappliable
+content parked before the ACK and replayed afterwards; accepts honoured only from a peer we
+actually asked; container regions made crash-atomic; proxies destroyed rather than flagged.
+
+**Deliberately NOT fixed, and why — read these before trusting a property:**
+
+- **Snapshot-diff against the Tier-2 container.** A cover-password write touches the same
+  offsets whether or not a hidden compartment exists, and a hidden write's changed bytes
+  fall inside the hidden region. An adversary holding two snapshots separates the
+  compartments by offset alone. Masking would require rewriting the whole container on every
+  save. See `docs/design/duress-tier2-container.md` — the earlier masking claim is retracted.
+- **Whole-directory rollback.** The session file carries a generation and a separate anchor
+  detects a PARTIAL rollback (one file restored from a backup). An adversary who restores
+  everything, or deletes the anchor, is not caught: no purely local state survives an
+  adversary who controls all local state.
+- **Relay mailbox durability.** An `Accepted` message lives in memory and does not survive a
+  relay restart. The boundary is now explicit (`RelayPolicy::mailbox_durability`) rather than
+  implied.
+- **A withheld one-time prekey.** Signing stops substitution, not withholding, and refusing
+  to talk would convert a downgrade into a lockout. The 3-DH case is reported
+  (`ForwardSecrecy::NoOneTimePrekey`) and recorded per peer.
+- **BlobGet request volume.** The size ratio is bounded (~437:1) and the transport rules out
+  spoofed-source reflection, but request VOLUME rides the deliberately stateless cookie.
+
+**Cost the user pays.** Recovery-phrase restore brings back the root's network identity
+only: never vault data, and — since proxies became destroyable — never the channels either.
+
 ## What the cold disk learns (at-rest audit, 2026-07-17)
 
 Encrypted at rest (`Argon2id` → `XChaCha20-Poly1305`, see `client::secretbox`): the

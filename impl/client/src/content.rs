@@ -1288,4 +1288,49 @@ mod tests {
             other => panic!("the transfer did not complete after the restart: {other:?}"),
         }
     }
+
+    /// A4-9 — the reassembler's INVARIANTS, not just its happy path.
+    ///
+    /// Each of these is a state a hostile or buggy sender can attempt, and each must be REFUSED
+    /// rather than absorbed: an orphan chunk with no manifest, a chunk index beyond the declared
+    /// count, and a completed transfer whose bytes do not match the declared hash. Absorbing any
+    /// of them would let a peer steer the reassembler into a shape the rest of the code assumes
+    /// cannot happen.
+    #[test]
+    fn the_reassembler_refuses_orphan_out_of_range_and_mismatched_transfers() {
+        let payload: Vec<u8> = (0..3_000u32).map(|i| (i % 251) as u8).collect();
+        let (manifest, chunks) = chunk_file("doc.bin", &payload).unwrap();
+
+        // 1. A chunk with no manifest is an orphan — nothing says how many to expect or what the
+        //    result should hash to, so accepting it would allocate on a stranger's say-so.
+        let mut re = Reassembler::new();
+        assert!(re.offer(chunks[0].clone(), 10).is_err(), "an orphan chunk must be refused");
+        assert_eq!(re.in_flight(), 0, "and must not create a transfer slot");
+
+        // 2. An index beyond the declared count.
+        let mut re = Reassembler::new();
+        assert!(re.offer(manifest.clone(), 10).unwrap().is_none());
+        let mut far = chunks[0].clone();
+        if let Content::FileChunk { index, .. } = &mut far {
+            *index = u32::MAX;
+        }
+        assert!(re.offer(far, 11).is_err(), "an out-of-range chunk index must be refused");
+
+        // 3. A complete transfer whose content does not match the declared hash: the end-to-end
+        //    backstop must fire instead of handing back a corrupted file.
+        let mut re = Reassembler::new();
+        assert!(re.offer(manifest, 10).unwrap().is_none());
+        let mut bad = chunks.clone();
+        if let Content::FileChunk { data, .. } = &mut bad[0] {
+            data[0] ^= 0xFF;
+        }
+        let mut outcome = Ok(None);
+        for c in bad {
+            outcome = re.offer(c, 12);
+            if outcome.is_err() {
+                break;
+            }
+        }
+        assert!(outcome.is_err(), "a hash mismatch must be reported, not silently assembled");
+    }
 }

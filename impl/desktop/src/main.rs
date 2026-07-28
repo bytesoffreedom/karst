@@ -3089,6 +3089,17 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
     client::reap_reassemblers(&mut app.reasm.lock().unwrap(), now_secs());
     // A relay counts as reachable if ANY proxy's poll reached it this pass.
     let mut reach_any = vec![false; relays.len()];
+    // SEC-34: every lease this poll takes, across every page and every proxy, held UNSENT until
+    // the one post-loop commit below. Nothing is deleted from any relay before the account's
+    // authority (the container, for a container-backed session) has actually recorded it.
+    let mut acks = client::DeferredAcks::default();
+    // Did this poll change anything on disk that a container-backed session still has to commit?
+    // Deliberately NOT `!out.is_empty()`: that was the second half of SEC-34. Control-only mail —
+    // reactions, `ChannelMigrate`, the `FileRef`/`PostAttachmentRef`/`GalleryRef` pointers whose
+    // pending entries are written before the ack — advances the ratchet and writes to the work
+    // dir while producing ZERO UI events, so gating the container save on UI output left exactly
+    // that mail acked-but-uncommitted.
+    let mut dirty = false;
     // PROXY-IDENTITY MODEL: poll EACH proxy's mailbox (never the root). `store` below is the proxy
     // handle — its NETWORK state (sessions/opks) is per-proxy, while the history/feed/files it
     // writes land on the shared ROOT data paths, so incoming lands in one unified inbox.
@@ -3133,6 +3144,11 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
                     reach_any[i] = true;
                 }
             }
+            // Carry this page's leases forward unsent (SEC-34). A page that fetched envelopes we
+            // could not decrypt still took leases and still advanced state, so `dirty` follows the
+            // leases, not the decrypted count.
+            dirty |= !poll.acks.is_empty();
+            acks.merge(poll.acks);
             let before = drained.len();
             drained.extend(poll.messages.into_iter().flatten());
             if drained.len() == before {
@@ -3146,6 +3162,12 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
         // midway replays rather than loses.
         let parked = root.load_quarantine().unwrap_or_default();
         let replayed = !parked.is_empty();
+        // A replay writes (the handlers' history/state, then the cleared log), so it too needs the
+        // container commit below. HONEST LIMIT: the quarantine log is NOT a mitigation for SEC-34 —
+        // it lives in the root store, which for a container-backed account IS the work dir, so a
+        // container that rolls back rolls the log back with it. It only ever protected the
+        // file-tree case.
+        dirty |= replayed;
         let drained: Vec<_> = parked
             .into_iter()
             .map(|q| node::peer::Received {
@@ -3513,19 +3535,38 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
         drive_pending_post_attachments(&app, &relay, &root, &mut out);
         drive_pending_galleries(&app, &relay, &root, &mut out);
     }
-    // Persist a container-backed account after receiving (design: save on each message; a poll
-    // batches a burst into one save). No-op for the file-tree path.
-    if !out.is_empty() {
+    // SEC-34, THE durability barrier of this poll: commit the account's authority, and only then
+    // tell the relays they may forget the ciphertext. For a container-backed session the authority
+    // is the encrypted container (the work dir the code above wrote to is a materialized working
+    // copy, and the next unlock restores the container, not it); for a file-tree session the
+    // writes above already were the authority, so the barrier is a no-op that still gates the ack.
+    //
+    // Gated on `dirty || !acks.is_empty()` — never on `out` (see `dirty`'s definition). `dirty`
+    // covers the case where leases were taken but nothing decoded; `!acks.is_empty()` cannot be
+    // true without `dirty`, and is kept because it is what makes "leases exist ⇒ a commit ran"
+    // true by reading, not by inference.
+    if dirty || !acks.is_empty() {
         // In-flight inline chunks are durable from here on: their carrier messages are about to be
-        // (or have just been) acked, so RAM is no longer a safe place to keep them.
+        // acked, so RAM is no longer a safe place to keep them. Inside the barrier, so the same
+        // commit that the ack waits on covers them too.
         client::save_reassemblers(&root, &app.reasm.lock().unwrap());
-        if let Some(cv) = app.container.lock().unwrap().as_mut() {
-            // Not fatal here (unlike `lock`): nothing is deleted, the work dir still holds the
-            // data and the next poll's save retries. But it must not be SILENT, or a container
-            // that has quietly stopped persisting looks identical to one that is fine.
-            if let Err(e) = cv.save() {
-                eprintln!("warning: could not persist this batch into the container: {e}");
-            }
+        let mut guard = app.container.lock().unwrap();
+        let committed = acks.commit_then_send(now_secs(), || match guard.as_mut() {
+            Some(cv) => cv.save().map_err(|e| e.to_string()),
+            None => Ok(()), // file-tree session: the store IS the authority
+        });
+        // Not fatal (unlike `lock`): nothing was deleted anywhere — the leases went UNSENT, so the
+        // relays still hold this batch and redeliver it once the leases expire. But it must not be
+        // silent, or a container that has quietly stopped persisting looks identical to a healthy
+        // one. HONEST LIMIT on "redeliverable": the work dir still holds the advanced ratchet, so
+        // within THIS session a redelivery fails closed and shows as nothing. The recovery is the
+        // one that matters — after a relock/restart the container's older snapshot is restored and
+        // the redelivered ciphertext opens against it.
+        if let Err(e) = committed {
+            eprintln!(
+                "warning: could not persist this batch into the container: {e} — \
+                 NOT acking, the relay keeps this batch and will redeliver it"
+            );
         }
     }
     Ok(PollOut { messages: out, reachable: reach_any })

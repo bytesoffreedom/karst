@@ -16,7 +16,11 @@
 //!   коммита ratchet/OPK и ДО ACK, поэтому оба прежних окна потери ([OPK→session],
 //!   [session→history]) закрыты; редоставленный дубликат отсекается по `payload_id`
 //!   (или fail-closed на продвинутом ratchet). Остаток: dedup только для текста — файл/
-//!   реакция в том же окне могут примениться повторно (отдельные срезы);
+//!   реакция в том же окне могут примениться повторно (отдельные срезы). Для
+//!   container-backed аккаунта `Store` — лишь распакованная рабочая копия, поэтому
+//!   `recv_session_multi` НЕ шлёт ACK сам: он возвращает [`DeferredAcks`], и удалить
+//!   сообщения с relay можно только через `commit_then_send`, т.е. после успешного
+//!   коммита авторитетного контейнера (SEC-34);
 //! - **at-rest секретов нет** (см. `store`) — теперь load-bearing: на диске
 //!   ratchet chain/root-ключи.
 
@@ -2872,6 +2876,14 @@ fn persist_incoming_history(store: &Store, msgs: &[Option<Received>], now: u64) 
 /// коммита ratchet/OPK и ДО ACK, поэтому краш в любом из окон `[OPK→session]` /
 /// `[session→history]` больше НЕ теряет сообщение (при переобработке дубликат
 /// отсекается по `payload_id`, либо fail-closed на продвинутом ratchet).
+///
+/// **FILE-TREE ACCOUNTS ONLY.** This acks internally, which is correct exactly while the
+/// `Store` it writes to is the authority. A CONTAINER-backed account's authority is the
+/// encrypted container, committed later and separately, so acking here would delete relay
+/// mail that the authority has not yet recorded (SEC-34). Container-backed callers use
+/// [`recv_session_multi`] + [`DeferredAcks::commit_then_send`]; the desktop, the only
+/// container-backed caller, already does. Keep it that way — a container-backed caller
+/// reaching for this function is the bug growing back.
 pub fn recv_session(
     store: &Store,
     relay: &Relay,
@@ -3023,12 +3035,80 @@ pub fn receive_threaded<T: Transport + Clone>(
     MultiReceive { messages, state, opks, failed, acks }
 }
 
-/// The outcome of a multi-homed poll through the store: the decrypted messages, and which
+/// The outcome of a multi-homed poll through the store: the decrypted messages, which
 /// of the passed relays were unreachable this poll (indices into the SAME `relays` slice,
-/// in order — the caller maps them back to drive a per-relay reachability indicator).
+/// in order — the caller maps them back to drive a per-relay reachability indicator), and
+/// the still-UNSENT lease receipts ([`DeferredAcks`]) the caller must commit before acking.
 pub struct MultiPoll {
     pub messages: Vec<Option<Received>>,
     pub failed: Vec<usize>,
+    /// The leases this poll took. Nothing is deleted from any relay until these are handed
+    /// to [`DeferredAcks::commit_then_send`] with a commit that succeeds — see that type.
+    pub acks: DeferredAcks,
+}
+
+/// Lease receipts held back until the caller's **authoritative** store has committed.
+///
+/// SEC-34. `recv_session_multi` used to ack inside itself, right after `store.save_*`. For a
+/// file-tree account those saves ARE the durable boundary, so that was correct. For a
+/// CONTAINER-backed account they are not: the `Store` is a materialized working copy, and the
+/// authority is the encrypted container, written by a separate, later `ContainerVault::save()`.
+/// The ack therefore told the relay to delete its only copy while the authority still held the
+/// PREVIOUS state — and a failed (or never-attempted) container save silently rolled the
+/// messages back out of existence on the next unlock.
+///
+/// The fix is structural rather than a re-ordering: receiving no longer acks, and the ONLY way
+/// to send these receipts is through [`commit_then_send`](Self::commit_then_send), which runs
+/// the caller's durability barrier first and sends nothing if it fails. There is deliberately
+/// no bare `send`: a caller that cannot name its barrier cannot ack. Forgetting the receipts
+/// entirely is the safe failure — the messages stay leased on the relay and redeliver.
+#[must_use = "receipts that are never committed leave their messages leased on the relay"]
+#[derive(Default)]
+pub struct DeferredAcks {
+    /// Each receipt paired with the transport of the relay that leased it (handles, cookies
+    /// and scope are relay-scoped). Paired rather than index-tagged so receipts from several
+    /// polls — different relay sets, different proxies — can be [`merge`](Self::merge)d into
+    /// one barrier without the indices meaning different things.
+    pending: Vec<(SocketTransport, node::peer::AckReceipt)>,
+}
+
+impl DeferredAcks {
+    /// No leases taken ⇒ nothing to commit for. A caller keying its container save off "did
+    /// this poll take any leases?" (rather than off whether the UI got anything to show) uses
+    /// this: control-only mail advances the ratchet and writes pending entries while producing
+    /// zero UI events, and it still has to be committed before it is acked.
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Fold another poll's receipts in, so one commit covers a whole drain (several pages,
+    /// several proxies, several relay sets).
+    pub fn merge(&mut self, other: DeferredAcks) {
+        self.pending.extend(other.pending);
+    }
+
+    /// Run the caller's durability barrier and, ONLY if it succeeds, delete the leased
+    /// messages from the relays that leased them.
+    ///
+    /// - File-tree caller: the `Store` writes already are the barrier, so `|| Ok(())` is the
+    ///   honest argument — it says "my store is the authority", not "skip the check".
+    /// - Container-backed caller: pass `ContainerVault::save`. On error nothing is acked, the
+    ///   error propagates, and the messages stay leased: the relay redelivers them once the
+    ///   lease expires, so the batch is recoverable rather than lost.
+    ///
+    /// Sending is best-effort per receipt (as before): a failed ack just leaves that message
+    /// leased to redeliver, which the ratchet's fail-closed duplicate handling absorbs.
+    pub fn commit_then_send(
+        self,
+        now: u64,
+        commit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        commit()?;
+        for (transport, receipt) in &self.pending {
+            node::peer::send_ack(transport, receipt, now);
+        }
+        Ok(())
+    }
 }
 
 /// Receive across a SET of relays (multi-homing) with the on-disk identity, persisting the
@@ -3041,6 +3121,10 @@ pub struct MultiPoll {
 /// see [`receive_threaded`]). `Err` is reserved for a real fault: no relays configured, or a
 /// store I/O failure. Kept SEPARATE from [`recv_session`], which fails closed on its single
 /// relay's error to drive the connection indicator — here reachability is per-relay data.
+///
+/// **This does NOT ack.** SEC-34: the store writes below are the durable boundary only for a
+/// file-tree account; a container-backed caller's authority is written later. The leases come
+/// back in `MultiPoll::acks` and are the caller's to commit — see [`DeferredAcks`].
 pub fn recv_session_multi(store: &Store, relays: &[Relay], now: u64) -> Result<MultiPoll, String> {
     if relays.is_empty() {
         return Err("no relays configured".into());
@@ -3064,13 +3148,15 @@ pub fn recv_session_multi(store: &Store, relays: &[Relay], now: u64) -> Result<M
     persist_incoming_history(store, &out.messages, now)?;
     store.save_opks(&out.opks).map_err(|e| format!("saving one-time prekeys: {e}"))?;
     store.save_sessions(&out.state).map_err(|e| format!("saving sessions: {e}"))?;
-    // Plaintext + state durable ⇒ delete the leased messages, each through the relay that
-    // leased it (handles/cookies/scope are relay-scoped, so the receipt's tag picks the
-    // transport). Best-effort.
-    for (i, receipt) in &out.acks {
-        node::peer::send_ack(&pairs[*i].0, receipt, now);
-    }
-    Ok(MultiPoll { messages: out.messages, failed: out.failed })
+    // Plaintext + state are durable IN THIS STORE — which is the whole story for a file-tree
+    // account and only half of it for a container-backed one (SEC-34). So the leases are handed
+    // back instead of acked here: each receipt carries the transport of the relay that leased it
+    // (handles/cookies/scope are relay-scoped), and the caller names the barrier that must hold
+    // before the relay is told it may forget the ciphertext.
+    let acks = DeferredAcks {
+        pending: out.acks.into_iter().map(|(i, r)| (pairs[i].0.clone(), r)).collect(),
+    };
+    Ok(MultiPoll { messages: out.messages, failed: out.failed, acks })
 }
 
 /// Send one loop (cover traffic) and drain any loops that came back. Returns how many

@@ -6,6 +6,7 @@
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -787,7 +788,7 @@ fn a_proxy_message_via_a_published_opk_delivers() {
     client::send_text(&a, &r, &b_proxy, b"hi via proxy opk", NOW, NOW).unwrap();
 
     // Bob's proxy receives via the multi-homed path the desktop poll uses.
-    let poll = client::recv_session_multi(&b, std::slice::from_ref(&r), NOW).unwrap();
+    let poll = recv_multi(&b, std::slice::from_ref(&r), NOW).unwrap();
     let msg = poll
         .messages
         .into_iter()
@@ -914,7 +915,7 @@ fn an_avatar_delivers_and_lands_in_the_recipients_peer_profile() {
     client::send_avatar(&astore, &r, &bob_ik, &avatar, NOW).unwrap();
 
     // Receive + reassemble exactly as the desktop poll does (per-sender Reassembler).
-    let got = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+    let got = recv_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
     let mut re = client::content::Reassembler::new();
     let mut assembled = None;
     for m in got.messages.into_iter().flatten() {
@@ -1145,7 +1146,7 @@ fn a_publication_image_delivers_and_reunites_with_its_post() {
     client::send_post_image(&astore, &r, &bob_ik, id, &image, NOW).expect("post image sends");
 
     // Receive + route exactly as the desktop poll does: text → feed, image → reassembler → sidecar.
-    let got = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+    let got = recv_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
     let mut re = client::content::Reassembler::new();
     for m in got.messages.into_iter().flatten() {
         match client::content::decode(&m.plaintext) {
@@ -1275,6 +1276,187 @@ fn recv_session_acks_and_drains_the_relay_over_the_wire() {
     std::fs::remove_dir_all(&bdir).ok();
 }
 
+/// Like `spawn_relay_handle`, but the relay's clock is an atomic a test can ADVANCE — the only
+/// way to observe a lease timing out, since lease visibility is decided by the RELAY's clock.
+/// Advanced in units of `node::node::LEASE_SECS`, never by sleeping: no wall-clock threshold.
+fn spawn_relay_handle_clock() -> (SocketAddr, client::RelayId, Arc<Mutex<RelayNode>>, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut relay = RelayNode::new(NOW);
+    relay.issue_capability(client::dev_capability());
+    let fetch_pub = relay.relay_public().to_bytes();
+    let clock = Arc::new(AtomicU64::new(NOW));
+    let c = clock.clone();
+    let server = RelayServer::new(relay, Arc::new(move || c.load(AtomicOrdering::SeqCst)));
+    let noise_pub = server.noise_public();
+    let handle = server.relay_handle();
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+    (addr, client::RelayId { noise_pub, fetch_pub }, handle, clock)
+}
+
+/// A container-backed account, set up the way `container_create` does it: a container file, a
+/// `ContainerVault` materialized into `work`, and a `Store` over that work dir. The vault comes
+/// back so the test can drive `save()` — the commit that a container-backed session's ACK must
+/// wait on.
+fn open_container_store(
+    cpath: &std::path::Path,
+    work: PathBuf,
+) -> (client::container::ContainerVault, Store) {
+    let cv = client::container::ContainerVault::open(cpath, b"container-pw", work).unwrap();
+    let store = Store::unlock(&cv.work_dir, b"pw").unwrap();
+    (cv, store)
+}
+
+/// **SEC-34 — the discriminating test.** A container-backed client's `Store` is a materialized
+/// working copy; the AUTHORITY is the encrypted container, written by a separate later `save()`.
+/// Receiving used to ack (= tell the relay to delete its only copy) as soon as that working copy
+/// was written, so a container `save()` that then failed — and the old code only *warned* about
+/// it — left the message gone from BOTH sides: the next unlock restores the container's older
+/// snapshot, and the relay has nothing left to redeliver.
+///
+/// Here the commit FAILS FOR REAL (an oversized file makes SEC-35's capacity check refuse the
+/// snapshot — no injected error), and the batch must survive: unacked ⇒ still on the relay ⇒ the
+/// lease expires ⇒ the reopened container, rolled back to its pre-message state, receives the
+/// exact message. Then a commit that SUCCEEDS acks and drains the relay, so this also pins that
+/// the barrier does not simply suppress acking forever.
+///
+/// Neuter check: ack before/regardless of the commit (`send` the receipts, then `cv.save()`) and
+/// the "still on the relay" assertion reds immediately.
+#[test]
+fn a_failed_container_commit_leaves_the_batch_redeliverable() {
+    let (relay_addr, relay_id, relay, clock) = spawn_relay_handle_clock();
+    let adir = temp_dir("sec34-alice");
+    let base = temp_dir("sec34-container");
+    let cpath = base.join("container.dat");
+    // 1 MiB container, main region 3/4 of it. A region holds two ping-pong copy slots, so the
+    // usable payload is roughly 3/8 MiB — far more than a provisioned account, far less than the
+    // oversized file planted below.
+    let total = 1024 * 1024;
+    client::container::Container::create(&cpath, total, b"container-pw", total / 4 * 3).unwrap();
+
+    let (mut cv, bstore) = open_container_store(&cpath, base.join("work-1"));
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    seed_provision(&astore);
+    seed_provision(&bstore);
+    astore.save_capability(&client::dev_capability()).unwrap();
+    bstore.save_capability(&client::dev_capability()).unwrap();
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+    // The container now holds the PROVISIONED, pre-message account — the state a rollback lands on.
+    cv.save().unwrap();
+
+    let r = ctx(relay_addr, &relay_id);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
+    client::send_text(&astore, &r, &bob_ik, b"survive the failed commit", NOW, NOW).unwrap();
+
+    // ---- poll #1: decrypts into the WORK DIR, then the container commit fails ----
+    let poll = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+    assert_eq!(poll.messages.iter().flatten().count(), 1, "decrypted into the working copy");
+    assert!(!poll.acks.is_empty(), "the fetch took a lease that now needs committing");
+    // A real, deterministic `save()` failure: one file larger than the compartment can ever hold.
+    std::fs::write(cv.work_dir.join("oversized.bin"), vec![0u8; total as usize]).unwrap();
+    let err = poll
+        .acks
+        .commit_then_send(NOW, || cv.save().map_err(|e| e.to_string()))
+        .expect_err("the container commit must fail here");
+    assert!(err.contains("budget") || err.contains("cap"), "expected a capacity refusal, got: {err}");
+    // THE finding: the commit failed, so NOTHING was acked and the relay still holds the message.
+    assert!(
+        !relay.lock().unwrap().all_slots_for_test().is_empty(),
+        "a failed container commit must not have acked — the relay's copy is the only one left"
+    );
+
+    // ---- reopen: what the next unlock actually sees is the container, not the work dir ----
+    std::fs::remove_file(cv.work_dir.join("oversized.bin")).unwrap();
+    drop(bstore);
+    drop(cv);
+    let (mut cv2, bstore2) = open_container_store(&cpath, base.join("work-2"));
+    assert!(
+        bstore2.load_history().unwrap().is_empty(),
+        "the restored container is the PRE-message state — this is the rollback the ack must not \
+         have raced"
+    );
+
+    // The unacked lease expires and the exact ciphertext redelivers (relay-clock driven, no sleep).
+    clock.store(NOW + node::node::LEASE_SECS + 1, AtomicOrdering::SeqCst);
+    let poll2 = client::recv_session_multi(&bstore2, std::slice::from_ref(&r), NOW).unwrap();
+    assert_eq!(
+        poll_texts(&poll2.messages),
+        vec![b"survive the failed commit".to_vec()],
+        "the message the failed commit did not lose is redelivered to the reopened container"
+    );
+    // …and a commit that SUCCEEDS acks, so the relay finally drops it.
+    poll2.acks.commit_then_send(NOW, || cv2.save().map_err(|e| e.to_string())).unwrap();
+    assert!(
+        relay.lock().unwrap().all_slots_for_test().is_empty(),
+        "a successful container commit does ack — the barrier gates the ack, it doesn't block it"
+    );
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// **SEC-34, second half.** The desktop used to save the container only `if !out.is_empty()` —
+/// keyed on whether the poll produced anything to SHOW. Control mail (a reaction here; equally
+/// `ChannelMigrate` or the `FileRef`/`GalleryRef` pointers) advances the ratchet and writes to
+/// the store while producing zero UI events, so that gate acked it and never committed it.
+///
+/// The invariant that replaces it is pinned here: a control-only batch still comes back with a
+/// NON-EMPTY `DeferredAcks`, so a caller keying its commit off the leases — as the desktop now
+/// does — cannot miss it. Gate on UI output instead and `acks` is what proves you're wrong.
+#[test]
+fn a_control_only_batch_still_carries_a_commit_barrier() {
+    let (relay_addr, relay_id, relay) = spawn_relay_handle();
+    let adir = temp_dir("sec34-ctl-a");
+    let bdir = temp_dir("sec34-ctl-b");
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    let bstore = Store::unlock(&bdir, b"pw").unwrap();
+    seed_provision(&astore);
+    seed_provision(&bstore);
+    astore.save_capability(&client::dev_capability()).unwrap();
+    bstore.save_capability(&client::dev_capability()).unwrap();
+    let bob_ik = bstore.load_account().unwrap().identity_public();
+
+    let r = ctx(relay_addr, &relay_id);
+    let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), bstore.load_capability().unwrap(), NOW);
+    assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
+    client::send_reaction(&astore, &r, &bob_ik, [9u8; 16], "👍", true, NOW).unwrap();
+
+    let poll = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+    // Nothing a UI would render…
+    assert!(poll_texts(&poll.messages).is_empty(), "a reaction produces no UI text");
+    assert!(
+        matches!(
+            client::content::decode(&poll.messages.iter().flatten().next().unwrap().plaintext),
+            Ok(client::content::Content::Reaction { .. })
+        ),
+        "…but a real control message did arrive"
+    );
+    // …and yet the batch is leased, so it MUST be committed before it may be acked.
+    assert!(!poll.acks.is_empty(), "control-only mail still holds leases that need committing");
+    assert!(
+        !relay.lock().unwrap().all_slots_for_test().is_empty(),
+        "receiving alone acked nothing — the ack is the committer's to send"
+    );
+    poll.acks.commit_then_send(NOW, || Ok(())).unwrap();
+    assert!(relay.lock().unwrap().all_slots_for_test().is_empty(), "committed ⇒ acked");
+
+    std::fs::remove_dir_all(&adir).ok();
+    std::fs::remove_dir_all(&bdir).ok();
+}
+
+/// Drive `recv_session_multi` the way a FILE-TREE client does: the store it just wrote to IS
+/// the authority, so the SEC-34 commit barrier is a genuine no-op and the leases are acked
+/// immediately. Container-backed callers do NOT get this shape — see
+/// `a_failed_container_commit_leaves_the_batch_redeliverable`.
+fn recv_multi(store: &Store, relays: &[client::Relay], now: u64) -> Result<client::MultiPoll, String> {
+    let mut poll = client::recv_session_multi(store, relays, now)?;
+    std::mem::take(&mut poll.acks).commit_then_send(now, || Ok(()))?;
+    Ok(poll)
+}
+
 /// Провижининг корня (энтропии свежей фразы) в стор; возвращает энтропию, чтобы
 /// тест мог вывести ожидаемые seal/account (`seed::derive`) для сверки. В новой
 /// модели identity+account — не независимые секреты, а вывод из ЕДИНОГО корня.
@@ -1332,7 +1514,7 @@ fn recv_session_multi_delivers_from_live_relays_and_flags_the_dead_one() {
     client::send_text(&astore, &r2, &bob_ik, b"via-r2", NOW, NOW).unwrap();
 
     // Dead relay in the MIDDLE, so a fail-fast poll would lose relay 2's message.
-    let poll = client::recv_session_multi(&bstore, &[r1.clone(), r_dead, r2.clone()], NOW).unwrap();
+    let poll = recv_multi(&bstore, &[r1.clone(), r_dead, r2.clone()], NOW).unwrap();
     assert_eq!(poll.failed, vec![1], "only the dead relay is unreachable");
     let texts = poll_texts(&poll.messages);
     assert!(texts.contains(&b"via-r1".to_vec()), "relay 1's message was not delivered");
@@ -1340,7 +1522,7 @@ fn recv_session_multi_delivers_from_live_relays_and_flags_the_dead_one() {
 
     // The mailboxes were drained on fetch, so a re-poll of the same live relays is empty.
     // This checks DRAINAGE, not persistence — it would hold even without saving state.
-    let drained = client::recv_session_multi(&bstore, &[r1.clone(), r2.clone()], NOW).unwrap();
+    let drained = recv_multi(&bstore, &[r1.clone(), r2.clone()], NOW).unwrap();
     assert!(poll_texts(&drained.messages).is_empty(), "a message was re-delivered (mailbox not drained)");
 
     // Persistence proper: a NEW post-opener message lands in a session-derived drop box, so
@@ -1348,7 +1530,7 @@ fn recv_session_multi_delivers_from_live_relays_and_flags_the_dead_one() {
     // through disk. Delete `save_sessions` in `recv_session_multi` and this reds — Bob loads
     // a stale session, never learns the drop box, and the follow-up is lost.
     client::send_text(&astore, &r1, &bob_ik, b"after", NOW, NOW).unwrap();
-    let follow = client::recv_session_multi(&bstore, &[r1, r2], NOW).unwrap();
+    let follow = recv_multi(&bstore, &[r1, r2], NOW).unwrap();
     assert!(
         poll_texts(&follow.messages).contains(&b"after".to_vec()),
         "the multi-poll's ratchet advance did not round-trip through disk"
@@ -2661,7 +2843,7 @@ fn two_concurrent_image_posts_both_reunite_with_their_posts() {
     // Drain the mailbox over several polls (like the desktop), routing exactly as the poll does.
     let mut re = client::content::Reassembler::new();
     for _ in 0..10 {
-        let got = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+        let got = recv_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
         let msgs: Vec<_> = got.messages.into_iter().flatten().collect();
         if msgs.is_empty() {
             break;
@@ -2719,7 +2901,7 @@ fn simultaneous_first_contact_publications_both_deliver() {
 
     let drain = |store: &Store| {
         for _ in 0..8 {
-            let got = client::recv_session_multi(store, std::slice::from_ref(&r), NOW).unwrap();
+            let got = recv_multi(store, std::slice::from_ref(&r), NOW).unwrap();
             let msgs: Vec<_> = got.messages.into_iter().flatten().collect();
             if msgs.is_empty() {
                 break;
@@ -2769,7 +2951,7 @@ fn simultaneous_first_contact_publications_both_deliver() {
     // Idempotency / no re-delivery storm: an extra poll after everything is drained must simply
     // return Ok with nothing — never re-run key agreement (which consumes the OPK) and never
     // resurface an un-decryptable payload every cycle (the `чанк без манифеста` → Killed hang).
-    let extra = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+    let extra = recv_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
     assert!(extra.messages.into_iter().flatten().count() == 0, "B re-delivered mail after a clean drain");
 
     std::fs::remove_dir_all(&adir).ok();
@@ -2805,7 +2987,7 @@ fn post_attachments_round_trip_images_and_file() {
 
     let mut reasm = client::content::Reassembler::default();
     for _ in 0..40 {
-        let got = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+        let got = recv_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
         let msgs: Vec<_> = got.messages.into_iter().flatten().collect();
         if msgs.is_empty() {
             break;
@@ -2864,7 +3046,7 @@ fn three_large_attachments_all_arrive() {
 
     let mut reasm = client::content::Reassembler::default();
     for _ in 0..200 {
-        let got = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+        let got = recv_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
         let msgs: Vec<_> = got.messages.into_iter().flatten().collect();
         if msgs.is_empty() {
             break;
@@ -2915,7 +3097,7 @@ fn contact_request_and_accept_exchange_profiles() {
     // B drains and applies the request like the desktop poll.
     let drain = |store: &Store| {
         for _ in 0..8 {
-            let got = client::recv_session_multi(store, std::slice::from_ref(&r), NOW).unwrap();
+            let got = recv_multi(store, std::slice::from_ref(&r), NOW).unwrap();
             let msgs: Vec<_> = got.messages.into_iter().flatten().collect();
             if msgs.is_empty() { break; }
             for m in msgs {

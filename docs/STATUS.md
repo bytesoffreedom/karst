@@ -180,6 +180,26 @@ build; clippy clean.**
   once the hidden account goes online** (circuit isolation + timing settings deferred — see #123).
   14 container tests. Desktop: `container_create/unlock/flush/active/hidden/add_hidden`,
   `net_offline/set_net_offline`, `Vault::adopt`.
+  **Receive durability (SEC-34, fixed).** A container-backed session's `Store` is a materialized
+  working copy; the authority is the container, written by a separate later `save()`. Receiving used
+  to ack the relay — telling it to delete its only copy — as soon as that working copy was written,
+  and the container save came later, was skipped entirely when a poll produced no UI events, and only
+  warned when it failed. Now `client::recv_session_multi` **does not ack**: it returns
+  `DeferredAcks`, whose only sender (`commit_then_send`) runs the caller's commit first and sends
+  nothing if it fails, and the desktop poll keys that commit off **leases taken**, not off UI output.
+  A failed commit therefore leaves the batch leased on the relay, to redeliver. Test:
+  `a_failed_container_commit_leaves_the_batch_redeliverable` (real capacity failure, reopened
+  container, relay-clock lease expiry), plus `a_control_only_batch_still_carries_a_commit_barrier`.
+  **Named limits.** (a) "Redeliverable" means *after a relock/restart*: within the same session the
+  work dir still holds the advanced ratchet, so a redelivery fails closed and shows as nothing — no
+  loss, but no in-session recovery either. (b) The **ratchet rollback itself is not fixed**: a stale
+  container snapshot can still overwrite a newer work dir on reopen (the audit's generation-marker
+  item), and a rollback deeper than `MAX_SKIP` can still wedge a conversation. Deferring the ack
+  removes the message LOSS, not the rollback. (c) Only the receive path is gated. Other writers of a
+  container-backed work dir — `flush_outbox`, the spawned download/attachment threads — are still
+  durable only at the next container save; nothing is deleted from a relay on their behalf, so this
+  costs redundant work after a rollback, not mail. (d) The quarantine/replay log is **not** a
+  mitigation here: it lives in the work dir, so it rolls back with everything else.
 - **Public-node admission door (`impl/admission`, `impl/node`).** A stateless proof-of-work → a
   short-lived capability, so a public relay admits strangers without an invite and without keeping
   per-client state at the door.

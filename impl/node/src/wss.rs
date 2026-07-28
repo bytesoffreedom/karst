@@ -58,10 +58,11 @@ fn ws_err(e: tungstenite::Error) -> io::Error {
 /// bypasses every other read cap in the system.
 const WS_MAX_FRAME: usize = 128 * 1024;
 fn ws_config() -> tungstenite::protocol::WebSocketConfig {
-    let mut c = tungstenite::protocol::WebSocketConfig::default();
-    c.max_message_size = Some(WS_MAX_FRAME);
-    c.max_frame_size = Some(WS_MAX_FRAME);
-    c
+    tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(WS_MAX_FRAME),
+        max_frame_size: Some(WS_MAX_FRAME),
+        ..Default::default()
+    }
 }
 
 impl<S: Read + Write> Read for WsByteStream<S> {

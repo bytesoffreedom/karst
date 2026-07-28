@@ -901,7 +901,7 @@ mod tests {
         assert!(c.write(b"realpw", &vec![7u8; main_cap]).is_err(), "protect refuses to exceed A");
 
         // P3 blind write big enough to spill past A into the hidden region → hidden corrupts.
-        c.write(b"blindpw", &vec![9u8; (main_cap + 40 * 1024)]).unwrap();
+        c.write(b"blindpw", &vec![9u8; main_cap + 40 * 1024]).unwrap();
         assert!(c.open(b"hiddenpw").is_err(), "blind spill overwrote the hidden compartment");
 
         let _ = std::fs::remove_file(&p);

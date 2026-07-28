@@ -301,3 +301,67 @@ fn a_client_with_the_wrong_capability_secret_is_refused() {
     let msgs = bob.receive(NOW).unwrap_or_default();
     assert!(msgs.iter().flatten().next().is_none(), "a refused message still reached the mailbox");
 }
+
+/// R2-7. The transport deliberately does NOT retry a request once it is on the wire: the relay
+/// may already have applied it. But the sender's outbox retries later, retransmitting the EXACT
+/// same ciphertext with a fresh nonce and capability proof — which admission correctly reads as a
+/// new request. Underneath it is the same message, and storing it twice cost the recipient a
+/// mailbox slot and the sender quota, while leaving every content type to dedup for itself.
+///
+/// Discriminating in both directions: the SAME payload deposited twice must leave ONE message,
+/// and a DIFFERENT payload must still leave two — a relay that dropped every repeat deposit, or
+/// swallowed everything after the first, fails one of the two.
+#[test]
+fn redepositing_the_same_ciphertext_does_not_duplicate_it_in_the_mailbox() {
+    use node::seal::SkeletonSeal;
+
+    let (relay, bob_id, _relay_pub) = setup();
+    let bob_pub = bob_id.public;
+    let cap = capability([0x33; 32]);
+
+    // ONE sealed envelope, deposited twice — exactly what the outbox retransmits.
+    let payload = Payload::Skeleton(SkeletonSeal::seal(&bob_pub, b"same bytes"));
+
+    let deposit = |relay: &Rc<RefCell<RelayNode>>, payload: &Payload, nonce: &[u8]| {
+        let mut msg = WireMessage {
+            client_addr: b"alice".to_vec(),
+            carrier_id: b"test".to_vec(),
+            cookie: None,
+            request_nonce: nonce.to_vec(),
+            capability_proof: cap.prove(nonce, 0),
+            recipient: bob_pub.to_bytes(),
+            payload: payload.clone(),
+        };
+        for _ in 0..2 {
+            match relay.borrow_mut().handle(&msg, NOW) {
+                Response::NeedCookie(c) => msg.cookie = Some(c),
+                other => return other,
+            }
+        }
+        panic!("persistent cookie challenge")
+    };
+
+    assert!(matches!(deposit(&relay, &payload, b"nonce-1"), Response::Accepted));
+    // The retry: same bytes, fresh nonce and proof, as the outbox would send it.
+    let again = deposit(&relay, &payload, b"nonce-2");
+    assert!(
+        matches!(again, Response::Accepted),
+        "a retry of an already-stored deposit must be ACCEPTED — the sender cannot tell it from a \
+         lost response and would retry forever: {again:?}"
+    );
+    assert_eq!(
+        relay.borrow().mailbox_len_for_test(&bob_pub.to_bytes()),
+        1,
+        "the same ciphertext was stored twice — one message costing the recipient two mailbox \
+         slots and the sender two quota units"
+    );
+
+    // Control: a genuinely different message must still land.
+    let other = Payload::Skeleton(SkeletonSeal::seal(&bob_pub, b"different bytes"));
+    assert!(matches!(deposit(&relay, &other, b"nonce-3"), Response::Accepted));
+    assert_eq!(
+        relay.borrow().mailbox_len_for_test(&bob_pub.to_bytes()),
+        2,
+        "dedup must key on the payload, not swallow every deposit after the first"
+    );
+}

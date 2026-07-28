@@ -526,6 +526,12 @@ impl RelayNode {
         self.cap_quota.len()
     }
 
+    /// How many messages are queued for `recipient` — so a test can prove a re-deposit did not
+    /// duplicate, without draining the mailbox (a fetch would remove the evidence).
+    pub fn mailbox_len_for_test(&self, recipient: &[u8; 32]) -> usize {
+        self.mailboxes.get(recipient).map_or(0, |m| m.len())
+    }
+
     /// Issue a cookie the way the request handlers do — so a test can build an admission-gated
     /// request by hand without reaching into the keyring.
     pub fn issue_cookie_for_test(&mut self, addr: &[u8], carrier: &[u8], now: u64) -> Cookie {
@@ -907,7 +913,28 @@ impl RelayNode {
                     // офлайн-получателя). Полный ящик = backpressure отправителю, не
                     // молчаливый сброс. В духе admission-троттлинга.
                     let mbox = self.mailboxes.entry(msg.recipient).or_default();
-                    if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
+                    // IDEMPOTENT deposit (R2-7). The transport deliberately does NOT retry a
+                    // request once it has been written to the connection: the relay may already
+                    // have applied it, and a blind retry would duplicate. But the sender's outbox
+                    // retries later, retransmitting the EXACT same ciphertext — with a fresh nonce
+                    // and capability proof, so admission correctly sees a new request. The deposit
+                    // underneath is the same message, and storing it twice cost the recipient a
+                    // mailbox slot and the sender quota, and left every content type to implement
+                    // its own dedup.
+                    //
+                    // `payload_id` is already the stable identity of those bytes — it is what an
+                    // ACK names — so no new wire field is needed: re-depositing a message that is
+                    // still in the mailbox is accepted and ignored. The scan is bounded by the
+                    // mailbox cap.
+                    //
+                    // Limit worth naming: this covers the window that actually produces duplicates
+                    // (response lost, sender retries), NOT a retry after the recipient has fetched
+                    // and the entry is gone. Catching that needs a delivered-ids record with its
+                    // own retention — a different trade, not this one.
+                    let deposit_id = payload_id(&msg.payload);
+                    if mbox.iter().any(|e| payload_id(&e.payload) == deposit_id) {
+                        Response::Accepted
+                    } else if mbox.len() >= crate::wire::MAX_FETCH_SEALS {
                         Response::Rejected("MailboxFull".into())
                     } else {
                         mbox.push(MailboxEntry { enqueued_at: now, leased_until: 0, payload: msg.payload.clone() });

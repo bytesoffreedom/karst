@@ -5,10 +5,15 @@
 //! cure used to be `forget_peer` + a fresh handshake.
 //!
 //! These tests simulate a GENUINE simultaneous first contact — both sides `connect_with_bundle`
-//! before either has processed the other's opener — and prove (1) both sides converge onto the
-//! SAME session with no wire message, (2) mail already queued on whichever chain turns out to
-//! be the LOSING one still arrives after the convergence swap relocates it, and (3) the merged
-//! session goes on to carry an ordinary multi-round bidirectional conversation.
+//! before either has processed the other's opener — end to end (full PQXDH + relay). They prove
+//! (1) both sides converge onto the SAME session with no wire message, and (2) delivery keeps
+//! working across the convergence swap (no message goes missing). What they do NOT — and, by
+//! construction, CANNOT — discriminate: whether the routing snapshot specifically prevents
+//! misdelivery, or whether the ratchet keeps healing round after round. Both of those are
+//! masked here by the same two mechanisms (dual-map trial-decrypt; `receive()` draining the
+//! identity mailbox before polling boxes in one call) and are pinned instead, directly, in
+//! `node/src/peer.rs`'s `convergence_route_tests` module — see each test's doc comment below for
+//! exactly which unit test to look at.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -103,12 +108,21 @@ fn simultaneous_first_contact_converges_both_sides_onto_the_same_session() {
 /// flight on the losing chain. `queue`s a second message on EACH side's pre-split outbound
 /// before either side has processed the other's opener, so by the time it is actually flushed
 /// to the relay, its own peer's `sessions[peer_ik]` entry may already have been SWAPPED by
-/// `converge_split_session` (if that side turns out to hold the losing chain). Both queued
-/// messages must still arrive, in order — regardless of which of the two sides that turns out
-/// to be, so the test queues (and asserts delivery) symmetrically on BOTH sides rather than
-/// betting on which one the (essentially random) tie-break favours.
+/// `converge_split_session` (if that side turns out to hold the losing chain).
+///
+/// **Known limit, stated plainly:** this test passes WITH OR WITHOUT `OutboxEntry`'s routing
+/// snapshot (verified by neutering it) — end to end, `receive()` always drains the identity
+/// mailbox (creating the peer's second session) before it polls drop-boxes IN THE SAME call,
+/// and `process_for_peer` trial-decrypts a peer's traffic against BOTH of that peer's held
+/// sessions regardless of which box it arrived on. Together those recover an address computed
+/// from the wrong session in every ordering this harness can produce. So THIS test only proves
+/// "convergence doesn't break ordinary delivery" — it is a regression check, not proof the
+/// snapshot matters. The snapshot's actual, narrower claim (a queued envelope routes by what
+/// encrypted it, not by whatever is CURRENTLY in `sessions[peer_ik]`) is pinned directly, by
+/// address comparison, in `peer.rs`'s
+/// `convergence_route_tests::a_queued_envelope_routes_by_its_own_snapshot_not_by_whatever_session_is_current`.
 #[test]
-fn a_message_queued_before_convergence_on_a_chain_still_arrives_after_the_swap() {
+fn a_message_queued_before_convergence_still_arrives_after_it_and_delivery_keeps_working() {
     let (mut alice, mut bob, alice_ik, bob_ik) = simultaneous_first_contact();
 
     // The opener travels immediately — an ordinary first message is never queued behind
@@ -155,6 +169,13 @@ fn a_message_queued_before_convergence_on_a_chain_still_arrives_after_the_swap()
 /// two one-way chains. Runs several more rounds after the convergence-triggering receives,
 /// exactly like `session_path.rs`'s non-split multi-round test, on what is now (per the first
 /// test above) the SAME session on both sides.
+///
+/// **Discriminating power is the precondition assert below, not the round trip**: a plain
+/// multi-round send/receive loop passes even in the UNCONVERGED split state (each one-way
+/// chain already delivers plaintext correctly on its own — that was the previous slice's whole
+/// point). What a split can never do is keep DH-ratcheting round after round; that property is
+/// pinned separately, by ratchet-pubkey, in `peer.rs`'s
+/// `convergence_route_tests::the_converged_session_keeps_dh_ratcheting_across_several_further_rounds`.
 #[test]
 fn the_converged_session_carries_an_ordinary_multi_round_conversation_afterward() {
     let (mut alice, mut bob, alice_ik, bob_ik) = simultaneous_first_contact();

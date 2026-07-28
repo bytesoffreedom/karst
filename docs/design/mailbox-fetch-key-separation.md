@@ -110,7 +110,7 @@ historical pre-implementation stance.)*
 Tracked in the protocol-hardening backlog alongside lease/ACK + exact retransmit and crash-safe blob
 retry, which share the "advance/commit state only after the durable + confirmed step" discipline.
 
-## Spike result (2026-07-19) — the primitive is built and proven, NOT wired
+## Spike result (2026-07-19) — the primitive is built and proven, NOT wired *(later WIRED — see the Update at the end)*
 
 `node/src/blind.rs` implements the point-blinding half as an **isolated, unwired spike**
 (nothing calls it; it changes no live behaviour). It confirms the construction works over
@@ -144,9 +144,10 @@ verifies; wrong secret / tampered proof / wrong context / wrong statement / malf
 Still un-CI-able the way a signature is; **before it could ship it needs known-answer vectors** (the
 randomized `prove` can't have a full-proof KAT, but the deterministic challenge format can).
 
-**So BOTH crypto halves are now proven on the shelf** (point-blinding + ownership proof), unwired.
+**So BOTH crypto halves are now proven on the shelf** (point-blinding + ownership proof) — at the
+time of this spike, unwired *(both were later wired for established sessions — see the Update below)*.
 
-**What is STILL deferred (and why the spikes are not a ship decision):**
+**What was still deferred at spike time (SUPERSEDED for established sessions — see the Update below):**
 
 1. **The live wiring — a wire-format change touching every client.** Shipping the separation means
    moving `peer.rs`'s drop-box derivation off the shared `drop_seed` onto the blinded keys (the
@@ -158,3 +159,21 @@ randomized `prove` can't have a full-proof KAT, but the deterministic challenge 
    deferral. The trigger to actually ship is when "can deposit" must stop implying "can read" —
    i.e. **group mailboxes or deposit delegation**. Until then, `blind.rs` is a proven primitive
    on the shelf, and the live drop-box path is unchanged.
+
+## Update (shipped) — the separation is now WIRED LIVE for established sessions
+
+The deferred wiring in item 1 above has since landed, superseding the "on the shelf" stance for
+established sessions:
+
+- `peer.rs` derives the outbound drop-box from the recipient's blinded `M` (`blind::deposit_address`),
+  no longer from the shared `drop_seed`.
+- the relay gates fetch/ack with `blind::FetchOwnershipProof` (verified in `node::mailbox_owner_ok`,
+  shared by `handle_fetch`/`handle_ack`), replacing the `DH` proof for blinded boxes.
+- it was a **breaking migration**: the prekey signature now covers `M`, the fetch wire carries
+  `own_proof`, and sessions/bundles predating it **fail LOUD** ("re-establish this session") rather
+  than silently misdeliver.
+
+**First-contact openers and the self loop-box still use the identity mailbox + DH proof**, so the
+"can deposit ⇒ can read" property is broken only for established sessions. The Schnorr proof remains a
+**reference, unaudited** construction that wants known-answer vectors before any production claim.
+Authoritative status: `docs/STATUS.md` ("Drop-box deposit no longer implies fetch — WIRED LIVE").

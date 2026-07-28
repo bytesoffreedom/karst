@@ -2065,10 +2065,10 @@ than enumeration). It is inherent to prekey distribution; for a private messenge
 it is named explicitly — the registration metadata is visible to the
 relay/observer.
 
-**Deferred (named):** signed prekeys (XEd25519) to bind prekey↔IK (until then a
-prekey swap is only fail-closed, not detected); one-time prekeys (replay of the
-initial KA); a capability gate on publishing and per-IK quotas (currently cookie +
-ownership proof + a shared bounded cap).
+**Implemented since:** signed prekeys (XEd25519 `prekey_sig` binds prekey↔IK, so a
+prekey swap is now DETECTED, not only fail-closed) and one-time prekeys (§2.1).
+**Deferred (named):** a capability gate on publishing and per-IK quotas (currently
+cookie + ownership proof + a shared bounded cap).
 
 ## Linux desktop client (`impl/client`, CLI `karst`)
 

@@ -132,7 +132,7 @@ and [`../SECURITY.md`](../SECURITY.md).
 These boundaries are backed by code review and automated tests. Representative existing
 tests (run `cargo test` / `cargo test --features unaudited-crypto`):
 
-- **Protected transport policy does not silently downgrade** — `socks5_dead_proxy_hard_fails_no_direct` (`impl/node/tests/socks5.rs`), `dead_socks5_hard_fails_no_direct_leak` (`impl/gui/tests`), `isolation_fails_closed_when_the_proxy_will_not_isolate`, and the carrier allowlist `filter_allowed_drops_a_live_direct_path_for_a_wss_user` (`impl/client`).
+- **Protected transport policy does not silently downgrade** — `socks5_dead_proxy_hard_fails_no_direct` (`impl/node/tests/socks5.rs`), `isolation_fails_closed_when_the_proxy_will_not_isolate`, and the carrier allowlist `filter_allowed_drops_a_live_direct_path_for_a_wss_user` (`impl/client`).
 - **Unknown / malformed frames are rejected before allocation** — `garbage_body_rejected`, `oversized_length_rejected_without_alloc`, `malformed_kem_ciphertext_length_rejected`, `oversize_chunk_is_rejected_before_store`.
 - **Relay mode requires explicit configuration (fails closed)** — `role_parse_fails_closed_on_an_unknown_mode` (`impl/node/src/bin/relay.rs`).
 - **Admission rejects unauthorized requests** — `without_a_pow_issuer_an_unknown_id_is_rejected`, `bad_capability_rejected_regardless_of_content`; the relay authenticates via `verify_accepts_real_relay_and_rejects_impostors`.

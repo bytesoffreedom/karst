@@ -29,7 +29,6 @@ echo "$RID" >"$RUN/relay-id"
 echo "$ADDR" >"$RUN/relay-addr"
 
 CLI="$(karst_bin karst)"
-GUI="$(karst_bin karst-gui)"
 
 cat <<EOF
 
@@ -37,16 +36,12 @@ relay running (pid $(cat "$RUN/relay.pid")), address $ADDR
 relay-id: $RID
   (saved in $RUN/relay-id; log $RELAY_LOG)
 
-── Option A: two GUI windows (the desktop product) — EASIEST ─────────────────
-  scripts/karst-gui.sh alice      # opens a window (relay-id already filled in)
-  scripts/karst-gui.sh bob        # a second window in another terminal
+── Option A: the desktop app (the product) ───────────────────────────────────
+  cd impl && cargo run -p desktop        # the Tauri client
   First run: "Create account" → write down the 12 words (recovery phrase) →
-  confirm the words → set a passphrase → "Create account" (relay/relay-id already
-  filled in). On a later run of a profile: just the passphrase → "Log in". Copy
-  your IK with the button at the top, paste it as a contact in the other window
-  (out-of-band trust), and confirm the safety number.
-
-  Manually (if needed): KARST_HOME=/tmp/karst-alice $GUI  (enter relay-id yourself)
+  confirm the words → set a passphrase → "Create account". Point it at the relay
+  address and relay-id above. Copy your IK, paste it as a contact in the other
+  instance (out-of-band trust), and confirm the safety number.
 
 ── Option B: two clients in the terminal (CLI) ──────────────────────────────
   export R="--relay $ADDR --relay-id $RID"

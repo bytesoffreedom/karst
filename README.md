@@ -76,7 +76,7 @@ See [`RESPONSIBLE_USE.md`](RESPONSIBLE_USE.md) for the project's intended purpos
 
 ## Architecture
 
-A Rust workspace of five crates:
+A Rust workspace of four crates:
 
 | Crate (binary) | Role |
 |----------------|------|
@@ -84,7 +84,6 @@ A Rust workspace of five crates:
 | `node` (`karst-relay`) | Relay node **and** the end-to-end session layer — PQXDH key agreement, Double Ratchet, safety number, relay-mediated discovery. |
 | `client` (`karst`) | CLI and library: identity from a BIP39 recovery phrase, encrypted at-rest vault, persistent sessions. |
 | `desktop` (`karst-desktop`) | Desktop client (Tauri: web frontend in a native webview over the shared `client`/`node` core): accounts, chats, relay + invite config, safety-number verification, file transfer with progress/cancel, profiles. |
-| `gui` (`karst-gui`) | Legacy desktop client (egui) — the working reference the Tauri client is being built to match; still maintained. |
 
 ### Security properties and their maturity
 
@@ -108,15 +107,13 @@ Each claim is hedged to match [`docs/STATUS.md`](docs/STATUS.md) — the authori
 ## Install and run
 
 > Reference build, **Linux desktop** (relay + CLI `karst` + the Tauri desktop
-> client `karst-desktop`, plus the legacy egui `karst-gui`).
+> client `karst-desktop`).
 > Not for production. There are no binary releases yet — you build from source.
 
 ### 1. Prerequisites
 
 - **Rust** (stable, 2021 edition) via [rustup](https://rustup.rs): `rustup toolchain install stable`.
 - A **C toolchain** (`cc`/`build-essential`) for a few native dependencies.
-- For the **egui GUI** only: a graphical session (X11 or Wayland) and OpenGL —
-  it uses egui/glow. A headless server can still run the relay and the CLI.
 - For the **Tauri desktop client** only: a graphical session plus WebKitGTK and
   GTK dev libraries — on Debian/Ubuntu: `libwebkit2gtk-4.1-dev libgtk-3-dev
   libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev`. No `tauri-cli` is
@@ -135,7 +132,7 @@ update.
 git clone https://github.com/bytesoffreedom/karst-messenger
 cd karst-messenger
 
-scripts/install-karst.sh         # the messenger: CLI `karst` + GUI `karst-gui`
+scripts/install-karst.sh         # the messenger: CLI `karst` + desktop `karst-desktop`
 #                                  (add --no-gui on a headless box)
 
 scripts/install-node.sh          # a relay node — interactive: it asks for the
@@ -154,8 +151,8 @@ crypto is unaudited reference).
 
 ```sh
 cd karst-messenger/impl
-cargo build --release            # builds relay + CLI + both desktop clients
-# binaries land in impl/target/release/: karst-relay, karst, karst-desktop, karst-gui
+cargo build --release            # builds relay + CLI + the desktop client
+# binaries land in impl/target/release/: karst-relay, karst, karst-desktop
 
 # Or run the Tauri desktop client directly (needs the WebKitGTK deps above):
 cargo run -p desktop
@@ -252,22 +249,18 @@ auto-generated labels (default account names, the placeholder for an as-yet-unna
 contact) are still English-only.
 
 **Desktop client** (`karst-desktop`) — the actively-developed client (Tauri web
-frontend over the shared core). Launch with `cargo run -p desktop`; the flow
-mirrors the GUI below — create an account from a 12-word phrase, point it at a
-relay (paste the relay's `invite.json` for a private relay), verify the safety
-number, chat, and transfer files with a progress bar you can cancel.
+frontend over the shared core). Launch with `cargo run -p desktop`.
 
-**GUI** (`karst-gui`) — the legacy egui client, kept as the working reference:
-
-1. Launch it (env vars above prefill the network fields). First run → **Create
-   account**: write down the **12-word recovery phrase** (the only way to restore
-   on another device), confirm the words, set a **device passphrase** (encrypts
-   secrets on *this* disk — different from the phrase). Later runs → just the passphrase.
-2. Copy your **address (IK)** from the top bar and give it to your contact
-   out-of-band; paste theirs in as a contact. There is deliberately no "find by
-   name" on the relay (that would reintroduce a MITM — see Principle 3).
-3. Expand the **safety number** and confirm it matches on both sides.
-4. Chat, send files, set disappearing timers, etc.
+1. First run → **Create account**: write down the **12-word recovery phrase** (the
+   only way to restore on another device), confirm the words, set a **device
+   passphrase** (encrypts secrets on *this* disk — different from the phrase).
+   Later runs → just the passphrase.
+2. Point it at a relay (paste the relay's `invite.json` for a private relay).
+3. Copy your **address (IK)** and give it to your contact out-of-band; paste
+   theirs in as a contact. There is deliberately no "find by name" on the relay
+   (that would reintroduce a MITM — see Principle 3).
+4. Expand the **safety number** and confirm it matches on both sides.
+5. Chat, transfer files with a cancellable progress bar, set disappearing timers.
 
 **CLI** (`karst`) — headless/testing. With `$R="--relay <addr> --relay-id <id>"`:
 
@@ -291,8 +284,7 @@ scripts/karst-demo.sh           # one-shot: relay + two clients + round-trip, th
 scripts/karst-wss-demo.sh       # same round-trip, but through the WebSocket-over-TLS carrier
 # or, to keep it running:
 scripts/karst-up.sh             # start a relay on 127.0.0.1:9000, print ready-to-paste commands
-scripts/karst-gui.sh alice      # a GUI window (relay-id filled in automatically)
-scripts/karst-gui.sh bob        # a second window in another terminal
+cd impl && cargo run -p desktop  # the desktop client (paste the relay-id it printed)
 scripts/karst-down.sh           # stop the relay
 ```
 

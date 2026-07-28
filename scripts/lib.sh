@@ -11,12 +11,12 @@ set -euo pipefail
 KARST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KARST_IMPL="$KARST_ROOT/impl"
 
-# Build the needed binaries (relay + CLI + GUI). Idempotent, fast incremental.
+# Build the needed binaries (relay + CLI). Idempotent, fast incremental.
+# The desktop GUI is the Tauri client (`impl/desktop`) and is built separately.
 karst_build() {
   cargo build --manifest-path "$KARST_IMPL/Cargo.toml" \
     -p node --bin karst-relay \
-    -p client --bin karst \
-    -p gui --bin karst-gui
+    -p client --bin karst
 }
 
 karst_bin() { echo "$KARST_IMPL/target/debug/$1"; }

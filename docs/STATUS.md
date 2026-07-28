@@ -9,7 +9,7 @@
 Last reconciled: `impl/admission` (§7) + `impl/node` (message-path skeleton +
 socket transport + epoch wiring + durable/out-of-order blob store) + `impl/client`
 (client core, CLI `karst`, multi-homing) + `impl/desktop` (the Tauri desktop) +
-`impl/gui` (the older egui client). Clippy clean. See **"What landed since the last reconcile
+Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
@@ -210,9 +210,8 @@ build; clippy clean.**
 Not just component tests — the assembled system was run for real. A `dev`-mode relay + two
 `karst` CLI clients on it: both create accounts, publish §2.1 bundles, and exchange text **both
 directions** (delivered, decrypted, attributed to the sender's IK); a file sends and arrives
-**byte-identical**. Both GUIs LAUNCH and render their welcome screen: the egui client
-(`karst-gui`) and the Tauri desktop (`karst-desktop`, brand cyan). So relay + client + both UIs
-work together, not only in isolation.
+**byte-identical**. The Tauri desktop (`karst-desktop`, brand cyan) LAUNCHES and renders its
+welcome screen. So relay + client + UI work together, not only in isolation.
 
 **At-rest sealing of received files, stated precisely:** the **large-file blob path seals
 received files at rest on every client** (`SealedFileWriter`, `files/<id>.dat`) — including the
@@ -249,7 +248,7 @@ be reused via JNI, the JNI itself is a separate slice). The **shipping desktop G
 client** (`impl/desktop`, web frontend on the brand design): messaging, on-disk history, the
 safety number (OOB verification of the IK), profiles, large-file transfer with a progress bar,
 route offers, and **multi-homing** (configure backup relays, live per-relay reachability). The
-older **egui client** (`impl/gui`) still exists and works, but is legacy.
+older egui client has been REMOVED (2026-07-27) — the Tauri desktop is the only GUI.
 
 **File transfer — the inline path's boundary (named):** ≤48 KiB (≤48 chunks + a
 manifest). The binding limit is **not** the mailbox (`MAX_FETCH_SEALS=256`) but
@@ -322,10 +321,10 @@ byte-identical, and a ~150 KiB file that guards the old inline/blob dead zone.
   **send** side has three discriminating tests (intermediate progress streams; a quick
   text overtakes an in-flight upload → off-loop proven; cancel aborts + worker stays
   responsive); the **receive** lifecycle (`FileIncoming`→`FileProgress`→finalize-by-id)
-  is covered by a worker e2e test + a controller unit test. **Screenshot-verified:**
-  the actual egui progress bar renders in the send bubble and advances live
-  (1%→4%→29%→50%→80% during a real 120 MB upload) with the ✕ cancel button drawn
-  alongside and the composer staying interactive (UI thread not blocked).
+  was covered by a worker e2e test + a controller unit test. **Screenshot-verified**
+  at the time (a live progress bar advancing 1%→4%→29%→50%→80% during a real 120 MB
+  upload, with the ✕ cancel button and an interactive composer) — on the legacy egui
+  client, which has since been removed; the Tauri desktop carries this feature now.
 - **Latent, named (not fixed):** (a) the worker no longer self-terminates on UI close —
   `run` holds its own `cmd_tx` clone so `cmd_rx` never sees `Disconnected` (that arm is
   now dead; masked by process exit). (b) A failed/cancelled *receive* drops its bar but
@@ -1459,7 +1458,6 @@ Only mix-routing / multiple non-colluding relays break it, and neither exists he
 | `client::secretbox` | ✅ Real | **At-rest**: `Argon2id(passphrase)` → a master key, `XChaCha20-Poly1305` with a fresh random 24-B nonce per write. Protects the COLD disk, NOT the hot process. Tests: wrong-pw→reject, no plaintext on disk, fresh-nonce-per-write |
 | `client::store` | ✅ Real (skeleton) | storage under **at-rest encryption**. **A single root**: `seed.key` (the phrase entropy); `load_identity`/`load_account` **derive** the keys (`seed::derive`) — disk and phrase do not diverge. `Store::unlock(dir, pass)` (single-account, CLI) + `Store::at(dir, key)` (over a ready key). **`Vault`** — multi-account: ONE device passphrase (Argon2id once) → a `MasterKey` for ALL accounts (`accounts/<ik>/`), switching is free (the same key); the `accounts.dat` registry is encrypted; migration of a legacy single account WITHOUT re-encryption (a base-level salt). The passphrase ≠ the phrase. Relay keys are not encrypted |
 | `client` (lib+bin `karst`) | ✅ Real (skeleton) | orchestration over `SocketTransport`; the CLI **init** (prints the recovery phrase) / **restore** (from the phrase) / **show-phrase** / id/account/dev-cap/import-cap/**publish**/send/**send-file**/recv **entirely on §2.1** (identity from the root phrase; persistent ratchet sessions under flock, atomic write; §12 discovery; **at-rest** via `KARST_PASSPHRASE`; text and files via the `content` envelope). A dev capability with a public secret |
-| `gui` (bin `karst-gui`) | ⚠️ Real (basic; the view is not run-verified) | Desktop GUI (egui/eframe, MIT/Apache). **A consumer of `client` — zero new crypto**: a worker thread owns the `Store`, calls `send_session`/`recv_session`/`publish_bundle` verbatim; the UI does not block. **Login screens** (Welcome→create/restore; creation shows the phrase + WORD CONFIRMATION before entry, not a checkbox; restore — enter the phrase + network; return — the device passphrase). **Multi-account (Telegram-style)**: a switcher in the left panel, "+ Add account" (no passphrase re-entry), instant switching; after migrating the GUI directory, the CLI needs `KARST_HOME=.../accounts/<ik>` (the demo scripts use their own directories). The controller + worker are testable (worker-e2e against a live relay, incl. "one phrase→one IK"); the egui view is checked with screenshots (login, chat, delivery statuses, contact persistence across restart). Chat history is an encrypted append log; **contacts are persisted** (`contacts.dat`, name + verification flag). **Delivery statuses** (⏳/delivered/✕ by `Evt::SendResult` correlation), **unread** (a badge + a counter in the title), a **connection indicator** (debounced) plus an **active-carrier chip** (direct/SOCKS5/wss — from the same source of truth `transport()` uses, so the proxy/transport is visible not assumed), a **safety number** with a "verified" flag, contact deletion, a text-length limit. SOCKS5-PT (Tor/obfs4) on all calls; **poll-cadence jitter** (the background relay poll is spread ±25% around its base via a non-crypto xorshift, so there is no constant heartbeat to fingerprint — §2.2 metadata hardening, NOT traffic concealment; discriminating test asserts the interval sequence is not constant); **file transfer** (a path field, receipt into `received/`). **Multi-account boundaries** (unlike Telegram): ONLY the active account is polled — inactive ones do not receive messages in the background, there are no cross-account unread/badges on other accounts; there is no renaming/deleting/logging-out of an account in the UI (labels are auto-assigned and permanent). Deferred: a native file dialog (rfd), an OS toast, multi-part text |
 
 **"Real"** = implemented with a real crypto library and covered by adversarial
 tests (not just the happy path). **"Reference / not audited"** =
@@ -2209,84 +2207,22 @@ from "unavailable / auth denied" (`Err`).
 - **a dev capability with a public secret** (`[0x33;32]`) — local testing only; a
   real capability issuance from an issuer (§7.2) is a separate layer.
 
-## Desktop GUI (`impl/gui`, `karst-gui`, egui/eframe)
+## Desktop GUI — the legacy egui client (`impl/gui`) was REMOVED (2026-07-27)
 
-A windowed client over the SAME `client`. **The key principle: the GUI is a
-consumer of a verified library, ZERO new crypto.** One worker thread owns one
-`Store` (unlock with the passphrase once, Argon2 ~once) and calls
-`send_session`/`recv_session`/`publish_bundle` VERBATIM — each under flock/atomic
-exactly like the CLI. All crypto invariants (keystream reuse along the concurrency
-and crash axes, at-rest) stay in the library; the GUI does not reinvent them.
+The egui/eframe client is gone: the crate, its `karst-gui` binary, its 36-test
+`worker_e2e` suite and `scripts/karst-gui.sh` were deleted and the workspace member
+dropped. The **Tauri desktop** (`impl/desktop`) is the only GUI.
 
-Layers: `controller` (pure state+actions, NO egui/network) ↔ channels ↔ `worker`
-(network/Store in the background; `recv_timeout` = a command-or-background-poll,
-the UI thread does not block) ↔ `app` (the egui view in the binary). Features:
-- unlock with the passphrase (in the window, not env) → top-up of
-  identity/account/dev-cap + publish; a **SOCKS5 (Tor/obfs4)** field — the block-
-  resistance route, threaded into all network calls (otherwise the proxy would be
-  silently lost = deanon);
-- contacts by MANUALLY pasting an IK (this is exactly OOB trust — **no contact
-  discovery on the relay**, otherwise an IK-swap MITM); incoming messages are laid
-  out into chats via sender attribution (`Received.sender`);
-- send/receive (the worker auto-polls; incoming messages flow into the UI).
+Why: two UIs meant two orchestration paths and two sets of integration tests, so a fix
+in one could (and did) sit unfixed in the other. It also pulled the whole
+eframe→winit→wayland-scanner→quick-xml chain into the tree, which is where both open
+RustSec advisories (RUSTSEC-2026-0194/0195) came from — removing it closes them.
 
-**Verification (honestly):** the controller — 8 unit tests (state transitions,
-layout by sender, history reconstruction into chats, safety number, IK parsing).
-The worker — six integration tests against a LIVE relay:
-`two_workers_exchange_message_over_relay` (Alice→Bob with correct attribution,
-receipt on an explicit `Cmd::Poll`), `auto_poll_delivers_without_explicit_poll`
-(the same receive path the REAL application uses — a background auto-poll on a
-timeout, zero explicit `Poll`s), `history_survives_worker_restart` (a message
-survives a worker restart), `failed_send_vanishes_but_ok_send_persists_across_restart`
-(the historical send boundary) and two SOCKS5
-(`worker_routes_all_calls_through_configured_socks5_proxy`,
-`dead_socks5_hard_fails_no_direct_leak` — see §15). Together they prove the GUI
-layer really carries, PERSISTS, and ROUTES (through a PT) a message. **The egui
-view — compiles, but is NOT run-verified in a headless environment** (a real
-window can't be launched; the binary starts and cleanly fails on "no display").
-Interaction/visuals require a desktop environment.
-
-**Chat history — an ENCRYPTED append log on disk** (`Store::append_history`/
-`load_history`, `history.dat`). Each record (`from_me`, `peer_ik`, `text`, `ts`)
-is sealed independently (`secretbox`, a FRESH 192-bit nonce → no counter, this is
-NOT a ratchet — there is no keystream reuse to have); format `len(u32-LE)‖sealed`;
-append is O(1) under a dedicated `history.lock`. On start, `load_history` restores
-integrity: it scans to the last cleanly-parsed boundary and TRUNCATES a torn tail
-(otherwise a corrupt length-prefix would poison all future appends). Recovery
-survives a restart (test `history_survives_worker_restart`). The contact list is
-reconstructed from the history's `peer_ik` (as `unknown XXXX` — English, but a
-plain constant, not yet localized into the 9 UI languages like the chrome/toasts);
-only the user's contact NAMES are lost — an address book as such is a separate
-layer. Auto-assigned account labels (`Account N`) are likewise English-only.
-
-**The optimistic send boundary — closed on disk** (deliberately left in the UI for
-responsiveness). `action_send` shows its own message in the chat immediately (an
-in-memory echo), but it is written to DURABLE history ONLY after `send_session`
-succeeds (incoming — unconditionally). A send failure is visible in the status
-line and correctly disappears on restart (does not remain as "delivered") —
-strictly better than the previous pure-in-memory behavior. Full UI reconciliation
-(a pending→sent/failed marker on `ChatMsg`) — a next slice; the passphrase is still
-in process memory (the hot-process boundary, at-rest is only the cold disk).
-
-**Safety number — OOB verification of IK authenticity (implemented).**
-`node::safety::safety_number(ik_a, ik_b)` — a pure symmetric function: it sorts the
-pair of IKs, `SHA-512(DOMAIN‖VERSION‖lo‖hi)` → 60 decimal digits (12 groups of 5,
-zero-pad, big-endian; a Signal-style format). An iterated KDF is NOT needed — at
-the full 60-digit width (~199 bits) a MITM runs into a ~2^100 collision. A frozen
-known-answer vector (+ symmetry/sensitivity/format). In the GUI it is shown for
-the selected contact (a collapsible panel); it is confirmed by voice/in person.
-**Completeness:** it verifies the AUTHENTICITY of the IK, and only that — which is
-sufficient, because IK authenticity ⟹ session authenticity (`root_key` loads
-`DH1=IK_A×PK_B` and binds both IKs into the transcript; a side without the IK
-secret does not agree the key — fail-closed; a prekey/KEM swap does not form a
-session). That the hashed `own_ik` = the real session authentication key is already
-pinned by the green `two_workers_exchange_message_over_relay` (`got.sender ==
-alice_ik`, where both ends are `identity_public()`): the fingerprint is tied to the
-real key, not decorative. **Boundary (named):** display-ONLY — the application does
-NOT record or enforce a "verified" status; unverified contacts can still be
-messaged. A persistent verified flag (Signal-style, without enforcement) is a
-possible next step. A CLI `karst safety-number <hex>` is trivial over the pure
-function, not done yet.
+**Honest consequence, not hidden:** those 36 worker tests exercised the legacy client's
+own worker, so they retire with the code they tested — but several behaviours were only
+ever covered end-to-end THERE (disappearing messages, delete-for-everyone, clear-chat),
+and the shipping Tauri client has almost no e2e tests of its own. That coverage gap is
+tracked, not written off.
 
 ## Calls (§21) — NOT implemented (honestly)
 
@@ -2346,7 +2282,7 @@ KARST_REGEN_VECTORS=1 cargo test conformance_vectors_match_frozen  # update the 
 # The CLI client (at-rest: needs KARST_PASSPHRASE):
 KARST_PASSPHRASE=... cargo run -p client --bin karst -- init
 # The desktop GUI (needs an X11/Wayland display — won't start headless):
-cargo run -p gui --bin karst-gui
+cargo run -p desktop --bin karst-desktop
 ```
 
 `admission/tests/vectors.json` — frozen conformance vectors (§14): a byte-for-byte

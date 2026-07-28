@@ -5,7 +5,7 @@
 > [STATUS.md](STATUS.md)). The goal is to run the whole system on one machine and
 > confirm that it works.
 
-Scope: **Linux desktop** (relay + CLI `karst` + the Tauri client `karst-desktop` + the legacy egui `karst-gui`).
+Scope: **Linux desktop** (relay + CLI `karst` + the Tauri client `karst-desktop`).
 The Android client is a separate large effort and is not here.
 
 ## Quick check — one command
@@ -52,16 +52,8 @@ KARST_HOME=/tmp/alice cargo run -p desktop          # Alice's window
 KARST_HOME=/tmp/bob   cargo run -p desktop          # Bob's window (another terminal)
 ```
 
-The **legacy egui GUI** (`karst-gui`) is the working reference:
-
-```sh
-scripts/karst-up.sh            # bring up the relay (once)
-scripts/karst-gui.sh alice     # Alice's window (relay-id fills in automatically)
-scripts/karst-gui.sh bob       # Bob's window (in another terminal)
-```
-
-`karst-up.sh` does NOT launch the GUI — it only prints commands; the windows are
-opened by `karst-gui.sh`. In each window (first run of a profile):
+`karst-up.sh` does NOT launch the client — it only prints commands and the
+relay-id to paste in. In each window (first run of a profile):
 
 1. **Create account** → write down the **12 words** shown (the only way to
    restore; on a new device, use "Restore from phrase"). → confirm the words →
@@ -197,9 +189,8 @@ We iterate until everything is green:
 - [x] file transfer (chunking+reassembly+SHA) — byte-for-byte (CLI, `karst-demo.sh`)
 - [x] sessions/history survive a process restart
 - [x] a route through a SOCKS5 PT works and fails hard with no silent direct fallback
-- [x] **both UIs launch and render** — the egui `karst-gui` and the Tauri
-      `karst-desktop` both open their welcome screen (verified by screenshot at a
-      display, 2026-07-19)
+- [x] **the desktop UI launches and renders** — the Tauri `karst-desktop` opens its
+      welcome screen (verified by screenshot at a display, 2026-07-19)
 - [ ] **GUI full flow by hand: unlock, copy IK, send/receive text between two
       windows, safety number matches, and a FILE (the "📎" field) → the
       recipient's `received/` byte-for-byte** — the two-window interactive exchange

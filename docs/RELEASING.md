@@ -50,7 +50,7 @@ the key.
 Run through this before tagging. Green means the tag is safe to push.
 
 - [ ] `cd impl && cargo test` passes (default) **and** `cargo test --features unaudited-crypto`; `cargo clippy --all-targets` is clean.
-- [ ] **Live smoke:** `scripts/karst-demo.sh` prints the both-directions exchange + file transfer; a `public` relay starts and `karst-relay pow status` answers; both UIs launch (`karst-gui`, `karst-desktop`). See [RUNNING.md](RUNNING.md).
+- [ ] **Live smoke:** `scripts/karst-demo.sh` prints the both-directions exchange + file transfer; a `public` relay starts and `karst-relay pow status` answers; the desktop UI launches (`karst-desktop`). See [RUNNING.md](RUNNING.md).
 - [ ] **[STATUS.md](STATUS.md) reconciled with the code** — test counts, feature maturity, and any "not yet built / walled" notes match reality (the code is the source of truth; fix STATUS, not the reverse).
 - [ ] **Reproducibility verified:** run `impl/scripts/build-reproducible.sh` in **two** different absolute paths and confirm the two `karst`/`karst-relay` sha256s are **identical** (see [design/reproducible-builds.md](design/reproducible-builds.md)).
 - [ ] `Cargo.lock` committed; version bumped where applicable.

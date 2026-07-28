@@ -5,7 +5,6 @@
 #
 #   scripts/install-karst.sh              # install the CLI + the Tauri desktop
 #   KARST_BIN_DIR=/some/dir scripts/install-karst.sh
-#   scripts/install-karst.sh --egui       # install the legacy egui client instead
 #   scripts/install-karst.sh --no-gui     # CLI only (headless machine)
 #
 # Reference build, LINUX DESKTOP, and NOT for production: the cryptography is an
@@ -16,12 +15,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 BINDIR="${KARST_BIN_DIR:-$HOME/.local/bin}"
 WANT_GUI=1
-GUI_KIND=desktop   # the Tauri desktop is the shipping client; `--egui` picks the legacy one
 for a in "$@"; do
   case "$a" in
     --no-gui) WANT_GUI=0 ;;
-    --egui) GUI_KIND=egui ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
 done
@@ -31,27 +28,25 @@ echo "   Reference build, unaudited crypto — see docs/STATUS.md. Not for produ
 echo
 karst_require_toolchain
 
-# Both GUIs need a graphical session at RUN time; warn if clearly headless.
+# The desktop client needs a graphical session at RUN time; warn if clearly headless.
 if [ "$WANT_GUI" = 1 ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
   echo "note: no DISPLAY/WAYLAND_DISPLAY detected — the GUI needs a graphical session"
   echo "      to RUN (it still builds fine here). Use --no-gui on a pure server."
 fi
 
 # The Tauri desktop needs WebKitGTK + GTK dev libraries to BUILD. Fail early with a
-# clear hint rather than deep in a cargo error — or point at the egui client.
-if [ "$WANT_GUI" = 1 ] && [ "$GUI_KIND" = desktop ] && ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+# clear hint rather than deep in a cargo error.
+if [ "$WANT_GUI" = 1 ] && ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
   echo "error: the Tauri desktop needs WebKitGTK + GTK dev libraries to build." >&2
   echo "  Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev \\" >&2
   echo "                 libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev" >&2
-  echo "  Or install the legacy egui client instead: scripts/install-karst.sh --egui" >&2
+  echo "  Or install the CLI only: scripts/install-karst.sh --no-gui" >&2
   exit 1
 fi
 
 echo "Building release binaries (this can take several minutes the first time)…"
 if [ "$WANT_GUI" = 0 ]; then
   karst_build_release -p client --bin karst
-elif [ "$GUI_KIND" = egui ]; then
-  karst_build_release -p client --bin karst -p gui --bin karst-gui
 else
   karst_build_release -p client --bin karst -p desktop --bin karst-desktop
 fi
@@ -61,11 +56,7 @@ karst_install_bin "$(karst_bin_release karst)" "$BINDIR/karst"
 echo "installed: $BINDIR/karst"
 
 if [ "$WANT_GUI" = 1 ]; then
-  if [ "$GUI_KIND" = egui ]; then
-    GUI_BIN=karst-gui
-  else
-    GUI_BIN=karst-desktop
-  fi
+  GUI_BIN=karst-desktop
   karst_install_bin "$(karst_bin_release "$GUI_BIN")" "$BINDIR/$GUI_BIN"
   echo "installed: $BINDIR/$GUI_BIN"
 

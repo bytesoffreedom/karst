@@ -20,6 +20,33 @@
 //!   compartment" and "wrong password" are the same answer, which is the whole point.
 //! - P1 (protect) and P3 (blind) wrap the SAME main region key, differing only by a
 //!   policy flag + write ceiling; revealing P3 cannot expose P1 or P2.
+//!
+//! **CRYPTO-14 — honest limit: P3 does NOT mask hidden writes against a snapshot-diff
+//! adversary, and this is not fixable at this layer.** Checked against all three things such an
+//! adversary can observe:
+//! - **Changed bytes:** every save touches only the bytes it actually changed (`persist_range`)
+//!   — that is the entire efficiency point of the region/copy-slot design. A P3 (cover) save
+//!   therefore touches the identical `(offset, length)` whether or not a hidden compartment
+//!   exists (pinned by `a_p3_write_touches_the_same_range_whether_or_not_a_hidden_compartment_exists`);
+//!   it does NOT "churn the tail" the way `duress-tier2-container.md` §2(b) hoped it would,
+//!   because a small P3 save never reaches that far. A HIDDEN write's changed bytes,
+//!   symmetrically, stay entirely inside the hidden region (pinned by
+//!   `a_hidden_write_changes_only_bytes_inside_the_hidden_region`). An adversary who holds two
+//!   images of the file (or one image plus a live watch) can diff them and localize every
+//!   change to a region — separating "ordinary main/cover activity" from "something else wrote
+//!   back here" by offset alone, no decryption needed. The only write that touches the hidden
+//!   region from the main/cover side is a P3 spill big enough to exceed the protect cap — which
+//!   doesn't mask the hidden write, it destroys it (masking and destruction are the same
+//!   operation on one shared key here). A real fix would need every save to rewrite the WHOLE
+//!   container so a diff can never localize anything — an O(N) rewrite per message, which
+//!   directly defeats `persist_range`'s reason to exist. Not implemented; do not claim it works.
+//! - **File size:** reveals nothing — `N` is fixed at `create()` time forever; every save is an
+//!   in-place rewrite of existing bytes (`persist`/`persist_range`), never a resize.
+//! - **mtime:** reveals ONLY that a save happened and roughly when — real, and already conceded
+//!   in `docs/design/duress-tier2-container.md` §8 — but not WHICH compartment, since mtime is a
+//!   single filesystem-wide timestamp with no per-region granularity. The changed-bytes leak
+//!   above is strictly more informative than mtime and is the one that actually distinguishes
+//!   compartments.
 
 use crate::secretbox::MasterKey;
 use std::io;
@@ -35,7 +62,40 @@ const HEADER_LEN: usize = SALT_LEN + SLOT_COUNT * SLOT_LEN;
 /// Each region begins with a fixed sealed length-header: `seal_raw(region_key, u64 len)`.
 /// Keeping the length INSIDE the region (under the region key) — not in the slot — keeps
 /// P1 and P3 consistent, since both share the region key and thus read the same length.
+/// (Still used by the append-log superblock/chunks below — the region PAYLOAD write path now
+/// uses `COPY_HDR_LEN` instead, see CRYPTO-13.)
 const LEN_HDR: usize = 24 + 8 + 16;
+/// CRYPTO-13 — a region's payload write is `seal_raw` over the WHOLE new blob, and a plain
+/// in-place overwrite is not crash-atomic: a save interrupted after only some of its bytes hit
+/// disk leaves a mix of old and new bytes that fails the region's own AEAD tag, so the region —
+/// not just the newest save, ALL of the compartment's history — becomes permanently unreadable.
+/// No plaintext journal or "dirty" flag is allowed (that would itself be a tell that this is a
+/// container), so the fix has to stay inside bytes that are already opaque: each region reserves
+/// TWO independent copy slots side by side, and a write always targets whichever slot is NOT the
+/// current newest, leaving the other — a complete, still-valid earlier save — untouched on disk.
+/// A crash mid-write to the NEXT save's target slot (the common case: the currently-newest copy
+/// is untouched by this call) can only cost the just-in-flight save; it can no longer brick the
+/// compartment. The copy header carries an 8-byte generation counter alongside the length, sealed
+/// together — the counter is what lets a reader pick the newer of two authenticating copies with
+/// NO plaintext selector anywhere; it is exactly as opaque as the length byte it sits next to.
+///
+/// **Honest limit — a damaged newest copy rolls back SILENTLY, with no error.** If the copy that
+/// already held the completed newest generation is the one that gets damaged (bitrot, a Blind
+/// spill landing on it, a second unlucky crash), `read_region_at` has no way to know that — from
+/// its perspective "one copy fails to authenticate" is indistinguishable from the routine case of
+/// a freshly-created region (slot 1 is unwritten random right after `create()`'s bootstrap) or a
+/// torn in-flight write to the STALE slot (the safe case above). So it silently falls back to
+/// whatever older generation still authenticates and returns it as if it were current — no error,
+/// no signal, just quietly older data. This can't be fixed by adding a "which copy is newest"
+/// flag outside the AEAD envelope without creating a new plaintext tell, so it isn't: the
+/// generation counter already lives inside the sealed header specifically to avoid that. Whoever
+/// calls `Container::write`/`open` needs to know a successful open is "the newest generation this
+/// region can still prove," not "the newest generation that was ever written."
+const COPY_HDR_PLAIN: usize = 8 + 8; // generation(8) ‖ ciphertext-len(8)
+const COPY_HDR_LEN: usize = 24 + COPY_HDR_PLAIN + 16; // nonce(24) + plaintext(16) + tag(16) = 56
+/// Below this, a region cannot fit two independent copies (each header + a minimal empty AEAD
+/// body) — refuse at creation rather than silently degrading to a single non-atomic copy.
+const MIN_REGION_CAP: usize = 2 * (COPY_HDR_LEN + 24 + 16); // 2 * 96 = 192
 /// A slot-directory (used-slot indices) sealed under the MANAGEMENT password's key (the P1
 /// password `create` was given), placed right after the slots. It records which of the 8
 /// slots are taken so adding P2/P3/wipe never clobbers an existing password's slot — the
@@ -263,11 +323,11 @@ impl Container {
     /// is reserved for a future hidden compartment (indistinguishable random until then).
     pub fn create(path: &Path, total: u64, main_password: &[u8], main_cap: u64) -> io::Result<Self> {
         let total = total as usize;
-        if total < DATA_OFF + LEN_HDR + 64 {
+        if total < DATA_OFF + MIN_REGION_CAP {
             return Err(io_err("container size too small"));
         }
         let main_cap = main_cap as usize;
-        if main_cap < LEN_HDR + 32 || DATA_OFF + main_cap > total {
+        if main_cap < MIN_REGION_CAP || DATA_OFF + main_cap > total {
             return Err(io_err("main_cap out of range for this container size"));
         }
         let mut buf = random_bytes(total); // salt prefix + all slots + dir + all regions start random
@@ -278,7 +338,7 @@ impl Container {
             buf: std::mem::take(&mut buf),
         };
         // Seal an empty payload so a fresh main region reads back as empty (not garbage).
-        Self::write_region_at(&mut c.buf, main_off, main_cap, &region_key, &[])?;
+        Self::write_region_at(&mut c.buf, main_off, main_cap, main_cap, &region_key, &[])?;
         c.seal_slot(0, Role::Main, Policy::Protect, main_password, main_off as u64, main_cap as u64, &region_key)?;
         let mgmt = c.key_for(main_password)?;
         c.write_dir(&mgmt, &[0])?; // slot 0 is the management/main slot
@@ -420,17 +480,27 @@ impl Container {
     }
 
     /// Add the P3 (blind) alias for the main account: give an existing main password to
-    /// learn the shared region key, then seal a new slot with the SAME region but a
-    /// `Blind` policy and a wider write ceiling (`blind_cap`, the "A+B" that may spill
-    /// into the hidden tail).
+    /// learn the shared region key, then seal a new slot with the SAME region and the SAME
+    /// `region_cap` (CRYPTO-13: `region_cap` is the ping-pong GEOMETRY of the region — where its
+    /// two copy slots live — and P1/P3 write the same physical bytes, so they must agree on it
+    /// byte-for-byte. Storing `blind_cap` there instead — as this used to — would make P3 alone
+    /// compute a different split point than P1, so a small P3 save could land its copy inside
+    /// what P1 thinks is empty tail (or the hidden region) instead of alternating in place).
+    /// The actual wider write PERMISSION for Blind (the "A+B that may spill into the hidden
+    /// tail") is derived from the `Blind` policy byte at write time instead, see `Container::write`.
+    /// `blind_cap` is kept as a caller-checked parameter, not silently ignored: it must equal
+    /// "the rest of the container after this region" (what `ContainerVault::add_blind` already
+    /// computes) or this errors — a smaller value would silently promise P3 less reach than the
+    /// design gives it; a bigger one would silently exceed the buffer.
     pub fn add_blind_main(&mut self, existing_main_password: &[u8], p3_password: &[u8], blind_cap: u64) -> io::Result<()> {
         let key = self.key_for(existing_main_password)?;
         let info = self.find_slot(&key).ok_or_else(|| io_err("wrong main password"))?;
         if info.role != Role::Main {
             return Err(io_err("not a main password"));
         }
-        if blind_cap as usize > self.buf.len().saturating_sub(info.region_off as usize) {
-            return Err(io_err("blind_cap exceeds container"));
+        let derived_ceiling = self.buf.len() as u64 - info.region_off;
+        if blind_cap != derived_ceiling {
+            return Err(io_err("blind_cap must equal the remaining container space after the main region"));
         }
         let p3key = self.key_for(p3_password)?;
         if self.find_slot(&p3key).is_some() {
@@ -438,7 +508,7 @@ impl Container {
         }
         let mut used = self.read_dir(&key)?;
         let idx = self.free_slot(&used).ok_or_else(|| io_err("no free slot"))?;
-        self.seal_slot(idx, Role::Main, Policy::Blind, p3_password, info.region_off, blind_cap, &info.region_key)?;
+        self.seal_slot(idx, Role::Main, Policy::Blind, p3_password, info.region_off, info.region_cap, &info.region_key)?;
         used.push(idx);
         self.write_dir(&key, &used)?;
         self.persist()
@@ -452,7 +522,7 @@ impl Container {
         let main = self.find_slot(&mkey).ok_or_else(|| io_err("wrong main password"))?;
         let hidden_off = main.region_off + main.region_cap;
         let hidden_cap = hidden_cap as usize;
-        if hidden_cap < LEN_HDR + 32 || hidden_off as usize + hidden_cap > self.buf.len() {
+        if hidden_cap < MIN_REGION_CAP || hidden_off as usize + hidden_cap > self.buf.len() {
             return Err(io_err("hidden region does not fit after the main region"));
         }
         let hkey = self.key_for(hidden_password)?;
@@ -468,7 +538,7 @@ impl Container {
             return Err(io_err("this container already holds a hidden account"));
         }
         let region_key = random_key();
-        Self::write_region_at(&mut self.buf, hidden_off as usize, hidden_cap, &region_key, &[])?;
+        Self::write_region_at(&mut self.buf, hidden_off as usize, hidden_cap, hidden_cap, &region_key, &[])?;
         let mut used = self.read_dir(&mkey)?;
         let idx = self.free_slot(&used).ok_or_else(|| io_err("no free slot"))?;
         self.seal_slot(idx, Role::Hidden, Policy::None, hidden_password, hidden_off, hidden_cap as u64, &region_key)?;
@@ -504,7 +574,7 @@ impl Container {
         if info.role == Role::Wipe {
             return Ok(Opened::Wipe);
         }
-        let payload = Self::read_region_at(&self.buf, info.region_off as usize, &info.region_key)?;
+        let payload = Self::read_region_at(&self.buf, info.region_off as usize, info.region_cap as usize, &info.region_key)?;
         Ok(Opened::Compartment {
             role: info.role,
             policy: info.policy,
@@ -514,8 +584,21 @@ impl Container {
     }
 
     /// Write the account-state payload for the compartment this password opens. Honors the
-    /// slot's write ceiling: Protect refuses to exceed its cap; Blind may spill past the
-    /// main region into the hidden tail (accepted risk — corrupts the hidden compartment).
+    /// slot's write ceiling: Protect refuses to exceed HALF its cap (CRYPTO-13 — that half is
+    /// exactly the atomic ping-pong budget; a Protect payload bigger than that has nowhere safe
+    /// to land and must be refused loudly, never silently handed to the non-atomic spill path).
+    /// Blind may spill past the main region into the hidden tail (accepted risk — corrupts the
+    /// hidden compartment).
+    ///
+    /// `region_cap` here is the ping-pong GEOMETRY (same for P1 and P3, see `add_blind_main`),
+    /// not necessarily the write PERMISSION — Blind's permission is wider (derived below from
+    /// the policy) and is exactly the ONLY case that can exceed the geometry and fall to the
+    /// non-atomic spill path inside `write_region_at` (CRYPTO-13). Protect's ceiling here MUST
+    /// match `write_region_at`'s safe-path boundary (`region_cap / 2`) exactly — checking against
+    /// the full `region_cap` instead (an earlier version of this fix did exactly that) let a
+    /// completely ordinary Protect save in the `(region_cap/2, region_cap]` band silently fall
+    /// through to the spill branch: no atomicity, no error, the same brick CRYPTO-13 exists to
+    /// prevent, just moved to happen only sometimes instead of always.
     pub fn write(&mut self, password: &[u8], payload: &[u8]) -> io::Result<()> {
         let key = self.key_for(password)?;
         let info = self
@@ -524,57 +607,184 @@ impl Container {
         if info.role == Role::Wipe {
             return Err(io_err("wipe password cannot write"));
         }
-        let need = LEN_HDR + 24 + payload.len() + 16;
-        if need > info.region_cap as usize {
-            // Protect cap reached (or Blind exhausted the whole container).
+        let need = COPY_HDR_LEN + 24 + payload.len() + 16;
+        let (hard_cap, ceiling) = match info.policy {
+            // Blind's write permission is the WHOLE rest of the container, computed fresh here —
+            // never read from `region_cap`, which now always holds the shared geometry instead.
+            // Blind's ceiling for THIS early check is that same wide permission: it may legally
+            // use the non-atomic spill path.
+            Policy::Blind => {
+                let hard_cap = self.buf.len() as u64 - info.region_off;
+                (hard_cap, hard_cap)
+            }
+            // Protect (and Hidden, which has no dual-cap concept at all): the ceiling is HALF the
+            // geometry — the safe-path boundary — not the full region_cap, so this can never be
+            // handed to the spill branch.
+            _ => (info.region_cap, info.region_cap / 2),
+        };
+        if need > ceiling as usize {
             return Err(io_err("payload exceeds the write ceiling for this password"));
         }
         let off = info.region_off as usize;
-        let n = Self::write_region_at(&mut self.buf, off, info.region_cap as usize, &info.region_key, payload)?;
-        // Hot path (called on every message save): write ONLY this region's changed bytes in
+        let (touched_off, touched_len) = Self::write_region_at(
+            &mut self.buf,
+            off,
+            info.region_cap as usize,
+            hard_cap as usize,
+            &info.region_key,
+            payload,
+        )?;
+        // Hot path (called on every message save): write ONLY the touched copy slot's bytes in
         // place, so a 10 GB container doesn't get fully rewritten per save. Other regions —
-        // including the hidden tail under a Protect write — are untouched on disk.
-        self.persist_range(off, n)
+        // including the hidden tail under a Protect write, and this region's OTHER copy slot
+        // (CRYPTO-13) — are untouched on disk.
+        self.persist_range(touched_off, touched_len)
     }
 
-    // ---- region primitives (format (b): [len-header][one sealed blob], length hidden) ----
+    // ---- region primitives (format (b): two ping-pong copy slots, length+generation hidden) ----
+    //
+    // CRYPTO-13: `atomic_cap` splits `[off, off+atomic_cap)` into two equal copy slots (0 at
+    // `off`, 1 at `off + atomic_cap/2`); a write always targets whichever slot is NOT the current
+    // newest, so the other slot — a complete earlier save — is never touched by this write and
+    // survives a crash mid-write untouched. `hard_cap` (>= atomic_cap) is the actual write
+    // PERMISSION, wider only for a Blind write that spills past `atomic_cap`; a spill writes
+    // directly at `off` the same way this module always did before this fix — genuinely NOT
+    // atomic, and already an accepted risk (it can stomp the whole ping-pong pair and the hidden
+    // tail beyond it). Protect's `hard_cap == atomic_cap`, so it can never reach the spill path.
 
-    /// Returns the number of bytes changed at `off` (`LEN_HDR + ciphertext`), so the caller can
-    /// persist ONLY that range instead of the whole file.
-    fn write_region_at(buf: &mut [u8], off: usize, cap: usize, region_key: &MasterKey, payload: &[u8]) -> io::Result<usize> {
-        let ct = region_key.seal_raw(BODY_LABEL, payload);
-        if LEN_HDR + ct.len() > cap {
-            return Err(io_err("payload exceeds region capacity"));
+    /// One copy slot's header: `(generation, ciphertext length)`, or `Err` if this slot doesn't
+    /// authenticate (absent, torn by a crash, or plain random padding — all the same to us).
+    fn read_copy_header(buf: &[u8], off: usize, region_key: &MasterKey) -> io::Result<(u64, usize)> {
+        if off + COPY_HDR_LEN > buf.len() {
+            return Err(io_err("copy header out of bounds"));
         }
-        let len_hdr = region_key.seal_raw(LEN_LABEL, &(ct.len() as u64).to_le_bytes());
-        debug_assert_eq!(len_hdr.len(), LEN_HDR);
-        if off + LEN_HDR + ct.len() > buf.len() {
+        let plain = region_key
+            .open_raw(LEN_LABEL, &buf[off..off + COPY_HDR_LEN])
+            .map_err(|_| io_err("copy header corrupt / wrong key"))?;
+        if plain.len() != COPY_HDR_PLAIN {
+            return Err(io_err("bad copy header"));
+        }
+        let gen = u64::from_le_bytes(plain[0..8].try_into().unwrap());
+        let ct_len = u64::from_le_bytes(plain[8..16].try_into().unwrap()) as usize;
+        Ok((gen, ct_len))
+    }
+
+    /// A copy slot's header AND body, decrypted. `Err` if either half fails to authenticate.
+    fn read_copy(buf: &[u8], off: usize, region_key: &MasterKey) -> io::Result<(u64, Vec<u8>)> {
+        let (gen, ct_len) = Self::read_copy_header(buf, off, region_key)?;
+        let start = off + COPY_HDR_LEN;
+        if start + ct_len > buf.len() {
+            return Err(io_err("copy payload out of bounds (corrupt?)"));
+        }
+        let payload = region_key
+            .open_raw(BODY_LABEL, &buf[start..start + ct_len])
+            .map_err(|_| io_err("copy payload corrupt / wrong key"))?;
+        Ok((gen, payload))
+    }
+
+    /// Returns `(touched_off, touched_len)` — the byte range that actually changed, so the
+    /// caller persists ONLY that slice (never the untouched copy — that's the whole point).
+    fn write_region_at(
+        buf: &mut [u8],
+        off: usize,
+        atomic_cap: usize,
+        hard_cap: usize,
+        region_key: &MasterKey,
+        payload: &[u8],
+    ) -> io::Result<(usize, usize)> {
+        let ct = region_key.seal_raw(BODY_LABEL, payload);
+        let half = atomic_cap / 2;
+        if COPY_HDR_LEN + ct.len() <= half {
+            // SAFE PATH: alternate copy slots, never touching whichever one is currently newest.
+            let slot0 = Self::read_copy_header(buf, off, region_key).ok();
+            let slot1 = if half > 0 {
+                Self::read_copy_header(buf, off + half, region_key).ok()
+            } else {
+                None
+            };
+            let (target, new_gen) = match (slot0, slot1) {
+                (None, None) => (0, 1), // brand-new region: bootstrap into slot 0
+                (Some((g0, _)), None) => (1, g0 + 1),
+                (None, Some((g1, _))) => (0, g1 + 1),
+                // A tie can't legitimately happen (generations are unique), but if it ever did,
+                // never pick the slot we're reading as "current" to write into itself.
+                (Some((g0, _)), Some((g1, _))) => {
+                    if g0 >= g1 {
+                        (1, g0 + 1)
+                    } else {
+                        (0, g1 + 1)
+                    }
+                }
+            };
+            let toff = off + target * half;
+            Self::write_copy_at(buf, toff, new_gen, region_key, &ct)?;
+            Ok((toff, COPY_HDR_LEN + ct.len()))
+        } else if hard_cap > atomic_cap && COPY_HDR_LEN + ct.len() <= hard_cap {
+            // SPILL PATH — reachable ONLY when the caller's write permission (`hard_cap`) is
+            // WIDER than the ping-pong geometry (`atomic_cap`), which today means Blind (Protect
+            // and Hidden always call this with `hard_cap == atomic_cap`, see `Container::write`).
+            // This is an explicit gate, not just a comment: `Container::write` is SUPPOSED to
+            // refuse a Protect payload in this band before it ever reaches here, but a caller bug
+            // there must not silently degrade into an unwitnessed non-atomic write — it falls
+            // through to the capacity error below instead. The pre-CRYPTO-13 behaviour, unchanged
+            // and still explicitly non-atomic: writes directly at `off`, which — since it's bigger
+            // than one copy slot — necessarily overwrites BOTH ping-pong slots and, past
+            // `atomic_cap`, whatever comes after in the container (accepted risk: this is exactly
+            // the write that is allowed to corrupt the hidden tail; see
+            // `docs/design/duress-tier2-container.md` §2).
+            let gen = [Self::read_copy_header(buf, off, region_key).ok(), {
+                if half > 0 {
+                    Self::read_copy_header(buf, off + half, region_key).ok()
+                } else {
+                    None
+                }
+            }]
+            .into_iter()
+            .flatten()
+            .map(|(g, _)| g)
+            .max()
+            .unwrap_or(0)
+                + 1;
+            Self::write_copy_at(buf, off, gen, region_key, &ct)?;
+            Ok((off, COPY_HDR_LEN + ct.len()))
+        } else {
+            Err(io_err("payload exceeds region capacity"))
+        }
+    }
+
+    /// Seal `(gen, ct.len())` as the copy header at `toff`, then the ciphertext right after it.
+    fn write_copy_at(buf: &mut [u8], toff: usize, gen: u64, region_key: &MasterKey, ct: &[u8]) -> io::Result<()> {
+        if toff + COPY_HDR_LEN + ct.len() > buf.len() {
             return Err(io_err("region write out of bounds"));
         }
-        buf[off..off + LEN_HDR].copy_from_slice(&len_hdr);
-        buf[off + LEN_HDR..off + LEN_HDR + ct.len()].copy_from_slice(&ct);
-        // Bytes after the ciphertext are left as-is (leftover random) → logical length hidden.
-        Ok(LEN_HDR + ct.len())
+        let mut hdr_plain = Vec::with_capacity(COPY_HDR_PLAIN);
+        hdr_plain.extend_from_slice(&gen.to_le_bytes());
+        hdr_plain.extend_from_slice(&(ct.len() as u64).to_le_bytes());
+        let hdr = region_key.seal_raw(LEN_LABEL, &hdr_plain);
+        debug_assert_eq!(hdr.len(), COPY_HDR_LEN);
+        // The header write and the body write below are each one contiguous byte range, but
+        // together they are still a single non-atomic in-place update — the crash-safety this
+        // buys comes from NEVER touching the region's OTHER copy slot in the same call, not from
+        // these two lines being atomic with each other.
+        buf[toff..toff + COPY_HDR_LEN].copy_from_slice(&hdr);
+        buf[toff + COPY_HDR_LEN..toff + COPY_HDR_LEN + ct.len()].copy_from_slice(ct);
+        Ok(())
     }
 
-    fn read_region_at(buf: &[u8], off: usize, region_key: &MasterKey) -> io::Result<Vec<u8>> {
-        if off + LEN_HDR > buf.len() {
-            return Err(io_err("region out of bounds"));
+    fn read_region_at(buf: &[u8], off: usize, atomic_cap: usize, region_key: &MasterKey) -> io::Result<Vec<u8>> {
+        let half = atomic_cap / 2;
+        let c0 = Self::read_copy(buf, off, region_key).ok();
+        let c1 = if half > 0 {
+            Self::read_copy(buf, off + half, region_key).ok()
+        } else {
+            None
+        };
+        match (c0, c1) {
+            (None, None) => Err(io_err("region payload corrupt / wrong key")),
+            (Some((_, p)), None) => Ok(p),
+            (None, Some((_, p))) => Ok(p),
+            (Some((g0, p0)), Some((g1, p1))) => Ok(if g0 >= g1 { p0 } else { p1 }),
         }
-        let len_bytes = region_key
-            .open_raw(LEN_LABEL, &buf[off..off + LEN_HDR])
-            .map_err(|_| io_err("region length header corrupt / wrong key"))?;
-        if len_bytes.len() != 8 {
-            return Err(io_err("bad region length header"));
-        }
-        let ct_len = u64::from_le_bytes(len_bytes.as_slice().try_into().unwrap()) as usize;
-        let start = off + LEN_HDR;
-        if start + ct_len > buf.len() {
-            return Err(io_err("region payload out of bounds (corrupt?)"));
-        }
-        region_key
-            .open_raw(BODY_LABEL, &buf[start..start + ct_len])
-            .map_err(|_| io_err("region payload corrupt / wrong key"))
     }
 
     // ---- append-only log within a region (the "chunks" model: a new entry writes ONE small
@@ -589,6 +799,12 @@ impl Container {
     // NOTE: the append-log primitives below are the Phase-2 storage mechanism (a region will hold
     // a small mutable core + this append-log for history). They are exercised by tests now and get
     // wired into the region model in a later Phase-2 slice, hence `dead_code` until then.
+    //
+    // CRYPTO-13 follow-up (NOT fixed here — this code isn't on the live path yet): the superblock
+    // has the exact same single-point-of-failure as the region length header did. It is a single
+    // sealed blob, re-sealed on every append; a torn write to it fails AEAD and `log_read` can't
+    // get past it, losing ALL history in the log — not just the newest append. When this gets
+    // wired in, it needs the same two-copy treatment as `write_region_at`/`read_region_at` above.
 
     /// Read the u64 sealed at `[off, off+LEN_HDR)` under `key`.
     #[allow(dead_code)]
@@ -927,16 +1143,17 @@ impl RegionStore {
     }
     /// Lay out an empty region: empty core + empty log.
     fn init(&self, buf: &mut [u8], key: &MasterKey) -> io::Result<()> {
-        Container::write_region_at(buf, self.off, self.core_cap, key, &[])?;
+        Container::write_region_at(buf, self.off, self.core_cap, self.core_cap, key, &[])?;
         Container::log_init(buf, self.log_off(), key);
         Ok(())
     }
-    /// Replace the mutable core (re-sealed in place; refuses to exceed `core_cap`).
+    /// Replace the mutable core (re-sealed in place; refuses to exceed `core_cap`). The core has
+    /// no Blind-style dual-cap concept, so `atomic_cap == hard_cap == core_cap` (CRYPTO-13).
     fn write_core(&self, buf: &mut [u8], key: &MasterKey, blob: &[u8]) -> io::Result<()> {
-        Container::write_region_at(buf, self.off, self.core_cap, key, blob).map(|_| ())
+        Container::write_region_at(buf, self.off, self.core_cap, self.core_cap, key, blob).map(|_| ())
     }
     fn read_core(&self, buf: &[u8], key: &MasterKey) -> io::Result<Vec<u8>> {
-        Container::read_region_at(buf, self.off, key)
+        Container::read_region_at(buf, self.off, self.core_cap, key)
     }
     /// Append one history entry (cheap — one chunk, older history untouched).
     fn append(&self, buf: &mut [u8], key: &MasterKey, chunk: &[u8]) -> io::Result<()> {
@@ -967,7 +1184,9 @@ mod tests {
         let hidden_cap = 96 * 1024; // "B"
         let mut c = Container::create(&p, total, b"realpw", main_cap as u64).unwrap();
         c.add_hidden(b"realpw", b"hiddenpw", hidden_cap as u64).unwrap();
-        c.add_blind_main(b"realpw", b"blindpw", (main_cap + hidden_cap) as u64).unwrap();
+        // blind_cap must be exactly "the rest of the container after the main region" (CRYPTO-13:
+        // region_cap is now shared geometry, not a caller-chosen permission — see `add_blind_main`).
+        c.add_blind_main(b"realpw", b"blindpw", total - DATA_OFF as u64).unwrap();
         c.add_wipe(b"realpw", b"burnpw").unwrap();
 
         // 1) The whole file is high-entropy: no 32-byte all-zero window, no KARST magic.
@@ -1029,7 +1248,7 @@ mod tests {
         let hidden_cap = 160 * 1024;
         let mut c = Container::create(&p, total, b"realpw", main_cap as u64).unwrap();
         c.add_hidden(b"realpw", b"hiddenpw", hidden_cap as u64).unwrap();
-        c.add_blind_main(b"realpw", b"blindpw", (main_cap + hidden_cap) as u64).unwrap();
+        c.add_blind_main(b"realpw", b"blindpw", total - DATA_OFF as u64).unwrap();
         c.write(b"hiddenpw", b"the launch codes").unwrap();
 
         // P1 write that fits within A: hidden survives.
@@ -1039,10 +1258,48 @@ mod tests {
         // P1 refuses to exceed its A cap (so it can never reach the tail).
         assert!(c.write(b"realpw", &vec![7u8; main_cap]).is_err(), "protect refuses to exceed A");
 
-        // P3 blind write big enough to spill past A into the hidden region → hidden corrupts.
-        c.write(b"blindpw", &vec![9u8; main_cap + 40 * 1024]).unwrap();
+        // P3 blind write big enough to spill past A and cover the ENTIRE hidden region → hidden
+        // corrupts. (CRYPTO-13: hidden's live generation could be sitting in EITHER of its two
+        // ping-pong copy slots, so a spill has to reach past both — hidden_cap worth past A, not
+        // just "a bit past A" — to guarantee destruction; a smaller spill can land only on the
+        // stale copy and leave the live one, which is still an accepted-risk write, just a less
+        // predictable one than the single-copy model used to give.)
+        c.write(b"blindpw", &vec![9u8; main_cap + hidden_cap]).unwrap();
         assert!(c.open(b"hiddenpw").is_err(), "blind spill overwrote the hidden compartment");
 
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// CRYPTO-13 — the exact boundary `Container::write` must enforce for Protect is
+    /// `region_cap / 2` (the ping-pong safe-path budget), NOT the full `region_cap`. An earlier
+    /// version of this fix checked against the full cap, which let a Protect payload in the
+    /// `(region_cap/2, region_cap]` band silently fall through `write_region_at` to the
+    /// non-atomic spill branch — no error, no atomicity, the exact brick this fix exists to
+    /// prevent, just gated behind a payload-size coin flip instead of happening unconditionally.
+    /// This test pins BOTH sides of that boundary so the band can never reopen unnoticed.
+    #[test]
+    fn protect_refuses_a_payload_over_half_its_cap_even_though_it_would_fit_the_whole_cap() {
+        let p = tmp("half-cap");
+        let _ = std::fs::remove_file(&p);
+        let main_cap = 64 * 1024usize;
+        let mut c = Container::create(&p, 200 * 1024, b"realpw", main_cap as u64).unwrap();
+
+        // Just OVER half the cap: fits easily inside the full region_cap, but must be refused —
+        // there is no safe (ping-pong) slot for it, and it must NOT be silently handed to the
+        // non-atomic spill path.
+        let over_half = main_cap / 2 + 1024;
+        assert!(
+            c.write(b"realpw", &vec![1u8; over_half]).is_err(),
+            "a Protect payload just over half the cap must be refused, not silently spilled"
+        );
+
+        // Just UNDER half the cap: must succeed and round-trip normally through the safe path.
+        let under_half = main_cap / 2 - 1024;
+        c.write(b"realpw", &vec![2u8; under_half]).unwrap();
+        match c.open(b"realpw").unwrap() {
+            Opened::Compartment { payload, .. } => assert_eq!(payload, vec![2u8; under_half]),
+            _ => panic!("must open the main compartment"),
+        }
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1093,7 +1350,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let mut c = Container::create(&p, 256 * 1024, b"realpw", 96 * 1024).unwrap();
         c.add_hidden(b"realpw", b"hiddenpw", 96 * 1024).unwrap();
-        c.add_blind_main(b"realpw", b"blindpw", 192 * 1024).unwrap();
+        c.add_blind_main(b"realpw", b"blindpw", 256 * 1024 - DATA_OFF as u64).unwrap();
 
         // P1 (management) can read the directory; P3 and the hidden password cannot.
         assert!(c.read_dir(&c.key_for(b"realpw").unwrap()).is_ok(), "P1 manages slots");
@@ -1447,7 +1704,7 @@ mod tests {
         {
             let mut c = Container::load(&cpath).unwrap();
             c.add_hidden(b"realpw", b"hiddenpw", 96 * 1024).unwrap();
-            c.add_blind_main(b"realpw", b"blindpw", 192 * 1024).unwrap();
+            c.add_blind_main(b"realpw", b"blindpw", 256 * 1024 - DATA_OFF as u64).unwrap();
             c.add_wipe(b"realpw", b"burnpw").unwrap();
         }
 
@@ -1535,6 +1792,7 @@ mod tests {
                 &mut c.buf,
                 slot.region_off as usize,
                 slot.region_cap as usize,
+                slot.region_cap as usize,
                 &hidden_key,
                 b"the hidden account payload",
             )
@@ -1556,10 +1814,169 @@ mod tests {
         let c = Container::load(&cpath).unwrap();
         let hkey = c.key_for(b"hiddenpw").unwrap();
         let slot = c.find_slot(&hkey).expect("the first hidden slot must survive");
-        let got = Container::read_region_at(&c.buf, slot.region_off as usize, &hidden_key)
+        let got = Container::read_region_at(&c.buf, slot.region_off as usize, slot.region_cap as usize, &hidden_key)
             .expect("the first hidden region must still decrypt");
         assert_eq!(got, b"the hidden account payload", "the first hidden account lost its data");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CRYPTO-13 — a torn save must roll a compartment back to its last good generation, never
+    /// brick it. We can't literally kill the process mid-syscall in a test, so instead of assuming
+    /// a byte layout we ASK THE CODE where the next save would land — a dry run of
+    /// `write_region_at` on a clone of the buffer — then simulate the crash by copying only a
+    /// PREFIX of that exact range into the real buffer, leaving a torn mix that fails AEAD. This
+    /// is deliberately layout-agnostic: it discriminates against ANY implementation (this one, or
+    /// a future change to the alternation rule) that fails to leave the OTHER copy slot untouched,
+    /// not just this specific offset arithmetic. Control: also destroying the slot that DOES hold
+    /// the good generation must make the region genuinely fail to open — otherwise this test could
+    /// pass by ignoring corruption everywhere.
+    #[test]
+    fn a_torn_save_rolls_back_to_the_previous_generation_instead_of_bricking() {
+        let key = random_key();
+        let cap = 4 * 1024usize;
+        let mut buf = random_bytes(cap);
+
+        Container::write_region_at(&mut buf, 0, cap, cap, &key, b"generation one").unwrap();
+        Container::write_region_at(&mut buf, 0, cap, cap, &key, b"generation two").unwrap();
+        assert_eq!(Container::read_region_at(&buf, 0, cap, &key).unwrap(), b"generation two");
+
+        // Dry run: where would the NEXT save land? Applied to a CLONE, not `buf` — we want to know
+        // the target without actually completing the write.
+        let mut probe = buf.clone();
+        let (target_off, target_len) =
+            Container::write_region_at(&mut probe, 0, cap, cap, &key, b"generation three").unwrap();
+
+        // Simulate a crash: only the first half of that write's bytes made it to disk.
+        let torn_prefix = target_len / 2;
+        buf[target_off..target_off + torn_prefix].copy_from_slice(&probe[target_off..target_off + torn_prefix]);
+
+        assert_eq!(
+            Container::read_region_at(&buf, 0, cap, &key).unwrap(),
+            b"generation two",
+            "a torn write to the OTHER copy slot must roll back to the last good save, not brick the region"
+        );
+
+        // Control: now also destroy the slot that DOES hold "generation two" (the opposite half
+        // from the torn one) — with nothing left untouched, this must genuinely fail to open.
+        let half = cap / 2;
+        let surviving_off = half - target_off; // the other of {0, half}
+        for b in buf[surviving_off..surviving_off + 24].iter_mut() {
+            *b ^= 0xFF;
+        }
+        assert!(
+            Container::read_region_at(&buf, 0, cap, &key).is_err(),
+            "control: with BOTH copy slots destroyed there is nothing left to recover"
+        );
+    }
+
+    /// CRYPTO-14 (part 1) — refutes the literal claim that "the cover password's own write
+    /// reveals a hidden compartment": a P3 (blind) save touches the EXACT SAME `(offset, length)`
+    /// whether or not a hidden compartment exists elsewhere in the container. Same total size N,
+    /// same region offsets (fixed at creation, independent of `add_hidden`), same ping-pong
+    /// alternation for the same sequence of main-account saves. We compare the deterministic
+    /// `(offset, length)` `write_region_at` itself reports — not a before/after byte diff of the
+    /// two files, which would be flaky here: ciphertext is pseudorandom, so a rewritten byte can
+    /// coincidentally equal its own previous value, silently shrinking a value-diff's apparent
+    /// range by a byte or two at either end with nothing to do with the code under test. The real
+    /// leak is not in this write — see the next test.
+    #[test]
+    fn a_p3_write_touches_the_same_range_whether_or_not_a_hidden_compartment_exists() {
+        let no_hidden = tmp("p3-no-hidden");
+        let with_hidden = tmp("p3-with-hidden");
+        let _ = std::fs::remove_file(&no_hidden);
+        let _ = std::fs::remove_file(&with_hidden);
+        let total = 256 * 1024u64;
+        let main_cap = 96 * 1024u64;
+
+        let mut a = Container::create(&no_hidden, total, b"realpw", main_cap).unwrap();
+        a.add_blind_main(b"realpw", b"blindpw", total - DATA_OFF as u64).unwrap();
+
+        let mut b = Container::create(&with_hidden, total, b"realpw", main_cap).unwrap();
+        b.add_hidden(b"realpw", b"hiddenpw", total - DATA_OFF as u64 - main_cap).unwrap();
+        b.add_blind_main(b"realpw", b"blindpw", total - DATA_OFF as u64).unwrap();
+
+        let payload = b"an ordinary cover-session save";
+        let a_info = a.find_slot(&a.key_for(b"blindpw").unwrap()).unwrap();
+        let a_hard_cap = a.buf.len() as u64 - a_info.region_off;
+        let touched_a = Container::write_region_at(
+            &mut a.buf,
+            a_info.region_off as usize,
+            a_info.region_cap as usize,
+            a_hard_cap as usize,
+            &a_info.region_key,
+            payload,
+        )
+        .unwrap();
+
+        let b_info = b.find_slot(&b.key_for(b"blindpw").unwrap()).unwrap();
+        let b_hard_cap = b.buf.len() as u64 - b_info.region_off;
+        let touched_b = Container::write_region_at(
+            &mut b.buf,
+            b_info.region_off as usize,
+            b_info.region_cap as usize,
+            b_hard_cap as usize,
+            &b_info.region_key,
+            payload,
+        )
+        .unwrap();
+
+        assert!(touched_a.1 > 0, "control: the write must actually touch some bytes");
+        assert_eq!(
+            touched_a, touched_b,
+            "a P3 write must touch the identical (offset, length) regardless of whether a hidden compartment exists"
+        );
+        let _ = std::fs::remove_file(&no_hidden);
+        let _ = std::fs::remove_file(&with_hidden);
+    }
+
+    /// CRYPTO-14 (part 2) — the ACTUAL leak, pinned so nobody re-claims it's solved: a HIDDEN
+    /// write's changed bytes localize entirely inside the hidden region, never touching the main
+    /// region (the reverse of `in_place_write_does_not_touch_the_hidden_region_on_disk`, which
+    /// pins the other direction). A snapshot-diff adversary holding two images of the file can
+    /// therefore tell "ordinary main/cover activity" (changes confined to the small zone near the
+    /// front of the file) apart from "something else wrote back here" — which is a real,
+    /// structural leak, not a bug: `duress-tier2-container.md` §2(b)'s claim that main-account
+    /// activity "masks" hidden writes does not hold below the point where a P3 save already
+    /// SPILLS into (and destroys) the hidden region — masking and destroying are the same
+    /// operation on one shared key. True masking would need every main save to rewrite the WHOLE
+    /// container so a diff can never localize anything, which directly defeats `persist_range`'s
+    /// whole reason to exist (an O(1)-ish save instead of an O(N) rewrite per message). NOT fixed
+    /// here — there is no disk-layer fix that keeps the efficient-save design.
+    #[test]
+    fn a_hidden_write_changes_only_bytes_inside_the_hidden_region() {
+        let p = tmp("leak");
+        let _ = std::fs::remove_file(&p);
+        let total = 256 * 1024u64;
+        let main_cap = 96 * 1024usize;
+        let hidden_cap = 96 * 1024u64;
+        let mut c = Container::create(&p, total, b"realpw", main_cap as u64).unwrap();
+        c.add_hidden(b"realpw", b"hiddenpw", hidden_cap).unwrap();
+
+        let before = std::fs::read(&p).unwrap();
+        c.write(b"hiddenpw", b"a message only the hidden account will ever see").unwrap();
+        let after = std::fs::read(&p).unwrap();
+
+        let main_off = DATA_OFF;
+        let hidden_off = DATA_OFF + main_cap;
+        let hidden_end = hidden_off + hidden_cap as usize;
+
+        let changed: Vec<usize> = before
+            .iter()
+            .zip(after.iter())
+            .enumerate()
+            .filter(|(_, (x, y))| x != y)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!changed.is_empty(), "control: the write must actually change some bytes");
+        assert!(
+            changed.iter().all(|&i| i >= hidden_off && i < hidden_end),
+            "a hidden write must not touch any byte outside its own region"
+        );
+        assert!(
+            changed.iter().all(|&i| !(i >= main_off && i < main_off + main_cap)),
+            "a hidden write must never touch the main region's bytes"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     /// A3-6 — a FAILED save must never be followed by deleting the work dir. A hidden account

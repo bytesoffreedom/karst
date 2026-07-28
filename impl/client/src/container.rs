@@ -347,24 +347,59 @@ impl Container {
         Ok(())
     }
 
+    /// Marks the directory entry of the ONE hidden slot. The directory is sealed under the
+    /// MANAGEMENT (P1) key — a cover password cannot read it (pinned by
+    /// `p3_reveal_does_not_expose_the_slot_directory`) — so recording this does not weaken the
+    /// property that revealing P3 cannot prove P1/P2 exist. It exists so `add_hidden` can refuse
+    /// to clobber an existing hidden region (A3-1); the region bytes themselves stay
+    /// indistinguishable from random, which is exactly why the container cannot detect it any
+    /// other way.
+    const HIDDEN_FLAG: u8 = 0x80;
+
     /// Read the used-slot list (sealed under the management key). `Err` = wrong key.
     fn read_dir(&self, mgmt_key: &MasterKey) -> io::Result<Vec<usize>> {
+        Ok(self.read_dir_entries(mgmt_key)?.into_iter().map(|(idx, _)| idx).collect())
+    }
+
+    /// The used slots with their hidden marker: `(slot index, is_hidden)`.
+    fn read_dir_entries(&self, mgmt_key: &MasterKey) -> io::Result<Vec<(usize, bool)>> {
         let plain = mgmt_key
             .open_raw(&self.buf[DIR_OFF..DIR_OFF + DIR_LEN])
             .map_err(|_| io_err("wrong management password"))?;
-        Ok(plain.iter().filter(|&&b| (b as usize) < SLOT_COUNT).map(|&b| b as usize).collect())
+        Ok(plain
+            .iter()
+            .filter(|&&b| ((b & !Self::HIDDEN_FLAG) as usize) < SLOT_COUNT)
+            .map(|&b| ((b & !Self::HIDDEN_FLAG) as usize, b & Self::HIDDEN_FLAG != 0))
+            .collect())
+    }
+
+    /// Which slot (if any) holds the hidden account.
+    fn hidden_slot(&self, mgmt_key: &MasterKey) -> io::Result<Option<usize>> {
+        Ok(self.read_dir_entries(mgmt_key)?.into_iter().find(|&(_, h)| h).map(|(idx, _)| idx))
     }
 
     /// Seal the used-slot list under the management key. Unused entries are 0xFF.
-    fn write_dir(&mut self, mgmt_key: &MasterKey, used: &[usize]) -> io::Result<()> {
+    /// `hidden` names the slot to tag with [`Self::HIDDEN_FLAG`], if any.
+    fn write_dir_marked(
+        &mut self,
+        mgmt_key: &MasterKey,
+        used: &[usize],
+        hidden: Option<usize>,
+    ) -> io::Result<()> {
         let mut plain = [0xFFu8; SLOT_COUNT];
         for (i, &idx) in used.iter().take(SLOT_COUNT).enumerate() {
-            plain[i] = idx as u8;
+            plain[i] = idx as u8 | if hidden == Some(idx) { Self::HIDDEN_FLAG } else { 0 };
         }
         let sealed = mgmt_key.seal_raw(&plain);
         debug_assert_eq!(sealed.len(), DIR_LEN);
         self.buf[DIR_OFF..DIR_OFF + DIR_LEN].copy_from_slice(&sealed);
         Ok(())
+    }
+
+    /// Seal the used-slot list, preserving whichever slot is already tagged hidden.
+    fn write_dir(&mut self, mgmt_key: &MasterKey, used: &[usize]) -> io::Result<()> {
+        let hidden = self.hidden_slot(mgmt_key).unwrap_or(None);
+        self.write_dir_marked(mgmt_key, used, hidden)
     }
 
     /// A free slot index not in the management directory. Random start → no order signal.
@@ -415,13 +450,21 @@ impl Container {
         if self.find_slot(&hkey).is_some() {
             return Err(io_err("that password is already in use"));
         }
+        // Refuse a SECOND hidden account. `hidden_off` is fixed, so a second call used to write a
+        // fresh empty region right on top of the existing one under a new key — silently and
+        // irreversibly destroying the first hidden account while its slot still pointed there with
+        // the now-useless old key (A3-1). The region bytes are indistinguishable from random by
+        // design, so the marker in the P1-sealed directory is the only way to know.
+        if self.hidden_slot(&mkey)?.is_some() {
+            return Err(io_err("this container already holds a hidden account"));
+        }
         let region_key = random_key();
         Self::write_region_at(&mut self.buf, hidden_off as usize, hidden_cap, &region_key, &[])?;
         let mut used = self.read_dir(&mkey)?;
         let idx = self.free_slot(&used).ok_or_else(|| io_err("no free slot"))?;
         self.seal_slot(idx, Role::Hidden, Policy::None, hidden_password, hidden_off, hidden_cap as u64, &region_key)?;
         used.push(idx);
-        self.write_dir(&mkey, &used)?;
+        self.write_dir_marked(&mkey, &used, Some(idx))?;
         self.persist()?;
         Ok(region_key)
     }
@@ -1420,6 +1463,58 @@ mod tests {
             Unlocked::Account(cv) => assert_eq!(cv.role, Role::Main),
             _ => panic!("a main account must still open without tmpfs"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A3-1 — a SECOND hidden account must be refused, not silently written over the first.
+    /// `hidden_off` is a fixed offset, so the old code wrote a fresh empty region on top of the
+    /// existing hidden account under a NEW key, leaving the original slot pointing at bytes its
+    /// key can no longer open: total, irreversible loss of a duress compartment with no warning.
+    /// Discriminating on the data, not just the return value — the first hidden password must
+    /// still open its account, with its contents intact, after the second attempt is refused.
+    #[test]
+    fn a_second_hidden_account_is_refused_without_touching_the_first() {
+        let root = tmp("two-hidden");
+        std::fs::create_dir_all(&root).unwrap();
+        let cpath = root.join("container.dat");
+        Container::create(&cpath, 512 * 1024, b"realpw", 128 * 1024).unwrap();
+        let hidden_key = {
+            let mut c = Container::load(&cpath).unwrap();
+            c.add_hidden(b"realpw", b"hiddenpw", 128 * 1024).unwrap()
+        };
+
+        // Put something in the hidden compartment so its loss would be observable.
+        {
+            let mut c = Container::load(&cpath).unwrap();
+            let slot = c.find_slot(&c.key_for(b"hiddenpw").unwrap()).expect("hidden slot");
+            Container::write_region_at(
+                &mut c.buf,
+                slot.region_off as usize,
+                slot.region_cap as usize,
+                &hidden_key,
+                b"the hidden account payload",
+            )
+            .unwrap();
+            c.persist().unwrap();
+        }
+
+        // A second hidden password must be REFUSED.
+        {
+            let mut c = Container::load(&cpath).unwrap();
+            assert!(
+                c.add_hidden(b"realpw", b"otherhidden", 128 * 1024).is_err(),
+                "a container must hold at most one hidden account"
+            );
+            c.persist().unwrap();
+        }
+
+        // The original hidden account still opens AND still has its data.
+        let c = Container::load(&cpath).unwrap();
+        let hkey = c.key_for(b"hiddenpw").unwrap();
+        let slot = c.find_slot(&hkey).expect("the first hidden slot must survive");
+        let got = Container::read_region_at(&c.buf, slot.region_off as usize, &hidden_key)
+            .expect("the first hidden region must still decrypt");
+        assert_eq!(got, b"the hidden account payload", "the first hidden account lost its data");
         let _ = std::fs::remove_dir_all(&root);
     }
 

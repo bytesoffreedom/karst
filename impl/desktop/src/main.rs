@@ -3550,10 +3550,15 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
         // acked, so RAM is no longer a safe place to keep them. Inside the barrier, so the same
         // commit that the ack waits on covers them too.
         client::save_reassemblers(&root, &app.reasm.lock().unwrap());
-        let mut guard = app.container.lock().unwrap();
-        let committed = acks.commit_then_send(now_secs(), || match guard.as_mut() {
-            Some(cv) => cv.save().map_err(|e| e.to_string()),
-            None => Ok(()), // file-tree session: the store IS the authority
+        // The container mutex is taken INSIDE the closure so it is released before the ACK round
+        // trips: `commit_then_send` does one network request per receipt after the commit, and
+        // `lock` (the duress-adjacent path) takes this same mutex. Holding it across the acks
+        // would make locking the app wait on a whole batch of relay round trips.
+        let committed = acks.commit_then_send(now_secs(), || {
+            match app.container.lock().unwrap().as_mut() {
+                Some(cv) => cv.save().map_err(|e| e.to_string()),
+                None => Ok(()), // file-tree session: the store IS the authority
+            }
         });
         // Not fatal (unlike `lock`): nothing was deleted anywhere — the leases went UNSENT, so the
         // relays still hold this batch and redeliver it once the leases expire. But it must not be

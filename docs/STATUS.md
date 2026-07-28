@@ -192,7 +192,10 @@ build; clippy clean.**
   container, relay-clock lease expiry), plus `a_control_only_batch_still_carries_a_commit_barrier`.
   **Named limits.** (a) "Redeliverable" means *after a relock/restart*: within the same session the
   work dir still holds the advanced ratchet, so a redelivery fails closed and shows as nothing — no
-  loss, but no in-session recovery either. (b) The **ratchet rollback itself is not fixed**: a stale
+  loss, but no in-session recovery either. A failed commit DROPS its receipts rather than deferring
+  them to the next successful save, so those messages occupy relay mailbox slots until the deposit
+  TTL sweeps them (bounded, never lossy — the copy that matters is the container's). (b) The
+  **ratchet rollback itself is not fixed**: a stale
   container snapshot can still overwrite a newer work dir on reopen (the audit's generation-marker
   item), and a rollback deeper than `MAX_SKIP` can still wedge a conversation. Deferring the ack
   removes the message LOSS, not the rollback. (c) Only the receive path is gated. Other writers of a

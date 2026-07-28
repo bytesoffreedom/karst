@@ -2037,13 +2037,25 @@ mod session_cap_tests {
     }
 
     /// SEC-33's core claim, made structural: on a garbage `Ratchet` message that matches NO
-    /// held session, the generic `process_ratchet` sweep (still used for the identity mailbox,
-    /// where the sender genuinely isn't known ahead of time) pays one `decrypt` attempt PER
-    /// session held — attacker-controlled, since `sessions` holds one entry per accepted
-    /// stranger. `process_for_peer` (the real per-session-box path, used for ordinary,
-    /// ongoing traffic) pays exactly ONE, because the box the payload arrived on already
-    /// identifies the owning peer. Counts real `decrypt` calls rather than timing anything, so
-    /// this cannot flake on a loaded CI box.
+    /// held session, the generic `process_ratchet` sweep pays one `decrypt` attempt PER session
+    /// held — attacker-controlled, since `sessions` holds one entry per accepted stranger.
+    /// `process_for_peer` (the real per-session-box path, used for ordinary, ongoing traffic)
+    /// pays exactly ONE, because the box the payload arrived on already identifies the owning
+    /// peer. Counts real `decrypt` calls rather than timing anything, so this cannot flake on a
+    /// loaded CI box.
+    ///
+    /// **`process_ratchet` itself has no production caller left.** `process()`'s `Ratchet` arm
+    /// is the only thing that invokes it, and `receive()` filters every `Ratchet`-shaped payload
+    /// out of the identity-mailbox loop BEFORE calling `process()` (see the `matches!` check
+    /// right before that call), because `route_for` never deposits a `Ratchet` envelope there —
+    /// only `Initial`/`InitialSealed`. `process_for_peer`'s own fallback to `process()` only
+    /// fires on its `_` arm, which a `Ratchet` payload can never reach (it is matched, and
+    /// handled directly, one arm up). So this test drives `process_ratchet` through
+    /// `open_for_test`, a test-only entry point — the O(sessions) sweep is retained as a generic
+    /// fallback with no live caller, not as an active cost on any current path. If a future
+    /// change ever routes a `Ratchet` payload back through `process()` from a real fetch, this
+    /// sweep would run again — which is exactly the regression `an_established_contact_...` and
+    /// the test below exist to catch.
     ///
     /// Uses a REPRESENTATIVE session count, not the full `MAX_SESSIONS` — the cap tests above
     /// already prove the boundary itself at negligible cost; this test's `decrypt` calls are

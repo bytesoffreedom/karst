@@ -2908,6 +2908,16 @@ mod tests {
             crate::wire::MAX_FETCH_SEALS,
             "the queue must sit exactly at the cap — the one-frame invariant is not negotiable"
         );
+
+        // And the interaction the cap check now DEPENDS on being ordered after the dedup scan: a
+        // retry of a message the relay already holds is `Accepted` even though the mailbox is
+        // full. Moving the cap check above the dedup scan would look like a harmless
+        // simplification and would instead tell a sender to keep retrying a message that is
+        // already sitting in the recipient's queue.
+        assert!(
+            matches!(first.0.deposit(&first.1.payload, NOW), Response::Accepted),
+            "an idempotent retry must still be Accepted at a full mailbox — it is already there"
+        );
     }
 
     /// #179: a fetch can no longer ask the relay to DELETE on read.
@@ -3204,6 +3214,41 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ))
+    }
+
+    /// #142/R2-5: the ADVERTISED durability and the real behaviour must be the same fact.
+    ///
+    /// `policy()` reads a cached flag rather than the mail store (so answering `GetPolicy` never
+    /// queues behind an fsync), which creates exactly the failure this project has been caught by
+    /// before: a reported value that nothing ties to what the code does. So this asserts both on
+    /// ONE relay — it says `Durable`, and a message deposited through it really is on disk.
+    #[test]
+    fn a_relay_that_advertises_durable_mail_actually_writes_it() {
+        let dir = mail_dir("advertised");
+        let identity = Identity::generate();
+        let recipient = PublicKey::from([0x51u8; 32]);
+        {
+            let mut relay = RelayNode::with_identity(NOW, identity.clone());
+            relay.enable_durable_mail(dir.clone(), NOW).expect("open the mail log");
+            assert_eq!(
+                relay.policy().mailbox_durability,
+                MailboxDurability::Durable,
+                "the relay advertises durable mail"
+            );
+            let cap = publish_cap();
+            relay.issue_capability(cap.clone());
+            let relay = Rc::new(RefCell::new(relay));
+            let mut sender = Client::new(InMemoryTransport::new(relay.clone()), cap, b"sender");
+            assert!(matches!(sender.send(&recipient, b"on disk?", NOW), Response::Accepted));
+        }
+        let mut restarted = RelayNode::with_identity(NOW, identity);
+        restarted.enable_durable_mail(dir.clone(), NOW).expect("reopen");
+        assert_eq!(
+            restarted.mailbox_len_for_test(&recipient.to_bytes()),
+            1,
+            "...and the advertisement was true: the message survived the restart"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// R2-5 (#161) — CHARACTERIZATION, not a fix. `mailboxes` lives only in `RelayNode`'s own

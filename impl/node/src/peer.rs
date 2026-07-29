@@ -224,7 +224,6 @@ pub struct PeerState {
     /// makes our own epoch monotonic, which is the half of the problem a client CAN fix about
     /// itself. Persisted for the same reason `last_sweep` is: a fresh `Peer` per poll would reset
     /// it every cycle and the guarantee would be worth nothing.
-    #[serde(default)]
     epoch_hwm: u64,
     /// Messages encrypted (ratchet advanced) but not yet accepted by a relay, so the exact
     /// ciphertext can be retransmitted after a transport failure instead of being lost with

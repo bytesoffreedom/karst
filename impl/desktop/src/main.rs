@@ -2439,21 +2439,9 @@ fn create_post(
     text: String,
     audience: Option<Vec<String>>,
     story: Option<bool>,
-    image: Option<String>,
     attachments: Option<Vec<AttachmentIn>>,
 ) -> Result<Vec<Post>, String> {
     let text = text.trim().to_string();
-    // Decode a legacy single image (kept for older callers). New callers pass `attachments`.
-    let image_bytes = match image.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(b64) => {
-            let bytes = STANDARD.decode(b64).map_err(|e| format!("bad image data: {e}"))?;
-            if bytes.len() > client::content::MAX_POST_IMAGE_BYTES {
-                return Err(format!("image too large (> {} KiB)", client::content::MAX_POST_IMAGE_BYTES / 1024));
-            }
-            Some(bytes)
-        }
-        None => None,
-    };
     // Decode multi-attachments (images + files): kind 0/1, base64 bytes, gated at the door.
     let atts: Vec<(u8, String, Vec<u8>)> = attachments
         .unwrap_or_default()
@@ -2466,7 +2454,7 @@ fn create_post(
             Ok((a.kind, sanitize_name(&a.name), bytes))
         })
         .collect::<Result<_, String>>()?;
-    if text.is_empty() && image_bytes.is_none() && atts.is_empty() {
+    if text.is_empty() && atts.is_empty() {
         return Err("empty post".into());
     }
     let (store, relays) = app.snapshot()?;
@@ -2485,9 +2473,6 @@ fn create_post(
         let _ = store.mark_public_post(id);
     }
     // Store our own copies locally so our feed shows them immediately.
-    if let Some(ref img) = image_bytes {
-        let _ = store.set_feed_image(own, id, img.clone());
-    }
     for (i, (kind, name, bytes)) in atts.iter().enumerate() {
         let _ = store.set_feed_attachment(
             own,
@@ -2513,10 +2498,6 @@ fn create_post(
                     Some(exp) => client::send_story(&ps, &relay, &ik, id, &text, ts, exp, now),
                     None => client::send_publication(&ps, &relay, &ik, id, &text, ts, now),
                 };
-                // Attachments follow the text packet on the FIFO mailbox, each manifest-first + batched.
-                if let Some(ref img) = image_bytes {
-                    let _ = client::send_post_image(&ps, &relay, &ik, id, img, now);
-                }
                 // Multi-attachment media rides the relay's BLOB store (per-recipient blob + a tiny
                 // ref) instead of ~90 inline chunks each — so a 4-image post lands 4 pointers, not
                 // ~360 seals into a 256-cap mailbox (the MailboxFull that dropped later images). An
@@ -3429,7 +3410,9 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
         // message can surface long after it was sent, so ordering by arrival would misplace it.
         let (text, ts, expire_at) = match c {
             Content::TextStamped { text, ts } | Content::TextReply { text, ts, .. } => (text, ts, None),
-            Content::Text(t) => (t, now_secs(), None),
+            // Unstamped `Text` is refused, not stamped with our arrival time — see the same
+            // refusal in `client::recv_session_multi` (#179).
+            Content::Text(_) => continue,
             Content::TextExpiring { text, expire_at } => {
                 // Arrived after its self-destruct time (DTN store-and-forward can delay it) — it
                 // came dead: never surface it, never persist it.

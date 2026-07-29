@@ -4087,7 +4087,6 @@ pub struct RelayPrefs {
     /// the decision belongs here — at relay CHOICE — rather than per message. `Durable` means
     /// "an accepted message survives that relay restarting"; `Volatile` is the lower-residue
     /// posture, and (like ephemeral blobs) an unverifiable claim.
-    #[serde(default)]
     pub prefer_mail_durability: Option<node::node::MailboxDurability>,
 }
 

@@ -3187,7 +3187,16 @@ fn persist_incoming_history(store: &Store, msgs: &[Option<Received>], now: u64) 
         let (text, ts) = match content::decode(&m.plaintext) {
             Ok(content::Content::TextStamped { text, ts })
             | Ok(content::Content::TextReply { text, ts, .. }) => (text, ts),
-            Ok(content::Content::Text(t)) => (t, now),
+            // Unstamped `Text` is REFUSED (#179). Nothing has produced it since messages carried
+            // the sender's timestamp: accepting it meant stamping the message with our ARRIVAL
+            // time, which then feeds `msg_id` — so the two sides computed different ids for one
+            // message and reactions, replies and edits silently failed to line up. The variant
+            // stays reserved in `Content` because postcard numbers variants positionally and the
+            // §14 vectors pin those numbers; what is gone is the behaviour.
+            Ok(content::Content::Text(_)) => {
+                eprintln!("[karst] refused an unstamped Text message — no sender timestamp");
+                continue;
+            }
             // A large-file announcement: persist it as a PENDING DOWNLOAD (idempotent by
             // blob_id) so a crash mid-download can retry — the blob lives on the relay until
             // its TTL. Durable here, BEFORE the ack, for the same reason text history is: the

@@ -1949,7 +1949,6 @@ pub struct FetchRequest {
     /// a Ristretto address has no DH with the relay's X25519 key, so it proves knowledge of the
     /// fetch secret (the discrete log of the address) instead. Empty = use the DH `proof` (the
     /// identity mailbox). Bound to the cookie MAC as its context (anti-replay).
-    #[serde(default)]
     pub own_proof: Vec<u8>,
 }
 
@@ -1967,7 +1966,6 @@ pub struct AckRequest {
     pub ids: Vec<[u8; 32]>,
     /// Schnorr ownership proof for a blinded drop-box (see `FetchRequest::own_proof`). Empty =
     /// use the DH `proof`. The right to delete is the same right as to read, proven the same way.
-    #[serde(default)]
     pub own_proof: Vec<u8>,
 }
 

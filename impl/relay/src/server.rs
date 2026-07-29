@@ -22,7 +22,7 @@ use snow::Builder;
 use node::protocol::{AckResponse, BlobResponse, BundleOpkResponse, FetchResponse, PublishResponse, Response};
 use crate::node::{RelayNode};
 use node::session::{Session, NOISE_PARAMS};
-use node::transport::Channel;
+use karst_transport::transport::Channel;
 use node::wire::{
     decode, encode, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_RESPONSE_FRAME,
 };
@@ -260,7 +260,7 @@ fn handle_conn(
     // the inner byte stream. Either way the Noise handshake comes BEFORE any
     // plaintext processing; a failure closes the connection.
     let channel: Box<dyn Channel> = match tls {
-        Some(config) => node::wss::accept_wss(stream, config)?,
+        Some(config) => karst_transport::wss::accept_wss(stream, config)?,
         None => Box::new(stream),
     };
     // A TCP connection carries one Noise session, so its unadmitted count is its own.

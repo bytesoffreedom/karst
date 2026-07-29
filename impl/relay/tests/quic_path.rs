@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use node::quic::QuicAdapter;
-use node::socket::SocketTransport;
-use node::transport::{Dest, Path};
+use karst_transport::quic::QuicAdapter;
+use karst_transport::socket::SocketTransport;
+use karst_transport::transport::{Dest, Path};
 use relay::node::RelayNode;
 use relay::quic_server::QuicServer;
 
@@ -98,7 +98,7 @@ fn a_dead_quic_path_does_not_delay_the_tcp_one() {
     let quic = Arc::new(QuicAdapter::new().expect("client endpoint"));
     let dead_quic = Path::new(quic, Dest::new("192.0.2.1", 9));
     let live_tcp = Path::new(
-        Arc::new(node::transport::DirectTcpAdapter::default()),
+        Arc::new(karst_transport::transport::DirectTcpAdapter::default()),
         Dest::from(tcp_addr),
     );
     let transport = SocketTransport::with_paths(vec![dead_quic, live_tcp], noise_pub);
@@ -106,7 +106,7 @@ fn a_dead_quic_path_does_not_delay_the_tcp_one() {
     let started = std::time::Instant::now();
     transport.get_policy().expect("the TCP path must answer");
     assert!(
-        started.elapsed() < node::transport::CONNECT_TIMEOUT,
+        started.elapsed() < karst_transport::transport::CONNECT_TIMEOUT,
         "took {:?} — the dead QUIC path was waited out instead of raced past",
         started.elapsed()
     );

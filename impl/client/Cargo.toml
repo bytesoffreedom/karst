@@ -25,6 +25,7 @@ rand = "0.8"
 # relying on whatever a transitive user happens to enable.
 zeroize = { version = "1", features = ["derive"] }
 qrcode = { version = "0.14.1", default-features = false }
+karst-transport = { version = "0.1.0", path = "../transport" }
 
 # Unix-only C calls, two of them: `flock(2)` for the deniable container's single-writer lock
 # (A3-8 — std has no advisory file locking, and a lock FILE is not an option because a hidden

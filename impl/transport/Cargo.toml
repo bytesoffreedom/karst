@@ -1,0 +1,34 @@
+[package]
+name = "karst-transport"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+# The CARRIERS (#247): how bytes reach a relay, and nothing about what they mean. Direct TCP,
+# SOCKS5 (the seam to an external pluggable transport), WebSocket-over-TLS, QUIC, and the client
+# dialer that runs a Noise session over whichever of them won.
+#
+# Depends on `node` for the protocol vocabulary and on `karst-crypto` for the Noise session; the
+# arrow never points back, because nothing in the protocol or the session layer knows which carrier
+# is underneath — which is the property that let a QUIC adapter drop in without changing anything
+# above it.
+[dependencies]
+node = { path = "../node" }
+karst-crypto = { path = "../crypto" }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+snow = "0.10.0"
+admission = { path = "../admission" }
+tungstenite = "0.24"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+rustls-pemfile = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync"] }
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

@@ -28,8 +28,4 @@ pub mod protocol;
 // path in this workspace keeps working: the CUT is the dependency direction, not a rename, and
 // making thirty call sites churn would bury the one change that matters.
 pub use karst_crypto::{blind, pqxdh, ratchet, safety, seal, session};
-pub mod quic;
-pub mod socket;
-pub mod transport;
 pub mod wire;
-pub mod wss;

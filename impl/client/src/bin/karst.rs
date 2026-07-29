@@ -776,7 +776,7 @@ fn positional_after_flags(args: &[String]) -> Option<String> {
 fn relay_arg(args: &[String]) -> Result<client::Relay, String> {
     let addr = flag(args, "--relay").ok_or("need --relay <addr>")?;
     // Host:port, not just IP:port — a `<b32>.b32.i2p:port` relay resolved by the SOCKS bridge.
-    let addr = node::transport::Dest::parse(&addr).map_err(|e| format!("relay address: {e}"))?;
+    let addr = karst_transport::transport::Dest::parse(&addr).map_err(|e| format!("relay address: {e}"))?;
     let id = flag(args, "--relay-id")
         .ok_or("need --relay-id <hex> (printed when karst-relay starts)")?;
     let id = client::RelayId::parse(&id)?;

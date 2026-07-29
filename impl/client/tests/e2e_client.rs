@@ -16,8 +16,8 @@ use relay::node::{BlobPutRequest, BlobResponse, FetchRequest, FetchResponse, Pay
 use node::peer::Peer;
 use node::pqxdh::Account;
 use relay::server::{RelayServer};
-use node::socket::{SocketTransport};
-use node::transport::{DirectTcpAdapter, Dest, Path, Socks5Adapter};
+use karst_transport::socket::{SocketTransport};
+use karst_transport::transport::{DirectTcpAdapter, Dest, Path, Socks5Adapter};
 use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;
@@ -2697,12 +2697,12 @@ fn failover_skips_a_path_that_accepts_tcp_then_stalls_the_handshake() {
 /// An adapter that counts connect attempts and always fails — stands in for a dead
 /// route without needing a real blackholed IP.
 struct CountingDead(Arc<std::sync::atomic::AtomicUsize>);
-impl node::transport::TransportAdapter for CountingDead {
+impl karst_transport::transport::TransportAdapter for CountingDead {
     fn carrier_label(&self) -> &'static str {
         "counting-dead"
     }
 
-    fn connect(&self, _dest: &node::transport::Dest) -> std::io::Result<Box<dyn node::transport::Channel>> {
+    fn connect(&self, _dest: &karst_transport::transport::Dest) -> std::io::Result<Box<dyn karst_transport::transport::Channel>> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "dead"))
     }

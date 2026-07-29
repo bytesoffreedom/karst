@@ -9,7 +9,7 @@ use std::thread;
 
 use relay::node::{RelayDescriptor, RelayNode, MAX_ADDRS_PER_RELAY, MAX_KNOWN_RELAYS};
 use relay::server::{RelayServer};
-use node::socket::{SocketTransport};
+use karst_transport::socket::{SocketTransport};
 
 const NOW: u64 = 1_000_000;
 

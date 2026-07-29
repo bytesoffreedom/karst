@@ -20,8 +20,8 @@ use std::sync::{Arc, RwLock};
 
 use node::protocol::{RelayDescriptor};
 use crate::node::{RelayNode};
-use node::socket::SocketTransport;
-use node::transport::Dest;
+use karst_transport::socket::SocketTransport;
+use karst_transport::transport::Dest;
 
 /// How often a gossip round runs (seconds).
 pub const GOSSIP_INTERVAL_SECS: u64 = 300;
@@ -67,7 +67,7 @@ pub fn verified_self_descriptor(
     addr: &str,
     allow_private: bool,
 ) -> Option<RelayDescriptor> {
-    if !node::transport::addr_is_dialable(addr, allow_private) {
+    if !karst_transport::transport::addr_is_dialable(addr, allow_private) {
         return None; // never dial into private/loopback space on a peer's say-so (A3-12)
     }
     let dest = Dest::parse(addr).ok()?;
@@ -77,7 +77,7 @@ pub fn verified_self_descriptor(
         .find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
     // Its self-declared addresses still have to pass the SSRF gate: "the relay said so" is not a
     // licence to dial someone's LAN either.
-    own.addrs.retain(|a| node::transport::addr_is_dialable(a, allow_private));
+    own.addrs.retain(|a| karst_transport::transport::addr_is_dialable(a, allow_private));
     if own.addrs.is_empty() {
         return None;
     }
@@ -111,7 +111,7 @@ pub fn gossip_round(
             continue;
         };
         dialed_addrs.insert(peer_addr.clone());
-        if !node::transport::addr_is_dialable(&peer_addr, allow_private) {
+        if !karst_transport::transport::addr_is_dialable(&peer_addr, allow_private) {
             continue; // a known peer's address is still an address we were told about
         }
         dials += 1;

@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use node::blobstore::{BLOB_TTL_SECS, MAX_BLOB_SIZE};
 use relay::node::{BlobPersistence, RelayNode};
 use relay::server::{RelayServer};
-use node::socket::{SocketTransport};
+use karst_transport::socket::{SocketTransport};
 
 const NOW: u64 = 1_000_000;
 

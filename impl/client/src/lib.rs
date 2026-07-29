@@ -43,7 +43,7 @@ pub mod store;
 // decision, because it is one.
 pub use node::peer::Received;
 pub use node::safety::safety_number;
-pub use node::transport::Dest;
+pub use karst_transport::transport::Dest;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -69,9 +69,9 @@ use node::protocol::{
 use node::peer::{ForwardSecrecy, Peer, PeerState};
 use node::pqxdh::Account;
 use node::seal::Identity;
-use node::socket::{BlobSession, SocketTransport};
-use node::transport::{isolation_token, DirectTcpAdapter, Path, Socks5Adapter, TransportAdapter};
-use node::wss::WssAdapter;
+use karst_transport::socket::{BlobSession, SocketTransport};
+use karst_transport::transport::{isolation_token, DirectTcpAdapter, Path, Socks5Adapter, TransportAdapter};
+use karst_transport::wss::WssAdapter;
 
 /// The §15 carrier `transport()` selects, given the SOCKS proxy setting and the
 /// `KARST_WSS` env. Single source of truth so the UI can show what is *actually*
@@ -570,7 +570,7 @@ fn wss_adapter(spec: String) -> WssAdapter {
     let (host, path) = split_wss_spec(&spec);
     let base = match std::env::var("KARST_WSS_ROOT_CA") {
         Ok(ca) if !ca.is_empty() => {
-            match node::wss::client_config_with_extra_root_pem(std::path::Path::new(&ca)) {
+            match karst_transport::wss::client_config_with_extra_root_pem(std::path::Path::new(&ca)) {
                 Ok(cfg) => WssAdapter::with_config(host, cfg),
                 Err(e) => {
                     eprintln!("KARST_WSS_ROOT_CA: {e}; using webpki roots only");
@@ -1119,7 +1119,7 @@ fn verified_self_address(
     hint: &str,
     allow_private: bool,
 ) -> Option<String> {
-    if !node::transport::addr_is_dialable(hint, allow_private) {
+    if !karst_transport::transport::addr_is_dialable(hint, allow_private) {
         return None; // never dial into private/loopback space on a peer's say-so (A3-12)
     }
     let dest = Dest::parse(hint).ok()?;
@@ -1128,7 +1128,7 @@ fn verified_self_address(
     // serves, its own entry (full relay-id: noise AND fetch key) is the only one it vouches for
     // with that key, so its addresses are the only ones this exchange can attribute to it.
     let self_entry = list.iter().find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
-    self_entry.addrs.iter().find(|a| node::transport::addr_is_dialable(a, allow_private)).cloned()
+    self_entry.addrs.iter().find(|a| karst_transport::transport::addr_is_dialable(a, allow_private)).cloned()
 }
 
 /// §12 — discover relays from a known one and IMPORT the verified ones into this account's
@@ -1168,7 +1168,7 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
     // local or LAN deployment the user configured deliberately, so its peers being local is
     // consistent. Relays added explicitly (invite / config) are unaffected — this gates only
     // AUTO-discovery.
-    let allow_private = !node::transport::addr_is_dialable(&from.addr.to_string(), false);
+    let allow_private = !karst_transport::transport::addr_is_dialable(&from.addr.to_string(), false);
     let mut added = 0usize;
     for d in discovered {
         let id_hex = d.relay_id_hex();

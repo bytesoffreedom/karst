@@ -504,6 +504,7 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
+ "karst-transport",
  "libc",
  "node",
  "postcard",
@@ -2085,6 +2086,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "karst-transport"
+version = "0.1.0"
+dependencies = [
+ "admission",
+ "chacha20poly1305",
+ "hex",
+ "karst-crypto",
+ "node",
+ "postcard",
+ "quinn",
+ "rand 0.8.7",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "sha2 0.10.9",
+ "snow",
+ "tokio",
+ "tungstenite",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "keccak"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2340,6 +2364,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "karst-crypto",
+ "karst-transport",
  "ml-kem",
  "postcard",
  "quinn",
@@ -3184,6 +3209,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "karst-transport",
  "node",
  "postcard",
  "quinn",

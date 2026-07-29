@@ -31,6 +31,7 @@ tungstenite = "0.24"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+karst-transport = { version = "0.1.0", path = "../transport" }
 
 [[bin]]
 name = "karst-relay"

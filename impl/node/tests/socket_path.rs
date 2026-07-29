@@ -24,7 +24,7 @@ use node::pqxdh::Account;
 use node::seal::Identity;
 use node::session::Session;
 use relay::server::{RelayServer};
-use node::socket::{SocketTransport};
+use karst_transport::socket::{SocketTransport};
 use node::wire::{self, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME};
 use x25519_dalek::PublicKey;
 

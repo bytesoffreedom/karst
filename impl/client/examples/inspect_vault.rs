@@ -70,7 +70,7 @@ fn main() {
     // can see whether a message already sent by the peer arrives and establishes a session.
     if mode.as_deref() == Some("poll") {
         let net = root.load_net().unwrap_or_default();
-        let addr = node::transport::Dest::parse(net.relay_addr.trim()).expect("relay addr");
+        let addr = karst_transport::transport::Dest::parse(net.relay_addr.trim()).expect("relay addr");
         let id = client::RelayId::parse(net.relay_id.trim()).expect("relay id");
         let relay = client::Relay::configured(addr, id, None, "");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();

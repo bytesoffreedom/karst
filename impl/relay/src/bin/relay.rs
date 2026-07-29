@@ -949,7 +949,7 @@ fn run_relay(addr: String) -> io::Result<()> {
     let carrier = match (std::env::var("KARST_RELAY_TLS_CERT"), std::env::var("KARST_RELAY_TLS_KEY"))
     {
         (Ok(cert), Ok(key)) => {
-            let config = node::wss::server_config_from_pem_files(
+            let config = karst_transport::wss::server_config_from_pem_files(
                 std::path::Path::new(&cert),
                 std::path::Path::new(&key),
             )

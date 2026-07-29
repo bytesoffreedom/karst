@@ -14,8 +14,8 @@ use admission::capability::{Capability, Quota, Scope};
 use node::demo::{Client, Recipient};
 use relay::node::{Response};
 use node::seal::Identity;
-use node::socket::SocketTransport;
-use node::transport::Socks5Adapter;
+use karst_transport::socket::SocketTransport;
+use karst_transport::transport::Socks5Adapter;
 use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;

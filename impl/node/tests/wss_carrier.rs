@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use node::session::{Session, NOISE_PARAMS};
-use node::transport::{DirectTcpAdapter, TransportAdapter};
-use node::wss::{accept_wss, client_config_with_roots, WssAdapter};
+use karst_transport::transport::{DirectTcpAdapter, TransportAdapter};
+use karst_transport::wss::{accept_wss, client_config_with_roots, WssAdapter};
 use rustls::pki_types::PrivateKeyDer;
 use rustls::{RootCertStore, ServerConfig};
 use snow::Builder;
@@ -106,7 +106,7 @@ fn wss_carrier_round_trips_and_first_bytes_are_a_tls_hello() {
     // Client side: dial the relay through the wss carrier (SNI "localhost", trusting
     // the test root), then speak Noise inside it.
     let adapter = WssAdapter::with_config("localhost", client_tls);
-    let channel = adapter.connect(&node::transport::Dest::from(addr)).unwrap();
+    let channel = adapter.connect(&karst_transport::transport::Dest::from(addr)).unwrap();
     let mut sess = Session::connect(channel, &relay_pub).unwrap();
     sess.write_msg(b"ping over https", 1 << 20).unwrap();
     let reply = sess.read_msg(1 << 20).unwrap();
@@ -169,7 +169,7 @@ fn wss_carrier_round_trips_a_multichunk_payload() {
     });
 
     let adapter = WssAdapter::with_config("localhost", client_tls);
-    let channel = adapter.connect(&node::transport::Dest::from(addr)).unwrap();
+    let channel = adapter.connect(&karst_transport::transport::Dest::from(addr)).unwrap();
     let mut sess = Session::connect(channel, &relay_pub).unwrap();
     sess.write_msg(&req, 1 << 20).unwrap();
     let got = sess.read_msg(1 << 20).unwrap();
@@ -187,7 +187,7 @@ fn relay_server_with_tls_serves_a_wss_client_end_to_end() {
     // end to end from the relay binary's own server type.
     use relay::node::{FetchRequest, FetchResponse, RelayNode, Transport};
     use relay::server::{generate_noise_keypair, RelayServer};
-use node::socket::{SocketTransport};
+use karst_transport::socket::{SocketTransport};
 
     // Matched client/server TLS from the same self-signed test cert.
     let (client_tls, server_cfg) = test_tls();
@@ -230,8 +230,8 @@ fn wss_trusts_an_extra_root_ca_loaded_from_pem() {
     let pem_path = std::env::temp_dir().join(format!("karst-test-ca-{}.pem", std::process::id()));
     std::fs::write(&pem_path, cert.cert.pem()).unwrap();
 
-    let client_tls = node::wss::client_config_with_extra_root_pem(&pem_path).unwrap();
-    let server_cfg = node::wss::server_config(vec![cert_der], key_der).unwrap();
+    let client_tls = karst_transport::wss::client_config_with_extra_root_pem(&pem_path).unwrap();
+    let server_cfg = karst_transport::wss::server_config(vec![cert_der], key_der).unwrap();
     std::fs::remove_file(&pem_path).ok();
 
     let (relay_priv, relay_pub) = relay_keys();
@@ -246,7 +246,7 @@ fn wss_trusts_an_extra_root_ca_loaded_from_pem() {
     });
 
     let adapter = WssAdapter::with_config("localhost", client_tls);
-    let channel = adapter.connect(&node::transport::Dest::from(addr)).unwrap();
+    let channel = adapter.connect(&karst_transport::transport::Dest::from(addr)).unwrap();
     let mut sess = Session::connect(channel, &relay_pub).unwrap();
     sess.write_msg(b"private ca", 1 << 20).unwrap();
     assert_eq!(sess.read_msg(1 << 20).unwrap(), b"ok");
@@ -266,10 +266,10 @@ impl TransportAdapter for SpyAdapter {
 
     fn connect(
         &self,
-        dest: &node::transport::Dest,
-    ) -> io::Result<Box<dyn node::transport::Channel>> {
+        dest: &karst_transport::transport::Dest,
+    ) -> io::Result<Box<dyn karst_transport::transport::Channel>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        node::transport::DirectTcpAdapter::default().connect(dest)
+        karst_transport::transport::DirectTcpAdapter::default().connect(dest)
     }
 }
 
@@ -293,7 +293,7 @@ fn wss_carrier_routes_through_an_inner_adapter() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let spy = Arc::new(SpyAdapter { calls: calls.clone() });
     let adapter = WssAdapter::with_config("localhost", client_tls).through(spy);
-    let channel = adapter.connect(&node::transport::Dest::from(addr)).unwrap();
+    let channel = adapter.connect(&karst_transport::transport::Dest::from(addr)).unwrap();
     let mut sess = Session::connect(channel, &relay_pub).unwrap();
     sess.write_msg(b"via inner", 1 << 20).unwrap();
     assert_eq!(sess.read_msg(1 << 20).unwrap(), b"ok");
@@ -325,7 +325,7 @@ fn direct_tcp_first_bytes_are_not_a_tls_hello() {
     });
 
     let adapter = DirectTcpAdapter::default();
-    let channel = adapter.connect(&node::transport::Dest::from(addr)).unwrap();
+    let channel = adapter.connect(&karst_transport::transport::Dest::from(addr)).unwrap();
     let mut sess = Session::connect(channel, &relay_pub).unwrap();
     sess.write_msg(b"hello", 1 << 20).unwrap();
     server.join().unwrap();
@@ -370,7 +370,7 @@ fn the_client_requests_the_configured_secret_path_not_root() {
     // The operator's secret co-hosting path — random and unguessable, never a KARST default.
     let secret = "/s3cret-9f2a-co-host";
     let adapter = WssAdapter::with_config("localhost", client_tls).path(secret);
-    let _channel = adapter.connect(&node::transport::Dest::from(addr)).unwrap();
+    let _channel = adapter.connect(&karst_transport::transport::Dest::from(addr)).unwrap();
 
     server.join().unwrap();
     assert_eq!(
@@ -408,7 +408,7 @@ fn the_default_path_is_neutral_root_not_a_karst_fingerprint() {
 
     // No .path() call → the default.
     let adapter = WssAdapter::with_config("localhost", client_tls);
-    let _channel = adapter.connect(&node::transport::Dest::from(addr)).unwrap();
+    let _channel = adapter.connect(&karst_transport::transport::Dest::from(addr)).unwrap();
 
     server.join().unwrap();
     assert_eq!(seen.lock().unwrap().as_str(), "/", "the default path must be the neutral /");

@@ -107,7 +107,7 @@ fn gossip_round_rejects_a_poisoned_descriptor() {
 /// itself is egress SSRF and internal port probing.
 #[test]
 fn gossip_refuses_private_and_loopback_destinations() {
-    use node::transport::addr_is_dialable;
+    use karst_transport::transport::addr_is_dialable;
 
     for addr in [
         "127.0.0.1:9000",          // loopback

@@ -13,12 +13,12 @@ use admission::capability::Capability;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use crate::discovery::DiscoveryRecord;
-use crate::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, Transport, WireMessage};
-use crate::pqxdh::PreKeyBundle;
-use crate::session::Session;
+use node::discovery::DiscoveryRecord;
+use node::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, Transport, WireMessage};
+use karst_crypto::pqxdh::PreKeyBundle;
+use karst_crypto::session::Session;
 use crate::transport::{Channel, Dest, DirectTcpAdapter, Path, TransportAdapter};
-use crate::wire::{
+use node::wire::{
     decode, encode, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME,
 };
 
@@ -468,7 +468,7 @@ impl Transport for SocketTransport {
         // is exactly how a full batch would have looked: "bundle not published", no reason given.
         match self.round_trip_sized(
             &WireRequest::PublishBundle(req.clone()),
-            crate::wire::MAX_PUBLISH_FRAME,
+            node::wire::MAX_PUBLISH_FRAME,
             MAX_RESPONSE_FRAME,
         ) {
             Ok(WireResponse::NeedCookie(c)) => PublishResponse::NeedCookie(c),

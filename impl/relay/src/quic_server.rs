@@ -17,7 +17,7 @@
 //! **The certificate is transport encapsulation, not identity.** It is self-signed and minted at
 //! startup, because the relay is authenticated by `Noise_NK` against its pinned relay-id INSIDE
 //! this tunnel — the same way on every carrier. Clients do not verify it (see
-//! `node::quic::NoiseAuthenticatesTheRelay`); a CA chain would certify a DNS name nobody uses.
+//! `karst_transport::quic::NoiseAuthenticatesTheRelay`); a CA chain would certify a DNS name nobody uses.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use quinn::rustls;
 
 use crate::node::RelayNode;
-use node::quic::ALPN;
+use karst_transport::quic::ALPN;
 
 use crate::server::{serve_channel, Clock, ConnLimiter, MAX_CONNECTIONS};
 

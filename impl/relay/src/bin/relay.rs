@@ -1171,6 +1171,7 @@ fn env_from_answers(
     blob: &str,
     mail: &str,
     quota: &str,
+    quic: &str,
 ) -> Vec<(&'static str, String)> {
     let mut env: Vec<(&'static str, String)> = vec![("KARST_RELAY_MODE", mode.trim().to_string())];
     let mut put = |k: &'static str, v: &str| {
@@ -1181,6 +1182,10 @@ fn env_from_answers(
     put("KARST_RELAY_ADDR", addr);
     put("KARST_RELAY_HOME", home);
     put("KARST_RELAY_ADVERTISE", advertise);
+    // Emitted EITHER way, not only when it differs from the default: the generated config is what
+    // an operator reads back later to see what this relay does, and a listening UDP port should
+    // not be something they have to remember was implied.
+    put("KARST_RELAY_QUIC", if is_yes(quic) { "on" } else { "off" });
     if mode.trim() == "public" {
         put("KARST_RELAY_POW_BITS", pow_bits);
     }
@@ -1301,6 +1306,18 @@ fn run_setup_wizard() -> io::Result<()> {
         }
     }
 
+    // QUIC belongs in Transport for the same reason wss does: it is a route the bytes may take,
+    // not a change to who may use the relay. Asked plainly, because an operator who does not know
+    // what QUIC is still has to be able to answer — and because a UDP port they did not expect is
+    // exactly the kind of surprise that erodes trust in an installer.
+    let quic = ask(
+        "\n Also accept QUIC (over UDP) beside TCP? Same port number, same protocol, and the same\n\
+         \x20 admission checks — it is simply a faster route for clients that can use it, and\n\
+         \x20 clients that cannot keep using TCP with nothing lost. It opens a UDP port. Some\n\
+         \x20 networks block UDP; if yours does the relay says so at startup and carries on. (Y/n)",
+        "y",
+    )?;
+
     // PoW + self-advertise + federation are asked ONLY for a public door: they are meaningless or
     // pure noise on the invite-only common path. Their niche uses stay reachable via env vars.
     let mut pow_bits = String::new();
@@ -1376,7 +1393,7 @@ fn run_setup_wizard() -> io::Result<()> {
     // thread is spawned), then show a readable summary + the exact scriptable equivalent.
     let env = env_from_answers(
         &mode, &addr, &home, &advertise, &pow_bits, &tls_cert, &tls_key, &peers, &blob, &mail,
-        &quota,
+        &quota, &quic,
     );
     for (k, v) in &env {
         std::env::set_var(k, v);
@@ -1598,9 +1615,12 @@ mod tests {
         let env = env_from_answers(
             "public", "0.0.0.0:9000", "/srv/relay", "relay.example:9000", "22",
             "/etc/tls/fullchain.pem", "/etc/tls/privkey.pem", "1.2.3.4:9000@aa", "ephemeral", "durable",
-            "media-friendly",
+            "media-friendly", "y",
         );
         let get = |k: &str| env.iter().find(|(kk, _)| *kk == k).map(|(_, v)| v.as_str());
+        // The QUIC listener is written out EITHER way, so the generated config says what the
+        // relay does rather than leaving a listening UDP port implied by a default.
+        assert_eq!(get("KARST_RELAY_QUIC"), Some("on"));
         assert_eq!(get("KARST_RELAY_MODE"), Some("public"));
         assert_eq!(get("KARST_RELAY_ADDR"), Some("0.0.0.0:9000"));
         assert_eq!(get("KARST_RELAY_HOME"), Some("/srv/relay"));
@@ -1616,18 +1636,33 @@ mod tests {
         assert!(Role::parse(get("KARST_RELAY_MODE")).is_ok());
         assert!(parse_blob_persistence(get("KARST_RELAY_BLOB_PERSIST")).is_ok());
 
-        // Private with everything optional blank: ONLY mode is set; PoW bits are dropped even if
-        // typed (they are public-only), and blanks never become empty-string env entries.
-        let env = env_from_answers("private", "", "", "", "20", "", "", "", "", "", "");
-        assert_eq!(env, vec![("KARST_RELAY_MODE", "private".to_string())], "blanks omitted; pow dropped for private");
+        // Private with everything optional blank: only the mode and the QUIC switch are set. PoW
+        // bits are dropped even if typed (they are public-only) and blanks never become
+        // empty-string entries — but the QUIC listener is written EITHER way, on purpose: the
+        // generated config is what an operator reads back to see what this relay does, and a
+        // listening UDP port must not be left implied by a default that could change later.
+        let env = env_from_answers("private", "", "", "", "20", "", "", "", "", "", "", "y");
+        assert_eq!(
+            env,
+            vec![
+                ("KARST_RELAY_MODE", "private".to_string()),
+                ("KARST_RELAY_QUIC", "on".to_string()),
+            ],
+            "blanks omitted; pow dropped for private; the QUIC choice always recorded"
+        );
+
+        // ...and "no" is recorded just as explicitly, so a relay that does NOT open a UDP port
+        // says so in its own config rather than by the absence of a line.
+        let off = env_from_answers("private", "", "", "", "", "", "", "", "", "", "", "n");
+        assert!(off.contains(&("KARST_RELAY_QUIC", "off".to_string())));
 
         // PoW bits are recorded for a public door.
-        let env = env_from_answers("public", "", "", "", "18", "", "", "", "", "", "");
+        let env = env_from_answers("public", "", "", "", "18", "", "", "", "", "", "", "y");
         assert!(env.contains(&("KARST_RELAY_POW_BITS", "18".to_string())));
 
         // wss is emitted only as a cert+key PAIR — a lone cert (or lone key) is dropped, never
         // half-configured (that would make the relay refuse to start).
-        let lone = env_from_answers("public", "", "", "", "20", "/c.pem", "", "", "", "", "");
+        let lone = env_from_answers("public", "", "", "", "20", "/c.pem", "", "", "", "", "", "y");
         assert!(!lone.iter().any(|(k, _)| k.starts_with("KARST_RELAY_TLS")), "lone cert dropped");
     }
 

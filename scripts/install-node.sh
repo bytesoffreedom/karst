@@ -51,7 +51,7 @@ echo
 karst_require_toolchain
 
 echo "Building the relay (release; this can take several minutes the first time)…"
-karst_build_release -p node --bin karst-relay
+karst_build_release -p relay --bin karst-relay
 mkdir -p "$BINDIR"
 # Atomic replace so re-installing over a RUNNING relay (the update path) works.
 karst_install_bin "$(karst_bin_release karst-relay)" "$BINDIR/karst-relay"
@@ -95,6 +95,15 @@ elif ask_yn "  Use DEV mode (LOCAL TESTING ONLY — not for real use)?" n; then
 else
   MODE="private"
 fi
+
+# QUIC sits beside wss in the same section for the same reason: it is a route the bytes may
+# take, not a change to who may use the relay. Asked explicitly rather than defaulted silently —
+# a UDP port an operator did not expect is exactly the surprise that costs an installer its trust.
+echo "  QUIC is a faster route for clients that can use it; clients that cannot keep using TCP"
+echo "  with nothing lost. Same protocol, same admission checks, same port number — it opens a"
+echo "  UDP port. Some networks block UDP; if yours does the relay says so and carries on."
+QUIC=off
+ask_yn "  Also accept QUIC (over UDP)?" y && QUIC=on
 
 CERT="" ; KEY=""
 if ask_yn "  Enable the WebSocket-over-TLS carrier (look like ordinary HTTPS)?" n; then
@@ -217,6 +226,9 @@ ENVFILE="$RHOME/relay.env"
   echo "KARST_RELAY_ADDR=$ADDR"
   echo "KARST_RELAY_HOME=$RHOME"
   echo "KARST_RELAY_MODE=$MODE"
+  # Written EITHER way: the config file is what you read back later to see whether this relay
+  # holds a UDP port open, and that must not be left implied by a default that could change.
+  echo "KARST_RELAY_QUIC=$QUIC"
   # PoW difficulty for a public door (0 = open / no PoW). Toggle live: `karst-relay pow`.
   [ "$MODE" = public ] && echo "KARST_RELAY_POW_BITS=${POW_BITS:-20}"
   # Node-list discovery (public — which relays exist). Advertise self + seed peers.
@@ -253,7 +265,7 @@ KEY_EXISTED=0 ; [ -f "$RHOME/relay.key" ] && KEY_EXISTED=1
 PROBE="$ADDR" ; case "$ADDR" in 0.0.0.0:*) PROBE="127.0.0.1:${ADDR##*:}" ;; esac
 PLOG="$(mktemp)"
 POW="" ; [ "$MODE" = public ] && POW="KARST_RELAY_POW_BITS=${POW_BITS:-20}"
-KARST_RELAY_HOME="$RHOME" KARST_RELAY_MODE="$MODE" $POW ${CERT:+KARST_RELAY_TLS_CERT="$CERT" KARST_RELAY_TLS_KEY="$KEY"} \
+KARST_RELAY_HOME="$RHOME" KARST_RELAY_MODE="$MODE" KARST_RELAY_QUIC="$QUIC" $POW ${CERT:+KARST_RELAY_TLS_CERT="$CERT" KARST_RELAY_TLS_KEY="$KEY"} \
   "$RELAY_BIN" "$ADDR" >"$PLOG" 2>&1 &
 PRIME_PID=$!
 RELAY_ID=""

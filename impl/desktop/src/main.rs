@@ -920,11 +920,24 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
     // (pre-proxy / fresh accounts get proxy 0 here). The root is never published.
     let _ = default_proxy(&store);
     // Unlock is this client's "we are online again" moment, and therefore where a channel that
-    // was created offline finally earns its own credential (A8-4). Gap-filling only, so an
-    // account whose channels are all provisioned makes no request at all. Offline is the empty
-    // relay set, so this no-ops there for the same reason `do_publish` does.
+    // was created offline finally earns its own credential (A8-4). Gap-filling only, so the
+    // ordinary unlock — every channel already provisioned — makes no request at all.
+    //
+    // OFF THE UNLOCK PATH, deliberately: a public relay's door is proof-of-work, capped at 26
+    // bits (SEC-41), so filling several channels' gaps at once is seconds of hashing. Inline, that
+    // is a UI that will not open while it grinds. The thread re-announces afterwards because a
+    // channel that just earned its credential was skipped by the `do_publish` below (publishing a
+    // bundle is metered, so a channel with no credential cannot announce).
     if !offline {
-        report_backfill(client::earn_missing_capabilities(&store, &relays));
+        let (bstore, brelays) = (store.clone(), relays.clone());
+        std::thread::spawn(move || {
+            let b = client::earn_missing_capabilities(&bstore, &brelays);
+            let earned = b.earned;
+            report_backfill(b);
+            if earned > 0 {
+                do_publish(&bstore, &brelays, false);
+            }
+        });
     }
     // OFFLINE mode emits nothing — do_publish no-ops when offline (a hidden account defaults to
     // offline so it produces zero network traffic until the user deliberately syncs).
@@ -1410,6 +1423,14 @@ fn add_extra_relay(app: State<App>, addr: String, relay_id: String) -> Result<()
         store.save_extra_relays(&list).map_err(|e| e.to_string())?;
     }
     s.relays = build_relays(&store);
+    // A newly added relay has no credential for ANY channel yet, so without this the announce
+    // below skips it and the backup silently does nothing (A8-4 — same pass as `set_net`, which
+    // does the identical thing for the primary). Inline rather than off-thread: unlike unlock,
+    // this is a deliberate action the user is waiting on, and a backup that is not reachable when
+    // the call returns is a backup that looks broken.
+    if !app.offline.load(Ordering::SeqCst) {
+        report_backfill(client::earn_missing_capabilities(&store, &s.relays));
+    }
     do_publish(&store, &s.relays, app.offline.load(Ordering::SeqCst));
     Ok(())
 }

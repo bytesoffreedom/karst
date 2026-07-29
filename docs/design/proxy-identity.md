@@ -168,6 +168,13 @@ it is never derived from, or storable back into, the recovery phrase. Consequenc
    gap is reported (`CapabilityBackfill::still_missing`) rather than swallowed, and the next
    online pass fills it.
 
+   The unlock-time pass runs OFF the unlock path, on its own thread, and re-announces if it earned
+   anything. A public relay's difficulty is capped at 26 bits (SEC-41), so filling several
+   channels' gaps at once is seconds of hashing — inline, that is a UI that will not open while it
+   grinds. The passes the user explicitly triggers (configuring a relay, adding a backup, minting
+   a channel) stay inline, because there the user is waiting on the result and a channel that
+   cannot reach the relay when the call returns just looks broken.
+
    **The remaining honest limit: invite-only relays.** An operator invite is ONE credential,
    resolved once and revocable as a unit (#231) — N channels cannot each hold their own unless the
    operator mints N invites. `Store::save_shared_capability_for` stores such a credential for every

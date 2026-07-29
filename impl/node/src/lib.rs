@@ -17,19 +17,18 @@
 /// Mailbox deposit/fetch key separation via Ristretto point-blinding — wired into the live
 /// drop-box path for established sessions (reference construction; the Schnorr fetch proof is
 /// unaudited, first-contact openers keep the identity mailbox + DH proof). See the module.
-pub mod blind;
 pub mod blobstore;
 pub mod demo;
 pub mod discovery;
 pub mod drop;
 pub mod peer;
 pub mod protocol;
-pub mod pqxdh;
+
+// The crypto primitives live in their own crate now (#247). Re-exported so every `node::seal::…`
+// path in this workspace keeps working: the CUT is the dependency direction, not a rename, and
+// making thirty call sites churn would bury the one change that matters.
+pub use karst_crypto::{blind, pqxdh, ratchet, safety, seal, session};
 pub mod quic;
-pub mod ratchet;
-pub mod safety;
-pub mod seal;
-pub mod session;
 pub mod socket;
 pub mod transport;
 pub mod wire;

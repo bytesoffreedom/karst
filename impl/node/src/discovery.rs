@@ -120,7 +120,7 @@ pub fn sign_binding(
     single_use: bool,
 ) -> Vec<u8> {
     let msg = binding_msg(discovery_pub, &account.identity_public(), location, expiry, single_use);
-    sign(&account.ik_secret_bytes(), &msg)
+    account.sign_with_ik(&msg)
 }
 
 /// Message the discovery key signs to authorise a delete (turn discovery off).

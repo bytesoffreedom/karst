@@ -7064,8 +7064,8 @@ mod at_rest_shape_guard {
         match module {
             "store" => include_str!("store.rs"),
             "peer" => include_str!("../../node/src/peer.rs"),
-            "ratchet" => include_str!("../../node/src/ratchet.rs"),
-            "pqxdh" => include_str!("../../node/src/pqxdh.rs"),
+            "ratchet" => include_str!("../../crypto/src/ratchet.rs"),
+            "pqxdh" => include_str!("../../crypto/src/pqxdh.rs"),
             other => panic!("no source registered for module {other}"),
         }
     }

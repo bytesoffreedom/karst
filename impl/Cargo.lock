@@ -2063,6 +2063,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "karst-crypto"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "hex",
+ "hkdf",
+ "hmac",
+ "ml-kem",
+ "postcard",
+ "rand 0.10.2",
+ "rand 0.8.7",
+ "serde",
+ "sha2 0.10.9",
+ "snow",
+ "subtle",
+ "x25519-dalek",
+ "xeddsa",
+ "zeroize",
+]
+
+[[package]]
 name = "keccak"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2317,6 +2339,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "karst-crypto",
  "ml-kem",
  "postcard",
  "quinn",

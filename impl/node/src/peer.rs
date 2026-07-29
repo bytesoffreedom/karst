@@ -1762,7 +1762,7 @@ impl<T: Transport> Peer<T> {
                             .map(|pt| Received { sender: sender_ik, plaintext: pt, msg_id: [0u8; 32] });
                     }
                 }
-                let mut session = Session::init_receiver(root_key, self.account.prekey().clone());
+                let mut session = self.account.init_receiver_session(root_key);
                 // THE authentication step: only a sender who actually holds the claimed identity
                 // key derives this root key, so a forged opener fails here. Bail BEFORE touching
                 // the session maps or the one-time prekey — otherwise a stranger could park a dead

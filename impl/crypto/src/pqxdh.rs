@@ -414,17 +414,25 @@ impl Account {
         self.ik.public.to_bytes()
     }
 
-    /// The identity key's SECRET, for the one signature that is not made here.
+    /// Sign an arbitrary message with the identity key — WITHOUT handing out the key.
     ///
     /// `sign_discovery` used to live on this type, and it was the only thing in the whole PQXDH
     /// module that reached for `discovery` and `protocol` — which made the module graph circular
     /// (`protocol` needs `PreKeyBundle` from here, and `discovery` needs `RelayDescriptor` from
     /// there). Legal inside one crate, impossible once these sit on either side of the trust
-    /// boundary. The signature now lives in `discovery`, where the message it covers is defined,
-    /// and this accessor is what it needs. Crate-visible only: an identity secret is not something
-    /// to hand out beyond the crate that owns the key material (#143).
-    pub(crate) fn ik_secret_bytes(&self) -> [u8; 32] {
-        self.ik.to_secret_bytes()
+    /// boundary. The signature now lives in `discovery`, where the message it covers is defined.
+    ///
+    /// It used to hand back the raw secret, which was tolerable only while `discovery` lived in
+    /// the same crate. Splitting the primitives out (#247) made that a secret crossing a crate
+    /// boundary — so it does not: the caller passes the message in and gets a signature back, and
+    /// the key never leaves the crate that owns it. The split found this; nothing else would
+    /// have.
+    pub fn sign_with_ik(&self, msg: &[u8]) -> Vec<u8> {
+        use xeddsa::Sign;
+        let sk = x25519_dalek::StaticSecret::from(self.ik.to_secret_bytes());
+        let signer = xeddsa::xed25519::PrivateKey::from(&sk);
+        let sig: [u8; 64] = signer.sign(msg, rand010::rng());
+        sig.to_vec()
     }
 
     /// Долговременный identity-ключ (для отправки: sender_ik) — внутри крейта,
@@ -434,7 +442,18 @@ impl Account {
     }
 
     /// Prekey-ключ (для приёма: начальный ratchet-ключ получателя).
-    pub(crate) fn prekey(&self) -> &Identity {
+    /// Open the RECEIVING half of a ratchet from an agreed root key, using this account's signed
+    /// prekey.
+    ///
+    /// A method rather than a `prekey()` accessor because the accessor handed a private key across
+    /// what is now a crate boundary (#247) for a caller that only ever fed it straight back into
+    /// `Session::init_receiver` — and both types live here, so the whole operation belongs here.
+    pub fn init_receiver_session(&self, root_key: [u8; 32]) -> crate::ratchet::Session {
+        crate::ratchet::Session::init_receiver(root_key, self.prekey.clone())
+    }
+
+    #[allow(dead_code)]
+    fn prekey_unused(&self) -> &Identity {
         &self.prekey
     }
 

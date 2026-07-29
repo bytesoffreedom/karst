@@ -28,9 +28,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::drop::DROP_EPOCH_SECS;
+use karst_client_core::drop::DROP_EPOCH_SECS;
 use relay::node::{FetchRequest, FetchResponse, InMemoryTransport, PublishRequest, PublishResponse, RelayNode, Response, Transport, WireMessage};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::{Account, PreKeyBundle};
 use x25519_dalek::PublicKey;
 

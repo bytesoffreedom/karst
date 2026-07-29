@@ -36,8 +36,8 @@ use admission::capability::Capability;
 use admission::cookie::Cookie;
 use x25519_dalek::PublicKey;
 
-use crate::protocol::{fetch_proof, payload_id, publish_proof, AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, Payload, PublishRequest, PublishResponse, Response, SessionEnvelope, Transport, WireMessage};
-use crate::pqxdh::{initiate_key_agreement, Account, KeyAgreement, PreKeyBundle};
+use node::protocol::{fetch_proof, payload_id, publish_proof, AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, Payload, PublishRequest, PublishResponse, Response, SessionEnvelope, Transport, WireMessage};
+use karst_crypto::pqxdh::{initiate_key_agreement, Account, KeyAgreement, PreKeyBundle};
 
 /// How much forward secrecy the FIRST message of a new session actually got.
 ///
@@ -64,8 +64,8 @@ pub enum ForwardSecrecy {
     /// only signal that the PQ leg of this particular handshake is recorded-now-decrypt-later.
     NoOneTimePrekey,
 }
-use crate::ratchet::{RatchetMessage, Session, SessionSnapshot};
-use crate::seal::Identity;
+use karst_crypto::ratchet::{RatchetMessage, Session, SessionSnapshot};
+use karst_crypto::seal::Identity;
 
 /// 32 fresh random bytes from the OS CSPRNG (pseudonyms, request nonces).
 fn random32() -> [u8; 32] {
@@ -101,7 +101,7 @@ struct SessionState {
     /// `crate::drop`). Taken from the root key at key agreement, so both sides hold it
     /// and neither has to send it.
     drop_seed: [u8; 32],
-    /// The PEER's mailbox point `M` (`crate::blind`) — where I compute my OUTBOUND blinded
+    /// The PEER's mailbox point `M` (`karst_crypto::blind`) — where I compute my OUTBOUND blinded
     /// deposit box. The initiator takes it from the peer's signed bundle; the responder from the
     /// key-agreement. My own inbound box uses my own account mailbox secret, not this.
     peer_mailbox_pub: [u8; 32],
@@ -175,7 +175,7 @@ const MAX_PENDING_ACKS: usize = 1_024;
 /// recipient's mailbox TTL bounds how long a deposit could survive anyway, and a ratchet
 /// step likely made the exact ciphertext undeliverable well before — so retrying past this
 /// wastes effort on mail no one can read.
-const OUTBOX_TTL_SECS: u64 = crate::protocol::MAILBOX_TTL_SECS;
+const OUTBOX_TTL_SECS: u64 = node::protocol::MAILBOX_TTL_SECS;
 
 /// One message encrypted and durably queued, awaiting delivery to the relay. Holds the
 /// EXACT ciphertext (`envelope`) so a failed transmit retries the identical bytes rather
@@ -544,7 +544,7 @@ pub struct AckReceipt {
 
 /// What proves ownership of the mailbox being fetched/acked: the IDENTITY mailbox is an X25519 key
 /// (DH proof); a rotating drop-box is a blinded Ristretto address (Schnorr proof over its fetch
-/// secret — `crate::blind`).
+/// secret — `karst_crypto::blind`).
 enum BoxAuth {
     Identity(Identity),
     DropBox { address: [u8; 32], fetch_secret: [u8; 32] },
@@ -571,7 +571,7 @@ pub fn send_ack<T: Transport>(transport: &T, receipt: &AckReceipt, now: u64) {
         // identity mailbox.
         let (proof, own_proof) = match (receipt.own_fetch_secret, cookie) {
             (Some(fs), Some(c)) => {
-                let own = crate::blind::FetchOwnershipProof::prove(&fs, &receipt.mailbox, &c.mac)
+                let own = karst_crypto::blind::FetchOwnershipProof::prove(&fs, &receipt.mailbox, &c.mac)
                     .map(|p| p.to_bytes().to_vec())
                     .unwrap_or_default();
                 ([0u8; 16], own)
@@ -799,13 +799,13 @@ impl<T: Transport> Peer<T> {
 
     /// Load persisted one-time prekey secrets into this peer's account (before receiving,
     /// so openers that used an OPK can be accepted; before publishing, to advertise them).
-    pub fn load_opks(&mut self, secrets: &[crate::pqxdh::OneTimeSecret]) {
+    pub fn load_opks(&mut self, secrets: &[karst_crypto::pqxdh::OneTimeSecret]) {
         self.account.import_opk_secrets(secrets);
     }
 
     /// The account's current unconsumed one-time prekey secrets, to persist after a
     /// `receive` (which consumes some) or a top-up.
-    pub fn export_opks(&self) -> Vec<crate::pqxdh::OneTimeSecret> {
+    pub fn export_opks(&self) -> Vec<karst_crypto::pqxdh::OneTimeSecret> {
         self.account.export_opk_secrets()
     }
 
@@ -862,7 +862,7 @@ impl<T: Transport> Peer<T> {
         now: u64,
     ) -> PublishResponse {
         let bundle = self.account.prekey_bundle();
-        let signed_opks: Vec<crate::pqxdh::SignedOpk> = opks
+        let signed_opks: Vec<karst_crypto::pqxdh::SignedOpk> = opks
             .iter()
             .filter_map(|k| self.account.signed_opk(k))
             .collect();
@@ -1035,7 +1035,7 @@ impl<T: Transport> Peer<T> {
             Some(ka) => {
                 let plain = postcard::to_stdvec(ka).map_err(|e| format!("encode ka: {e}"))?;
                 let sealed_ka =
-                    crate::seal::SkeletonSeal::seal(&PublicKey::from(*peer_ik), &plain);
+                    karst_crypto::seal::SkeletonSeal::seal(&PublicKey::from(*peer_ik), &plain);
                 SessionEnvelope::InitialSealed { sealed_ka, msg: rmsg }
             }
             None => SessionEnvelope::Ratchet(rmsg),
@@ -1197,8 +1197,8 @@ impl<T: Transport> Peer<T> {
         // relay comparing size DISTRIBUTIONS can still tell the populations apart. The
         // Noise layer's buckets hide this from an on-path observer but not from the relay,
         // which sees the payload after decryption. Named, not solved.
-        let msg = crate::ratchet::RatchetMessage {
-            header: crate::ratchet::Header { dh: random32(), pn: 0, n: 0, salt: [7u8; 16] },
+        let msg = karst_crypto::ratchet::RatchetMessage {
+            header: karst_crypto::ratchet::Header { dh: random32(), pn: 0, n: 0, salt: [7u8; 16] },
             ciphertext: {
                 let mut c = vec![0u8; 96];
                 use chacha20poly1305::aead::rand_core::RngCore;
@@ -1278,7 +1278,7 @@ impl<T: Transport> Peer<T> {
                 if peer_mailbox_pub == [0u8; 32] {
                     return Err("session predates blinded mailboxes — re-establish it (connect anew)".into());
                 }
-                let address = crate::blind::deposit_address(&peer_mailbox_pub, &drop_seed, epoch, dir)
+                let address = karst_crypto::blind::deposit_address(&peer_mailbox_pub, &drop_seed, epoch, dir)
                     .ok_or("peer mailbox point is not a valid curve point")?;
                 Ok((address, Handle::Box(*peer_ik, epoch)))
             }
@@ -1456,7 +1456,7 @@ impl<T: Transport> Peer<T> {
                 epochs
                     .iter()
                     .filter_map(|e| {
-                        let address = crate::blind::deposit_address(&own_m, &st.drop_seed, *e, dir)?;
+                        let address = karst_crypto::blind::deposit_address(&own_m, &st.drop_seed, *e, dir)?;
                         let fetch_secret = account.mailbox_fetch_secret(&st.drop_seed, *e, dir);
                         Some((BoxAuth::DropBox { address, fetch_secret }, Handle::Box(*peer_ik, *e), *peer_ik))
                     })
@@ -1541,7 +1541,7 @@ impl<T: Transport> Peer<T> {
                     (fetch_proof(&id.dh(&self.relay_pub), &c.mac, &mailbox), Vec::new())
                 }
                 (BoxAuth::DropBox { fetch_secret, .. }, Some(c)) => {
-                    let own = crate::blind::FetchOwnershipProof::prove(fetch_secret, &mailbox, &c.mac)
+                    let own = karst_crypto::blind::FetchOwnershipProof::prove(fetch_secret, &mailbox, &c.mac)
                         .map(|p| p.to_bytes().to_vec())
                         .unwrap_or_default();
                     ([0u8; 16], own)
@@ -1914,8 +1914,8 @@ impl<T: Transport> Peer<T> {
 #[cfg(test)]
 mod outbox_state_tests {
     use super::{OutboxEntry, PeerState, PersistedSession};
-    use crate::protocol::SessionEnvelope;
-    use crate::ratchet::{Header, RatchetMessage, Session};
+    use node::protocol::SessionEnvelope;
+    use karst_crypto::ratchet::{Header, RatchetMessage, Session};
     use admission::cookie::Cookie;
 
     fn a_ratchet_envelope() -> SessionEnvelope {
@@ -2068,10 +2068,10 @@ mod outbox_state_tests {
     /// LOUD ("re-establish") instead of dropping mail into the void.
     #[test]
     fn a_stale_session_without_a_mailbox_point_fails_loud_on_send() {
-        use crate::protocol::{Response};
+        use node::protocol::{Response};
 use super::LoopbackMail;
-        use crate::pqxdh::Account;
-        use crate::ratchet::Session;
+        use karst_crypto::pqxdh::Account;
+        use karst_crypto::ratchet::Session;
         use admission::capability::{Capability, Quota, Scope};
         
         
@@ -2109,10 +2109,10 @@ use super::LoopbackMail;
 /// SEC-33: unbounded session growth as a trial-decryption DoS amplifier.
 #[cfg(test)]
 mod session_cap_tests {
-    use crate::protocol::{Payload, Response, SessionEnvelope};
+    use node::protocol::{Payload, Response, SessionEnvelope};
 use super::LoopbackMail;
-    use crate::pqxdh::Account;
-    use crate::ratchet::{Header, RatchetMessage, Session};
+    use karst_crypto::pqxdh::Account;
+    use karst_crypto::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
     
     
@@ -2382,10 +2382,10 @@ use super::LoopbackMail;
 #[cfg(test)]
 mod convergence_route_tests {
     use super::{SessionEnvelope, SessionState};
-    use crate::protocol::{Response};
+    use node::protocol::{Response};
 use super::LoopbackMail;
-    use crate::pqxdh::Account;
-    use crate::ratchet::{Header, RatchetMessage, Session};
+    use karst_crypto::pqxdh::Account;
+    use karst_crypto::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
     
     
@@ -2434,7 +2434,7 @@ use super::LoopbackMail;
     fn a_queued_envelope_routes_by_its_own_snapshot_not_by_whatever_session_is_current() {
         let mut peer = mk_lone_peer();
         let peer_ik = [9u8; 32];
-        let mailbox_pub = crate::blind::MailboxSecret::generate().public();
+        let mailbox_pub = karst_crypto::blind::MailboxSecret::generate().public();
         let pre_swap_seed = [1u8; 32];
         let post_swap_seed = [2u8; 32];
         let mk_state = |drop_seed: [u8; 32]| SessionState {
@@ -2453,7 +2453,7 @@ use super::LoopbackMail;
         let dir = crate::drop::direction(&peer.identity(), &peer_ik);
         let epoch = crate::drop::epoch_of(NOW);
         let correct_address =
-            crate::blind::deposit_address(&mailbox_pub, &pre_swap_seed, epoch, dir)
+            karst_crypto::blind::deposit_address(&mailbox_pub, &pre_swap_seed, epoch, dir)
                 .expect("valid curve point");
 
         // The convergence swap: some OTHER session now occupies `sessions[peer_ik]` — the
@@ -2498,7 +2498,7 @@ use super::LoopbackMail;
         let mut peer = super::Peer::new(transport, Account::generate(), dev_cap(), relay_pub);
         let peer_ik = [9u8; 32];
         let seed = [4u8; 32];
-        let mailbox_pub = crate::blind::MailboxSecret::generate().public();
+        let mailbox_pub = karst_crypto::blind::MailboxSecret::generate().public();
         peer.sessions.insert(
             peer_ik,
             SessionState {
@@ -2606,7 +2606,7 @@ use super::LoopbackMail;
     fn a_split_present_only_because_it_was_just_loaded_from_disk_converges_on_the_next_receive() {
         let mut peer = mk_lone_peer();
         let peer_ik = [9u8; 32];
-        let mailbox_pub = crate::blind::MailboxSecret::generate().public();
+        let mailbox_pub = karst_crypto::blind::MailboxSecret::generate().public();
         let mk_state = |drop_seed: [u8; 32]| SessionState {
             session: Session::init_sender([7u8; 32], [8u8; 32]),
             pending_initial: None,
@@ -2644,11 +2644,11 @@ use super::LoopbackMail;
 /// R2-12: one receive pass is bounded in wall-clock time.
 #[cfg(test)]
 mod receive_budget_tests {
-    use crate::protocol::{AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, PublishRequest, PublishResponse, Response, Transport, WireMessage};
+    use node::protocol::{AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, PublishRequest, PublishResponse, Response, Transport, WireMessage};
 use super::LoopbackMail;
-    use crate::pqxdh::PreKeyBundle;
-    use crate::pqxdh::Account;
-    use crate::ratchet::Session;
+    use karst_crypto::pqxdh::PreKeyBundle;
+    use karst_crypto::pqxdh::Account;
+    use karst_crypto::ratchet::Session;
     use admission::capability::{Capability, Quota, Scope};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2868,12 +2868,12 @@ use super::LoopbackMail;
             },
         );
         // A ratchet message this session cannot open — what a diverged chain produces.
-        let garbage = crate::ratchet::RatchetMessage {
-            header: crate::ratchet::Header { dh: [9u8; 32], pn: 0, n: 0, salt: [0u8; 16] },
+        let garbage = karst_crypto::ratchet::RatchetMessage {
+            header: karst_crypto::ratchet::Header { dh: [9u8; 32], pn: 0, n: 0, salt: [0u8; 16] },
             ciphertext: vec![0u8; 32],
         };
-        let payload = crate::protocol::Payload::Session(
-            crate::protocol::SessionEnvelope::Ratchet(garbage),
+        let payload = node::protocol::Payload::Session(
+            node::protocol::SessionEnvelope::Ratchet(garbage),
         );
 
         assert!(peer.process_for_peer(&known, &payload).is_none(), "it genuinely cannot be opened");
@@ -3011,7 +3011,7 @@ pub(crate) struct LoopbackMail {
     boxes: std::rc::Rc<std::cell::RefCell<HashMap<[u8; 32], Vec<Payload>>>>,
     #[allow(clippy::type_complexity)]
     bundles: std::rc::Rc<
-        std::cell::RefCell<HashMap<[u8; 32], (PreKeyBundle, Vec<crate::pqxdh::SignedOpk>)>>,
+        std::cell::RefCell<HashMap<[u8; 32], (PreKeyBundle, Vec<karst_crypto::pqxdh::SignedOpk>)>>,
     >,
 }
 

@@ -13,11 +13,11 @@ use admission::capability::Capability;
 use admission::cookie::Cookie;
 use x25519_dalek::PublicKey;
 
-use crate::protocol::{
+use node::protocol::{
     fetch_proof, payload_id, AckRequest, FetchRequest, FetchResponse, Payload,
     Response, Transport, WireMessage,
 };
-use crate::seal::{Identity, SkeletonSeal};
+use karst_crypto::seal::{Identity, SkeletonSeal};
 
 /// Тонкий клиент: запечатывает сообщение (§2.1-скелет), проходит admission
 /// (§7) с реальным cookie round-trip и шлёт через транспорт.

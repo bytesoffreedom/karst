@@ -1625,7 +1625,7 @@ impl Transport for InMemoryTransport {
 
 #[cfg(test)]
 mod tests {
-    use node::demo::{Client, Recipient};
+    use karst_client_core::demo::{Client, Recipient};
     use node::seal::SkeletonSeal;
     /// A capability the in-crate tests can present when a publish CREATES a slot (CRYPTO-18).
     fn publish_cap() -> Capability {

@@ -1,5 +1,5 @@
 //! §2.1 сессионный E2E: PQXDH + Double Ratchet поверх РЕАЛЬНОГО пути сообщения
-//! (admission §7 → mailbox → fetch-auth), через `node::peer::Peer`.
+//! (admission §7 → mailbox → fetch-auth), через `karst_client_core::peer::Peer`.
 //!
 //! Несущее (не single-roundtrip, который не тронул бы ни цепочку, ни переход
 //! Initial→Ratchet): МУЛЬТИсообщение в ОБЕ стороны через настоящий mailbox с
@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use relay::node::{FetchRequest, FetchResponse, InMemoryTransport, Payload, RelayNode, Response, SessionEnvelope, Transport, WireMessage};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::Account;
 use x25519_dalek::PublicKey;
 
@@ -42,7 +42,7 @@ fn peer(transport: &InMemoryTransport, relay_pub: PublicKey) -> Peer<InMemoryTra
 }
 
 /// Только не-`None` расшифровки, в порядке.
-fn plaintexts(v: Vec<Option<node::peer::Received>>) -> Vec<Vec<u8>> {
+fn plaintexts(v: Vec<Option<karst_client_core::peer::Received>>) -> Vec<Vec<u8>> {
     v.into_iter().flatten().map(|r| r.plaintext).collect()
 }
 

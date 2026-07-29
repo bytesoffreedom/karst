@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use relay::node::{InMemoryTransport, RelayNode, Response, LEASE_SECS};
-use node::peer::{Peer, PeerState};
+use karst_client_core::peer::{Peer, PeerState};
 use node::pqxdh::Account;
 use x25519_dalek::PublicKey;
 
@@ -37,7 +37,7 @@ fn shared() -> (InMemoryTransport, PublicKey) {
     (InMemoryTransport::new(Rc::new(RefCell::new(relay))), relay_pub)
 }
 
-fn plaintexts(v: Vec<Option<node::peer::Received>>) -> Vec<Vec<u8>> {
+fn plaintexts(v: Vec<Option<karst_client_core::peer::Received>>) -> Vec<Vec<u8>> {
     v.into_iter().flatten().map(|r| r.plaintext).collect()
 }
 

@@ -92,7 +92,7 @@ fn main() {
                             Err(_) => println!("    from {}: ({} raw bytes)", short(&m.sender), m.plaintext.len()),
                         }
                     }
-                    let st = ps.load_sessions().unwrap_or_else(|_| node::peer::PeerState::empty());
+                    let st = ps.load_sessions().unwrap_or_else(|_| karst_client_core::peer::PeerState::empty());
                     let (out, inb) = st.debug_peers();
                     println!("    now holds: {} outbound, {} inbound session(s)", out.len(), inb.len());
                 }
@@ -160,7 +160,7 @@ fn main() {
     for p in root.load_proxies() {
         let ps = root.as_proxy(p.index);
         let ik = ps.load_account().map(|ac| ac.identity_public()).unwrap_or([0; 32]);
-        let st = ps.load_sessions().unwrap_or_else(|_| node::peer::PeerState::empty());
+        let st = ps.load_sessions().unwrap_or_else(|_| karst_client_core::peer::PeerState::empty());
         let (out, inb) = st.debug_peers();
         println!("  proxy #{} IK={} outbox={}", p.index, short(&ik), st.outbox_len());
         for (peer, seed) in &out {

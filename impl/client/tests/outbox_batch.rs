@@ -1,7 +1,7 @@
 //! #215 (A4-8) + open half of #163 (R2-6).
 //!
 //! A4-8: `send_session_batch` used to queue a manifest and its chunks one payload at a time,
-//! with no idea whether the outbox (`node::peer`'s shared, capped `PeerState::outbox`) had room
+//! with no idea whether the outbox (`karst_client_core::peer`'s shared, capped `PeerState::outbox`) had room
 //! for the whole batch. `Peer::queue` evicts the OLDEST queued entry — silently — whenever the
 //! outbox is already at its cap, so an unreserved batch could evict entries belonging to a
 //! completely different conversation, all while the ratchet kept advancing and the call reported
@@ -106,7 +106,7 @@ fn filler(n: u32) -> Vec<Vec<u8>> {
     (0..n).map(|i| i.to_le_bytes().to_vec()).collect()
 }
 
-/// The node outbox cap (`node::peer::MAX_OUTBOX`, private to that module) as of this writing.
+/// The node outbox cap (`karst_client_core::peer::MAX_OUTBOX`, private to that module) as of this writing.
 /// Duplicated here because nothing on the client side can see the real constant either. If it
 /// ever drifts out of sync, the failure is loud, not silent: the refusal test below fills to
 /// THIS number and then expects one more payload to be refused — if the real cap is actually
@@ -204,7 +204,7 @@ fn an_eviction_outside_a_batch_is_recorded_with_the_right_victim() {
 }
 
 /// R2-6, the other half: a message nobody could deliver (relay stays dead) ages out past
-/// `node::peer`'s outbox TTL (`relay::node::MAILBOX_TTL_SECS`) during a later `flush_outbox` pass.
+/// `karst_client_core::peer`'s outbox TTL (`relay::node::MAILBOX_TTL_SECS`) during a later `flush_outbox` pass.
 /// No eviction is ever triggered here (the outbox holds one entry, nowhere near its cap) — this
 /// is purely the TTL path, and it must be attributed as `"expired"`, not conflated with
 /// `"evicted"`. Driven entirely by the `now` argument — no real waiting.

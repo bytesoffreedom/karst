@@ -41,7 +41,7 @@ pub mod store;
 // Re-exported here rather than left as a direct dependency so the boundary is stated in one place:
 // what the UI may use is what this crate hands it. Adding to this list should feel like a
 // decision, because it is one.
-pub use node::peer::Received;
+pub use karst_client_core::peer::Received;
 pub use node::safety::safety_number;
 pub use karst_transport::transport::Dest;
 
@@ -61,12 +61,12 @@ fn secret_load_err(what: &str, e: std::io::Error) -> String {
 }
 
 use admission::capability::{Capability, Quota, Scope};
-use node::demo::{Client, Recipient};
+use karst_client_core::demo::{Client, Recipient};
 use node::protocol::{
     BlobGetRequest, BlobPutRequest, BlobResponse, PublishResponse, Response,
     Transport,
 };
-use node::peer::{ForwardSecrecy, Peer, PeerState};
+use karst_client_core::peer::{ForwardSecrecy, Peer, PeerState};
 use node::pqxdh::Account;
 use node::seal::Identity;
 use karst_transport::socket::{BlobSession, SocketTransport};
@@ -1588,7 +1588,7 @@ fn note_lost(store: &Store, peer_ik: [u8; 32], plaintext: &[u8], queued_at: u64,
 }
 
 /// `Peer::queue` one payload against `to_ik`, returning its id and — if queuing it evicted an
-/// OLDER entry to make room (`node::peer::Peer::queue`'s outbox cap silently drops the oldest
+/// OLDER entry to make room (`karst_client_core::peer::Peer::queue`'s outbox cap silently drops the oldest
 /// queued entry when full) — the ledger entry that eviction claimed. The caller must not record
 /// that victim as lost until the save that makes the eviction REAL has landed: recording it
 /// earlier could survive a crash that rolls the eviction back, reporting a message lost that is
@@ -1783,7 +1783,7 @@ pub fn send_session_multi(
 /// retransmit queue. Payloads are queued IN ORDER, so a manifest passed first still precedes its
 /// chunks on the FIFO mailbox.
 ///
-/// **All-or-nothing (#215/A4-8).** `node::peer::Peer::queue` evicts the OLDEST queued entry
+/// **All-or-nothing (#215/A4-8).** `karst_client_core::peer::Peer::queue` evicts the OLDEST queued entry
 /// whenever the outbox is already at its cap, one push at a time — it does not know it is in the
 /// middle of a batch, so an unreserved N-payload batch could have its early pushes evict entries
 /// from a completely unrelated conversation and, if the batch itself is larger than the whole
@@ -3487,7 +3487,7 @@ pub struct MultiReceive {
     /// whose `receive` returned `Ok`: a failed relay's advance is rolled back, so acking its
     /// leased messages would delete mail that was never durably received (delete-without-
     /// deliver). See [`recv_session_multi`], which drains this after its single save.
-    pub acks: Vec<(usize, node::peer::AckReceipt)>,
+    pub acks: Vec<(usize, karst_client_core::peer::AckReceipt)>,
 }
 
 /// Receive across SEVERAL relays with one logical identity (multi-homing), returning every
@@ -3623,7 +3623,7 @@ pub struct DeferredAcks {
     /// and scope are relay-scoped). Paired rather than index-tagged so receipts from several
     /// polls — different relay sets, different proxies — can be [`merge`](Self::merge)d into
     /// one barrier without the indices meaning different things.
-    pending: Vec<(SocketTransport, node::peer::AckReceipt)>,
+    pending: Vec<(SocketTransport, karst_client_core::peer::AckReceipt)>,
 }
 
 impl DeferredAcks {
@@ -3659,7 +3659,7 @@ impl DeferredAcks {
     ) -> Result<(), String> {
         commit()?;
         for (transport, receipt) in &self.pending {
-            node::peer::send_ack(transport, receipt, now);
+            karst_client_core::peer::send_ack(transport, receipt, now);
         }
         Ok(())
     }
@@ -3790,9 +3790,9 @@ mod tests {
         (dir, store)
     }
 
-    fn rx(sender: [u8; 32], text: &[u8], ts: u64, msg_id: [u8; 32]) -> node::peer::Received {
+    fn rx(sender: [u8; 32], text: &[u8], ts: u64, msg_id: [u8; 32]) -> karst_client_core::peer::Received {
         let plaintext = content::encode(&content::Content::TextStamped { text: text.to_vec(), ts });
-        node::peer::Received { sender, plaintext, msg_id }
+        karst_client_core::peer::Received { sender, plaintext, msg_id }
     }
 
     /// A5-10, THE carrying test. The multi-relay receive claimed a failed relay's state change
@@ -3812,7 +3812,7 @@ mod tests {
     #[test]
     fn a_relay_that_fails_leaves_no_trace_in_the_state() {
         use node::protocol::{AckResponse, AckRequest, FetchRequest, FetchResponse, Response, Transport, WireMessage};
-        use node::peer::PeerState;
+        use karst_client_core::peer::PeerState;
 
         #[derive(Clone)]
         struct Fake {
@@ -3880,8 +3880,8 @@ mod tests {
             expire_at: 1_000,
         });
         let msgs = vec![
-            Some(node::peer::Received { sender, plaintext: profile.clone(), msg_id: [1u8; 32] }),
-            Some(node::peer::Received { sender, plaintext: expiring.clone(), msg_id: [2u8; 32] }),
+            Some(karst_client_core::peer::Received { sender, plaintext: profile.clone(), msg_id: [1u8; 32] }),
+            Some(karst_client_core::peer::Received { sender, plaintext: expiring.clone(), msg_id: [2u8; 32] }),
         ];
 
         persist_incoming_history(&store, &msgs, 100).expect("commit succeeds");
@@ -3946,7 +3946,7 @@ mod tests {
         size: u64,
         chunks: u32,
         msg_id: [u8; 32],
-    ) -> node::peer::Received {
+    ) -> karst_client_core::peer::Received {
         let plaintext = content::encode(&content::Content::PostAttachmentRef {
             post_id: [9u8; 16],
             index: 0,
@@ -3958,7 +3958,7 @@ mod tests {
             size,
             chunks,
         });
-        node::peer::Received { sender, plaintext, msg_id }
+        karst_client_core::peer::Received { sender, plaintext, msg_id }
     }
 
     /// SEC-31, the AUTHORIZATION half. A `PostAttachmentRef` was written straight into the pending

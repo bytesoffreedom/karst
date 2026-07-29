@@ -17,9 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::demo::{Client, Recipient};
+use karst_client_core::demo::{Client, Recipient};
 use relay::node::{FetchRequest, FetchResponse, PublishResponse, Response, Transport};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::Account;
 use node::seal::Identity;
 use node::session::Session;

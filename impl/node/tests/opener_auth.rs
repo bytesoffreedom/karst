@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use relay::node::{InMemoryTransport, Payload, RelayNode, SessionEnvelope};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::{initiate_key_agreement, Account};
 use node::ratchet::{Header, RatchetMessage, Session};
 use node::seal::Identity;
@@ -233,7 +233,7 @@ fn a_relay_substituted_one_time_prekey_is_refused() {
 /// full-strength one.
 #[test]
 fn a_bundle_with_no_one_time_prekey_reports_reduced_forward_secrecy() {
-    use node::peer::ForwardSecrecy;
+    use karst_client_core::peer::ForwardSecrecy;
 
     let mut bob = bob_peer();
     let opk = bob.add_opks(1)[0];

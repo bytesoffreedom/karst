@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::store::Store;
 use relay::node::{BlobPutRequest, BlobResponse, FetchRequest, FetchResponse, Payload, PublishResponse, RelayNode, Response, SessionEnvelope, Transport, WireMessage};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::Account;
 use relay::server::{RelayServer};
 use karst_transport::socket::{SocketTransport};
@@ -1503,7 +1503,7 @@ fn seed_provision(s: &Store) -> [u8; client::seed::ENTROPY_BYTES] {
 }
 
 /// The plaintext of every decrypted §2.1 message in a poll (Text/TextStamped).
-fn poll_texts(msgs: &[Option<node::peer::Received>]) -> Vec<Vec<u8>> {
+fn poll_texts(msgs: &[Option<karst_client_core::peer::Received>]) -> Vec<Vec<u8>> {
     msgs.iter()
         .flatten()
         .filter_map(|m| match client::content::decode(&m.plaintext).ok()? {

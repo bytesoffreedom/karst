@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use relay::node::{InMemoryTransport, PublishResponse, RelayNode, Response};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::{Account, PreKeyBundle};
 use x25519_dalek::PublicKey;
 
@@ -40,7 +40,7 @@ fn peer(t: &InMemoryTransport, relay_pub: PublicKey) -> Peer<InMemoryTransport> 
     Peer::new(t.clone(), Account::generate(), dev_cap(), relay_pub)
 }
 
-fn plaintexts(v: Vec<Option<node::peer::Received>>) -> Vec<Vec<u8>> {
+fn plaintexts(v: Vec<Option<karst_client_core::peer::Received>>) -> Vec<Vec<u8>> {
     v.into_iter().flatten().map(|r| r.plaintext).collect()
 }
 
@@ -301,7 +301,7 @@ fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
 #[test]
 fn anonymous_bundle_reads_cannot_drain_a_victims_one_time_prekeys() {
     use relay::node::Transport;
-    use node::peer::ForwardSecrecy;
+    use karst_client_core::peer::ForwardSecrecy;
 
     let (t, relay_pub) = shared();
     let mut bob = peer(&t, relay_pub);

@@ -18,10 +18,7 @@
 /// drop-box path for established sessions (reference construction; the Schnorr fetch proof is
 /// unaudited, first-contact openers keep the identity mailbox + DH proof). See the module.
 pub mod blobstore;
-pub mod demo;
 pub mod discovery;
-pub mod drop;
-pub mod peer;
 pub mod protocol;
 
 // The crypto primitives live in their own crate now (#247). Re-exported so every `node::seal::…`

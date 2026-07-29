@@ -40,3 +40,4 @@ path = "src/bin/relay.rs"
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 postcard = { version = "1", features = ["use-std"] }
+karst-client-core = { path = "../client-core" }

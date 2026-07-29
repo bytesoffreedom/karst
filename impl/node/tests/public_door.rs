@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use admission::params::{EPOCH_DURATION_SECS, POW_WINDOW_SECS};
 use admission::pow;
-use node::demo::{Client, Recipient};
+use karst_client_core::demo::{Client, Recipient};
 use relay::node::{InMemoryTransport, JoinRequest, RelayNode, Response};
 use node::seal::Identity;
 
@@ -311,7 +311,7 @@ fn an_issued_pow_capability_advertises_the_quota_enforcement_will_actually_grant
 fn a_one_time_prekey_batch_is_charged_against_the_publishers_byte_budget() {
     use admission::capability::{Capability, Quota, Scope};
     use relay::node::{InMemoryTransport, RelayNode};
-    use node::peer::Peer;
+    use karst_client_core::peer::Peer;
     use node::pqxdh::Account;
 
     let cap = |max_bytes: u64| Capability {

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use admission::capability::{Capability, Quota, Scope};
 use node::discovery::{self, DiscoveryRecord, DEFAULT_TTL_SECS, MAX_TTL_SECS};
 use relay::node::{InMemoryTransport, PublishResponse, RelayDescriptor, RelayNode};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::Account;
 
 const NOW: u64 = 1_000_000;

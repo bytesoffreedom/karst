@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use relay::node::{AckRequest, AckResponse, FetchRequest, FetchResponse, InMemoryTransport, PublishResponse, RelayNode, Response, Transport, WireMessage};
-use node::peer::Peer;
+use karst_client_core::peer::Peer;
 use node::pqxdh::Account;
 
 const NOW: u64 = 1_000_000;
@@ -76,7 +76,7 @@ impl Transport for Flaky {
     }
 }
 
-fn plaintexts(v: Vec<Option<node::peer::Received>>) -> Vec<Vec<u8>> {
+fn plaintexts(v: Vec<Option<karst_client_core::peer::Received>>) -> Vec<Vec<u8>> {
     v.into_iter().flatten().map(|r| r.plaintext).collect()
 }
 

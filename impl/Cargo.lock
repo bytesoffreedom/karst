@@ -504,6 +504,7 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
+ "karst-client-core",
  "karst-transport",
  "libc",
  "node",
@@ -879,6 +880,7 @@ dependencies = [
  "base64 0.22.1",
  "client",
  "hex",
+ "karst-client-core",
  "serde",
  "serde_json",
  "tauri",
@@ -2064,6 +2066,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "karst-client-core"
+version = "0.1.0"
+dependencies = [
+ "admission",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "hex",
+ "hkdf",
+ "hmac",
+ "karst-crypto",
+ "karst-transport",
+ "node",
+ "postcard",
+ "rand 0.8.7",
+ "serde",
+ "sha2 0.10.9",
+ "subtle",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "karst-crypto"
 version = "0.1.0"
 dependencies = [
@@ -2363,6 +2386,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "karst-client-core",
  "karst-crypto",
  "karst-transport",
  "ml-kem",
@@ -3209,6 +3233,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "karst-client-core",
  "karst-transport",
  "node",
  "postcard",

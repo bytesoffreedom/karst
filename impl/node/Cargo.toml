@@ -57,3 +57,4 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # the client's on-disk store uses, so the test's "disk" round-trip is faithful.
 postcard = { version = "1", features = ["use-std"] }
 karst-transport = { path = "../transport" }
+karst-client-core = { path = "../client-core" }

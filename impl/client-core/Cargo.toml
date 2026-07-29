@@ -1,0 +1,30 @@
+[package]
+name = "karst-client-core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+# The CLIENT's session layer (#247): the §2.1 peer (PQXDH + Double Ratchet + drop-box routing),
+# the drop-box epoch arithmetic, and the skeleton-seal demo path.
+#
+# The last of the five crates #143 planned. Depends on `node` for the protocol vocabulary and on
+# `karst-crypto` for the primitives; nothing in either points back, and NOTHING here can name a
+# relay — which is the whole point the split started from.
+[dependencies]
+node = { path = "../node" }
+karst-crypto = { path = "../crypto" }
+admission = { path = "../admission" }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = { version = "4.1.3", features = ["digest"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+
+[dev-dependencies]
+karst-transport = { path = "../transport" }

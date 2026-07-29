@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::demo::{Client, Recipient};
+use karst_client_core::demo::{Client, Recipient};
 use relay::node::{Response};
 use node::seal::Identity;
 use karst_transport::socket::SocketTransport;

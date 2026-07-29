@@ -220,8 +220,8 @@ fn blob_quota_and_message_quota_are_independent_under_the_same_capability() {
     let bob = node::seal::Identity::generate();
     let relay_rc = std::rc::Rc::new(std::cell::RefCell::new(relay));
     let transport = relay::node::InMemoryTransport::new(relay_rc.clone());
-    let mut alice = node::demo::Client::new(transport.clone(), cap.clone(), &client_addr);
-    let recipient = node::demo::Recipient::new(transport, bob, relay_rc.borrow().relay_public());
+    let mut alice = karst_client_core::demo::Client::new(transport.clone(), cap.clone(), &client_addr);
+    let recipient = karst_client_core::demo::Recipient::new(transport, bob, relay_rc.borrow().relay_public());
     let bob_pub = recipient.public();
     assert!(
         matches!(alice.send(&bob_pub, b"first", NOW), Response::Accepted),

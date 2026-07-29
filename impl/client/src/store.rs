@@ -14,7 +14,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use admission::capability::Capability;
-use node::peer::PeerState;
+use karst_client_core::peer::PeerState;
 use node::pqxdh::Account;
 use node::seal::Identity;
 use rand::rngs::OsRng;
@@ -130,13 +130,13 @@ pub struct QuarantinedMessage {
     pub received_at: u64,
 }
 
-/// One message this build durably queued for delivery (`node::peer::Peer::queue`) but has not
+/// One message this build durably queued for delivery (`karst_client_core::peer::Peer::queue`) but has not
 /// yet resolved — delivered, evicted, or expired. `PeerState`'s own outbox holds only ciphertext
 /// keyed by an opaque id; once an entry is gone there, there is no way to ask it "whose message
 /// was that". This is the client's own memory of that mapping, so a LATER loss (see
 /// [`StrandedSend`]) can still be attributed to what it was, not just that it happened (R2-6).
 /// Removed the moment its id resolves — delivered, evicted, or expired — so it never grows
-/// beyond roughly what `node::peer`'s own outbox cap allows.
+/// beyond roughly what `karst_client_core::peer`'s own outbox cap allows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingSend {
     pub id: u64,
@@ -146,14 +146,14 @@ pub struct PendingSend {
 }
 
 /// Defensive ceiling on the pending-send ledger. In normal operation it never holds more than
-/// `node::peer`'s own outbox cap (512 as of this writing) — every entry here names one still-
-/// queued outbox id — but that constant is private to `node::peer` and this file cannot see it,
+/// `karst_client_core::peer`'s own outbox cap (512 as of this writing) — every entry here names one still-
+/// queued outbox id — but that constant is private to `karst_client_core::peer` and this file cannot see it,
 /// so this is our OWN generous headroom rather than the real number: a loud refusal if
 /// reconciliation ever fell far enough behind to blow through it (a bug, not normal operation).
 const MAX_LEDGER: usize = 4096;
 
 /// A message that was durably queued (ratchet advanced, ciphertext committed to `sessions.dat`)
-/// but will never reach a relay: `node::peer`'s outbox cap evicted it to admit something newer,
+/// but will never reach a relay: `karst_client_core::peer`'s outbox cap evicted it to admit something newer,
 /// or its TTL expired first. Either way the ratchet already moved past this position — there is
 /// nothing to retry, only something to tell the user about instead of the "sent" they would
 /// otherwise see (#215/R2-6). Durably appended by [`Store::park_stranded_send`], read back by
@@ -5421,7 +5421,7 @@ mod tests {
     /// by refusing everything. Deleting the anchor comparison reds it.
     #[test]
     fn a_rolled_back_session_file_is_refused_not_loaded_in_silence() {
-        use node::peer::PeerState;
+        use karst_client_core::peer::PeerState;
         let dir = std::env::temp_dir().join(format!("karst-anchor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::unlock(&dir, b"pw").unwrap();
@@ -7063,7 +7063,7 @@ mod at_rest_shape_guard {
     fn source(module: &str) -> &'static str {
         match module {
             "store" => include_str!("store.rs"),
-            "peer" => include_str!("../../node/src/peer.rs"),
+            "peer" => include_str!("../../client-core/src/peer.rs"),
             "ratchet" => include_str!("../../crypto/src/ratchet.rs"),
             "pqxdh" => include_str!("../../crypto/src/pqxdh.rs"),
             other => panic!("no source registered for module {other}"),

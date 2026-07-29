@@ -30,7 +30,7 @@
 //!   address regardless of what the addresses are. That is a transport concern
 //!   (§15 path isolation), not one addressing can fix.
 
-use crate::seal::Identity;
+use karst_crypto::seal::Identity;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -56,7 +56,7 @@ pub const DROP_EPOCH_SECS: u64 = 24 * 3600;
 /// How many epochs of history can still hold live mail: the relay's `MAILBOX_TTL_SECS`,
 /// rounded up. Derived rather than hardcoded — if either constant moves, the sweep window
 /// must move with it or mail goes quietly unreachable.
-const TTL_EPOCHS: u64 = crate::protocol::MAILBOX_TTL_SECS.div_ceil(DROP_EPOCH_SECS);
+const TTL_EPOCHS: u64 = node::protocol::MAILBOX_TTL_SECS.div_ceil(DROP_EPOCH_SECS);
 
 /// Take a session's stable drop-box seed from its root key.
 ///
@@ -249,7 +249,7 @@ mod tests {
 
         // A DH step advances the ratchet's own root key — that is what heals message keys.
         let stepped = {
-            let mut s = crate::ratchet::Session::init_sender(root, [8u8; 32]);
+            let mut s = karst_crypto::ratchet::Session::init_sender(root, [8u8; 32]);
             let _ = s.encrypt(b"advance the chain");
             s.snapshot()
         };
@@ -329,7 +329,7 @@ mod tests {
         // the sweep OR lengthening the TTL without the other reddens.
         let now = 500 * DROP_EPOCH_SECS;
         let sweep = sweep_epochs(now);
-        let oldest_live = epoch_of(now - crate::protocol::MAILBOX_TTL_SECS);
+        let oldest_live = epoch_of(now - node::protocol::MAILBOX_TTL_SECS);
         assert!(sweep.contains(&oldest_live), "a box still inside the TTL is never polled");
         assert!(sweep.contains(&(epoch_of(now) + 1)), "the sweep must cover the skew epoch too");
     }

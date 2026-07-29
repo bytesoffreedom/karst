@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use relay::node::{FetchRequest, FetchResponse, InMemoryTransport, PublishResponse, RelayNode, Response, Transport, WireMessage, LEASE_SECS};
-use node::peer::{Peer, PeerState};
+use karst_client_core::peer::{Peer, PeerState};
 use node::pqxdh::Account;
 use x25519_dalek::PublicKey;
 
@@ -35,7 +35,7 @@ fn relay() -> (Rc<RefCell<RelayNode>>, InMemoryTransport, PublicKey) {
 
 /// Every decrypted plaintext in a `receive_threaded` batch (drops the `None`s that mean
 /// "not addressed to us / tampered").
-fn plaintexts(msgs: &[Option<node::peer::Received>]) -> Vec<Vec<u8>> {
+fn plaintexts(msgs: &[Option<karst_client_core::peer::Received>]) -> Vec<Vec<u8>> {
     msgs.iter().flatten().map(|r| r.plaintext.clone()).collect()
 }
 
@@ -274,7 +274,7 @@ fn multihomed_receive_acks_and_drains_every_live_relay() {
 
     // State is durable ⇒ ack each receipt through its tagged relay's transport.
     for (i, receipt) in &out.acks {
-        node::peer::send_ack(&relays[*i].0, receipt, NOW);
+        karst_client_core::peer::send_ack(&relays[*i].0, receipt, NOW);
     }
     assert!(r1.borrow().all_slots_for_test().is_empty(), "relay 1 drained by its ACK");
     assert!(r2.borrow().all_slots_for_test().is_empty(), "relay 2 drained by its ACK");
@@ -303,7 +303,7 @@ fn multihomed_crash_before_save_redelivers_after_lease() {
     let p3 = client::receive_threaded(bob.clone(), PeerState::empty(), Vec::new(), &relays, later);
     assert!(plaintexts(&p3.messages).contains(&b"again".to_vec()), "redelivered exactly once");
     for (i, receipt) in &p3.acks {
-        node::peer::send_ack(&relays[*i].0, receipt, later);
+        karst_client_core::peer::send_ack(&relays[*i].0, receipt, later);
     }
     assert!(r1.borrow().all_slots_for_test().is_empty(), "delivered message acked away");
 }
@@ -337,7 +337,7 @@ fn multihomed_crash_after_save_dedups_and_tolerates_a_dead_relay() {
     assert!(plaintexts(&p2.messages).is_empty(), "duplicate fails closed: delivered exactly once");
     // Ack the duplicate away (poll 2's receipt) so the relay stops redelivering it.
     for (i, receipt) in &p2.acks {
-        node::peer::send_ack(&relays[*i].0, receipt, later);
+        karst_client_core::peer::send_ack(&relays[*i].0, receipt, later);
     }
     assert!(r1.borrow().all_slots_for_test().is_empty(), "duplicate acked and removed");
 }

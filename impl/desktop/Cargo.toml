@@ -14,6 +14,7 @@ serde_json = "1"
 client = { path = "../client" }
 hex = "0.4"
 base64 = "0.22"
+karst-client-core = { version = "0.1.0", path = "../client-core" }
 
 [[bin]]
 name = "karst-desktop"

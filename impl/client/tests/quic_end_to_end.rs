@@ -103,6 +103,54 @@ fn a_message_travels_over_quic_discovered_the_way_a_real_client_discovers_it() {
     );
 }
 
+/// **The desktop's actual path: relay → sidecar → next unlock → QUIC.**
+///
+/// The test above proves the chain a caller drives in one go. The desktop does not do that. It
+/// refreshes endpoints into an encrypted sidecar on one run and rebuilds its relays from that
+/// sidecar on the NEXT unlock, so the round trip through `quic_endpoints.dat` is a link the
+/// in-memory test never touches — and it is precisely the link the sentence "the desktop is where
+/// QUIC runs" rests on. An untested link under a published claim is how `Carrier::from_label` got
+/// away with reporting `direct`: everything around it was green.
+///
+/// DISCRIMINATING: have `refresh_quic_endpoints` skip the write, or have the sidecar round-trip
+/// an empty list, and this goes red while both tests above stay green.
+#[test]
+fn what_the_relay_said_survives_the_sidecar_and_still_builds_a_quic_path() {
+    let (addr, rid) = spawn_relay_with_quic();
+    let dir = std::env::temp_dir().join(format!(
+        "karst-test-quic-sidecar-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    // Run #1 — what the desktop's background thread does after unlocking.
+    let relays = vec![client::Relay::new(addr, rid, None)];
+    {
+        let store = client::store::Store::unlock(dir.clone(), b"pw").expect("vault");
+        let changed = client::refresh_quic_endpoints(&store, &relays);
+        assert_eq!(changed, 1, "the refresh learned nothing worth caching from a relay that advertises");
+    }
+
+    // Run #2 — a fresh unlock, exactly as `build_relays` reconstructs its relays: read the cache,
+    // apply it by relay-id, and nothing else.
+    let store = client::store::Store::unlock(dir, b"pw").expect("re-unlock");
+    let cached: std::collections::HashMap<String, Vec<String>> =
+        store.load_quic_endpoints().expect("sidecar readable").into_iter().collect();
+    let eps = cached.get(&rid.hex()).expect("the sidecar kept nothing under this relay's id").clone();
+    assert!(!eps.is_empty(), "the sidecar round-tripped an EMPTY list — a cache that silently forgets");
+
+    let r = client::Relay::new(addr, rid, None).with_quic(eps);
+    assert!(r.carriers().contains(&"quic"), "the cached endpoint did not become a path");
+    client::relay_policy(&r).expect("the relay answered");
+    assert_eq!(
+        r.carrier().label(),
+        "quic",
+        "the desktop's own path completed over some other carrier — the claim that the desktop is \
+         where QUIC runs would be false"
+    );
+}
+
 /// **CONTROL ARM: the same relay through a proxy gets no QUIC path at all.**
 ///
 /// Not "tries QUIC and falls back" — never builds it. Tor implements no SOCKS5 `UDP ASSOCIATE`,

@@ -32,3 +32,8 @@ site_gitignore/
 KARST_logo_kit/
 KARST_screenshots/
 POS2_GITIGNORE.md
+
+# Scratch analysis notes — the suffix IS the marker, so a new one is ignored by
+# construction rather than by remembering to stage explicit paths.
+*_gitignore*.md
+*_gitignore*/

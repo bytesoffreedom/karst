@@ -3,9 +3,6 @@
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#2ED7D1"/>
     </marker>
-    <marker id="arrowDim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7d84"/>
-    </marker>
     <style>
       .card   { fill:#171c1f; stroke:#2b3438; stroke-width:1.5; rx:14; }
       .relay  { fill:#181113; stroke:#4a3138; stroke-width:1.5; rx:14; }
@@ -96,7 +93,7 @@
   <text class="edge" x="620" y="435" text-anchor="middle">end-to-end encryption closes here</text>
 
   <!-- ─────────── Transports ─────────── -->
-  <rect class="card" x="40" y="470" width="500" height="180"/>
+  <rect class="card" x="40" y="470" width="500" height="196"/>
   <text class="title" x="64" y="506">How the bytes travel</text>
   <text class="sub"   x="64" y="527">the user picks; the protocol above is identical</text>
   <text class="item mono" x="64" y="559">direct TCP</text>
@@ -105,30 +102,27 @@
   <text class="note" x="300" y="559">fastest, reveals your address</text>
   <text class="note" x="300" y="583">looks like ordinary web traffic</text>
   <text class="note" x="300" y="607">hides the address, costs latency</text>
-  <text class="note" x="64" y="633">A dead path is raced past, not waited out.</text>
+  <text class="note" x="64" y="649">A path that is down is skipped; the next one carries it.</text>
 
   <!-- ─────────── Multi-homing ─────────── -->
-  <rect class="card" x="580" y="470" width="620" height="180"/>
+  <rect class="card" x="580" y="470" width="620" height="196"/>
   <text class="title" x="604" y="506">No relay is load-bearing</text>
-  <text class="sub"   x="604" y="527">a client is multi-homed and receives from all of them</text>
+  <text class="sub"   x="604" y="527">add more and a client receives through all of them</text>
 
-  <rect class="relay" x="604" y="548" width="150" height="76"/>
+  <rect class="relay" x="604" y="548" width="177" height="76"/>
   <text class="item" x="622" y="574">Relay A</text>
   <text class="note" x="622" y="594">your own</text>
   <text class="note" x="622" y="610">one binary</text>
 
-  <rect class="relay" x="774" y="548" width="150" height="76"/>
-  <text class="item" x="792" y="574">Relay B</text>
-  <text class="note" x="792" y="594">a friend’s</text>
-  <text class="note" x="792" y="610">invite-only</text>
+  <rect class="relay" x="801" y="548" width="177" height="76"/>
+  <text class="item" x="819" y="574">Relay B</text>
+  <text class="note" x="819" y="594">a friend’s</text>
+  <text class="note" x="819" y="610">invite-only</text>
 
-  <rect class="relay" x="944" y="548" width="150" height="76"/>
-  <text class="item" x="962" y="574">Relay C</text>
-  <text class="note" x="962" y="594">public</text>
-  <text class="note" x="962" y="610">proof-of-work door</text>
+  <rect class="relay" x="998" y="548" width="177" height="76"/>
+  <text class="item" x="1016" y="574">Relay C</text>
+  <text class="note" x="1016" y="594">public</text>
+  <text class="note" x="1016" y="610">proof-of-work door</text>
 
-  <path d="M 1114 586 L 1176 586" stroke="#6b7d84" stroke-width="1.5" fill="none" marker-end="url(#arrowDim)"/>
-  <text class="note" x="1120" y="574">…</text>
-
-  <text class="note" x="604" y="644">Losing one costs a route, not an identity — the identity never lived on a relay.</text>
+  <text class="note" x="604" y="649">Losing one costs a route, not an identity — the identity never lived on a relay.</text>
 </svg>

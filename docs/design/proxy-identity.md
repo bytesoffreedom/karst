@@ -141,20 +141,26 @@ it is never derived from, or storable back into, the recovery phrase. Consequenc
    proxies back together exactly the way they were supposed to be kept apart, and letting one
    proxy's traffic burn through another's rate budget.
 
-   **Why this is not being fixed by minting a capability per proxy:** limit #1 above already
-   concedes that a relay serving several of your proxies over one connection/IP can cluster them
-   from fetch timing alone, closable only by putting each proxy on its own circuit (Tor/bridge) —
-   which does not exist yet. Splitting the capability removes one linkage channel while a strictly
-   stronger one (the connection itself) stays wide open, so it buys no real anonymity gain against
-   the threat model this document states, for the price of a new per-proxy PoW-earn/backfill flow,
-   burn-time cleanup, a new "can't publish because its solve failed while offline" failure mode,
-   and — since a relay's per-capability quota is a real anti-abuse control — an N× increase in one
-   account's total addressable relay throughput that nobody asked to grant. The PoW itself is cheap
-   in isolation (`DEFAULT_POW_BITS = 20`, "a sub-second-to-seconds speed bump on a CPU" per
-   `admission::params`) — a handful to a few dozen proxies would cost a few dozen seconds of CPU a
-   day — so cost is not the blocker; the missing per-circuit isolation is. Revisit this once #1 has
-   a real fix (each proxy on its own circuit); until then, a shared capability is consistent, not an
-   extra hole.
+   **CORRECTION (#206, re-examined).** An earlier revision of this document argued that splitting
+   the capability "buys no real anonymity gain", because a relay serving several proxies over one
+   connection can cluster them from timing anyway. That argument does not hold for the
+   configuration this project is actually for. `Peer::scope_for(handle)` derives a SOCKS
+   stream-isolation token PER HANDLE, and handles are per-purpose, per-box, per-epoch — so over
+   Tor each request already rides its own circuit and the connection does NOT link two proxies.
+   In that configuration the shared `capability_id` is not a secondary channel behind a stronger
+   one; it is THE linkage channel, presented in the clear on every single request.
+
+   The reasoning was inverted: the connection-level clustering it leaned on is exactly what the
+   per-handle isolation already removes. The cost side stands — per-proxy credentials need a
+   PoW-earn and backfill flow, a new "cannot publish, its solve failed while offline" failure
+   mode, and an N× rise in one account's addressable relay throughput, since the per-capability
+   quota is a real anti-abuse control. But those are a price to be paid, not a reason the fix is
+   pointless. The credential store is already keyed per relay (`capabilities.dat`, CRYPTO-24), so
+   the shape is (relay-id, proxy) → capability; the missing piece is issuance, not storage.
+
+   Status: OPEN and re-prioritised. Direct-connection users are linked by IP regardless, so this
+   changes nothing for them; Tor users are linked ONLY by this, which is the case the proxy
+   mechanism exists to serve.
 
    **The one real consequence today is a reliability cost, not a privacy one:** a proxy sent under
    heavy load can exhaust the ONE shared 100-request/10-minute window (`POW_CAP_QUOTA`) and starve

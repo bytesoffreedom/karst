@@ -30,6 +30,7 @@
 //! - **только 1:1.**
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use admission::capability::Capability;
 use admission::cookie::Cookie;
@@ -137,6 +138,32 @@ const MAX_OUTBOX: usize = 512;
 /// cap cannot tell them apart. `Peer::take_refused_sessions` makes that refusal loud (a counter
 /// the caller can surface) rather than a message silently vanishing with no trace at all.
 const MAX_SESSIONS: usize = 10_000;
+
+/// Wall-clock ceiling on ONE `Peer::receive` pass (R2-12).
+///
+/// A receive pass fetches the identity mailbox and then EVERY session's inbound drop-box, one
+/// epoch at a time — `sessions + inbound_sessions` boxes on an ordinary cycle (`poll_epochs`, 3
+/// epochs), ten epochs' worth on a sweep cycle. Each of those is its own connect + Noise handshake
+/// + request, because a request per handle is what keeps the relay from linking them.
+///
+/// That loop had no time bound at all. A relay that ACCEPTS connections and then stalls costs
+/// `READ_TIMEOUT` (15 s) per box rather than failing fast the way a blackholed one does (the
+/// identity fetch's `?` aborts that case in one `CONNECT_TIMEOUT`), and box errors are collected
+/// rather than propagated — deliberately, so one bad box cannot discard mail already drained. Put
+/// together: a few dozen sessions on a sweep cycle against a stalling relay is hours inside one
+/// call, with the caller's poll thread wedged behind it. Multi-homed, the relays are polled
+/// sequentially (the ratchet is one conversation, so state has to thread through them in order),
+/// so a single such relay stalls every OTHER relay's mail behind it — the head-of-line half of
+/// R2-12.
+///
+/// Stopping early is safe in the direction that matters: an unfetched box is not a drained one.
+/// Its mail is still on the relay and the next cycle collects it, which is exactly what already
+/// happens for a box whose fetch errors. What is NOT safe is the reverse — dropping mail already
+/// in hand — so the pass returns what it collected and reports the truncation as a box error.
+///
+/// This bounds ONE relay's pass, not the total work. Shrinking the work itself (fewer round trips
+/// per poll) is a different problem, tracked separately as the polling-cost item.
+const RECEIVE_BUDGET: Duration = Duration::from_secs(20);
 
 /// Ceiling on receipts held for a later ACK. One receipt per (relay, box) page fetched in a
 /// receive cycle, so a legitimate multi-homed poll produces a handful; anything approaching this
@@ -429,6 +456,10 @@ pub struct Peer<T: Transport> {
     /// persisted state it loads/saves holds every relay's handles, and a handle minted for
     /// one relay must never be presented to another (see `PeerState::handles`).
     handles: HashMap<([u8; 32], Handle), [u8; 32]>,
+    /// Wall-clock ceiling on one `receive` pass — see `RECEIVE_BUDGET`. A runtime knob, not
+    /// persisted state: it describes how long THIS process is willing to wait, not anything about
+    /// the conversation. Tests shrink it to prove the loop actually stops.
+    receive_budget: Duration,
     /// See `PeerState::last_sweep`.
     last_sweep: u64,
     /// See `PeerState::epoch_hwm` (A6-8, #224).
@@ -557,6 +588,7 @@ impl<T: Transport> Peer<T> {
             nonce_ctr: 0,
             handles: HashMap::new(),
             cookies: HashMap::new(),
+            receive_budget: RECEIVE_BUDGET,
             last_sweep: 0,
             epoch_hwm: 0,
             sessions: HashMap::new(),
@@ -567,6 +599,14 @@ impl<T: Transport> Peer<T> {
             sessions_refused: 0,
             decrypt_attempts_for_test: 0,
         }
+    }
+
+    /// Shorten (or lengthen) the wall-clock ceiling on one `receive` pass — see `RECEIVE_BUDGET`
+    /// for what it bounds and why stopping early is safe. A caller that polls on a tight schedule
+    /// can hand it a budget smaller than the interval so a stalling relay can never make one poll
+    /// overlap the next.
+    pub fn set_receive_budget(&mut self, budget: Duration) {
+        self.receive_budget = budget;
     }
 
     /// This client's drop-box epoch, forced monotonic (A6-8, #224).
@@ -1271,6 +1311,9 @@ impl<T: Transport> Peer<T> {
     /// binds, the fix is a batched multi-mailbox fetch — but note that batching every box
     /// under ONE `client_addr` would relink them and undo the slice.
     pub fn receive(&mut self, now: u64) -> Result<Vec<Option<Received>>, String> {
+        // Monotonic, and deliberately not `now`: the budget measures how long WE have been in this
+        // call, which a wall clock that jumps (or a caller passing a fixed test clock) cannot say.
+        let started = Instant::now();
         self.prune_handles(now);
         // A6-1: converge any split held from BEFORE this cycle — state `import_state`d from an
         // older build, or from a peer this side hasn't polled since the other half landed.
@@ -1351,7 +1394,17 @@ impl<T: Transport> Peer<T> {
             })
             .collect();
         let mut box_err: Option<String> = None;
+        let mut skipped = 0usize;
+        let total_boxes = boxes.len();
         for (auth, handle, owner) in boxes {
+            // R2-12: stop once this pass has spent its budget (see `RECEIVE_BUDGET`). Checked
+            // BEFORE each fetch, not after, so the budget bounds when the last request STARTS —
+            // one in-flight request may still run to its own timeout, which is the tightest bound
+            // available without cancelling a socket mid-flight.
+            if started.elapsed() >= self.receive_budget {
+                skipped += 1;
+                continue;
+            }
             match self.fetch_mailbox(auth, handle, now) {
                 Ok(payloads) => {
                     for p in &payloads {
@@ -1360,6 +1413,17 @@ impl<T: Transport> Peer<T> {
                 }
                 Err(e) => box_err = Some(e),
             }
+        }
+        if skipped > 0 {
+            // Reported through the same channel a failed box uses, and for the same reason: the
+            // mail is still on the relay, so this is "not finished", never "nothing there". It
+            // only becomes the returned error when this pass collected nothing at all (see the
+            // match below) — a truncated pass that DID deliver hands the mail over first.
+            box_err = Some(format!(
+                "receive budget of {}s exhausted — {skipped} of {total_boxes} boxes not fetched \
+                 this cycle; their mail stays on the relay and the next cycle collects it",
+                self.receive_budget.as_secs()
+            ));
         }
 
         // A failed box fetch must not discard mail we already drained. A SUCCESSFUL
@@ -2474,6 +2538,194 @@ mod convergence_route_tests {
              check would — `sessions[peer]` (what `send`/`queue` actually use) must end up \
              holding it regardless of which map the winner started in, and regardless of \
              whether the split was detected fresh or reloaded from disk"
+        );
+    }
+}
+
+/// R2-12: one receive pass is bounded in wall-clock time.
+#[cfg(test)]
+mod receive_budget_tests {
+    use crate::node::{
+        AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse,
+        InMemoryTransport, PublishRequest, PublishResponse, RelayNode, Response, Transport,
+        WireMessage,
+    };
+    use crate::pqxdh::PreKeyBundle;
+    use crate::pqxdh::Account;
+    use crate::ratchet::Session;
+    use admission::capability::{Capability, Quota, Scope};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    /// A relay that answers correctly but SLOWLY — the shape that costs the client dearly. A
+    /// blackholed relay fails fast (the identity fetch's `?` aborts the pass in one connect
+    /// timeout); one that accepts the connection and then takes its time does not, because box
+    /// errors are collected rather than propagated. Counting fetches is what makes the assertion
+    /// independent of how fast the machine running it happens to be.
+    #[derive(Clone)]
+    struct SlowTransport {
+        inner: InMemoryTransport,
+        per_request: Duration,
+        /// Which mailbox ADDRESSES the pass actually reached. Counting requests instead would
+        /// count each box's `NeedCookie` retry as well, which says nothing about how much of the
+        /// box set was covered.
+        seen: Rc<RefCell<std::collections::BTreeSet<[u8; 32]>>>,
+    }
+
+    impl Transport for SlowTransport {
+        fn send(&self, msg: &WireMessage, now: u64) -> Response {
+            self.inner.send(msg, now)
+        }
+        fn fetch(&self, req: &FetchRequest, now: u64) -> FetchResponse {
+            self.seen.borrow_mut().insert(req.mailbox);
+            std::thread::sleep(self.per_request);
+            self.inner.fetch(req, now)
+        }
+        fn ack(&self, req: &AckRequest, now: u64) -> AckResponse {
+            self.inner.ack(req, now)
+        }
+        fn publish_bundle(&self, req: &PublishRequest, now: u64) -> PublishResponse {
+            self.inner.publish_bundle(req, now)
+        }
+        fn fetch_bundle(&self, ik: &[u8; 32], now: u64) -> Result<Option<PreKeyBundle>, String> {
+            self.inner.fetch_bundle(ik, now)
+        }
+        fn fetch_bundle_opk(
+            &self,
+            req: &BundleOpkRequest,
+            now: u64,
+        ) -> Result<BundleOpkResponse, String> {
+            self.inner.fetch_bundle_opk(req, now)
+        }
+    }
+
+    fn dev_cap() -> Capability {
+        Capability {
+            capability_id: [0xCD; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 1_000_000, max_bytes: 1 << 30, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x37; 32],
+        }
+    }
+
+    /// A time far enough from the epoch origin that `poll_epochs`'s window does not collapse
+    /// (at `now = 0` the previous epoch saturates onto the current one), and a multiple of the
+    /// epoch length so it does not sit on a boundary.
+    const NOW: u64 = 40 * crate::drop::DROP_EPOCH_SECS;
+
+    /// How many DISTINCT boxes one session contributes to an ordinary (non-sweep) pass. Derived
+    /// from the same function the code under test uses, so the expectation cannot drift away from
+    /// the polling window by being written down twice.
+    fn distinct_poll_epochs(now: u64) -> usize {
+        let e = crate::drop::poll_epochs(now);
+        e.iter().collect::<std::collections::BTreeSet<_>>().len()
+    }
+
+    /// A synthetic session under a fabricated peer IK. The receive side addresses a box from OUR
+    /// own mailbox point and the session's `drop_seed`, so a session with no cryptographic history
+    /// still produces a real box address to fetch — which is all this test needs.
+    fn dummy_ik(i: u64) -> [u8; 32] {
+        let mut ik = [0u8; 32];
+        ik[..8].copy_from_slice(&i.to_le_bytes());
+        ik[31] = 1;
+        ik
+    }
+
+    /// The pass stops when its budget is spent instead of walking every box.
+    ///
+    /// Without the budget this loop is unbounded in time: `sessions × epochs` boxes, each its own
+    /// connect + handshake + request, and a stalling relay makes every one of them pay a read
+    /// timeout. Multi-homed, the relays are polled in sequence, so that one relay holds up all the
+    /// others' mail — the head-of-line half of R2-12.
+    #[test]
+    fn a_slow_relay_cannot_stretch_one_receive_pass_without_end() {
+        let mut relay = RelayNode::new(0);
+        relay.issue_capability(dev_cap());
+        let relay_pub = relay.relay_public();
+        let seen = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
+        let transport = SlowTransport {
+            inner: InMemoryTransport::new(Rc::new(RefCell::new(relay))),
+            per_request: Duration::from_millis(20),
+            seen: seen.clone(),
+        };
+
+        let mut peer = super::Peer::new(transport, Account::generate(), dev_cap(), relay_pub);
+        const SESSIONS: u64 = 40;
+        for i in 0..SESSIONS {
+            peer.sessions.insert(
+                dummy_ik(i),
+                super::SessionState {
+                    session: Session::init_sender([1u8; 32], [2u8; 32]),
+                    pending_initial: None,
+                    drop_seed: [i as u8; 32],
+                    peer_mailbox_pub: [0u8; 32],
+                },
+            );
+        }
+        // Ordinary cycle, not a sweep: a sweep would fetch ten epochs per session instead of the
+        // polling window's, which makes the same point with a bigger number but ties the test to
+        // whichever branch `sweep_due` happens to take.
+        peer.last_sweep = NOW;
+        let boxes = 1 + (SESSIONS as usize) * distinct_poll_epochs(NOW); // + the identity mailbox
+        peer.set_receive_budget(Duration::from_millis(120));
+
+        let got = peer.receive(NOW);
+        let done = seen.borrow().len();
+        assert!(
+            done < boxes / 2,
+            "the pass walked {done} of {boxes} boxes — the budget did not stop it"
+        );
+        // Nothing was waiting, so the truncation is what the pass has to report: an unfetched box
+        // is not an empty one, and reporting it as "no mail" would be a lie the caller acts on.
+        match got {
+            Err(e) => assert!(
+                e.contains("receive budget"),
+                "the truncation must name itself, not surface as some other fault: {e}"
+            ),
+            Ok(msgs) => panic!("a truncated, empty pass reported success with {} messages", msgs.len()),
+        }
+    }
+
+    /// The control arm: with a budget it can meet, the SAME pass fetches every box. Without this,
+    /// a bug that stopped after one box would pass the test above.
+    #[test]
+    fn an_unhurried_pass_still_visits_every_box() {
+        let mut relay = RelayNode::new(0);
+        relay.issue_capability(dev_cap());
+        let relay_pub = relay.relay_public();
+        let seen = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
+        let transport = SlowTransport {
+            inner: InMemoryTransport::new(Rc::new(RefCell::new(relay))),
+            per_request: Duration::from_millis(0),
+            seen: seen.clone(),
+        };
+
+        let mut peer = super::Peer::new(transport, Account::generate(), dev_cap(), relay_pub);
+        const SESSIONS: u64 = 8;
+        for i in 0..SESSIONS {
+            peer.sessions.insert(
+                dummy_ik(i),
+                super::SessionState {
+                    session: Session::init_sender([1u8; 32], [2u8; 32]),
+                    pending_initial: None,
+                    drop_seed: [i as u8; 32],
+                    peer_mailbox_pub: [0u8; 32],
+                },
+            );
+        }
+        peer.last_sweep = NOW;
+        // Identity mailbox + one box per (session × poll epoch).
+        let expected = 1 + (SESSIONS as usize) * distinct_poll_epochs(NOW);
+
+        let got = peer.receive(NOW);
+        assert_eq!(seen.borrow().len(), expected, "an unhurried pass skipped boxes");
+        assert!(
+            got.is_ok(),
+            "an unhurried empty pass must not report a fault: {}",
+            got.err().unwrap_or_default()
         );
     }
 }

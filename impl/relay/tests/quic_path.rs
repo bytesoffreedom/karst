@@ -111,3 +111,107 @@ fn a_dead_quic_path_does_not_delay_the_tcp_one() {
         started.elapsed()
     );
 }
+
+/// A fetch nobody can serve: no cookie, so the relay answers `NeedCookie` and the request counts
+/// as UNADMITTED. Cheap on both sides and it exercises the leash, which is the point.
+fn unservable_fetch() -> node::protocol::FetchRequest {
+    node::protocol::FetchRequest {
+        mailbox: [0x5A; 32],
+        client_addr: vec![0x11; 32],
+        carrier_id: b"quic-pool-test".to_vec(),
+        cookie: None,
+        proof: [0u8; 16],
+        own_proof: Vec::new(),
+    }
+}
+
+/// **The pool is real, and it is exactly as wide as the caller said** (QUIC-5).
+///
+/// DISCRIMINATING at the relay, not at a counter the client owns: `MAX_UNADMITTED_REQUESTS` is
+/// shared by every stream of ONE connection (#239). So if requests carrying one scope really do
+/// ride one connection, the ninth is refused by a leash the first eight spent — and if the pool
+/// were not working, each request would arrive on its own connection with its own fresh count and
+/// all nine would be answered. That is the whole slice observed from the outside.
+///
+/// This is also the first test that can see `MAX_UNADMITTED_STREAMS_PER_CONN` and the per-`ConnState`
+/// counters do anything at all: before pooling, one connection never carried a second stream.
+#[test]
+fn requests_in_one_scope_share_a_connection_and_therefore_share_the_leash() {
+    use node::protocol::Transport;
+
+    let (addr, noise_pub) = spawn_quic_relay();
+    let quic = Arc::new(QuicAdapter::new().expect("client endpoint"));
+    let transport =
+        SocketTransport::with_paths(vec![Path::new(quic.clone(), Dest::from(addr))], noise_pub);
+
+    let leash = relay::server::MAX_UNADMITTED_REQUESTS;
+    let answers: Vec<_> = (0..=leash)
+        .map(|_| transport.fetch_isolated(&unservable_fetch(), NOW, Some("one-channel")))
+        .collect();
+
+    assert_eq!(quic.pooled(), 1, "one scope must hold exactly one connection");
+    for (i, a) in answers.iter().take(leash).enumerate() {
+        assert!(
+            matches!(a, node::protocol::FetchResponse::NeedCookie(_)),
+            "request {i} was within the leash and should have been answered"
+        );
+    }
+    match answers.last().expect("one answer per request") {
+        node::protocol::FetchResponse::Rejected(why) => assert!(
+            why.starts_with("transport:"),
+            "the leash should have cut the connection, not produced a protocol answer: {why}"
+        ),
+        _ => panic!("the {}th unadmitted request rode a fresh leash", leash + 1),
+    }
+}
+
+/// **CONTROL ARM for the test above, and the rule that makes pooling safe.**
+///
+/// The same requests with NO scope must not pool: an unscoped caller has not said which compartment
+/// it belongs to, and merging on "unknown" would put every unscoped request in the process — bundle
+/// publishes, blob transfers, discovery lookups, across every channel — on one connection, which is
+/// the A8-4 join rebuilt in the transport. So each gets its own connection, its own leash, and all
+/// of them are answered.
+///
+/// If the rule were ever relaxed, this test fails at the same request the scoped one is refused at.
+#[test]
+fn unscoped_requests_are_never_pooled_together() {
+    use node::protocol::Transport;
+
+    let (addr, noise_pub) = spawn_quic_relay();
+    let quic = Arc::new(QuicAdapter::new().expect("client endpoint"));
+    let transport =
+        SocketTransport::with_paths(vec![Path::new(quic.clone(), Dest::from(addr))], noise_pub);
+
+    for i in 0..=relay::server::MAX_UNADMITTED_REQUESTS {
+        let a = transport.fetch_isolated(&unservable_fetch(), NOW, None);
+        assert!(
+            matches!(a, node::protocol::FetchResponse::NeedCookie(_)),
+            "unscoped request {i} shared a leash it should never have shared"
+        );
+    }
+    assert_eq!(quic.pooled(), 0, "an unscoped request must leave nothing in the pool");
+}
+
+/// Two scopes are two connections — the separation the pool key exists to preserve.
+///
+/// Weaker than it looks on its own (a relay can still join them by source address on the direct
+/// path, which is why QUIC is direct-only), and that is the honest claim: this stops the pool from
+/// turning a same-IP INFERENCE into a same-connection CERTAINTY that also survives the address
+/// changing.
+#[test]
+fn two_scopes_never_share_a_connection() {
+    use node::protocol::Transport;
+
+    let (addr, noise_pub) = spawn_quic_relay();
+    let quic = Arc::new(QuicAdapter::new().expect("client endpoint"));
+    let transport =
+        SocketTransport::with_paths(vec![Path::new(quic.clone(), Dest::from(addr))], noise_pub);
+
+    for scope in ["channel-a", "channel-b", "channel-c"] {
+        // Twice each: the second must REUSE, so the count follows scopes and not requests.
+        transport.fetch_isolated(&unservable_fetch(), NOW, Some(scope));
+        transport.fetch_isolated(&unservable_fetch(), NOW, Some(scope));
+    }
+    assert_eq!(quic.pooled(), 3, "three scopes, three connections, six requests");
+}

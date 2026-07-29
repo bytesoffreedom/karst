@@ -15,16 +15,22 @@
 //! **Where this may be used.** The DIRECT path only. See `docs/design/quic-transport.md` §1: a
 //! long-lived multiplexed connection re-clusters handles that per-handle SOCKS isolation keeps
 //! apart, which is the linkage A8-4 removed. Tor cannot carry QUIC anyway (no `UDP ASSOCIATE`), so
-//! the privacy answer and the plumbing answer agree — and this adapter deliberately does not
-//! implement `connect_isolated`, so it inherits the default and cannot pretend to isolate circuits
-//! it has no way to separate.
+//! the privacy answer and the plumbing answer agree.
+//!
+//! **What `connect_isolated` means here, and what it does not.** This adapter implements it, but
+//! not to isolate anything: on the direct path there is no circuit to separate, and two scopes ride
+//! the same UDP socket from the same address whatever they are called. It implements it because
+//! that is where the caller states which compartment a request belongs to, and a POOL needs exactly
+//! that to be safe (QUIC-5, see `QuicAdapter::pool`). The scope is a key, not a boundary, and the
+//! name is inherited from the seam rather than a claim about what QUIC provides.
 //!
 //! **Async, contained.** `quinn` is async and everything above here is blocking. This module owns
 //! its runtime and bridges at the read/write boundary; async does not leak into the client's
 //! execution model.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use quinn::rustls;
 
@@ -34,10 +40,46 @@ use crate::transport::{Channel, Dest, TransportAdapter, CONNECT_TIMEOUT, READ_TI
 /// relay that could name its own would be negotiating which protocol is spoken at all.
 pub const ALPN: &[u8] = b"karst-relay/1";
 
+/// How many connections one adapter keeps alive at once.
+///
+/// A bound rather than a tuning knob: the pool is keyed by scope and scopes are minted freely
+/// (a handle per epoch per conversation), so an unbounded map would hold a UDP connection per
+/// scope the process ever used. When it is full the oldest-inserted entry is evicted and its
+/// connection closed — a closed pooled connection costs a redial, which is what the unpooled
+/// path pays on every single request anyway.
+const MAX_POOLED_CONNECTIONS: usize = 32;
+
 /// Direct QUIC over UDP.
 pub struct QuicAdapter {
     endpoint: quinn::Endpoint,
     runtime: Arc<tokio::runtime::Runtime>,
+    /// Live connections, keyed by `(destination, scope)` — QUIC-5.
+    ///
+    /// **Why the key is the scope, and why an absent scope is never pooled.** The point of QUIC
+    /// is one connection carrying many requests, and the danger is that "many requests" silently
+    /// becomes "requests from compartments that must not be joined". A relay that serves two
+    /// requests on one connection knows they came from one party with certainty — an exact join,
+    /// stronger than the same-IP inference it could already make, and one that survives the
+    /// address changing. So the pool may only merge requests the CALLER has said belong together.
+    /// The scope is that statement (`Peer::scope_for`, derived from the handle the relay already
+    /// sees in the clear). A request that passes no scope has said nothing, and pooling on
+    /// "unknown" would merge every unscoped request in the process — bundle publishes, blob
+    /// transfers and discovery lookups across every channel — onto one connection. That is the
+    /// A8-4 join rebuilt at the transport layer, so it is refused: no scope, no pool, a fresh
+    /// connection every time, exactly the behaviour before this slice.
+    ///
+    /// This is a RULE, not a setting. There is no flag that turns unscoped pooling on.
+    ///
+    /// Insertion order is kept alongside so eviction has something to choose by; a `HashMap` of
+    /// this size does not warrant a real LRU.
+    pool: Mutex<Pool>,
+}
+
+/// The pooled connections plus the insertion order eviction uses.
+#[derive(Default)]
+struct Pool {
+    live: HashMap<(String, String), quinn::Connection>,
+    order: Vec<(String, String)>,
 }
 
 impl QuicAdapter {
@@ -80,14 +122,14 @@ impl QuicAdapter {
         // is the receiver's decision, and putting it there means the property does not depend on
         // every client being well-behaved.
         //
-        // Nothing to migrate on this side yet in any case: without connection pooling (QUIC-5) a
-        // connection carries one request and is gone. When pooling lands, a pooled connection must
-        // be DROPPED on a local network change rather than carried across it.
+        // The client side of that rule is in `connect_isolated`: a pooled connection that has died
+        // — which is what a local network change looks like from here, since the relay refuses to
+        // migrate it — is EVICTED and redialled, never handed to the next caller as live.
         client.transport_config(Arc::new(transport));
 
         let mut endpoint = quinn::Endpoint::client("[::]:0".parse().expect("valid bind address"))?;
         endpoint.set_default_client_config(client);
-        Ok(QuicAdapter { endpoint, runtime })
+        Ok(QuicAdapter { endpoint, runtime, pool: Mutex::new(Pool::default()) })
     }
 }
 
@@ -96,7 +138,42 @@ impl TransportAdapter for QuicAdapter {
         "quic"
     }
 
+    /// No scope: a fresh connection, never pooled and never reused. See `QuicAdapter::pool`.
     fn connect(&self, dest: &Dest) -> io::Result<Box<dyn Channel>> {
+        self.stream_on(self.dial(dest)?)
+    }
+
+    /// Scoped: reuse this scope's connection at this destination if one is live, else dial and
+    /// remember it. An absent scope falls through to `connect`, which never pools — the rule the
+    /// `pool` field's doc states.
+    fn connect_isolated(&self, dest: &Dest, scope: Option<&str>) -> io::Result<Box<dyn Channel>> {
+        let Some(scope) = scope else { return self.connect(dest) };
+        let key = (dest.to_string(), scope.to_string());
+
+        // A pooled connection may have died since it was stored — the relay closed it, the leash
+        // fired, or the local network moved under it (which the relay refuses to migrate, QUIC-6).
+        // `close_reason` catches the ones already known dead; `open_bi` catches the rest. Either
+        // way the entry is dropped and redialled rather than handed over as live, because a stale
+        // pooled entry turns one transient failure into a permanently broken path.
+        if let Some(conn) = self.take_live(&key) {
+            match self.stream_on(conn.clone()) {
+                Ok(channel) => {
+                    self.store(key, conn);
+                    return Ok(channel);
+                }
+                Err(_) => { /* dead after all: fall through to a fresh dial */ }
+            }
+        }
+        let conn = self.dial(dest)?;
+        let channel = self.stream_on(conn.clone())?;
+        self.store(key, conn);
+        Ok(channel)
+    }
+}
+
+impl QuicAdapter {
+    /// One QUIC connection to `dest`, with no pooling involved.
+    fn dial(&self, dest: &Dest) -> io::Result<quinn::Connection> {
         // QUIC needs a socket address; a name only a carrier can resolve (`.onion`, `.i2p`) has no
         // meaning here and resolving it locally would either fail or leak the lookup — the same
         // refusal `DirectTcpAdapter` makes, for the same reason.
@@ -112,7 +189,7 @@ impl TransportAdapter for QuicAdapter {
         // The TLS SNI has to be SOMETHING and names nothing here: the relay is identified by its
         // Noise key, not by a hostname. A fixed placeholder keeps it from leaking the address as a
         // hostname in the clear part of the handshake.
-        let conn = self.runtime.block_on(async {
+        self.runtime.block_on(async {
             let connecting = self
                 .endpoint
                 .connect(addr, "karst")
@@ -121,7 +198,11 @@ impl TransportAdapter for QuicAdapter {
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "quic handshake timed out"))?
                 .map_err(|e| io::Error::other(format!("quic handshake: {e}")))
-        })?;
+        })
+    }
+
+    /// Open one bidirectional stream on `conn` and present it as a blocking channel.
+    fn stream_on(&self, conn: quinn::Connection) -> io::Result<Box<dyn Channel>> {
         let (send, recv) = self
             .runtime
             .block_on(conn.open_bi())
@@ -134,6 +215,37 @@ impl TransportAdapter for QuicAdapter {
             _conn: conn,
             pending: Vec::new(),
         }))
+    }
+
+    /// Remove and return this key's connection if it has not already failed.
+    fn take_live(&self, key: &(String, String)) -> Option<quinn::Connection> {
+        let mut pool = self.pool.lock().expect("quic pool mutex");
+        let conn = pool.live.remove(key)?;
+        pool.order.retain(|k| k != key);
+        conn.close_reason().is_none().then_some(conn)
+    }
+
+    /// Remember `conn` for `key`, evicting the oldest entry if the pool is full.
+    fn store(&self, key: (String, String), conn: quinn::Connection) {
+        let mut pool = self.pool.lock().expect("quic pool mutex");
+        if pool.live.len() >= MAX_POOLED_CONNECTIONS {
+            if let Some(oldest) = pool.order.first().cloned() {
+                if let Some(dead) = pool.live.remove(&oldest) {
+                    dead.close(0u32.into(), b"pool full");
+                }
+                pool.order.remove(0);
+            }
+        }
+        pool.order.retain(|k| *k != key);
+        pool.order.push(key.clone());
+        pool.live.insert(key, conn);
+    }
+
+    /// How many connections the pool is holding — a test seam for the rule that an unscoped
+    /// request never pools, and for eviction.
+    #[doc(hidden)]
+    pub fn pooled(&self) -> usize {
+        self.pool.lock().expect("quic pool mutex").live.len()
     }
 }
 

@@ -59,6 +59,36 @@ On a SOCKS/Tor path there is no pool even if QUIC were somehow available — a
 connection per handle, as today. Written as a rule so that a later performance
 pass cannot flip it as a configuration choice.
 
+### What the pool is keyed by — settled when it was built (QUIC-5)
+
+The sketch above assumed the key would be the proxy identity, and that
+`Relay`, which today is built once from an account's settings, would have to be
+rebuilt per channel to supply it. **Both were wrong, and the reason is worth
+keeping** — the alternative was a refactor of ~35 call sites that would have
+landed a COARSER key than the one already available.
+
+The key is the **per-request scope** the caller already threads through
+`connect_isolated` (`Peer::scope_for`, derived from the handle the relay sees in
+the clear). It is strictly finer than a per-proxy key, needs no new plumbing,
+and is the value the SOCKS carrier already uses for the same purpose one layer
+along. On the direct path the finer granularity costs only connections, not
+unlinkability, because there is no circuit to separate — which is the same
+observation that put QUIC on the direct path in the first place.
+
+The load-bearing half is what happens when there is **no** scope. An unscoped
+request has not said which compartment it belongs to, and pooling on "unknown"
+would put every unscoped request in the process — bundle publishes, blob
+transfers, discovery lookups, across every channel — onto one connection. That
+is the #206 join rebuilt at the transport layer, and it would be *worse* than
+no pool, since today each of those requests dials its own connection. So:
+
+> **No scope, no pool.** An unscoped request gets a fresh connection every
+> time. This is a rule with no setting behind it.
+
+A pooled connection that has died is evicted and redialled, never handed on as
+live — that is the client half of "migration off" (§4): from here, a local
+network change looks exactly like a connection the relay refused to migrate.
+
 ---
 
 ## 2. Where QUIC applies
@@ -141,7 +171,7 @@ across an account's channels. A shared ticket store would rebuild the linkage
 genuinely useful on mobile, and it tells the relay that the old address and the
 new address are the same client — the RFC warns about exactly this and requires
 distinct connection IDs. The private posture is the default: on a network
-change, a new session with a new transport pseudonym and a new route. Migration
+change, a new session on a new connection and a new route. Migration
 is an explicit opt-in whose UI text says plainly what the relay learns. Same
 shape as the direct-P2P rule: the convenient thing is opt-in, never a "safe"
 default.

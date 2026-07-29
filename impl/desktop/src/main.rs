@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use client::content::{decode, Assembled, Content, Reassembler};
 use client::store::{
-    AccountEntry, ContactRecord, ExtraPassword, HistoryRecord, NetSettings, Opened, ReceivedFile,
-    Store, Vault,
+    AccountEntry, ContactRecord, ExtraPassword, HistoryRecord, NetSettings, Opened, PendingUpload,
+    ReceivedFile, Store, Vault,
 };
 use client::{Relay, RelayId};
 use serde::Serialize;
@@ -2990,6 +2990,10 @@ fn file_abort(app: State<App>, id: String) {
 /// larger ones stream up as an E2E blob OFF this thread (progress + cancel), and only on success
 /// does the tiny `FileRef` + "📎 name" history line go out. Shared by `send_file` (small,
 /// single-payload) and `file_commit` (streamed large).
+///
+/// The blob upload is RESUMABLE: it records the transfer under a content-derived `upload_id`, so
+/// re-sending the same file to the same contact after a crash, a cancel, or a restart continues
+/// from the relay's watermark instead of re-uploading everything (A4-1).
 fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Result<FileSent, String> {
     if bytes.is_empty() {
         return Err("empty file".into());
@@ -3043,11 +3047,46 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
             let cap = store
                 .load_capability_for(&relay.id)
                 .map_err(|e| format!("no credential to upload through this relay: {e}"))?;
-            let (blob_id, key, hash, chunks) = client::blob_upload_with(
+            // RESUMABLE (A4-1). This path used to call `blob_upload_with`, which mints a fresh
+            // random `blob_id`+`key` every time and records nothing — so the GUI, the client
+            // people actually run, re-uploaded a multi-GB file from byte zero after any
+            // interruption, and the whole resume layer (`PendingUpload`, `blob_stat`) was reachable
+            // only from the CLI. Now it keys the same persisted record the CLI does: re-sending
+            // the same file to the same contact finds it and continues from the relay's watermark.
+            //
+            // The id covers the file's CONTENT, so a resume can only ever continue the same bytes;
+            // picking a different file starts its own transfer.
+            let upload_id =
+                client::upload_id_for(&peer, &name2, size, &client::blob::plaintext_hash(&bytes));
+            client::sweep_pending_uploads(&store, ts);
+            let (blob_id, key) = match store.get_pending_upload(&upload_id) {
+                Ok(Some(pu)) => (pu.blob_id, pu.key),
+                _ => {
+                    let (b, k) = (client::blob::random32(), client::blob::random32());
+                    let _ = store.add_pending_upload(&PendingUpload {
+                        upload_id,
+                        blob_id: b,
+                        key: k,
+                        to_ik: peer,
+                        name: name2.clone(),
+                        size,
+                        queued_at: ts,
+                        // The bytes live in the webview-fed buffer, not on a path we may re-read
+                        // (the frontend hands us content, never a filename), so an unattended
+                        // resume-on-restart is not possible here — the user re-picks the file and
+                        // the record does the rest.
+                        path: None,
+                    });
+                    (b, k)
+                }
+            };
+            let (blob_id, key, hash, chunks) = client::blob_upload_resumable_with(
                 &relay,
                 &cap,
                 Cursor::new(bytes),
                 size,
+                blob_id,
+                key,
                 &cancel,
                 |done, total| transfer_progress_step(&transfers, tid, done, total),
             )?;
@@ -3061,6 +3100,9 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
                 text: format!("📎 {name2}").into_bytes(),
                 ts,
             });
+            // The pointer is delivered — the transfer is over, so the resume record has nothing
+            // left to resume. Cleared only HERE, after the `FileRef`, never after the upload alone.
+            let _ = store.remove_pending_upload(&upload_id);
             Ok(())
         })();
         match res {
@@ -3069,11 +3111,15 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
                 // SEC-45: `stop_for_offline` cancels every active transfer the same way the
                 // Cancel button does, but unlike a manual abandon this one is NOT data loss — the
                 // bytes we were uploading are our own file, still untouched on the user's disk
-                // (only the in-memory copy this thread held is dropped), so "reported" (not
-                // "resumed") satisfies the never-silently-lose-data bar. Say which one happened.
+                // (only the in-memory copy this thread held is dropped). Say which one happened.
+                //
+                // The old wording promised "nothing was sent", which stopped being true when this
+                // path became resumable (A4-1): the chunks that made it are parked on the relay,
+                // encrypted, and a resend continues from there instead of restarting. Neither
+                // over- nor under-claiming — describe what actually happens next.
                 let msg = offline.load(Ordering::SeqCst).then(|| {
-                    "stopped by Offline — resend when back online (nothing was sent; your file \
-                     on disk is untouched)"
+                    "stopped by Offline — resend the same file when back online and it continues \
+                     from where it stopped (your file on disk is untouched)"
                         .to_string()
                 });
                 transfer_finish(&transfers, tid, "cancelled", None, msg);

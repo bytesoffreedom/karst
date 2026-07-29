@@ -70,6 +70,39 @@ fn chunk_aead(key: &BlobKey, index: u32, salt: &[u8; CHUNK_SALT]) -> ([u8; 32], 
     (k, *Nonce::from_slice(&okm[32..]))
 }
 
+/// The blob's DURABLE owner handle — what a `BlobPut` puts in `client_addr`. The relay's blob
+/// store is first-writer-wins: it records the `sender` of a blob's first chunk and rejects later
+/// chunks from anyone else ("blob owned by another sender"). That check needs an identity that
+/// outlives the process, and the transport pseudonym is the opposite of one — `Relay::configured`
+/// mints a fresh random pseudonym per instance and deliberately never persists it. So an upload
+/// interrupted by a CLIENT restart could never be continued: the resume record survived, the
+/// identity that owned the bytes did not, and every retry minted another stranger (A4-1). The
+/// upload stayed stuck until the relay's 7-day TTL swept the partial blob.
+///
+/// Deriving the handle from the file key kills that class rather than the instance: the one thing
+/// a resume already has to persist (`K`, in `PendingUpload`) now IS the proof of ownership, so
+/// ownership is durable exactly when and because resumability is, with no second secret to keep in
+/// sync. It is also per-blob, where the session pseudonym it replaces was per-process: no field the
+/// uploader sends now repeats across two of its blobs (`verify_durability`, which runs on the same
+/// `blob_id` right after each upload, uses this handle too — leaving the pseudonym there would have
+/// re-linked the blobs it had just separated).
+///
+/// Honest limits. (1) This is NOT anonymity: the relay still sees one connection uploading blob
+/// after blob, so IP + timing correlate them however the addressing field is derived — this removes
+/// a stable identifier the client was handing over for free, nothing more. The recipient's
+/// downloads still carry their own session pseudonym. (2) It is a bearer token, not a
+/// challenge-response proof: the relay compares bytes, so anyone who learns the token can append to
+/// an INCOMPLETE blob. Deriving it needs `K`, which only the uploader has until the `FileRef` goes
+/// out — and by then the blob is complete and frozen. (3) The relay's per-sender caps
+/// (`MAX_SENDER_BYTES`, `MAX_BLOBS_PER_SENDER`) now aggregate per BLOB for honest clients, i.e. they
+/// stop binding; see the note on the upload driver in `lib.rs` for what still does.
+pub fn owner_token(key: &BlobKey, id: &BlobId) -> [u8; 32] {
+    let hk = hkdf::Hkdf::<Sha256>::new(Some(id), key);
+    let mut out = [0u8; 32];
+    hk.expand(b"KARST-blob-owner-v1", &mut out).expect("32 within HKDF output limit");
+    out
+}
+
 /// Position-binding AAD: authenticates where this chunk sits so the relay cannot move,
 /// drop, or splice chunks undetected. `count`/`is_last` also pin the total length.
 fn chunk_aad(
@@ -234,6 +267,21 @@ mod tests {
             "keystream reuse: the relay can XOR two stored chunks and recover the XOR of both \
              plaintexts — the chunk key/nonce must depend on the per-chunk salt"
         );
+    }
+
+    /// A4-1: the owner handle must be a pure function of the two things a resume already persists
+    /// (`blob_id`, `K`) — that is the whole reason it survives a client restart — while separating
+    /// blobs from each other and never leaking the file key onto the wire.
+    #[test]
+    fn the_owner_token_is_derived_only_from_the_blob_id_and_key() {
+        let (key, id) = (random32(), random32());
+        assert_eq!(owner_token(&key, &id), owner_token(&key, &id), "same inputs → same handle");
+        assert_ne!(owner_token(&key, &random32()), owner_token(&key, &id), "per-blob, not per-key");
+        assert_ne!(owner_token(&random32(), &id), owner_token(&key, &id), "a stranger cannot claim it");
+        // It travels in the clear as `client_addr`, so it must not be the key (nor the id, which
+        // the relay already knows — that would make the handle no proof at all).
+        assert_ne!(owner_token(&key, &id), key, "the file key must not ride on the wire");
+        assert_ne!(owner_token(&key, &id), id, "the handle must not be public knowledge");
     }
 
     /// The salt is authenticated, not merely carried: swapping in another chunk's salt must fail

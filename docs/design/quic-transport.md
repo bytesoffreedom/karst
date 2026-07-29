@@ -89,6 +89,40 @@ A pooled connection that has died is evicted and redialled, never handed on as
 live — that is the client half of "migration off" (§4): from here, a local
 network change looks exactly like a connection the relay refused to migrate.
 
+### Which request classes carry a scope — settled (QUIC-13)
+
+The pool only merges what a caller scoped, so "which classes get a scope" decides
+what QUIC is worth. Surveyed class by class; the answer is **the two that already
+have one, and no more**.
+
+**Scoped, and correctly so.** Mail — `send`, `fetch`, `ack` — carries the handle
+scope (`Peer::scope_for`), which is the frequent path and the one pooling was
+built for. A blob DOWNLOAD carries a scope minted per download (QUIC-7), which is
+the heavy path.
+
+**Left unscoped deliberately, not by omission:**
+
+- **Public reads** — `get_policy`, `get_node_list`, `blob_stat`,
+  `lookup_discovery`, `fetch_bundle`. These carry no identity and are answered to
+  anyone. Giving one a scope would attach a channel label to a request that has
+  none today — *creating* linkage in the name of pooling. This is the sharp case:
+  scoping them would be actively harmful, so a guard keeps them unscoped rather
+  than trusting the next reader to notice.
+- **Channel-bearing but rare** — `publish_bundle`, `join`, discovery publish and
+  delete, `fetch_bundle_opk`. A scope here would add no linkage the relay lacks
+  (these already carry the channel's key) and would save roughly one handshake
+  per channel per relay per unlock. Not worth a moving part. Revisit only if
+  something makes them frequent.
+- **Blob upload** — already holds one session per file since FT4, so there is
+  nothing for a pool to merge; unscoped means that session is never pooled with
+  anything else, which is the most separated arrangement available.
+
+The conclusion is that pooling pays on exactly the two paths that already use it.
+That is a smaller answer than "wire scopes everywhere", and it is the honest one:
+the remaining classes are either too rare to matter or would be made *worse* by a
+label they currently do without.
+
+
 ---
 
 ## 2. Where QUIC applies

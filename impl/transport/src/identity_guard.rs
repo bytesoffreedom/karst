@@ -132,4 +132,35 @@ mod tests {
             );
         }
     }
+
+    /// **A public read never acquires a scope** (QUIC-13).
+    ///
+    /// `get_policy`, `get_node_list`, `blob_stat`, `lookup_discovery` and `fetch_bundle` are
+    /// answered to anyone and carry no identity. Handing one a scope would attach a channel label
+    /// to a request that has none — creating linkage in the name of pooling, which is the exact
+    /// trade the pool rule exists to prevent. Pinned rather than trusted to a comment because on
+    /// the day someone is optimising round trips, "let it pool too" reads like an improvement.
+    ///
+    /// DISCRIMINATING: route any of these through `round_trip_scoped` and this goes red.
+    #[test]
+    fn a_public_read_is_never_given_a_scope() {
+        let src = include_str!("socket.rs");
+        // Split so the needle never appears verbatim in this file.
+        let scoped = concat!("round_trip", "_scoped(");
+        for name in ["get_policy", "get_node_list", "blob_stat", "lookup_discovery", "fetch_bundle"]
+        {
+            let at = src
+                .find(&format!("fn {name}"))
+                .unwrap_or_else(|| panic!("{name} still exists in the dialer"));
+            let rest = &src[at..];
+            let body = &rest[..rest.find("\n    pub fn ").or_else(|| rest.find("\n    fn ")).unwrap_or(rest.len())];
+            assert!(
+                !body.contains(scoped),
+                "`{name}` is a PUBLIC read — it is answered to anyone and carries no identity. \
+                 Giving it a scope would let the pool merge it with a channel's traffic, which \
+                 attaches a label to a request that currently has none. See \
+                 docs/design/quic-transport.md, \"Which request classes carry a scope\"."
+            );
+        }
+    }
 }

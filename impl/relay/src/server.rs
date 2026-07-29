@@ -226,6 +226,22 @@ impl RelayServer {
     /// Serve an already-bound listener. Handler threads are capped by `ConnLimiter`
     /// (`MAX_CONNECTIONS`): at capacity a new connection is dropped without a reply
     /// (DropNoReply), so a flood can't spawn unbounded threads.
+    /// Build a server over relay state something else already holds.
+    ///
+    /// `with_noise_keypair` takes the node by value, which is right for the binary — it builds the
+    /// node, hands it over, and asks for the shared handle back. A caller that already has the
+    /// handle (a QUIC listener constructed first, say) would otherwise have no way to put a TCP
+    /// listener on the same state without inventing a second node, which is the failure
+    /// `shared_node` exists to prevent.
+    pub fn from_shared(
+        relay: Arc<RwLock<RelayNode>>,
+        clock: Clock,
+        noise_private: [u8; 32],
+        noise_public: [u8; 32],
+    ) -> Self {
+        RelayServer { relay, clock, noise_private, noise_public, tls: None }
+    }
+
     /// The relay state this server serves, so a SECOND listener can serve the same one.
     ///
     /// Load-bearing rather than convenient: a relay that runs both a TCP and a QUIC listener must

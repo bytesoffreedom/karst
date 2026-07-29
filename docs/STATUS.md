@@ -13,6 +13,40 @@ Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
+## What landed since the last reconcile (2026-07-29, sixth batch)
+
+**QUIC went from written to working.** It had been built and unreachable at the same time: the
+`QuicServer` existed and was tested since QUIC-3 but the relay binary never mentioned it, so no
+relay had ever accepted a QUIC packet; `quic_addrs` was added in QUIC-1 and set to empty at every
+site that built a descriptor; and `build_paths` had no QUIC branch, so the transport race written
+in QUIC-4 had nothing to race. Five slices closed that:
+
+- **QUIC-10** — the relay binary starts the listener beside the TCP one, sharing ONE `RelayNode`.
+  That sharing is the load-bearing part: two listeners over two nodes would mean two mailbox sets,
+  and mail deposited over QUIC would not be there over TCP — which from outside looks like the
+  relay losing messages rather than like a wiring mistake. `KARST_RELAY_QUIC=off`; a failed UDP
+  bind is loud but not fatal, because networks block UDP and a relay that refused to start there
+  would break the day a hosting provider changed a rule.
+- **QUIC-11** — the relay advertises the endpoint it actually bound, and only after it bound.
+  Advertising a UDP endpoint that is not listening would send every client down a path that must
+  time out first — the exact cost QUIC-4 exists to avoid, handed out by the relay. Found while
+  wiring it: `add_relay` merged `addrs` for a known relay but silently dropped `quic_addrs`, so a
+  gossiped endpoint could never propagate.
+- **QUIC-12** — the client learns the endpoint from the relay's OWN node-list entry (never a third
+  party's claim about it, CRYPTO-23) and builds a path from it. **A proxied relay never gets a
+  QUIC path**, enforced in path construction rather than by convention.
+- **QUIC-13** — which request classes carry a scope, settled: the two that already do. Public
+  reads stay unscoped and are now guarded, because scoping them would attach a channel label to
+  requests that have none — creating linkage in the name of pooling.
+- **QUIC-14** — an end-to-end test with no `set_paths_for_test` anywhere. It caught a real defect
+  the moment it ran: `Carrier::from_label` had no `"quic"` arm, so a request that rode QUIC would
+  have reported its carrier as `direct` — the wrong-indicator failure A4-10 exists to prevent,
+  reappearing for a new carrier.
+
+**Honest limit:** the CLI still builds no QUIC path. It has no vault handle where it constructs a
+relay, and fetching endpoints there would put a node-list round trip in front of every command.
+The desktop is where QUIC is exercised.
+
 ## What landed since the last reconcile (2026-07-29, fifth batch)
 
 - **There is no production build, and the compiler now says so** (#145). `--features production`

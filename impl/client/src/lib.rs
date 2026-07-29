@@ -99,6 +99,12 @@ pub enum Carrier {
     /// route anonymity. There is no address suffix (Nym's SOCKS client picks the path), so this
     /// carrier is chosen by an EXPLICIT flag, not inferred from the address.
     Mixnet,
+    /// QUIC over UDP, direct path only. A carrier like any other from the indicator's point of
+    /// view — and it needs to BE one, because a request that rode QUIC while the badge said
+    /// "direct" is precisely the wrong-indicator failure A4-10 exists to prevent. Adding a
+    /// carrier without adding it here reintroduces that silently, which is how this one was
+    /// found: by an end-to-end test asserting what actually carried the request.
+    Quic,
 }
 
 impl Carrier {
@@ -113,6 +119,7 @@ impl Carrier {
             Carrier::I2p => "i2p",
             Carrier::Tor => "Tor",
             Carrier::Mixnet => "mixnet",
+            Carrier::Quic => "quic",
         }
     }
 
@@ -129,6 +136,7 @@ impl Carrier {
             "socks5" => Some(Carrier::Socks5),
             "wss" => Some(Carrier::Wss),
             "wss+socks5" => Some(Carrier::WssOverSocks5),
+            "quic" => Some(Carrier::Quic),
             _ => None,
         }
     }
@@ -164,6 +172,11 @@ fn allowed_carriers(intent: Carrier) -> &'static [Carrier] {
         Carrier::Direct => {
             &[Carrier::Direct, Carrier::Socks5, Carrier::Wss, Carrier::WssOverSocks5]
         }
+        // QUIC is only ever an intent on the direct path (`build_paths` refuses to construct one
+        // behind a proxy), so the set it may switch within is the direct one. It is NOT listed as
+        // a switchable target above: a QUIC path is added from an endpoint the relay declared,
+        // never chosen as a substitute for a carrier the user asked for.
+        Carrier::Quic => &[Carrier::Direct, Carrier::Socks5, Carrier::Wss, Carrier::WssOverSocks5],
         // Chose Tor/PT: the traffic MUST keep riding the external proxy. Bare wss is
         // excluded too — it rides standard HTTPS but exits from THIS host, which
         // exposes your IP, not merely weaker routing.
@@ -273,6 +286,11 @@ fn adapter_for(
         Carrier::Socks5 => Some(Arc::new(socks(proxy?))),
         Carrier::Wss => Some(Arc::new(wss()?)),
         Carrier::WssOverSocks5 => Some(Arc::new(wss()?.through(Arc::new(socks(proxy?))))),
+        // QUIC paths are not built through this function: they come from endpoints the relay
+        // declared for itself, each with its own adapter, and only on the direct path. Returning
+        // `None` keeps that single construction site — a second one here could quietly build a
+        // QUIC path behind a proxy, which is the rule `build_paths` enforces.
+        Carrier::Quic => None,
         // i2p rides SOCKS5 to the local i2p router, which resolves the *.i2p destination and
         // builds the in-network tunnel; the host in the `Dest` is forwarded to it unresolved.
         Carrier::I2p => Some(Arc::new(socks(proxy?))),

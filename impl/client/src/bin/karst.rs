@@ -794,6 +794,12 @@ fn relay_arg(args: &[String]) -> Result<client::Relay, String> {
     if mixnet && proxy.is_none() {
         return Err("--mixnet needs the Nym SOCKS client: pass --socks5 127.0.0.1:1080".into());
     }
+    // HONEST GAP: the CLI builds no QUIC path (QUIC-12). Doing so needs the account's cached
+    // endpoints, and `relay_arg` has no vault handle — it runs before, and for commands that never
+    // open one. Fetching them here instead would put a node-list round trip in front of every
+    // single command to decide a carrier, which is a bad trade for a headless tool. The desktop,
+    // which does hold a store and refreshes off the UI thread, is where QUIC is exercised; adding
+    // it here means threading a store through `relay_arg`, and that is its own change.
     let r = client::Relay::new(addr, id, proxy).with_mixnet(mixnet);
     if r.path_count() > 1 {
         eprintln!("paths: {} (failover across configured routes)", r.path_count());

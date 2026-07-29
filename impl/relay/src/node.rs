@@ -823,13 +823,11 @@ impl RelayNode {
         self.relay_identity.public
     }
 
-    /// Every payload the relay is holding, ignoring which mailbox it sits in.
-    ///
-    /// This is deliberately the view PIR would grant: a reader who has NOT proved it owns
-    /// any mailbox. Exposed so a test can assert that such a reader learns nothing — the
-    /// composition the whole PIR slice rests on.
     /// The mail plane's own handle — for tests that need to inspect or seed queues directly, and
     /// for anything that wants mail work off the relay lock.
+    ///
+    /// (The doc block that used to sit here belonged to `MailStore::all_payloads` and had drifted
+    /// onto its neighbour, describing a method this type does not have.)
     pub fn mail_store(&self) -> Arc<Mutex<MailStore>> {
         self.mail.clone()
     }

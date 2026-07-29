@@ -226,6 +226,16 @@ impl RelayServer {
     /// Serve an already-bound listener. Handler threads are capped by `ConnLimiter`
     /// (`MAX_CONNECTIONS`): at capacity a new connection is dropped without a reply
     /// (DropNoReply), so a flood can't spawn unbounded threads.
+    /// The relay state this server serves, so a SECOND listener can serve the same one.
+    ///
+    /// Load-bearing rather than convenient: a relay that runs both a TCP and a QUIC listener must
+    /// have them share ONE `RelayNode`. Two nodes would mean two mailbox sets — a message
+    /// deposited over QUIC would be invisible to a fetch over TCP, and the failure would look like
+    /// lost mail rather than like a wiring mistake.
+    pub fn shared_node(&self) -> Arc<RwLock<RelayNode>> {
+        self.relay.clone()
+    }
+
     pub fn serve_listener(self, listener: TcpListener) -> io::Result<()> {
         let limiter = ConnLimiter::new(MAX_CONNECTIONS);
         for stream in listener.incoming() {

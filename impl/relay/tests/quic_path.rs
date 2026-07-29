@@ -215,3 +215,94 @@ fn two_scopes_never_share_a_connection() {
     }
     assert_eq!(quic.pooled(), 3, "three scopes, three connections, six requests");
 }
+
+/// **Both listeners serve ONE relay** — what QUIC accepts lands in the state TCP serves.
+///
+/// The risk this pins is not subtle but it is silent: a relay that ran two listeners over two
+/// `RelayNode`s would have two mailbox sets, and mail deposited on one carrier would simply not be
+/// there on the other. From outside that does not look like a wiring mistake — it looks like the
+/// relay losing messages, which is the hardest kind of bug to attribute.
+///
+/// DISCRIMINATING: hand `QuicServer::bind` a fresh `RelayNode` instead of `server.shared_node()`
+/// and the shared state stays empty.
+#[test]
+fn a_deposit_over_quic_lands_in_the_state_the_tcp_listener_serves() {
+    use node::protocol::Transport;
+
+    let (noise_priv, noise_pub) = relay::server::generate_noise_keypair();
+    let mut node = RelayNode::new(NOW);
+    node.issue_capability(dev_cap());
+
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+    let server = relay::server::RelayServer::with_noise_keypair(
+        node,
+        Arc::new(move || NOW),
+        noise_priv,
+        noise_pub,
+    );
+    // The handle the binary hands to its QUIC listener (QUIC-10) — and the one this test reads
+    // afterwards, which is what makes "shared" the thing being checked.
+    let shared = server.shared_node();
+
+    let quic = QuicServer::bind(
+        "127.0.0.1:0".parse().expect("valid"),
+        server.shared_node(),
+        Arc::new(move || NOW),
+        noise_priv,
+    )
+    .expect("bind quic");
+    let quic_addr = quic.local_addr().expect("bound");
+    std::thread::spawn(move || {
+        let _ = quic.serve();
+    });
+    std::thread::spawn(move || {
+        let _ = server.serve_listener(tcp);
+    });
+
+    assert_eq!(
+        shared.read().expect("relay lock").mail_store().lock().expect("mail lock").all_payloads().len(),
+        0,
+        "the relay should start with nothing stored"
+    );
+
+    let over_quic = SocketTransport::with_paths(
+        vec![Path::new(Arc::new(QuicAdapter::new().expect("endpoint")), Dest::from(quic_addr))],
+        noise_pub,
+    );
+    let nonce = [0x31u8; 32];
+    // The relay never decrypts a payload — it stores bytes — so an envelope shaped like one is
+    // all this needs. What is under test is the plumbing, not the crypto.
+    let mut msg = node::protocol::WireMessage {
+        client_addr: vec![0x22; 32],
+        carrier_id: b"quic-share-test".to_vec(),
+        cookie: None,
+        request_nonce: nonce.to_vec(),
+        capability_proof: dev_cap().prove(&nonce, 0),
+        recipient: [0x77u8; 32],
+        payload: node::protocol::Payload::Skeleton(node::seal::SkeletonSeal {
+            ephemeral_pub: [0x55; 32],
+            nonce: [0x66; 12],
+            ciphertext: b"carried by udp, read out of the shared state".to_vec(),
+        }),
+    };
+    // First send earns the cookie; the relay answers `NeedCookie` and the second carries it.
+    let mut accepted = false;
+    for _ in 0..2 {
+        match over_quic.send(&msg, NOW) {
+            node::protocol::Response::NeedCookie(c) => msg.cookie = Some(c),
+            node::protocol::Response::Accepted => {
+                accepted = true;
+                break;
+            }
+            other => panic!("the QUIC listener refused the deposit: {other:?}"),
+        }
+    }
+    assert!(accepted, "the QUIC listener never accepted the deposit");
+
+    assert_eq!(
+        shared.read().expect("relay lock").mail_store().lock().expect("mail lock").all_payloads().len(),
+        1,
+        "the deposit arrived over QUIC but is not in the state the TCP listener serves — the two \
+         listeners are looking at different relays"
+    );
+}

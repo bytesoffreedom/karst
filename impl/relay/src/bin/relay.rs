@@ -710,6 +710,27 @@ fn run_admin_client(rest: &[String]) -> io::Result<()> {
     admin_send(&format!("pow {cmd}"))
 }
 
+/// Whether to run the QUIC listener beside the TCP one, from `KARST_RELAY_QUIC`.
+///
+/// Default is ON. That is a deliberate call and not an oversight: QUIC speaks the SAME protocol
+/// through the SAME admission gate and the same unadmitted-request leash as TCP (#239), so what it
+/// adds is a port rather than a second trust surface — and a carrier nobody runs is a carrier that
+/// rots, which this repository has just spent a day proving. It is one variable to turn off, and
+/// the banner says at every start which way it went.
+///
+/// An UNKNOWN value refuses to start rather than silently defaulting, the same rule
+/// `KARST_RELAY_MODE` follows: an operator who typed `KARST_RELAY_QUIC=of` should learn it now.
+fn quic_enabled() -> Result<bool, String> {
+    match std::env::var("KARST_RELAY_QUIC").ok().as_deref() {
+        None | Some("") | Some("on") | Some("1") => Ok(true),
+        Some("off") | Some("0") => Ok(false),
+        Some(other) => Err(format!(
+            "unknown KARST_RELAY_QUIC '{other}' — use on | off. Refusing to start rather than \
+             guessing which one you meant."
+        )),
+    }
+}
+
 fn main() -> io::Result<()> {
     let arg1 = std::env::args().nth(1);
 
@@ -857,6 +878,14 @@ fn run_relay(addr: String) -> io::Result<()> {
             std::process::exit(1);
         }
     };
+    // Read BEFORE any port is bound or any file is written, so a typo costs nothing but a message.
+    let quic_on = match quic_enabled() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("karst-relay: config error: {e}");
+            std::process::exit(1);
+        }
+    };
     // PoW difficulty for a Public door (operator-tunable). Ignored by Private/Dev.
     let pow_bits = std::env::var("KARST_RELAY_POW_BITS")
         .ok()
@@ -983,12 +1012,42 @@ fn run_relay(addr: String) -> io::Result<()> {
         None => None,
     };
 
+    // The QUIC listener, beside the TCP one and sharing its state (QUIC-10). UDP and TCP can hold
+    // the same port number at once, so this needs no second address from the operator.
+    //
+    // A failed UDP bind is NOT fatal. Plenty of networks drop or block UDP outright, and a relay
+    // that refused to start there would be a relay that stops working the day a hosting provider
+    // changes a firewall rule. It says so loudly and carries on serving TCP, which is the whole
+    // service — QUIC is a carrier, not the product.
+    let quic_status: String = if quic_on {
+        match relay::quic_server::QuicServer::bind(
+            listener.local_addr().unwrap_or_else(|_| addr.parse().expect("addr parsed at bind")),
+            server.shared_node(),
+            Arc::new(wall_clock),
+            noise_priv,
+        ) {
+            Ok(q) => {
+                let bound = q.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.clone());
+                std::thread::spawn(move || {
+                    if let Err(e) = q.serve() {
+                        eprintln!("WARNING: the QUIC listener stopped: {e} — TCP is unaffected");
+                    }
+                });
+                format!("on, UDP {bound}")
+            }
+            Err(e) => format!("OFF — could not bind UDP: {e} (TCP is unaffected)"),
+        }
+    } else {
+        "off (KARST_RELAY_QUIC)".to_string()
+    };
+
     eprintln!("karst-relay (REFERENCE build, NOT for production) listening on {addr}");
     // Not a scare line: `--features production` is a real thing you can try, and it will
     // refuse to compile while an audited token verifier does not exist (#145). Saying so
     // here means an operator learns it from the program, not from a paragraph they skipped.
     eprintln!("  there is no production build yet — `cargo build -p relay --features production` says why");
     eprintln!("carrier: {carrier}");
+    eprintln!("quic: {quic_status}");
     eprintln!("role: {}", role.name());
     eprintln!(
         "large-file blobs: {} (KARST_RELAY_BLOB_PERSIST)",

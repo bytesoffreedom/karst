@@ -261,14 +261,12 @@ select.field option{background:var(--panel);color:var(--text)}
 .rfmeta{font-size:11px;color:var(--muted)}
 .rfdl{flex:none;font-size:11.5px;font-weight:600;color:var(--accent);cursor:pointer;padding:4px 8px;border-radius:7px;transition:.15s}
 .rfdl:hover{background:rgba(46,215,209,.12)}
-/* Connection-channels (proxy/IK) list: scroll past a few so many channels never blow up the card;
-   burned channels are dimmed, collapsed behind a toggle, and tagged — separated from the live ones. */
+/* Connection-channels (proxy/IK) list: scroll past a few so many channels never blow up the card.
+   There is no "burned" row style: burning DELETES the channel and its secret (A6-4, #207), so a
+   burned channel has nothing left to render. The styles that dimmed and tagged one are gone with
+   the code that used them. */
 .rflist{max-height:230px;overflow-y:auto;margin-right:-4px;padding-right:4px}
-.rfrow.burned{opacity:.5}
-.rfrow.burned .rfdl{display:none}
 .rftag{flex:none;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--danger);border:1px solid var(--danger);border-radius:6px;padding:1px 6px;opacity:.85}
-.rfburned-head{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--faint);cursor:pointer;user-select:none;padding:9px 0 3px}
-.rfburned-head:hover{color:var(--muted)}
 .xbar{height:5px;border-radius:4px;background:rgba(255,255,255,.12);overflow:hidden;margin-top:8px}
 .b.me .xbar{background:rgba(0,0,0,.18)}
 .xbar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s ease}
@@ -377,6 +375,9 @@ select.field option{background:var(--panel);color:var(--text)}
 .chead{position:relative}
 mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 .toast{position:fixed;left:50%;bottom:34px;transform:translateX(-50%);z-index:60;background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:12px;padding:11px 18px;font-size:13.5px;box-shadow:0 12px 32px rgba(0,0,0,.5)}
+/* Errors get their own colour and a longer life: they carry something the user has to act on,
+   where an ordinary toast only confirms something that already worked. */
+.toast.err{border-color:var(--danger);max-width:560px;text-align:left;line-height:1.45}
 </style></head><body>
 
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
@@ -1140,7 +1141,7 @@ function wireSubscribeBtn(){
   const b=document.getElementById('dh-subscribe');if(!b||!currentChat)return;
   b.onclick=async()=>{const ik=currentChat.ik;
     try{await inv('subscribe',{peerIk:ik});_chatSubscribed=true;renderShared();
-      toast(t('Subscribed — their posts will arrive in your feed.'));}catch(e){alert(String(e));}};
+      toast(t('Subscribed — their posts will arrive in your feed.'));}catch(e){toastErr(String(e));}};
 }
 // Fetch image/attachment bytes for the Shared-panel Posts tab and re-render once — so posts show
 // their photos there too (the panel was text-only). Terminates: after a fetch, the re-render finds
@@ -1512,7 +1513,7 @@ function clearFeedUnread(){document.querySelectorAll('.rail .navbtn[data-nav="fe
 async function downloadFile(fid,name){
   // Native save dialog (WebKitGTK ignores the <a download> blob trick, so files couldn't be saved).
   try{const path=await inv('save_received_file',{fileId:fid});if(path)toast(t('Saved'));}
-  catch(e){alert(t('Download failed: ')+e);}
+  catch(e){toastErr(t('Download failed: ')+explain(e));}
 }
 // ---- large-file transfers: progress bubbles + a gated fast poll ----
 function fpct(d,t){return t?Math.min(100,Math.round(d/t*100)):0;}
@@ -1607,12 +1608,12 @@ async function openChat(c){
   const vb=document.getElementById('dh-verify');
   if(vb){vb.textContent=c.verified?t('Verified — tap to undo'):t('Mark as verified');
     vb.onclick=async()=>{const nv=!c.verified;
-      try{await inv('set_verified',{peerIk:c.ik,verified:nv});c.verified=nv;await refreshContacts(false);openChat(c);}catch(e){alert(String(e));}};}
+      try{await inv('set_verified',{peerIk:c.ik,verified:nv});c.verified=nv;await refreshContacts(false);openChat(c);}catch(e){toastErr(String(e));}};}
   const rb=document.getElementById('dh-reconnect');
   if(rb){rb.onclick=async()=>{
     try{const cleared=await inv('reconnect_peer',{peerIk:c.ik});
       toast(cleared?t('Session reset — send a message to reconnect.'):t('Nothing to reset — no stale session.'));}
-    catch(e){alert(String(e));}};}
+    catch(e){toastErr(String(e));}};}
   // Incoming request from THIS peer? Surface it ON the chat (not a separate mystery contact): show
   // who's asking (name revealed) with Accept/Decline right here. (`req` computed above.)
   const reqSec=document.getElementById('dh-request-sec');
@@ -1622,9 +1623,9 @@ async function openChat(c){
     document.getElementById('dh-req-accept').onclick=async()=>{
       try{await inv('accept_contact_request',{peerIk:c.ik,viaProxy:null});await loadContactRequests();
         toast(t('Contact added'));const cs=await refreshContacts(false);const nc=cs.find(x=>x.ik===c.ik);if(nc)openChat(nc);}
-      catch(e){alert(String(e));}};
+      catch(e){toastErr(String(e));}};
     document.getElementById('dh-req-decline').onclick=async()=>{
-      try{await inv('decline_contact_request',{peerIk:c.ik});await loadContactRequests();openChat(c);}catch(e){alert(String(e));}};
+      try{await inv('decline_contact_request',{peerIk:c.ik});await loadContactRequests();openChat(c);}catch(e){toastErr(String(e));}};
   }
   // Conversation-only peer with NO pending request: offer an explicit "Add to contacts".
   const acSec=document.getElementById('dh-addcontact-sec');
@@ -1634,7 +1635,7 @@ async function openChat(c){
     try{await inv('add_contact',{name:'',ik:c.ik,viaProxy:null});
       toast(t('Added to contacts'));
       const cs=await refreshContacts(false);const nc=cs.find(x=>x.ik===c.ik);if(nc)openChat(nc);}
-    catch(e){alert(String(e));}};}
+    catch(e){toastErr(String(e));}};}
   // Real safety number for {my IK, their IK} — identical across CLI/egui/desktop for OOB checks.
   const fp=document.getElementById('dh-fp');
   if(fp){fp.textContent='…';try{fp.textContent=await inv('safety_number',{peerIk:c.ik});}catch(e){fp.textContent=t('(unavailable)');}}
@@ -1675,7 +1676,7 @@ async function sendCurrent(){
   const text=inp.value.trim();if(!text)return;
   inp.value='';
   try{const m=await inv('send',{peerIk:currentChat.ik,text});appendBubble(m);}
-  catch(e){inp.value=text;err('unlock-err','');alert(t('Send failed: ')+e);}
+  catch(e){inp.value=text;err('unlock-err','');toastErr(t('Send failed: ')+explain(e));}
 }
 function readAsBase64(file){return new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result.split(',')[1]);fr.onerror=()=>rej(fr.error);fr.readAsDataURL(file);});}
 const STREAM_CHUNK=4*1024*1024;   // raw bytes per push; base64 of this stays under the IPC cap
@@ -1700,7 +1701,7 @@ async function sendFile(file){
     }
     if(m.done){appendBubble(Object.assign({kind:'file'},m));}          // inline: instant
     else{appendTransfer({tid:m.tid,dir:'up',from_me:true,name:m.name,size:m.size,ts:m.ts});ensureProgressPoll();}
-  }catch(e){alert(t('File send failed: ')+e);}
+  }catch(e){toastErr(t('File send failed: ')+explain(e));}
 }
 
 // ── Emoji picker: inserts a Unicode emoji into the composer (client-only, no protocol) ─────────
@@ -1965,8 +1966,28 @@ function selectTab(tab){
 }
 function toast(msg){
   const el=document.getElementById('toast');if(!el)return;
+  el.classList.remove('err');
   el.textContent=msg;el.style.display='block';
   clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',2600);
+}
+// Failures used to go through the browser's own `toastErr()`, which renders a system dialog titled
+// "JavaScript - tauri://localhost" — it names the toolkit, looks like a crash, and blocks the UI
+// thread. An error belongs in the app's own surface, and stays up long enough to read and act on.
+// Some failures come from the shared client library, which is frontend-neutral by design and so
+// cannot name where to fix them in THIS app. That last step belongs here: the library says what is
+// missing, the desktop says which screen resolves it. Anything unrecognised passes through
+// unchanged rather than being dressed up.
+function explain(e){
+  const s=String(e);
+  if(s.includes('no admission credential'))
+    return s+' — '+t('open Settings → Network & relays and paste the invite the relay operator gave you.');
+  return s;
+}
+function toastErr(msg){
+  const el=document.getElementById('toast');if(!el)return;
+  el.classList.add('err');
+  el.textContent=msg;el.style.display='block';
+  clearTimeout(el._t);el._t=setTimeout(()=>{el.style.display='none';el.classList.remove('err');},9000);
 }
 function showModal(id){document.getElementById(id).style.display='grid';}
 
@@ -2254,28 +2275,18 @@ async function loadProxies(){
   const el=document.getElementById('proxy-list');if(!el)return;
   let list=[];try{list=await inv('proxies');}catch(_){}
   if(!list.length){el.innerHTML='<span style="color:var(--muted);font-size:13px">'+t('No channels yet.')+'</span>';return;}
-  const live=list.filter(p=>p.active), burned=list.filter(p=>!p.active);
-  const liveRow=p=>`<div class="rfrow"><div class="rfbody">`
+  // Every entry IS live: burning a channel DELETES its entry and its secret (A6-4, #207), so
+  // there is no such thing as a burned row to render. This used to split the list on `p.active`
+  // — a field the backend stopped sending when burning became destruction rather than a flag —
+  // so every live channel arrived with `active === undefined` and the whole section reported
+  // "All channels are burned" on a brand-new account that was publishing fine.
+  const proxyRow=p=>`<div class="rfrow"><div class="rfbody">`
     +`<div class="rfname">${esc(p.label||t('channel'))}</div>`
     +`<div class="rfmeta mono">${esc(p.ik.slice(0,16))}…</div></div>`
     +`<span class="rfdl" data-copyproxy="${esc(p.ik)}">${t('Copy address')}</span>`
     +`<span class="rfdl" data-migrateproxy="${p.index}" style="color:var(--accent)">${t('Migrate')}</span>`
     +`<span class="rfdl" data-burnproxy="${p.index}" style="color:var(--danger)">${t('Burn')}</span></div>`;
-  // A burned channel is dead — no address to copy, nothing to migrate/burn: just a dimmed, tagged
-  // reminder it existed. Kept OUT of the live list (and collapsed) so live channels stay clean.
-  const burnedRow=p=>`<div class="rfrow burned"><div class="rfbody">`
-    +`<div class="rfname">${esc(p.label||t('channel'))}</div>`
-    +`<div class="rfmeta mono">${esc(p.ik.slice(0,16))}…</div></div>`
-    +`<span class="rftag">${t('burned')}</span></div>`;
-  let h='<div class="rflist">'+(live.length?live.map(liveRow).join(''):'<span style="color:var(--muted);font-size:12.5px">'+t('All channels are burned — create a new one.')+'</span>')+'</div>';
-  if(burned.length){
-    h+=`<div class="rfburned-head" id="burned-toggle"><span id="burned-caret">▸</span> ${burned.length} ${t('burned')}</div>`
-      +`<div class="rflist" id="burned-list" style="display:none">`+burned.map(burnedRow).join('')+`</div>`;
-  }
-  el.innerHTML=h;
-  const tg=document.getElementById('burned-toggle');
-  if(tg)tg.onclick=()=>{const bl=document.getElementById('burned-list'),cr=document.getElementById('burned-caret');
-    const open=bl.style.display==='none';bl.style.display=open?'':'none';cr.textContent=open?'▾':'▸';};
+  el.innerHTML='<div class="rflist">'+list.map(proxyRow).join('')+'</div>';
 }
 async function createProxyUI(){
   const inp=document.getElementById('proxy-label');const label=(inp.value||'').trim();
@@ -2754,10 +2765,12 @@ if(TA){
   document.getElementById('phrase-pw').addEventListener('keydown',e=>{if(e.key==='Enter')revealPhrase();});
   const openNewChat=async()=>{
     document.getElementById('modal-contact').style.display='grid';
-    // Populate the "reach them from your channel" picker with our ACTIVE channels (all equal).
+    // Populate the "reach them from your channel" picker. Every channel the backend returns is
+    // live — burning deletes the entry (A6-4, #207) — so there is nothing to filter. Filtering on
+    // the `active` field the backend no longer sends emptied this picker completely.
     const sel=document.getElementById('nc-channel');
     if(sel){sel.innerHTML='';let ps=[];try{ps=await inv('proxies');}catch(_){}
-      ps.filter(p=>p.active).forEach(p=>{const o=document.createElement('option');o.value=p.index;
+      ps.forEach(p=>{const o=document.createElement('option');o.value=p.index;
         o.textContent=`${p.label||('channel '+p.index)} · ${p.ik.slice(0,8)}…`;sel.appendChild(o);});
       enhanceSelect(sel);refreshSelect(sel);}
     document.getElementById('nc-ik').focus();
@@ -2782,7 +2795,7 @@ if(TA){
   document.addEventListener('click',e=>{
     const ff=e.target.closest('.ffchip');
     if(ff){const k=ff.dataset.ff;
-      if(k==='__sub'){const ik=_feedFilter;inv('subscribe',{peerIk:ik}).then(()=>{_viewSubscribed=true;renderFeedFilter();toast(t('Subscribed — their posts will arrive in your feed.'));}).catch(err=>alert(String(err)));return;}
+      if(k==='__sub'){const ik=_feedFilter;inv('subscribe',{peerIk:ik}).then(()=>{_viewSubscribed=true;renderFeedFilter();toast(t('Subscribed — their posts will arrive in your feed.'));}).catch(err=>toastErr(String(err)));return;}
       setFeedFilter(k==='all'||k==='clear'?null:k);return;}
     const au=e.target.closest('.pauthor');
     if(au){setFeedFilter(au.dataset.author);return;}

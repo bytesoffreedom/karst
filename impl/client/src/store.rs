@@ -1638,8 +1638,12 @@ impl Store {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "no admission credential for relay {} on channel {} — join it \
-                         (karst join) or import its invite (karst import-cap)",
+                        // Frontend-NEUTRAL on purpose. This crate serves the CLI and the
+                        // desktop, and the message used to name `karst join` / `karst import-cap`
+                        // — telling a desktop user to run commands their app does not have.
+                        // Each frontend appends its own route to the fix.
+                        "no admission credential for relay {} on channel {} — this relay is \
+                         invite-only or has not been joined yet",
                         &relay.hex()[..16],
                         self.cap_slot()
                     ),

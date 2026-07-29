@@ -90,7 +90,8 @@ else
 fi
 
 echo "== QUIC: the same relay, reached over UDP instead of TCP =="
-# QUIC spent months fully written, fully tested and completely unreachable, because nothing
+# QUIC sat fully written, fully tested and completely unreachable across several slices, because
+# nothing
 # outside its own unit tests ever asked it to carry a byte. So this step asks the PRODUCT, not
 # the adapter: take the UDP address the relay says it bound, hand it to the CLI the same way the
 # relay's TCP address is handed over, and require the client to report that QUIC is what actually

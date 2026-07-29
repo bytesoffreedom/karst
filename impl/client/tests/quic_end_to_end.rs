@@ -2,8 +2,9 @@
 //!
 //! Every earlier QUIC test built its path with `set_paths_for_test`, which proves the carrier
 //! works and skips the wiring that decides whether anyone ever reaches it. That wiring is exactly
-//! what was missing for months: the listener was never started, the endpoint was never advertised,
-//! and the client had no branch that could build a QUIC path. So this test refuses the shortcut —
+//! what was missing through every earlier QUIC slice: the listener was never started, the endpoint
+//! was never advertised, and the client had no branch that could build a QUIC path. So this test
+//! refuses the shortcut —
 //! it starts a relay, lets that relay declare its own endpoint, and makes the client discover it
 //! the way a real client does.
 //!

@@ -2,11 +2,13 @@
 //! docs/STATUS.md): §2.1 E2E (PQXDH+ratchet) есть, но дев-capability с публичным
 //! секретом, доверие к IK — вне канала, нет обфускации транспорта, крипта не аудирована.
 //!
-//! Секреты на диске под **at-rest шифрованием** — пароль в `KARST_PASSPHRASE`
-//! (защита ХОЛОДНОГО диска, не живого процесса). Каталог: `$KARST_HOME`.
+//! On-disk secrets are under **at-rest encryption** — the password is prompted for on the
+//! terminal with echo off, with `KARST_PASSPHRASE` as the non-interactive fallback (protects a
+//! COLD disk, not a live process). Directory: `$KARST_HOME`.
 //! Команды: init/id/account/dev-cap/import-cap/publish/send/recv (см. `--help`).
 
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
@@ -101,17 +103,87 @@ fn print_usage() {
     );
 }
 
-/// Открыть хранилище под at-rest шифрованием. Пароль — из `KARST_PASSPHRASE`
-/// (защищает ХОЛОДНЫЙ диск: кража/бэкап/синк — НЕ живой процесс; интерактивный
-/// no-echo промпт — отдельный срез). Пустой/отсутствующий → явная ошибка.
+/// Open the vault under at-rest encryption. This protects a COLD disk (theft, a backup, a sync)
+/// — not a live process.
+///
+/// The password is read from the TERMINAL, with echo off, and `KARST_PASSPHRASE` is the fallback
+/// for scripts (CRYPTO-09). It used to be the only way in, which put the secret somewhere every
+/// child process inherits, `ps -e` environments can show on some systems, and a shell history or
+/// a CI log keeps for as long as anyone looks. A prompt has none of those properties, and a
+/// non-interactive caller loses nothing — the variable still works when there is no tty.
+///
+/// The bytes live in a `Zeroizing<String>`, so they are cleared when this function returns rather
+/// than lingering in freed heap. Honest limit, as everywhere else in this pass: it does not undo
+/// copies the runtime made on the way here (the environment string, the terminal's own buffer),
+/// and on a tty the line editor has already seen it.
 fn store() -> Result<Store, String> {
-    let pass = std::env::var("KARST_PASSPHRASE")
-        .map_err(|_| "set KARST_PASSPHRASE (the at-rest secret-encryption password)".to_string())?;
+    let pass = read_passphrase()?;
     if pass.is_empty() {
-        return Err("KARST_PASSPHRASE is empty — set a non-empty password".into());
+        return Err("empty password — the vault needs a non-empty one".into());
     }
     Store::unlock(Store::default_dir(), pass.as_bytes())
         .map_err(|e| format!("opening the vault: {e}"))
+}
+
+/// Prompt on the tty with echo disabled; fall back to `KARST_PASSPHRASE` when there is no tty
+/// (scripts, CI) or the variable is already set (an explicit choice by the caller).
+fn read_passphrase() -> Result<zeroize::Zeroizing<String>, String> {
+    if let Ok(v) = std::env::var("KARST_PASSPHRASE") {
+        return Ok(zeroize::Zeroizing::new(v));
+    }
+    let tty = match std::fs::File::open("/dev/tty") {
+        Ok(f) => f,
+        // No terminal and no variable: say what to do rather than blocking on a read that will
+        // never return.
+        Err(_) => {
+            return Err("no terminal to prompt on — set KARST_PASSPHRASE for non-interactive use".into())
+        }
+    };
+    eprint!("passphrase: ");
+    let _guard = EchoOff::new(&tty)?;
+    let mut pass = zeroize::Zeroizing::new(String::new());
+    std::io::BufReader::new(&tty)
+        .read_line(&mut pass)
+        .map_err(|e| format!("reading the passphrase: {e}"))?;
+    eprintln!();
+    while pass.ends_with('\n') || pass.ends_with('\r') {
+        pass.pop();
+    }
+    Ok(pass)
+}
+
+/// Turns terminal echo off for as long as it is alive, and back on when dropped — including on
+/// an early return or a panic, which is the whole reason it is a guard and not two calls.
+struct EchoOff {
+    fd: std::os::fd::RawFd,
+    restore: libc::termios,
+}
+
+impl EchoOff {
+    fn new(tty: &std::fs::File) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+        let fd = tty.as_raw_fd();
+        // SAFETY: `fd` is a live descriptor for the terminal we just opened, and `termios` is a
+        // plain C struct the kernel fills in.
+        let mut term: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+            return Err("could not read the terminal mode".into());
+        }
+        let restore = term;
+        term.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+            return Err("could not turn terminal echo off".into());
+        }
+        Ok(EchoOff { fd, restore })
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // Best effort: if this fails the terminal is left without echo, which is bad UX but not a
+        // secret leak — and there is nothing useful to do about it from a `Drop`.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.restore) };
+    }
 }
 
 /// Создать аккаунт: свежая 12-словная фраза → корень на диск. Фраза печатается

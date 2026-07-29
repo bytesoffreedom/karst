@@ -507,6 +507,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -2316,6 +2317,7 @@ dependencies = [
  "webpki-roots 0.26.11",
  "x25519-dalek",
  "xeddsa",
+ "zeroize",
 ]
 
 [[package]]

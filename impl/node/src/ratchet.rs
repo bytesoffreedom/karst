@@ -58,7 +58,7 @@ const MAX_SKIPPED_GENERATIONS: u64 = 4;
 
 /// Хранимый пропущенный ключ сообщения: идентифицируется (ratchet-pubkey цепочки,
 /// номер). `mk` — ключ сообщения; ложится at-rest (см. FS-компромисс в доке).
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct SkippedKey {
     dh: [u8; 32],
     n: u32,
@@ -113,10 +113,22 @@ pub enum RatchetError {
     NonContributoryDh,
 }
 
-/// Состояние Double-Ratchet-сессии. `Clone` — для транзакционного decrypt
-/// (мутируем копию, коммитим при успехе AEAD).
-#[derive(Clone)]
+/// Double-Ratchet session state. `Clone` exists for the transactional decrypt (mutate a copy,
+/// commit only once the AEAD verifies).
+///
+/// `ZeroizeOnDrop` (CRYPTO-09): the root key, both chain keys and every stored skipped message
+/// key are overwritten when the session — including each transient decrypt CLONE — is dropped.
+/// The clone matters most: a failed decrypt throws its copy away, and that copy held the same
+/// chain keys as the original.
+///
+/// HONEST LIMIT: this scrubs what the value owns at drop time. A move is a memcpy and does not
+/// scrub the source, the allocator may have reused the page, and the OS may have paged it out
+/// first. It shortens the window; it does not close it.
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct Session {
+    // `x25519_dalek::StaticSecret` inside `Identity` is already `ZeroizeOnDrop`, so scrubbing it
+    // again here would be a second pass over bytes dalek has cleared — skipped, not forgotten.
+    #[zeroize(skip)]
     dhs: Identity,           // наша ratchet-пара
     dhr: Option<[u8; 32]>,   // ratchet-pubkey собеседника
     rk: [u8; 32],            // root key
@@ -138,7 +150,10 @@ pub struct Session {
 /// пропущенные же ложатся ОСОЗНАННО (без этого фикс не переживает reload — см.
 /// FS-компромисс в доке модуля). `dhs_secret` — приватный ключ в открытом виде:
 /// вызывающий обязан писать под 0600 (тут at-rest — через `client::Store`).
-#[derive(serde::Serialize, serde::Deserialize)]
+/// Zeroized on drop for the same reason as `Session` (CRYPTO-09): a snapshot is the SAME key
+/// material in a serializable shape, and it exists exactly in the window where it is copied
+/// around — taken, encoded, sealed, dropped.
+#[derive(serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct SessionSnapshot {
     dhs_secret: [u8; 32],
     dhr: Option<[u8; 32]>,
@@ -172,7 +187,7 @@ impl Session {
     }
 
     /// Восстановить сессию из снимка.
-    pub fn restore(s: SessionSnapshot) -> Self {
+    pub fn restore(mut s: SessionSnapshot) -> Self {
         Session {
             dhs: Identity::from_secret_bytes(s.dhs_secret),
             dhr: s.dhr,
@@ -182,7 +197,9 @@ impl Session {
             ns: s.ns,
             nr: s.nr,
             pn: s.pn,
-            skipped: s.skipped,
+            // `SessionSnapshot` zeroizes on drop, which makes it non-`Copy` and unmovable field
+            // by field — take the vector out and leave an empty one behind for the drop to scrub.
+            skipped: std::mem::take(&mut s.skipped),
             dh_gen: s.dh_gen,
         }
     }
@@ -667,5 +684,39 @@ mod tests {
         // И сессия продолжает работать в пределах допустимого.
         let m1 = alice.encrypt(b"one");
         assert_eq!(bob.decrypt(&m1).unwrap(), b"one");
+    }
+
+    /// CRYPTO-09 (#157): the session's key material is scrubbed when the value is dropped.
+    ///
+    /// Discriminating on the BYTES, not on the trait: `zeroize()` is called on a session whose
+    /// keys are known, and the root key, both chain keys and every stored skipped key must come
+    /// back all-zero. Removing `ZeroizeOnDrop` (or a `#[zeroize(skip)]` slapped on `rk` to quiet
+    /// a compiler complaint) fails this — an "assert the type implements the trait" test would
+    /// not, because the derive can be present and still skip the field that matters.
+    ///
+    /// What this does NOT prove, stated so nobody reads more into it: that no COPY survives
+    /// elsewhere. A move is a memcpy and leaves the source untouched, and reading freed memory to
+    /// check would be undefined behaviour. This pins the one thing that is actually checkable —
+    /// the owned bytes are cleared — and the type doc carries the rest of the limit.
+    #[test]
+    fn dropping_a_session_scrubs_its_key_material() {
+        use zeroize::Zeroize;
+        let (mut alice, mut bob) = pair();
+        let m0 = alice.encrypt(b"zero");
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
+        // Leave a skipped key behind too, so the vector is not empty when we scrub.
+        let _m1 = alice.encrypt(b"one");
+        let m2 = alice.encrypt(b"two");
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two");
+        assert!(!bob.skipped.is_empty(), "precondition: a skipped key is stored");
+        assert_ne!(bob.rk, [0u8; 32], "precondition: the root key is real");
+        assert!(bob.ckr.is_some_and(|c| c != [0u8; 32]), "precondition: a receiving chain exists");
+
+        bob.zeroize();
+
+        assert_eq!(bob.rk, [0u8; 32], "the root key must be scrubbed");
+        assert_eq!(bob.cks, None, "the sending chain key is gone, not merely blanked");
+        assert_eq!(bob.ckr, None, "the receiving chain key is gone, not merely blanked");
+        assert!(bob.skipped.is_empty(), "stored skipped message keys must not survive");
     }
 }

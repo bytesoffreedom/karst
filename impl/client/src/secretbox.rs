@@ -105,10 +105,19 @@ pub fn random_salt() -> [u8; 16] {
     s
 }
 
-/// Мастер-ключ, выведенный из пароля. Держите ОДИН на процесс (Argon2id дорог) и
-/// переиспользуйте для всех secret-файлов. `Clone` дёшев (32 байта) — один
-/// vault-ключ раздаётся всем аккаунтам (`Vault::account`), переключение бесплатно.
-#[derive(Clone)]
+/// The password-derived master key. Keep ONE per process (Argon2id is expensive) and reuse it for
+/// every sealed file. `Clone` is cheap (32 bytes) — one vault key is handed to every account
+/// (`Vault::account`), so switching costs nothing.
+///
+/// `ZeroizeOnDrop` (CRYPTO-09): the bytes are overwritten when the last copy goes away, so a key
+/// does not outlive its owner in freed heap, a core dump, or a swapped-out page.
+///
+/// HONEST LIMIT, because zeroization is easy to overclaim: this covers the memory THIS value
+/// owns at the moment it is dropped. Rust may have copied the key while moving it (a move is a
+/// memcpy and the source is not scrubbed), the allocator may have handed the page on, and the OS
+/// may have paged it out before any of this ran. Clones are still explicit and few on purpose —
+/// the real bound is how many copies exist, and `Drop` is the floor under that, not a substitute.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct MasterKey([u8; 32]);
 
 impl MasterKey {

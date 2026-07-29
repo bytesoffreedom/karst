@@ -81,6 +81,11 @@ The commands are printed by `karst-up.sh`; in brief (`$R` = `--relay ...
 --relay-id ...`):
 
 ```sh
+> The CLI PROMPTS for the vault password on the terminal (echo off). `KARST_PASSPHRASE` below
+> is the non-interactive escape hatch for scripts — convenient here, but it puts the secret into
+> an environment every child process inherits and into your shell history, so prefer the prompt
+> for anything you care about.
+
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst init          # → prints the PHRASE + IK
 # restore on another device: karst restore word1 … word12  (into an empty $KARST_HOME)
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst dev-cap $R    # a credential is per RELAY, so name it

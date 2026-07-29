@@ -2111,6 +2111,29 @@ credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_l
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
 
+**Key material is zeroized on drop, with the limit stated (#157, CRYPTO-09).** `MasterKey`, the
+ratchet `Session` (root key, both chain keys, every stored skipped message key) and
+`SessionSnapshot` now carry `ZeroizeOnDrop`, and the intermediate KDF buffers in `seed::derive`
+(the BIP39 seed and the 160-byte HKDF output — the whole identity in raw form) are `Zeroizing`.
+The ratchet clone is the one that matters most: a failed decrypt throws away a copy holding the
+same chain keys, and that copy is now scrubbed too. `Identity` is deliberately skipped — dalek's
+`StaticSecret` already zeroizes itself, and a second pass would be noise. Pinned by
+`dropping_a_session_scrubs_its_key_material`, which discriminates on the BYTES rather than on the
+trait: an "implements ZeroizeOnDrop" assertion passes even when the field that matters carries
+`#[zeroize(skip)]`, and that neuter is exactly what reddens this test.
+
+**What zeroization does NOT buy, said plainly:** it clears the memory a value OWNS at the moment
+it is dropped. A move in Rust is a memcpy that leaves the source untouched, the allocator may
+have handed the page on, and the OS may have paged it out before any of it ran. The real bound
+is how few copies exist; `Drop` is the floor under that, not a substitute for it. Reading freed
+memory to "prove" more would be undefined behaviour, so the test claims only what is checkable.
+
+**The CLI prompts for the vault password (#157).** It used to require `KARST_PASSPHRASE`, which
+puts the at-rest secret into an environment every child process inherits, into shell history, and
+into CI logs. The password is now read from the terminal with echo off (restored by a guard, so
+an early return or a panic cannot leave the tty mute), held in a `Zeroizing<String>`, and the
+environment variable remains as the explicit non-interactive fallback for scripts.
+
 **A gossiped address is only a place to dial (#232, CRYPTO-23 node side).** `gossip_round` used to
 store the descriptor a PEER handed it, once `verify` confirmed a relay with those keys answered
 there. Everything that check tests is also true of a transparent proxy in front of an honest

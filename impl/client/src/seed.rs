@@ -124,10 +124,12 @@ pub fn mnemonic_of_entropy(entropy: &[u8; ENTROPY_BYTES]) -> Mnemonic {
 /// ```
 pub fn derive(entropy: &[u8; ENTROPY_BYTES]) -> DerivedIdentity {
     let m = mnemonic_of_entropy(entropy);
-    let seed = m.to_seed(""); // BIP39 PBKDF2, ПУСТАЯ passphrase — часть контракта
-    let hk = Hkdf::<Sha256>::new(None, &seed); // salt=None (пустой)
-    let mut okm = [0u8; 160];
-    hk.expand(HKDF_INFO, &mut okm).expect("160 ≤ 255*32");
+    // The BIP39 seed and the HKDF output are the whole identity in raw form — both are wiped
+    // when this function returns rather than left in freed stack/heap (CRYPTO-09).
+    let seed = zeroize::Zeroizing::new(m.to_seed("")); // BIP39 PBKDF2, EMPTY passphrase — part of the contract
+    let hk = Hkdf::<Sha256>::new(None, seed.as_ref()); // salt=None (empty)
+    let mut okm = zeroize::Zeroizing::new([0u8; 160]);
+    hk.expand(HKDF_INFO, okm.as_mut()).expect("160 ≤ 255*32");
     let seal = Identity::from_secret_bytes(okm[0..32].try_into().expect("32"));
     let account = Account::from_secret_bytes(okm[32..160].try_into().expect("128"));
     DerivedIdentity { seal, account }
@@ -164,8 +166,8 @@ const HKDF_PROXY_SECRET_INFO: &[u8] = b"KARST-proxy-secret-derive-v1";
 /// секреты, которые ещё не были подставлены сюда — не миллион розданных фраз.
 pub fn derive_proxy_from_secret(secret: &[u8; 32]) -> DerivedIdentity {
     let hk = Hkdf::<Sha256>::new(None, secret);
-    let mut okm = [0u8; 160];
-    hk.expand(HKDF_PROXY_SECRET_INFO, &mut okm).expect("160 ≤ 255*32");
+    let mut okm = zeroize::Zeroizing::new([0u8; 160]);
+    hk.expand(HKDF_PROXY_SECRET_INFO, okm.as_mut()).expect("160 ≤ 255*32");
     let seal = Identity::from_secret_bytes(okm[0..32].try_into().expect("32"));
     let account = Account::from_secret_bytes(okm[32..160].try_into().expect("128"));
     DerivedIdentity { seal, account }

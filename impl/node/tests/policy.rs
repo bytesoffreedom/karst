@@ -14,8 +14,20 @@ use node::socket::{RelayServer, SocketTransport};
 const NOW: u64 = 1_000_000;
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // Uniqueness must not rest on the clock alone: tests in one binary run on several threads
+    // with the SAME pid, and a coarse timer hands two of them the same nanosecond — which showed
+    // up as `AlreadyExists` on CI, not locally. A process-wide counter makes collision impossible
+    // rather than unlikely.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    std::env::temp_dir().join(format!("karst-policy-{tag}-{}-{nanos}", std::process::id()))
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "karst-test-{tag}-{}-{nanos}-{seq}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[test]

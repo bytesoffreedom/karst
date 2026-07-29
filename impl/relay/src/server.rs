@@ -12,6 +12,7 @@
 
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -43,7 +44,7 @@ pub fn generate_noise_keypair() -> ([u8; 32], [u8; 32]) {
 
 /// Per-connection read timeout: a hung/slow client (slowloris) becomes a clean
 /// error, not a thread pinned forever. Thread COUNT is bounded by `ConnLimiter` below.
-const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hard bounds on a REUSED connection (§15 / FT4). A client may stream many requests over one
 /// Noise session, but never more than this many, and never for longer than the wall-clock
@@ -57,7 +58,7 @@ const CONN_TOTAL_DEADLINE: Duration = Duration::from_secs(120);
 /// is RESOURCE HYGIENE for an untrusted relay — NOT the §7 admission gate (cookie/
 /// capability), which is a separate layer. Generous: it stops exhaustion, not a
 /// handful of legitimate concurrent clients.
-const MAX_CONNECTIONS: usize = 1024;
+pub(crate) const MAX_CONNECTIONS: usize = 1024;
 
 /// How many requests a connection may make WITHOUT ever having one admitted, before it is
 /// dropped (R2-13).
@@ -262,6 +263,29 @@ fn handle_conn(
         Some(config) => node::wss::accept_wss(stream, config)?,
         None => Box::new(stream),
     };
+    // A TCP connection carries one Noise session, so its unadmitted count is its own.
+    serve_channel(channel, relay, clock, noise_priv, &AtomicUsize::new(0))
+}
+
+/// Run one Noise session over an already-established byte channel.
+///
+/// Split out of `handle_conn` so a QUIC STREAM can be served by the identical code (QUIC-3). There
+/// must not be a second implementation of the request loop: the leash, the per-class frame
+/// ceilings and the deadlines are security properties, and a carrier that reimplemented them would
+/// be a carrier where they drift.
+///
+/// `unadmitted` is shared across everything that belongs to ONE transport connection. On TCP that
+/// is this channel alone. On QUIC it is every stream of the connection together — which is the
+/// point: `MAX_UNADMITTED_REQUESTS` bounds what a stranger can cost while holding a slot, and a
+/// per-STREAM count would let one connection open a thousand streams and pay the leash once each
+/// (R2-13, closed on TCP and wide open on QUIC without this).
+pub(crate) fn serve_channel(
+    channel: Box<dyn Channel>,
+    relay: Arc<RwLock<RelayNode>>,
+    clock: Clock,
+    noise_priv: [u8; 32],
+    unadmitted: &AtomicUsize,
+) -> io::Result<()> {
     let mut session = Session::accept(channel, &noise_priv)?;
 
     // ONE Noise session, MANY requests (§15 / FT4): after the handshake the client may send a
@@ -275,12 +299,11 @@ fn handle_conn(
     // Has this connection ever had a request ADMITTED? Until it has, it is a stranger holding a
     // slot, and is held to a much shorter leash (R2-13).
     let mut admitted = false;
-    let mut unadmitted_requests = 0usize;
     for _ in 0..MAX_REQUESTS_PER_CONN {
         if started.elapsed() > CONN_TOTAL_DEADLINE {
             break;
         }
-        if !admitted && unadmitted_requests >= MAX_UNADMITTED_REQUESTS {
+        if !admitted && unadmitted.load(Ordering::Relaxed) >= MAX_UNADMITTED_REQUESTS {
             break;
         }
         // Read with the blob ceiling: it covers both the tight normal requests and a
@@ -311,7 +334,7 @@ fn handle_conn(
         }
 
         if !admitted {
-            unadmitted_requests += 1;
+            unadmitted.fetch_add(1, Ordering::Relaxed);
         }
         // Whether THIS class can prove admission has to be read before `req` is consumed below.
         let credentialed = requires_admission(&req);

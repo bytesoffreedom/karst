@@ -28,6 +28,9 @@ snow = "0.10.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 tungstenite = "0.24"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [[bin]]
 name = "karst-relay"

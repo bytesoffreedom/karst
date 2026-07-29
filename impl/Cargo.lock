@@ -3163,6 +3163,7 @@ dependencies = [
  "hmac",
  "node",
  "postcard",
+ "quinn",
  "rand 0.8.7",
  "rcgen",
  "rustls",
@@ -3172,6 +3173,7 @@ dependencies = [
  "sha2 0.10.9",
  "snow",
  "subtle",
+ "tokio",
  "tungstenite",
  "x25519-dalek",
 ]

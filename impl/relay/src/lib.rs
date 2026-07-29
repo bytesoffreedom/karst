@@ -12,4 +12,5 @@
 pub mod gossip;
 pub mod mailstore;
 pub mod node;
+pub mod quic_server;
 pub mod server;

@@ -44,6 +44,13 @@ pub const ENTROPY_BYTES: usize = 32;
 /// Words in a phrase — a function of the entropy width (BIP-39: 32 bytes → 24 words).
 pub const PHRASE_WORDS: usize = 24;
 
+/// CRYPTO-32, enforced at COMPILE time: the root must not be weaker than the strongest primitive
+/// derived from it. ML-KEM-768 claims Category 3 (~192 bits); everything here is deterministic in
+/// the phrase, so a narrower root would silently make that claim false. Narrowing `ENTROPY_BYTES`
+/// therefore fails the BUILD rather than a test somebody could ignore.
+const ROOT_COVERS_ML_KEM_768: () = assert!(ENTROPY_BYTES * 8 >= 192);
+const _: () = ROOT_COVERS_ML_KEM_768;
+
 /// Выведенные из фразы секреты. Оба детерминированы от одной энтропии.
 pub struct DerivedIdentity {
     pub seal: Identity,
@@ -307,15 +314,10 @@ mod tests {
     /// (someone widening only the display) would still fail here.
     #[test]
     fn the_root_seed_is_not_weaker_than_ml_kem_768() {
-        const ML_KEM_768_CATEGORY_3_BITS: usize = 192;
-        assert!(
-            ENTROPY_BYTES * 8 >= ML_KEM_768_CATEGORY_3_BITS,
-            "a {}-bit root is below Category 3 ({ML_KEM_768_CATEGORY_3_BITS}) — the PQ claim \
-             would be untrue: no reason to break a lattice when the seed can be searched",
-            ENTROPY_BYTES * 8
-        );
-        // And the phrase really carries that entropy (rather than showing more words over the
-        // same root).
+        // The width itself is checked at COMPILE time (see `ROOT_COVERS_ML_KEM_768` next to the
+        // constant) — narrowing the root does not fail a test, it fails the build. What is left
+        // to check at runtime is that a real phrase carries that entropy, rather than showing
+        // more words over the same root.
         let m = generate_mnemonic();
         assert_eq!(m.word_count(), PHRASE_WORDS);
         assert_eq!(entropy_of(&m).len(), ENTROPY_BYTES);

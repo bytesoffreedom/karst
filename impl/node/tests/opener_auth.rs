@@ -101,18 +101,22 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
     assert_eq!(bob.opk_count(), 0, "the genuine acceptance consumes the one-time prekey");
 }
 
-/// The UNSEALED opener is refused on the wire.
+/// The UNSEALED opener cannot be expressed at all any more (#232 / A3-14).
 ///
-/// `SessionEnvelope::Initial` carries the sender's identity key in the clear, so a relay can read
-/// the social-graph edge straight off it — the exact leak `InitialSealed` was introduced to close.
-/// The variant was kept only so an in-flight capsule from an older client would still open; with
-/// no older clients that tolerance is pure downside, because ANY peer could send the legacy form
-/// and silently downgrade a conversation's metadata privacy without the recipient noticing.
+/// It used to be `SessionEnvelope::Initial`, carrying `KeyAgreement.ik_a_pub` — the sender's
+/// long-term identity — in the clear, so a relay that wanted the social graph could read every
+/// edge straight off the openers. `Peer::process` refused it at runtime; the variant itself was
+/// kept so an in-flight capsule from an older client would still open. With no older clients that
+/// tolerance was pure downside, and a runtime refusal is a weaker thing than a shape that cannot
+/// be constructed — so the variant is gone.
 ///
-/// Discriminating: the very same agreement is accepted when SEALED, so this pins the refusal to
+/// What is left to test is that the LEGACY BYTES do not become a session. They no longer decode
+/// as an opener at all (postcard numbers variants positionally, so the old index now means
+/// something else), which is fail-closed rather than a loud refusal — the honest description of
+/// what removal buys. The sealed form of the very same agreement is accepted, which pins this to
 /// the envelope form rather than to a broken opener.
 #[test]
-fn an_unsealed_opener_is_refused_but_the_sealed_form_of_it_works() {
+fn the_legacy_unsealed_opener_shape_cannot_become_a_session() {
     let mut bob = bob_peer();
     let opk = bob.add_opks(1)[0];
     let bundle = bob.bundle_with_opk(opk);
@@ -122,10 +126,25 @@ fn an_unsealed_opener_is_refused_but_the_sealed_form_of_it_works() {
     let mut sender = Session::init_sender(root, bundle.prekey_pub);
     let msg = sender.encrypt(b"first contact");
 
-    // Legacy form: identical contents, unsealed → refused, and nothing is consumed.
-    let legacy = Payload::Session(SessionEnvelope::Initial { ka: ka.clone(), msg: msg.clone() });
-    assert!(bob.open_for_test(&legacy).is_none(), "an unsealed opener must not be accepted");
-    assert_eq!(bob.opk_count(), 1, "a refused envelope must not consume the one-time prekey");
+    // The old wire shape, written by hand: variant index 0 (which `Initial` used to occupy)
+    // followed by the agreement and the first ratchet message.
+    #[derive(serde::Serialize)]
+    enum LegacyEnvelope {
+        Initial { ka: node::pqxdh::KeyAgreement, msg: node::ratchet::RatchetMessage },
+    }
+    let legacy_bytes =
+        postcard::to_stdvec(&LegacyEnvelope::Initial { ka: ka.clone(), msg: msg.clone() })
+            .expect("legacy shape encodes");
+    match postcard::from_bytes::<SessionEnvelope>(&legacy_bytes) {
+        Err(_) => {} // refused at the wire boundary
+        Ok(env) => {
+            // It decoded as SOMETHING (the index now names another variant) — then it must not
+            // open, and must not consume the one-time prekey.
+            let payload = Payload::Session(env);
+            assert!(bob.open_for_test(&payload).is_none(), "legacy opener bytes must not open a session");
+        }
+    }
+    assert_eq!(bob.opk_count(), 1, "nothing about the legacy shape may consume the one-time prekey");
 
     // Sealed form of the SAME agreement: accepted.
     let sealed = sealed_to(bob.bundle().ik_pub, &ka, msg);

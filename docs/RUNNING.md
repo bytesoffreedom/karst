@@ -109,27 +109,33 @@ the reference for what it configures.
 
 | Mode | Who gets in | Use it for |
 |---|---|---|
-| `private` (default) | invite-only — you hand each peer the `invite.json` the relay writes (`karst import-cap`) | a closed group; the safe default |
+| `private` (default) | invite-only — one credential per invitee (`karst-relay invite new NAME`), handed over as its own file | a closed group; the safe default |
 | `public` | anyone who **earns** a capability (`karst join`), rate-bounded by proof-of-work + the per-capability quota | public infrastructure |
 | `dev` | a known, public capability (local testing only — never expose) | the one-machine demo above |
 
 An **unknown** mode value refuses to start (no silent default).
 
-> **Known limit of the private door (CRYPTO-25, open).** A private relay mints exactly ONE
-> capability and `invite.json` is that one credential, handed to everybody. So all your invitees
-> share one `capability_id` — and the quota tracker meters by `capability_id`, which means they
-> share **one quota bucket** too. Consequences to plan around: one noisy or compromised invitee can
-> exhaust the bucket and everyone else's messages start coming back `CapabilityQuota`; you cannot
-> revoke or rate-limit ONE person; you cannot tell whose traffic is whose; and rotating
-> `capability.key` cuts off every user at once. A capability is a bearer token either way (any
-> holder can pass it on voluntarily), so per-invite credentials would not stop sharing — but they
-> would isolate quota, allow a targeted revoke, and keep one compromised client from becoming a
-> denial of service for the whole group. Until that lands, size a private relay to people you would
-> trust with each other's availability.
+A private relay mints **one credential per invitee**, not one shared by everybody:
+
+```sh
+karst-relay invite new alice     # mint + write invites/<id>.json (0600) — hand THAT file to Alice
+karst-relay invite list          # id, label, live/revoked
+karst-relay invite revoke <id>   # stops working on the NEXT request, not at the next restart
+```
+
+That matters because the quota tracker meters by `capability_id`. With one shared invite, every
+invitee drew on one bucket: a single noisy or compromised client could exhaust it and everyone
+else started getting `CapabilityQuota` back, you could not revoke or rate-limit one person, you
+could not tell whose traffic was whose, and rotating the secret cut off the entire group at once.
+
+Honest limit that per-invite credentials do NOT fix: a capability is a bearer token, so any holder
+can pass theirs on voluntarily. What changed is that quota is isolated, a targeted revoke exists,
+and one compromised client can no longer deny service to the whole group.
 
 Since a capability belongs to ONE relay, the client always names the relay an invite is for:
-`karst import-cap invite.json --relay HOST:PORT --relay-id <hex>` (the invite file itself carries
-no relay-id — the relay writes the bare credential).
+`karst import-cap invites/<id>.json --relay HOST:PORT --relay-id <hex>`. The invite file now
+carries the relay-id and address itself, so those flags are a cross-check rather than the only
+source of truth.
 
 ### Proof-of-work on a public door — and toggling it live
 

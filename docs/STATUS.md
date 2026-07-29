@@ -88,9 +88,15 @@ Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests g
   overwriting a real credential), the same way `KARST_INSECURE_FAST_KDF` is stated rather than
   inferred. Auto-earning a
   capability when a relay is discovered is a deliberate non-goal here — it would make discovery emit
-  a PoW admission round trip on its own. Related node-side gap: an invite file (`invite.json`) is a
-  bare serialized capability with NO relay-id in it, so the CLI/desktop must be TOLD which relay an
-  invite belongs to (`--relay-id`; the desktop binds it to the configured primary).
+  a PoW admission round trip on its own. The node-side half is now closed too (CRYPTO-25): a private
+  relay mints ONE credential PER INVITEE (`karst-relay invite new|list|revoke`), each with its own
+  `capability_id` — so the quota tracker, which meters by that id, no longer pools every invitee
+  into one bucket, a single person can be revoked without touching the others (effective on the
+  next request, not at the next restart), and the invite file now carries the relay-id and address
+  it belongs to instead of being a bare credential the client had to be told about out of band.
+  Pinned by `revoking_one_invite_leaves_every_other_invite_working`, which discriminates on the
+  property that matters: after the revoke, that invite's proof is refused and every other invite
+  still verifies.
 - **Metadata hardening (Loopix-style) — status.** The impactful pieces are already shipped and
   verified: the relay fetch response is a FIXED 16 000-byte page whether it carries 0 or `FETCH_CAP`
   seals (§2.2 — message COUNT never leaks through response length), polling is jittered, and messages
@@ -2018,6 +2024,30 @@ deadline with one `BlobStat`, since the public reads answer without looking at a
 credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_leash`
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
+
+**A gossiped address is only a place to dial (#232, CRYPTO-23 node side).** `gossip_round` used to
+store the descriptor a PEER handed it, once `verify` confirmed a relay with those keys answered
+there. Everything that check tests is also true of a transparent proxy in front of an honest
+relay: the TCP lands on the proxy, Noise terminates at the real relay behind it, and the relay
+serves its own relay-id correctly — so a peer could advertise `proxy → honest relay-id` and we
+would adopt the proxy as the route, handing whoever runs it a permanent view of client IPs,
+timing and volume plus a selective-drop switch, with the encryption intact. `verified_self_
+descriptor` now returns the relay's OWN entry for itself and that is what gets stored; the
+offered address is used only to dial. Comparing offered against self-declared was rejected on both
+sides for the same reason: it needs canonicalisation across host-vs-IP, carrier, port and path,
+and any rule strict enough to catch the proxy also rejects an honest relay spelled differently. A
+relay that declares no address of its own is simply not stored — it is undiscoverable by its own
+choice, and inventing an address for it is the behaviour being removed. Pinned by
+`gossip_stores_the_relays_own_address_not_a_peers_proxy`, which runs a real transparent TCP proxy.
+
+**The unsealed opener no longer exists (#232, A3-14 residual).** `SessionEnvelope::Initial`
+carried the sender's long-term identity key in the clear, so a relay wanting the social graph
+could read every edge off the openers; `InitialSealed` replaced it and `Peer::process` already
+refused the legacy form. Keeping the variant meant the shape stayed EXPRESSIBLE, and a runtime
+refusal is weaker than a form nobody can construct — so it is gone. Honest about what that
+changes: postcard numbers variants positionally, so old bytes now decode as a different variant
+and fail closed rather than being refused loudly. A free wire break at zero users, taken
+deliberately.
 
 **The relay cannot admit a token credential (#145).** The token-verifier field used to be
 `MockRingVerifier`, the non-cryptographic structural stub the pipeline tests compose against. It

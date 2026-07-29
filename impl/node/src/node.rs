@@ -256,15 +256,15 @@ fn mailbox_owner_ok(
 /// Relay хранит непрозрачно — ключа не имеет, различить содержимое не может.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum SessionEnvelope {
-    /// Первый контакт: PQXDH-согласование + первое ratchet-сообщение.
-    ///
-    /// **LEGACY — names the sender to the relay.** `KeyAgreement.ik_a_pub` is the
-    /// sender's long-term identity in the clear: the relay treats the payload as opaque,
-    /// but the format is public, so a relay that wants the social graph reads every edge
-    /// off the openers. Superseded by `InitialSealed`; kept so an in-flight capsule from
-    /// an older peer still opens.
-    Initial { ka: KeyAgreement, msg: RatchetMessage },
     /// Продолжение установленной сессии.
+    ///
+    /// The unsealed `Initial` opener that used to sit here is GONE (#232/A3-14). It carried
+    /// `KeyAgreement.ik_a_pub` — the sender's long-term identity — in the clear, so any relay
+    /// that wanted the social graph could read every edge straight off the openers.
+    /// `InitialSealed` replaced it, and `Peer::process` already refused the legacy form; keeping
+    /// the variant meant the shape stayed EXPRESSIBLE, and a runtime refusal is a weaker thing
+    /// than a form that cannot be constructed. Removing it renumbers the postcard variants,
+    /// which is a wire break — free at zero users, and taken deliberately.
     Ratchet(RatchetMessage),
     /// **Sealed opener**: the same PQXDH `KeyAgreement`, wrapped in a sealed box
     /// addressed to the RECIPIENT's identity key (ephemeral X25519 → their `ik_pub`,
@@ -300,9 +300,6 @@ impl Payload {
     fn approx_len(&self) -> usize {
         match self {
             Payload::Skeleton(s) => s.ciphertext.len(),
-            Payload::Session(SessionEnvelope::Initial { ka, msg }) => {
-                ka.kem_ct.len() + msg.ciphertext.len() + 64
-            }
             Payload::Session(SessionEnvelope::InitialSealed { sealed_ka, msg }) => {
                 sealed_ka.ciphertext.len() + msg.ciphertext.len() + 64
             }
@@ -1185,6 +1182,19 @@ impl RelayNode {
     /// у relay для верификации.
     pub fn issue_capability(&mut self, cap: Capability) {
         self.capabilities.insert(cap);
+    }
+
+    /// Withdraw a stored capability (CRYPTO-25). An invite is a bearer credential: the only way
+    /// to take one back is to stop honouring its id, and that has to bite on the NEXT request,
+    /// not at the next restart — an operator revoking an invite is usually reacting to something.
+    /// Returns whether the id was known.
+    pub fn revoke_capability(&mut self, capability_id: &[u8; 16]) -> bool {
+        self.capabilities.remove(capability_id)
+    }
+
+    /// Stored capability ids (operator listing).
+    pub fn capability_ids(&self) -> Vec<[u8; 16]> {
+        self.capabilities.ids()
     }
 
     /// Add (or update) a relay descriptor in the node list (discovery plane). **Operator-

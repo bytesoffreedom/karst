@@ -185,6 +185,22 @@ impl CapabilityTable {
         self.entries.insert(cap.capability_id, cap);
     }
 
+    /// Remove a stored capability, so REVOKING an invite takes effect on the next request rather
+    /// than at the next restart (CRYPTO-25). Returns whether anything was there — the caller
+    /// reports "unknown id" rather than pretending it revoked something.
+    ///
+    /// Only stored credentials can be revoked this way. A PoW-earned capability is verified
+    /// STATELESSLY (there is no entry to remove), which is the trade that makes the public door
+    /// cheap; bounding those is the quota's job, not a revocation list's.
+    pub fn remove(&mut self, capability_id: &[u8; 16]) -> bool {
+        self.entries.remove(capability_id).is_some()
+    }
+
+    /// Stored capability ids, for an operator listing (`invite list`).
+    pub fn ids(&self) -> Vec<[u8; 16]> {
+        self.entries.keys().copied().collect()
+    }
+
     /// Enable stateless PoW-capability verification (the Public door, slice 4a). Idempotent.
     pub fn set_pow_issuer(&mut self, issuer_key: [u8; 32]) {
         self.pow_issuer = Some(issuer_key);

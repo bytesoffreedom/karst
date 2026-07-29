@@ -185,3 +185,76 @@ fn advertisement_rotates_and_a_new_address_replaces_the_oldest() {
         moved.addrs
     );
 }
+
+/// CRYPTO-23 (node side, #232): a peer's ADDRESS for a relay is only a place to dial — what gets
+/// stored is what the relay says about itself.
+///
+/// Everything `verify` checks is also true through a transparent proxy in front of an honest
+/// relay: the TCP lands on the proxy, Noise terminates at the real relay behind it, and the relay
+/// serves its own relay-id correctly. So a peer could advertise `proxy → honest relay-id`, we
+/// would verify it, and then store THE PROXY as the route — a permanent view of client IPs,
+/// timing and volume for whoever runs it, plus a selective-drop switch, with the encryption
+/// perfectly intact.
+///
+/// Here relay A advertises B at a proxy address that really does reach B. C gossips with A and
+/// must end up holding B's OWN address. Store the offered descriptor instead and it reddens.
+#[test]
+fn gossip_stores_the_relays_own_address_not_a_peers_proxy() {
+    // B: a real relay that advertises its own address.
+    let (b_addr, b_np, b_fp) = spawn(vec![], true);
+    // A transparent proxy in front of B — a different address that reaches the same relay.
+    let proxy_addr = spawn_tcp_proxy(&b_addr);
+    assert_ne!(proxy_addr, b_addr);
+
+    // A knows B only through the proxy address, and tells C so.
+    let (a_addr, a_np, a_fp) = spawn(vec![desc(b_np, b_fp, &proxy_addr)], true);
+
+    let c = Arc::new(Mutex::new(RelayNode::with_identity(NOW, Identity::generate())));
+    let (c_np, _c_pub) = generate_noise_keypair();
+    c.lock().unwrap().add_relay(desc(a_np, a_fp, &a_addr));
+
+    let added = node::gossip::gossip_round(&c, &c_np, true);
+    assert_eq!(added, 1, "C should learn B from A");
+
+    let stored = c.lock().unwrap().known_relays();
+    let b_entry = stored
+        .iter()
+        .find(|d| d.noise_pub == b_np && d.fetch_pub == b_fp)
+        .expect("B is now known to C");
+    assert!(
+        b_entry.addrs.contains(&b_addr),
+        "C must route to B's OWN address, got {:?}",
+        b_entry.addrs
+    );
+    assert!(
+        !b_entry.addrs.contains(&proxy_addr),
+        "the proxy address A offered must not be stored as a route to B"
+    );
+}
+
+/// A transparent TCP proxy: everything that arrives goes upstream and back, untouched. Enough to
+/// stand in for an on-path relay operator's front end — the Noise session is end-to-end, so it
+/// completes perfectly through this.
+fn spawn_tcp_proxy(upstream: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let upstream = upstream.to_string();
+    thread::spawn(move || {
+        for inbound in listener.incoming() {
+            let Ok(inbound) = inbound else { continue };
+            let Ok(out) = std::net::TcpStream::connect(&upstream) else { continue };
+            let (Ok(in2), Ok(out2)) = (inbound.try_clone(), out.try_clone()) else { continue };
+            thread::spawn(move || {
+                let mut a = inbound;
+                let mut b = out;
+                let _ = std::io::copy(&mut a, &mut b);
+            });
+            thread::spawn(move || {
+                let mut a = out2;
+                let mut b = in2;
+                let _ = std::io::copy(&mut a, &mut b);
+            });
+        }
+    });
+    addr
+}

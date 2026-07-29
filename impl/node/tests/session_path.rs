@@ -184,7 +184,6 @@ fn failed_send_never_reuses_ratchet_position() {
     for m in tap.sent.borrow().iter() {
         if let Payload::Session(env) = &m.payload {
             let (h, ct) = match env {
-                SessionEnvelope::Initial { msg, .. } => (msg.header, msg.ciphertext.clone()),
                 SessionEnvelope::InitialSealed { msg, .. } => (msg.header, msg.ciphertext.clone()),
                 SessionEnvelope::Ratchet(msg) => (msg.header, msg.ciphertext.clone()),
             };

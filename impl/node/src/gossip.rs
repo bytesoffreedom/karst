@@ -103,16 +103,47 @@ pub const MAX_NEW_FROM_ONE_PEER: usize = 4;
 /// (2) needs the target to self-advertise (it must, to be discoverable) and to include its
 /// self-entry in the served page — self is seeded first, so it sits in the frame prefix.
 pub fn verify(d: &RelayDescriptor, addr: &str, allow_private: bool) -> bool {
+    verified_self_descriptor(d, addr, allow_private).is_some()
+}
+
+/// Dial `addr`, confirm the relay with `d`'s keys answers there, and return **its own** entry for
+/// itself — the addresses IT declares, not the ones we were told to expect (CRYPTO-23).
+///
+/// This distinction is the fix. Everything `verify` checks is also true of a transparent proxy in
+/// front of an honest relay: the TCP connection lands on the proxy, the Noise handshake terminates
+/// at the real relay behind it, and the relay serves its own relay-id exactly as it should. So a
+/// peer could hand out `victim-proxy:port → honest relay-id`, we would verify it, and then STORE
+/// the proxy — handing whoever runs it a permanent view of client IPs, timing and volume, plus a
+/// selective-drop switch, with the encryption completely intact.
+///
+/// Comparing the offered address against the self-declared one was considered and rejected (the
+/// client side reached the same conclusion): it needs canonicalisation across host-vs-IP, carrier,
+/// port and path, and every rule strict enough to catch the proxy also rejects an honest relay
+/// reached by a different spelling of its own address. So the offered address is used only as a
+/// PLACE TO DIAL, and what gets stored comes from the relay itself.
+///
+/// A relay that declares no address of its own is not stored: it is not discoverable by its own
+/// choice, and inventing one for it is exactly the behaviour being removed.
+pub fn verified_self_descriptor(
+    d: &RelayDescriptor,
+    addr: &str,
+    allow_private: bool,
+) -> Option<RelayDescriptor> {
     if !addr_is_dialable(addr, allow_private) {
-        return false; // never dial into private/loopback space on a peer's say-so (A3-12)
+        return None; // never dial into private/loopback space on a peer's say-so (A3-12)
     }
-    let Ok(dest) = Dest::parse(addr) else {
-        return false;
-    };
-    match SocketTransport::new(dest, d.noise_pub).get_node_list() {
-        Ok(list) => list.iter().any(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub),
-        Err(_) => false, // handshake failed (wrong key / not a relay) or unreachable
+    let dest = Dest::parse(addr).ok()?;
+    let list = SocketTransport::new(dest, d.noise_pub).get_node_list().ok()?;
+    let mut own = list
+        .into_iter()
+        .find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
+    // Its self-declared addresses still have to pass the SSRF gate: "the relay said so" is not a
+    // licence to dial someone's LAN either.
+    own.addrs.retain(|a| addr_is_dialable(a, allow_private));
+    if own.addrs.is_empty() {
+        return None;
     }
+    Some(own)
 }
 
 /// One gossip round. Pulls each known PEER's node-list and merges newly-heard descriptors that
@@ -171,8 +202,10 @@ pub fn gossip_round(
             dialed_addrs.insert(addr.clone());
             dials += 1;
             new_from_peer += 1;
-            if verify(&d, &addr, allow_private) {
-                relay.lock().expect("relay mutex").add_relay(d.clone());
+            // Store what the relay says about ITSELF, not what the peer said about it
+            // (CRYPTO-23). The peer's address was only a place to dial.
+            if let Some(own) = verified_self_descriptor(&d, &addr, allow_private) {
+                relay.lock().expect("relay mutex").add_relay(own);
                 known_ids.insert(id);
                 added += 1;
             }

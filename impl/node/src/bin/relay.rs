@@ -123,6 +123,117 @@ fn mail_persistence_from_env() -> Result<MailboxDurability, String> {
     parse_mail_persistence(std::env::var("KARST_RELAY_MAIL_PERSIST").ok().as_deref())
 }
 
+/// One issued invite (CRYPTO-25). The capability itself is the bearer credential; everything
+/// else is what an OPERATOR needs to manage it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Invite {
+    /// Operator's own name for this invite ("alice", "conference-2026") — the whole point of
+    /// per-invite credentials is being able to say WHICH one to revoke.
+    label: String,
+    created_at: u64,
+    /// Revoked invites are KEPT (with this flag) rather than deleted, so the id can never be
+    /// re-minted by accident and `invite list` can still explain what happened to it.
+    revoked: bool,
+    cap: Capability,
+}
+
+/// The persisted invite table. Bounded: an operator who can mint invites can also fill a disk,
+/// but a bug or a script in a loop should not be able to.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct Invites {
+    entries: Vec<Invite>,
+}
+
+/// Ceiling on stored invites (live + revoked). Generous for any real deployment — a relay handing
+/// out more than this is running a public door, not an invite list.
+const MAX_INVITES: usize = 4_096;
+
+/// What an invite file carries. NOT a bare `Capability` any more (CRYPTO-24/25): a credential
+/// with no idea which relay it belongs to forced the client to be TOLD, out of band, which relay
+/// each invite was for — and the client now keeps credentials per relay, so that was a real gap
+/// rather than a cosmetic one. `relay_id` is the same 128-hex identifier the connect block
+/// prints, so importing an invite binds it to exactly one relay with no extra ceremony.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InviteFile {
+    relay_id: String,
+    addr: String,
+    label: String,
+    cap: Capability,
+}
+
+/// The address a client should actually dial: the advertised one when it is routable, else the
+/// listen address. Shared by the invite file and the connect block so they can never disagree.
+fn client_addr_hint<'a>(advertise: &'a str, addr: &'a str) -> &'a str {
+    if is_routable_advertise(advertise) {
+        advertise
+    } else {
+        addr
+    }
+}
+
+fn invites_path() -> PathBuf {
+    key_dir().join("invites.json")
+}
+
+fn load_invites() -> io::Result<Invites> {
+    match std::fs::read(invites_path()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            // LOUD, not "start with an empty list": an unreadable invite table means every
+            // invitee silently loses access, and re-minting would hand out new credentials while
+            // the old ones are still in the wild.
+            io::Error::new(io::ErrorKind::InvalidData, format!("invites.json unreadable: {e}"))
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Invites::default()),
+        Err(e) => Err(e),
+    }
+}
+
+fn save_invites(inv: &Invites) -> io::Result<()> {
+    let dir = key_dir();
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_vec_pretty(inv).map_err(io::Error::other)?;
+    // The secrets in here ARE the doors. Write via a 0600 temp + rename so a crash cannot leave a
+    // truncated table (which `load_invites` would then refuse to start on).
+    let tmp = dir.join("invites.json.tmp");
+    {
+        let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(&json)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, invites_path())?;
+    Ok(())
+}
+
+/// Mint a fresh, unique invite credential. Each gets its OWN `capability_id` and secret, which is
+/// the whole fix (CRYPTO-25): the quota tracker meters by `capability_id`, so one shared invite
+/// meant one shared bucket — every invitee's sending charged against everyone else's — with no
+/// way to revoke a single person and no rotation that did not cut off the entire relay.
+fn mint_invite(label: &str, now: u64) -> Invite {
+    use rand::RngCore;
+    let mut id = [0u8; 16];
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut id);
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    Invite {
+        label: label.to_string(),
+        created_at: now,
+        revoked: false,
+        cap: Capability {
+            capability_id: id,
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 100, max_bytes: 1 << 20, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret,
+        },
+    }
+}
+
+/// Hex id, for operator commands and file names.
+fn invite_id_hex(cap: &Capability) -> String {
+    cap.capability_id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The relay's admission capability, sized like the dev one but with a role-appropriate
 /// secret. `Dev` returns the known public cap; `Private`/`Public` load or create a random
 /// secret persisted 0600 in `capability.key`, so the invite stays valid across restarts.
@@ -177,12 +288,23 @@ fn load_or_create_cap(role: Role) -> io::Result<Capability> {
     })
 }
 
-/// Write the capability as an invite file the operator hands to a peer, who runs
-/// `karst import-cap <file>`. JSON, matching the client's `import-cap` reader. 0600 —
-/// the secret in it IS the key to the door.
-fn write_invite(cap: &Capability) -> io::Result<PathBuf> {
-    let path = key_dir().join("invite.json");
-    let json = serde_json::to_vec_pretty(cap).map_err(io::Error::other)?;
+/// Write ONE invite as the file an operator hands to ONE peer, who runs
+/// `karst import-cap <file>`. 0600 — the secret in it IS the key to the door.
+///
+/// One file per invite, named by its id, so handing out two invites cannot silently overwrite the
+/// first (which the single `invite.json` did, and which is how a "per-invite" credential quietly
+/// becomes a shared one again).
+fn write_invite_file(inv: &Invite, relay_id: &str, addr: &str) -> io::Result<PathBuf> {
+    let dir = key_dir().join("invites");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", invite_id_hex(&inv.cap)));
+    let file = InviteFile {
+        relay_id: relay_id.to_string(),
+        addr: addr.to_string(),
+        label: inv.label.clone(),
+        cap: inv.cap.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
     f.write_all(&json)?;
     Ok(path)
@@ -320,7 +442,7 @@ fn is_stop_command(line: &str) -> bool {
 /// Apply one admin command line to the running relay, returning the reply line. Pure over the
 /// shared relay + the parsed line, so it is unit-tested. `stop` is handled by the caller (it
 /// exits the process), so it never reaches here — the error text still lists it for discovery.
-fn apply_admin_command(relay: &Arc<Mutex<RelayNode>>, line: &str) -> String {
+fn apply_admin_command(relay: &Arc<Mutex<RelayNode>>, line: &str, ctx: &InviteCtx) -> String {
     let mut parts = line.split_whitespace();
     match (parts.next(), parts.next()) {
         (Some("pow"), Some("status")) | (Some("pow"), None) => {}
@@ -353,14 +475,101 @@ fn apply_admin_command(relay: &Arc<Mutex<RelayNode>>, line: &str) -> String {
             let cur = relay.lock().expect("relay mutex").quota_policy();
             return format!("quota: {}", describe_quota(cur));
         }
+        // CRYPTO-25: per-invite credentials an operator can actually manage. `new` mints a fresh
+        // id+secret and writes its own file; `revoke` stops honouring one id — on the NEXT
+        // request, not at the next restart, because revoking is usually a reaction to something.
+        (Some("invite"), sub) => return invite_command(relay, sub, parts.next(), ctx),
         _ => {
             return format!(
-                "error: unknown command '{line}' — use: pow status|off|open|on [BITS] | quota status|off|set REQ BYTES WINDOW|preset NAME | stop"
+                "error: unknown command '{line}' — use: pow status|off|open|on [BITS] | quota status|off|set REQ BYTES WINDOW|preset NAME | invite list|new LABEL|revoke ID | stop"
             )
         }
     }
     let now = relay.lock().expect("relay mutex").pow_difficulty();
     format!("pow: {}", describe_pow(now))
+}
+
+/// What an invite needs to know about the relay it belongs to, so a minted invite file can name
+/// its relay (which is what lets a client bind the credential to exactly one relay — the coupling
+/// CRYPTO-24 exposed).
+#[derive(Clone, Default)]
+struct InviteCtx {
+    relay_id: String,
+    addr: String,
+}
+
+/// `invite list | new LABEL | revoke ID`.
+fn invite_command(
+    relay: &Arc<Mutex<RelayNode>>,
+    sub: Option<&str>,
+    arg: Option<&str>,
+    ctx: &InviteCtx,
+) -> String {
+    let mut invites = match load_invites() {
+        Ok(i) => i,
+        // Fail LOUD: minting on top of a table we could not read would hand out a credential
+        // while the existing ones are still in the wild and unaccounted for.
+        Err(e) => return format!("error: {e}"),
+    };
+    match sub {
+        None | Some("list") => {
+            if invites.entries.is_empty() {
+                return "invites: none".into();
+            }
+            let mut out = String::from("invites:");
+            for inv in &invites.entries {
+                out.push_str(&format!(
+                    "\n  {} {:<16} {}",
+                    invite_id_hex(&inv.cap),
+                    inv.label,
+                    if inv.revoked { "revoked" } else { "live" }
+                ));
+            }
+            out
+        }
+        Some("new") => {
+            let Some(label) = arg else { return "error: invite new LABEL".into() };
+            if invites.entries.len() >= MAX_INVITES {
+                return format!("error: invite table is full ({MAX_INVITES}); revoke some first");
+            }
+            let inv = mint_invite(label, wall_clock());
+            invites.entries.push(inv.clone());
+            if let Err(e) = save_invites(&invites) {
+                // Persist BEFORE honouring it: a credential the relay accepts but would forget on
+                // restart is worse than one that was never minted.
+                return format!("error: could not save invites: {e}");
+            }
+            relay.lock().expect("relay mutex").issue_capability(inv.cap.clone());
+            match write_invite_file(&inv, &ctx.relay_id, &ctx.addr) {
+                Ok(p) => format!("invite {} ({}) → {}", invite_id_hex(&inv.cap), inv.label, p.display()),
+                Err(e) => format!(
+                    "invite {} ({}) minted and live, but its file could not be written: {e}",
+                    invite_id_hex(&inv.cap),
+                    inv.label
+                ),
+            }
+        }
+        Some("revoke") => {
+            let Some(id_hex) = arg else { return "error: invite revoke ID".into() };
+            let Some(inv) = invites.entries.iter_mut().find(|i| invite_id_hex(&i.cap) == id_hex) else {
+                return format!("error: no invite with id {id_hex}");
+            };
+            if inv.revoked {
+                return format!("invite {id_hex} was already revoked");
+            }
+            inv.revoked = true;
+            let cap_id = inv.cap.capability_id;
+            let label = inv.label.clone();
+            if let Err(e) = save_invites(&invites) {
+                return format!("error: could not save invites: {e}");
+            }
+            // Live effect, and the file goes too — it is a bearer secret with no purpose left.
+            relay.lock().expect("relay mutex").revoke_capability(&cap_id);
+            let _ = std::fs::remove_file(key_dir().join("invites").join(format!("{id_hex}.json")));
+            format!("invite {id_hex} ({label}) revoked")
+        }
+        Some(other) => format!("error: unknown invite subcommand '{other}' — use list|new LABEL|revoke ID"),
+    }
 }
 
 /// A named quota preset → a ceiling (`Some(None)` = unlimited/off; `None` = unknown name).
@@ -420,7 +629,7 @@ fn describe_quota(q: Option<Quota>) -> String {
 
 /// Bind the admin socket and serve it on a background thread. A stale socket from a prior run
 /// is removed first (a crash leaves the file behind).
-fn spawn_admin_socket(relay: Arc<Mutex<RelayNode>>) -> io::Result<()> {
+fn spawn_admin_socket(relay: Arc<Mutex<RelayNode>>, ctx: InviteCtx) -> io::Result<()> {
     let path = admin_socket_path();
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -444,7 +653,7 @@ fn spawn_admin_socket(relay: Arc<Mutex<RelayNode>>) -> io::Result<()> {
                     eprintln!("admin: stop received — shutting down");
                     std::process::exit(0);
                 }
-                let reply = apply_admin_command(&relay, trimmed);
+                let reply = apply_admin_command(&relay, trimmed, &ctx);
                 let _ = writeln!(stream, "{reply}");
             }
         }
@@ -515,6 +724,13 @@ fn main() -> io::Result<()> {
         let cmd = if rest.is_empty() { "status".to_string() } else { rest.join(" ") };
         return admin_send(&format!("quota {cmd}"));
     }
+    // `karst-relay invite …` — mint / list / revoke per-invitee credentials on a RUNNING relay
+    // (CRYPTO-25). Revoking bites on the next request, not at the next restart.
+    if arg1.as_deref() == Some("invite") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let cmd = if rest.is_empty() { "list".to_string() } else { rest.join(" ") };
+        return admin_send(&format!("invite {cmd}"));
+    }
     // `karst-relay stop` asks a RUNNING relay (same KARST_RELAY_HOME) to exit gracefully — the
     // no-kill shutdown, works for a detached/background node too.
     if matches!(arg1.as_deref(), Some("stop" | "shutdown")) {
@@ -529,6 +745,8 @@ fn main() -> io::Result<()> {
                  karst-relay setup | -i          interactive setup, then start (also: bare run at a\n\
                  \x20                              TTY with no addr/env asks the same questions)\n\
                  karst-relay pow status|off|open|on [BITS]   control a RUNNING relay's door\n\
+                 karst-relay invite list|new LABEL|revoke ID one credential per invitee, not one\n\
+                 \x20                              shared by everyone (revoke takes effect at once)\n\
                  karst-relay stop                stop a RUNNING relay gracefully (no kill; same\n\
                  \x20                              KARST_RELAY_HOME) — works for a detached node\n\
                  \n\
@@ -652,10 +870,29 @@ fn run_relay(addr: String) -> io::Result<()> {
             relay.enable_pow_issue(pow_bits);
             None
         }
-        Role::Private | Role::Dev => {
+        Role::Dev => {
             let cap = load_or_create_cap(role)?;
             relay.issue_capability(cap.clone());
-            Some(cap)
+            None
+        }
+        Role::Private => {
+            // CRYPTO-25: one credential PER INVITE, not one shared by everyone the operator ever
+            // invited. The quota tracker meters by `capability_id`, so a shared invite meant a
+            // shared bucket — one invitee's traffic charged against everyone else's — with no way
+            // to revoke a single person and no rotation that did not lock out the whole relay.
+            let mut invites = load_invites()?;
+            if !invites.entries.iter().any(|i| !i.revoked) {
+                // First run (or every invite revoked): mint one so the operator has something to
+                // hand out, exactly as the old single-capability path did.
+                invites.entries.push(mint_invite("first", wall_clock()));
+                save_invites(&invites)?;
+            }
+            let live: Vec<Invite> = invites.entries.iter().filter(|i| !i.revoked).cloned().collect();
+            for inv in &live {
+                relay.issue_capability(inv.cap.clone());
+            }
+            eprintln!("invites: {} live (karst-relay invite list)", live.len());
+            live.last().cloned()
         }
     };
 
@@ -730,17 +967,18 @@ fn run_relay(addr: String) -> io::Result<()> {
         _ => "raw TCP (set KARST_RELAY_TLS_CERT + KARST_RELAY_TLS_KEY for wss)",
     };
 
-    // Write the private invite up front so the connect-block below can point at it.
-    let invite_path = match role {
-        Role::Private => match invite_cap.as_ref().map(write_invite) {
-            Some(Ok(p)) => Some(p),
-            Some(Err(e)) => {
+    // Write the newest invite's file up front so the connect-block below can point at it. Older
+    // invites keep their own files (one per id) — writing them again would be pointless churn on
+    // secrets that are already in their holders' hands.
+    let invite_path = match invite_cap.as_ref() {
+        Some(inv) => match write_invite_file(inv, &relay_id, client_addr_hint(&advertise, &addr)) {
+            Ok(p) => Some(p),
+            Err(e) => {
                 eprintln!("WARNING: could not write invite file: {e}");
                 None
             }
-            None => None,
         },
-        _ => None,
+        None => None,
     };
 
     eprintln!("karst-relay (SKELETON, NOT for production) listening on {addr}");
@@ -774,7 +1012,9 @@ fn run_relay(addr: String) -> io::Result<()> {
     // Owner control of a RUNNING relay (turn PoW off/open/on live — early on there may be no
     // spam to gate). Owner-only by fs perms. A crash that skips the socket is not fatal to
     // serving, so a bind failure only warns.
-    match spawn_admin_socket(server.relay_handle()) {
+    let invite_ctx =
+        InviteCtx { relay_id: relay_id.clone(), addr: client_addr_hint(&advertise, &addr).to_string() };
+    match spawn_admin_socket(server.relay_handle(), invite_ctx) {
         Ok(()) => eprintln!(
             "admin: karst-relay pow status|off|open|on [BITS]   (socket {}, KARST_RELAY_HOME-scoped)",
             admin_socket_path().display()
@@ -809,7 +1049,7 @@ fn run_relay(addr: String) -> io::Result<()> {
     // values a client needs. relay-id leads (clients pin it; it is not derivable). For a private
     // relay the invite JSON is printed IN FULL — it is what you paste into the app's "Relay invite"
     // box, so you should not have to go `cat` a file. It is the door key: share only with invitees.
-    let client_addr = if is_routable_advertise(&advertise) { advertise.as_str() } else { addr.as_str() };
+    let client_addr = client_addr_hint(&advertise, &addr);
     eprintln!("\n╭─ clients connect with ───────────────────────────────────────");
     eprintln!("│  relay address   {client_addr}");
     eprintln!("│  relay-id        {relay_id}");
@@ -817,8 +1057,13 @@ fn run_relay(addr: String) -> io::Result<()> {
         Role::Private => {
             eprintln!("│  admission       private — paste the invite below into the app's");
             eprintln!("│                  \"Relay invite\" box (or: karst import-cap <file>)");
-            if let Some(cap) = invite_cap.as_ref() {
-                match serde_json::to_string(cap) {
+            if let Some(inv) = invite_cap.as_ref() {
+                match serde_json::to_string(&InviteFile {
+                    relay_id: relay_id.clone(),
+                    addr: client_addr.to_string(),
+                    label: inv.label.clone(),
+                    cap: inv.cap.clone(),
+                }) {
                     Ok(j) => {
                         eprintln!("│");
                         eprintln!("│  relay invite (this IS the door key — share only with invitees):");
@@ -1098,7 +1343,7 @@ fn run_setup_wizard() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_admin_command, describe_pow, env_from_answers, is_stop_command, is_yes,
+        apply_admin_command, describe_pow, env_from_answers, is_stop_command, is_yes, InviteCtx,
         no_relay_message, parse_blob_persistence, parse_mail_persistence, parse_quota_spec,
         shell_quote, Role,
     };
@@ -1133,25 +1378,25 @@ mod tests {
         let relay = Arc::new(Mutex::new(RelayNode::new(1_000_000)));
         assert_eq!(relay.lock().unwrap().pow_difficulty(), None, "a fresh relay issues nothing");
 
-        assert!(apply_admin_command(&relay, "pow open").contains("open"));
+        assert!(apply_admin_command(&relay, "pow open", &InviteCtx::default()).contains("open"));
         assert_eq!(relay.lock().unwrap().pow_difficulty(), Some(0), "open → issue without PoW");
 
-        assert!(apply_admin_command(&relay, "pow on 22").contains("22"));
+        assert!(apply_admin_command(&relay, "pow on 22", &InviteCtx::default()).contains("22"));
         assert_eq!(relay.lock().unwrap().pow_difficulty(), Some(22));
 
         // status reports without mutating.
-        assert!(apply_admin_command(&relay, "pow status").contains("22"));
+        assert!(apply_admin_command(&relay, "pow status", &InviteCtx::default()).contains("22"));
         assert_eq!(relay.lock().unwrap().pow_difficulty(), Some(22));
 
-        apply_admin_command(&relay, "pow off");
+        apply_admin_command(&relay, "pow off", &InviteCtx::default());
         assert_eq!(relay.lock().unwrap().pow_difficulty(), None, "off → issuance disabled");
 
         // An unknown command errors and leaves the policy untouched.
         let before = relay.lock().unwrap().pow_difficulty();
-        assert!(apply_admin_command(&relay, "pow frobnicate").starts_with("error"));
+        assert!(apply_admin_command(&relay, "pow frobnicate", &InviteCtx::default()).starts_with("error"));
         assert_eq!(relay.lock().unwrap().pow_difficulty(), before, "a bad command must not change state");
         // The unknown-command help lists `stop` so an operator can discover the no-kill shutdown.
-        assert!(apply_admin_command(&relay, "bogus").contains("stop"));
+        assert!(apply_admin_command(&relay, "bogus", &InviteCtx::default()).contains("stop"));
 
         assert!(describe_pow(Some(0)).contains("open"));
         assert!(describe_pow(None).contains("off"));
@@ -1183,18 +1428,18 @@ mod tests {
         let relay = Arc::new(Mutex::new(RelayNode::new(1_000_000)));
         assert_eq!(relay.lock().unwrap().quota_policy(), None, "off by default");
 
-        assert!(apply_admin_command(&relay, "quota preset media-friendly").contains("ceiling"));
+        assert!(apply_admin_command(&relay, "quota preset media-friendly", &InviteCtx::default()).contains("ceiling"));
         assert!(relay.lock().unwrap().quota_policy().is_some(), "preset set a ceiling");
 
-        assert!(apply_admin_command(&relay, "quota set 500 64M 600").contains("500"));
+        assert!(apply_admin_command(&relay, "quota set 500 64M 600", &InviteCtx::default()).contains("500"));
         assert_eq!(relay.lock().unwrap().quota_policy().unwrap().max_requests, 500);
 
-        apply_admin_command(&relay, "quota off");
+        apply_admin_command(&relay, "quota off", &InviteCtx::default());
         assert_eq!(relay.lock().unwrap().quota_policy(), None, "off → no ceiling");
 
         // status reports without mutating; a bad subcommand errors and leaves state alone.
-        assert!(apply_admin_command(&relay, "quota status").starts_with("quota:"));
-        assert!(apply_admin_command(&relay, "quota preset bogus").starts_with("error"));
+        assert!(apply_admin_command(&relay, "quota status", &InviteCtx::default()).starts_with("quota:"));
+        assert!(apply_admin_command(&relay, "quota preset bogus", &InviteCtx::default()).starts_with("error"));
         assert_eq!(relay.lock().unwrap().quota_policy(), None);
     }
 
@@ -1227,6 +1472,49 @@ mod tests {
         // "unsafe acknowledgement" is retired: `public` opens on the bare mode string.
         // (The safety now lives in the PoW door itself, tested in the node crate.)
         assert_eq!(Role::parse(Some("public")).unwrap(), Role::Public);
+    }
+
+    /// CRYPTO-25 (#232): one credential PER INVITE, and revoking one must not touch the others.
+    ///
+    /// The relay used to mint ONE capability and write it into `invite.json` for everybody. The
+    /// quota tracker meters by `capability_id`, so that was one shared bucket — every invitee's
+    /// traffic charged against everyone else's — with no way to revoke one person and no rotation
+    /// that did not lock out the whole relay.
+    ///
+    /// Discriminating on the property that actually matters: after revoking Alice, ALICE's proof
+    /// is refused and BOB's still verifies. A test that only checked "the ids differ" would pass
+    /// against a relay that honoured a revoked credential forever.
+    #[test]
+    fn revoking_one_invite_leaves_every_other_invite_working() {
+        use admission::capability::{CapabilityTable, Scope};
+        let now = 1_000_000u64;
+        let alice = super::mint_invite("alice", now);
+        let bob = super::mint_invite("bob", now);
+        assert_ne!(
+            alice.cap.capability_id, bob.cap.capability_id,
+            "two invites must not share an id — that is what makes them separately meterable"
+        );
+        assert_ne!(alice.cap.secret, bob.cap.secret, "...nor a secret");
+
+        let mut table = CapabilityTable::new();
+        table.insert(alice.cap.clone());
+        table.insert(bob.cap.clone());
+        let nonce = b"request-nonce";
+        let alice_proof = alice.cap.prove(nonce, 0);
+        let bob_proof = bob.cap.prove(nonce, 0);
+        assert!(table.verify(&alice_proof, nonce, Scope::MessageDelivery, now as u32).is_ok());
+        assert!(table.verify(&bob_proof, nonce, Scope::MessageDelivery, now as u32).is_ok());
+
+        assert!(table.remove(&alice.cap.capability_id), "revoking a known id reports success");
+        assert!(
+            table.verify(&alice_proof, nonce, Scope::MessageDelivery, now as u32).is_err(),
+            "a revoked invite must stop opening the door"
+        );
+        assert!(
+            table.verify(&bob_proof, nonce, Scope::MessageDelivery, now as u32).is_ok(),
+            "...and every OTHER invitee must be untouched — that is the whole point"
+        );
+        assert!(!table.remove(&alice.cap.capability_id), "revoking twice reports 'unknown', not success");
     }
 
     #[test]

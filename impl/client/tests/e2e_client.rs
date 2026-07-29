@@ -525,7 +525,8 @@ fn a_deposit_does_not_carry_the_senders_identity_in_the_transport_fields() {
 /// EXISTED (`KeyAgreement.ik_a_pub` in the clear), because an untested gap is one
 /// everyone assumes is closed. Its flip is the record that the work is done.
 ///
-/// Discriminating: send the opener unsealed (`SessionEnvelope::Initial`) → reds.
+/// Discriminating: an opener that is not sealed cannot even be built any more (#232) — that
+/// shape was removed from the wire, so this pins the sealed path itself.
 ///
 /// Scope, stated exactly: this removes the SENDER from the opener. The recipient's
 /// mailbox is still named (until rotating drop-boxes), and the fetch-names-you
@@ -1909,7 +1910,6 @@ fn concurrent_sends_under_lock_never_reuse_ratchet_position() {
     let mut positions: Vec<([u8; 32], u32)> = sent
         .iter()
         .filter_map(|m| match &m.payload {
-            Payload::Session(SessionEnvelope::Initial { msg, .. }) => Some((msg.header.dh, msg.header.n)),
             Payload::Session(SessionEnvelope::Ratchet(msg)) => Some((msg.header.dh, msg.header.n)),
             _ => None,
         })
@@ -1979,7 +1979,6 @@ fn crash_between_transmit_and_save_never_reuses_position() {
     let positions: Vec<([u8; 32], u32)> = sent
         .iter()
         .filter_map(|m| match &m.payload {
-            Payload::Session(SessionEnvelope::Initial { msg, .. }) => Some((msg.header.dh, msg.header.n)),
             Payload::Session(SessionEnvelope::Ratchet(msg)) => Some((msg.header.dh, msg.header.n)),
             _ => None,
         })

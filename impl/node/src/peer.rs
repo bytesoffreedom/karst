@@ -1141,7 +1141,7 @@ impl<T: Transport> Peer<T> {
         now: u64,
     ) -> Result<([u8; 32], Handle), String> {
         match envelope {
-            SessionEnvelope::Initial { .. } | SessionEnvelope::InitialSealed { .. } => {
+            SessionEnvelope::InitialSealed { .. } => {
                 Ok((*peer_ik, Handle::Opener(*peer_ik)))
             }
             SessionEnvelope::Ratchet(_) => {
@@ -1528,7 +1528,6 @@ impl<T: Transport> Peer<T> {
             // from an older client would still open; there are no older clients, and accepting it
             // let any peer silently downgrade a conversation's metadata privacy by sending the
             // legacy form. We only ever SEND sealed, so nothing legitimate produces this.
-            Payload::Session(SessionEnvelope::Initial { .. }) => None,
             Payload::Session(SessionEnvelope::Ratchet(msg)) => self.process_ratchet(msg),
         }
     }

@@ -62,7 +62,7 @@ instead of being handed a forgeable one. Never set it against a relay you did no
 `karst-up.sh` does NOT launch the client — it only prints commands and the
 relay-id to paste in. In each window (first run of a profile):
 
-1. **Create account** → write down the **12 words** shown (the only way to
+1. **Create account** → write down the **24 words** shown (the only way to
    restore; on a new device, use "Restore from phrase"). → confirm the words →
    set a **device passphrase** (encrypts secrets on THIS disk; ≠ the phrase) →
    **Create account** (relay and relay-id are already filled in by the script).

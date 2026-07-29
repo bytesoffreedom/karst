@@ -23,7 +23,7 @@ Built in Rust around independently operated relays.
 
 ## See it running
 
-The desktop client — no phone number, no signup; your identity is a 12-word phrase.
+The desktop client — no phone number, no signup; your identity is a 24-word phrase.
 
 <p align="center"><img src="docs/assets/screenshot-desktop.png" alt="KARST desktop client" width="620"></p>
 
@@ -251,7 +251,7 @@ contact) are still English-only.
 **Desktop client** (`karst-desktop`) — the actively-developed client (Tauri web
 frontend over the shared core). Launch with `cargo run -p desktop`.
 
-1. First run → **Create account**: write down the **12-word recovery phrase** (the
+1. First run → **Create account**: write down the **24-word recovery phrase** (the
    only way to restore on another device), confirm the words, set a **device
    passphrase** (encrypts secrets on *this* disk — different from the phrase).
    Later runs → just the passphrase.

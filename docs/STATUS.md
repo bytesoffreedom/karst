@@ -13,6 +13,65 @@ Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
+## What landed since the last reconcile (2026-07-29, second batch)
+
+Fourteen commits: the crate split, the format guards, the polling cursor, the lock hierarchy, the
+audience decision and the QUIC carrier. Newest first.
+
+- **QUIC is a carrier, on the direct path only** (`8530cdc` design, `3361f22` `afaf819` `44d124b`
+  `cabbd23` `0aade2f`). The gate document (`docs/design/quic-transport.md`) settles the question
+  everything else hangs on: QUIC's value is one long-lived multiplexed connection, and pooling
+  re-clusters the handles per-handle SOCKS isolation keeps apart — the linkage A8-4 removed. So
+  QUIC serves the DIRECT path, where the IP already links everything; Tor and SOCKS stay on TCP/WSS
+  (and Tor carries no UDP anyway, so the privacy answer and the plumbing answer coincide). Landed:
+  a `quic_addrs` field on the descriptor (and three fields from the sketch REFUSED — an ALPN is a
+  protocol constant, a certificate fingerprint would sit in the unsigned part of a descriptor whose
+  signature covers only the relay-id, and a transport bitfield restates "is `quic_addrs`
+  non-empty"); `QuicAdapter` behind the existing `TransportAdapter` seam with Noise kept inside and
+  0-RTT off; a relay listener feeding the SAME request loop, with the R2-13 leash counted per
+  CONNECTION rather than per stream (a per-stream count is the protection closed on TCP and wide
+  open on QUIC) plus a bound on silent unadmitted streams; a transport RACE so a network that drops
+  UDP silently costs a 250 ms head start instead of a 5 s connect timeout (measured 5.05s → 0.34s);
+  and connection migration REFUSED BY THE RELAY, because whether a session may follow a client to a
+  new address is the receiver's decision. **Not done, and blocked on purpose:** connection pooling
+  (QUIC-5). The pool key must be per (relay × proxy), the adapter has no proxy identity, and a pool
+  keyed on anything else would share a connection across an account's channels — precisely the
+  linkage the design forbids. QUIC is deliberately not yet wired into `build_paths`, so there is no
+  production exposure while that stands.
+- **The audience is a decision now, not an accident** (`e9967d9`,
+  `docs/design/audience-scale.md`). Publication is per-recipient and therefore linear in the
+  audience; that is what stops a relay reading an object's audience off its own disk. Meanwhile
+  `MAX_SUBSCRIBERS` was 50 000. Mass reach and a hidden audience cannot both be had, and nothing
+  said which KARST gives up. It gives up reach: **512**, chosen where the cost becomes visible
+  (one post with one 300 KB image is ~150 MB of upload) rather than where the container stops. The
+  alternatives — sender keys/MLS, one blob with per-recipient wrapped keys, relay-side fan-out —
+  are recorded with their price rather than dismissed.
+- **The Tauri backend's lock hierarchy is pinned by a test** (`4e56739`). Eight mutexes in one
+  global `App`; nothing stopped two being taken in opposite orders in different commands, which
+  deadlocks on a user action with no error and no log line. The acquisition graph is extracted from
+  the source and checked acyclic (two edges today, no cycle), and a second test asserts the SET of
+  pairs — the one that actually protects, since the cycle test only fires once BOTH directions
+  exist. The service decomposition the task also describes was NOT attempted: a large
+  behaviour-preserving refactor of three heavily-verified files, whose risk is what this test now
+  covers.
+- **The sweep stops re-polling drop-boxes nothing can deposit into** (`bc40524`). `sessions × 10`
+  round trips every ten minutes, most of them to epochs a sender can no longer reach. A durable
+  cursor in `PeerState` collapses the sweep to the epochs still open; it advances only on a pass
+  that walked every box it meant to, because moving it past an unread box loses that box's mail
+  permanently. `STATE_VERSION` 8 → 9.
+- **Format guards** (`acef118`, `9d47c94`, `05a2b0f`). A hash of every persisted type's declaration
+  makes the `STATE_VERSION` bump mechanical — it was forgotten twice in one day and no test could
+  catch it, since every test writes a fresh vault. `docs/design/crash-consistency.md` enumerates
+  which of the ~51 files must agree and what a crash between each pair costs; the one group that
+  cannot take the safe ordering is a burn (secret destroyed FIRST is right under duress), so its
+  residue is swept at unlock instead. And every frame now carries a protocol version, checked
+  before the payload is interpreted.
+- **The relay is its own crate** (`8dd8c46`, `5f1f6e7`, `7125e1c`). Untrusted relay and trusted
+  client crypto no longer share one. Two dependency cycles had to die first — `wire ↔ node` and
+  `protocol → pqxdh → discovery → protocol` — which is why the split began with extracting the
+  protocol vocabulary rather than moving files. The desktop's direct dependency on `node` is gone.
+  Three of the five planned crates remain, and are now mechanical.
+
 ## What landed since the last reconcile (2026-07-27 → 2026-07-29)
 
 Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests green, CI green on
@@ -1833,7 +1892,7 @@ Only mix-routing / multiple non-colluding relays break it, and neither exists he
 | `node::safety` (2.1) | ✅ Real | **Safety number** for OOB verification of IK authenticity: a pure symmetric `SHA-512` function of a pair of IKs → 60 digits (12×5, zero-pad; Signal format). Addresses the §12 "external wall" (OOB verification of the IK). Complete: it verifies IK authenticity, and that is sufficient (IK ⟹ session, see `pqxdh` DH1). Frozen KAT + symmetry/sensitivity. Shown in the GUI; **display-only** (the verified flag is not stored) |
 | `node::seal` (2.1) | ⏳ Deferred (skeleton for socket/CLI) | classical-only sealed-box; NOT §2.1 (no sender-auth/FS/PQ). Carries the socket/CLI path (`Client`/`Recipient`) until session persistence is added there; the in-process path is on `peer` |
 | `client::content` | ✅ Real | **Content envelope** over the byte-level E2E (`node`/`peer` stay content-agnostic): `Content::{Text,FileManifest,FileChunk}`. **File transfer** across the 1400 limit — chunking (≤1024 B/chunk) + reassembly with a SHA-256 check. Anti-DoS: an absurd manifest/oversize/concurrency limit — before allocation. First slice ≤256 KiB (one mailbox). Tests: byte-for-byte round-trip, corruption detection (discriminating), missing-never-completes |
-| `client::seed` | ⚠️ Reference / NOT audited | **Mnemonic phrase (BIP39) — the single root of identity.** 12 words → `to_seed("")` (PBKDF2-HMAC-SHA512, 2048) → `HKDF-SHA256` → 160 B = seal(32)‖account(128). One phrase → the same IK on any device (recovery). Wordlist/checksum — the `bip39` crate (MIT, pure-Rust). **The `derive` circuit is FROZEN** (KAT `frozen_derivation_vector`) — a compatibility contract: it cannot change, or it would orphan written-down phrases. **NOT wallet-compatible** (KARST's own HKDF over the BIP39 seed). **Losing the phrase = losing the identity FOREVER** (there is no backdoor). Tests: KAT, determinism, rejection of a bad checksum (discriminating), word confirmation |
+| `client::seed` | ⚠️ Reference / NOT audited | **Mnemonic phrase (BIP39) — the single root of identity.** 24 words (CRYPTO-32: 16 bytes of entropy would cap everything derived from the phrase below ML-KEM-768's Category 3 claim) → `to_seed("")` (PBKDF2-HMAC-SHA512, 2048) → `HKDF-SHA256` → 160 B = seal(32)‖account(128). One phrase → the same IK on any device (recovery). Wordlist/checksum — the `bip39` crate (MIT, pure-Rust). **The `derive` circuit is FROZEN** (KAT `frozen_derivation_vector`) — a compatibility contract: it cannot change, or it would orphan written-down phrases. **NOT wallet-compatible** (KARST's own HKDF over the BIP39 seed). **Losing the phrase = losing the identity FOREVER** (there is no backdoor). Tests: KAT, determinism, rejection of a bad checksum (discriminating), word confirmation |
 | `client::secretbox` | ✅ Real | **At-rest**: `Argon2id(passphrase)` → a master key, then `HKDF(master, label)` per file; `XChaCha20-Poly1305` with a fresh random 24-B nonce per write, the label and a `STATE_VERSION` in the AAD. Pinned KDF profile **m=131072 KiB, t=3, p=1** (raised from OWASP's 19 MiB floor — CRYPTO-34); a `cfg(debug_assertions)`-only `KARST_INSECURE_FAST_KDF` hatch keeps the test suite fast and cannot exist in a release build. Protects the COLD disk, NOT the hot process. Tests: wrong-pw→reject, no plaintext on disk, fresh-nonce-per-write, cross-account/cross-file splice rejected, newer state version refused |
 | `client::store` | ✅ Real (skeleton) | storage under **at-rest encryption**. **A single root**: `seed.key` (the phrase entropy); `load_identity`/`load_account` **derive** the keys (`seed::derive`) — disk and phrase do not diverge. `Store::unlock(dir, pass)` (single-account, CLI) + `Store::at(dir, key)` (over a ready key). **`Vault`** — multi-account: ONE device passphrase (Argon2id once) → a `MasterKey` for ALL accounts (`accounts/<ik>/`), switching is free (the same key); the `accounts.dat` registry is encrypted. At-rest keys are derived PER (account, file) from the device key (`HKDF(master, label)`), so one account's sealed file cannot be opened in another's slot, nor under another file's name (CRYPTO-05); the legacy single-account migration was removed with format v2 — a bare pre-vault directory stays a standalone `Store`. The passphrase ≠ the phrase. Relay keys are not encrypted |
 | `client` (lib+bin `karst`) | ✅ Real (skeleton) | orchestration over `SocketTransport`; the CLI **init** (prints the recovery phrase) / **restore** (from the phrase) / **show-phrase** / id/account/dev-cap/import-cap/**publish**/send/**send-file**/recv **entirely on §2.1** (identity from the root phrase; persistent ratchet sessions under flock, atomic write; §12 discovery; **at-rest** via `KARST_PASSPHRASE`; text and files via the `content` envelope). A dev capability with a public secret |
@@ -2659,7 +2718,7 @@ cookie + ownership proof + a shared bounded cap).
 ## Linux desktop client (`impl/client`, CLI `karst`)
 
 The first thing usable by hand: `karst init` (create an account — **prints the
-12-word recovery phrase**), `karst restore <12 words>` (restore into an empty
+24-word recovery phrase**), `karst restore <24 words>` (restore into an empty
 `$KARST_HOME`), `karst show-phrase` (show your phrase), `karst id` (the skeleton
 pubkey), `karst account` (the §2.1 IK — the address for discovery),
 `karst dev-cap`/`import-cap` (a capability, which now names the relay it is FOR:

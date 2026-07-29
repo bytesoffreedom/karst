@@ -1030,7 +1030,7 @@ fn set_vault_dir(app: State<App>, dir: String) -> Result<bool, String> {
     Ok(dir_has_account(std::path::Path::new(dir)))
 }
 
-/// A fresh 12-word recovery phrase — generated in-memory, NOT yet persisted.
+/// A fresh 24-word recovery phrase — generated in-memory, NOT yet persisted.
 #[tauri::command]
 fn generate_phrase() -> Vec<String> {
     client::seed::generate_mnemonic()
@@ -1277,7 +1277,7 @@ async fn set_net_offline(app: State<'_, App>, offline: bool) -> Result<(), Strin
 
 /// Add a HIDDEN account to the open container: mints a FRESH identity + recovery phrase, provisions
 /// an empty account for it entirely in RAM, folds it into the container's hidden region, and wipes
-/// the RAM build. Returns the 12-word phrase for the user to save (the only way to recover it).
+/// the RAM build. Returns the 24-word phrase for the user to save (the only way to recover it).
 /// Requires an open MAIN container session (uses the ONE held instance — no two-writers hazard).
 #[tauri::command]
 fn container_add_hidden(app: State<App>, hidden_password: String) -> Result<Vec<String>, String> {
@@ -1605,7 +1605,7 @@ fn switch_account(app: State<App>, id: String) -> Result<Me, String> {
     Ok(enter(&app, vault, id, decoy, false))
 }
 
-/// The active account's 12-word recovery phrase, gated behind a fresh password check (the vault
+/// The active account's 24-word recovery phrase, gated behind a fresh password check (the vault
 /// is already open, but re-showing the SECRET must re-verify the human present). Derived from the
 /// stored root entropy — nothing new is generated or written.
 #[tauri::command]

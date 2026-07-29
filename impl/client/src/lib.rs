@@ -3472,6 +3472,16 @@ pub struct MultiReceive {
     /// rejected). Empty = every relay answered. A relay in here cost the caller nothing:
     /// the healthy relays' messages and state advance are still returned.
     pub failed: Vec<usize>,
+    /// Messages that arrived from a contact we hold a session with and that our ratchet could NOT
+    /// open (R2-11). Zero is the normal answer.
+    ///
+    /// Anything else is the locally-visible symptom of a SECOND DEVICE using this identity — or of
+    /// state restored from a backup while the live copy kept moving. The box address is derived
+    /// from the session's own seed, so reaching it proves the sender holds that session; our chain
+    /// being unable to open the message means something else advanced it. KARST cannot merge the
+    /// two (there is no device identity in `PeerState` to merge along), but the user must not be
+    /// left with "messages just stop arriving" and nothing anywhere saying why.
+    pub out_of_step: u64,
     /// Lease/ACK receipts to send AFTER the caller persists the advanced state, each tagged
     /// with the index of the relay it must be acked through. Collected ONLY from relays
     /// whose `receive` returned `Ok`: a failed relay's advance is rolled back, so acking its
@@ -3515,6 +3525,9 @@ pub fn receive_threaded<T: Transport + Clone>(
     let mut messages = Vec::new();
     let mut failed = Vec::new();
     let mut acks = Vec::new();
+    // R2-11: summed across relays — a diverged channel is diverged everywhere, since the ratchet
+    // is one conversation regardless of which relay carried it.
+    let mut out_of_step = 0u64;
     for (i, (transport, relay_pub)) in relays.iter().enumerate() {
         // capability is unused on receive (fetch-auth = cookie + ownership-proof), same as
         // `recv_session`; the dev capability fills the slot.
@@ -3543,6 +3556,7 @@ pub fn receive_threaded<T: Transport + Clone>(
                 messages.append(&mut got);
                 acks.extend(peer.take_pending_acks().into_iter().map(|r| (i, r)));
                 opks = peer.export_opks();
+                out_of_step += peer.take_out_of_step();
                 state = peer.export_state();
             }
             Err(_) => {
@@ -3569,7 +3583,7 @@ pub fn receive_threaded<T: Transport + Clone>(
             }
         }
     }
-    MultiReceive { messages, state, opks, failed, acks }
+    MultiReceive { messages, state, opks, failed, acks, out_of_step }
 }
 
 /// The outcome of a multi-homed poll through the store: the decrypted messages, which
@@ -3579,6 +3593,9 @@ pub fn receive_threaded<T: Transport + Clone>(
 pub struct MultiPoll {
     pub messages: Vec<Option<Received>>,
     pub failed: Vec<usize>,
+    /// See `MultiReceive::out_of_step` — messages from a known contact this vault's ratchet could
+    /// not open, the local symptom of a second device on this identity (R2-11).
+    pub out_of_step: u64,
     /// The leases this poll took. Nothing is deleted from any relay until these are handed
     /// to [`DeferredAcks::commit_then_send`] with a commit that succeeds — see that type.
     pub acks: DeferredAcks,
@@ -3695,7 +3712,7 @@ pub fn recv_session_multi(store: &Store, relays: &[Relay], now: u64) -> Result<M
     let acks = DeferredAcks {
         pending: out.acks.into_iter().map(|(i, r)| (pairs[i].0.clone(), r)).collect(),
     };
-    Ok(MultiPoll { messages: out.messages, failed: out.failed, acks })
+    Ok(MultiPoll { messages: out.messages, failed: out.failed, out_of_step: out.out_of_step, acks })
 }
 
 /// Send one loop (cover traffic) and drain any loops that came back. Returns how many

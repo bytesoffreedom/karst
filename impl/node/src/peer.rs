@@ -475,6 +475,11 @@ pub struct Peer<T: Transport> {
     /// persisted state: it describes how long THIS process is willing to wait, not anything about
     /// the conversation. Tests shrink it to prove the loop actually stops.
     receive_budget: Duration,
+    /// Messages from a peer we DO have a session with that our chain could not open, this pass.
+    ///
+    /// In-memory and per-pass, deliberately not persisted: it describes what THIS run observed,
+    /// not a property of the conversation. See `process_for_peer` for what it means (R2-11).
+    out_of_step: u64,
     /// See `PeerState::swept_through` (#147).
     swept_through: u64,
     /// See `PeerState::last_sweep`.
@@ -606,6 +611,7 @@ impl<T: Transport> Peer<T> {
             handles: HashMap::new(),
             cookies: HashMap::new(),
             receive_budget: RECEIVE_BUDGET,
+            out_of_step: 0,
             swept_through: 0,
             last_sweep: 0,
             epoch_hwm: 0,
@@ -617,6 +623,17 @@ impl<T: Transport> Peer<T> {
             sessions_refused: 0,
             decrypt_attempts_for_test: 0,
         }
+    }
+
+    /// How many messages this pass arrived from a peer we hold a session with and could NOT be
+    /// opened — the local, detectable symptom of another device using this identity (R2-11).
+    ///
+    /// Take it after `receive` and surface it. Zero is the normal answer; anything else means the
+    /// ratchet with that contact has been advanced by something this vault did not do, and the
+    /// mail is not going to start arriving on its own. Reading it RESETS it, so a caller polling
+    /// in a loop reports per pass rather than a growing total.
+    pub fn take_out_of_step(&mut self) -> u64 {
+        std::mem::take(&mut self.out_of_step)
     }
 
     /// Shorten (or lengthen) the wall-clock ceiling on one `receive` pass — see `RECEIVE_BUDGET`
@@ -1629,6 +1646,26 @@ impl<T: Transport> Peer<T> {
                     if let Ok(pt) = st.session.decrypt(msg) {
                         return Some(Received { sender: *peer_ik, plaintext: pt, msg_id: [0u8; 32] });
                     }
+                }
+                // R2-11, the loud half. This is NOT the "garbage from a stranger" case: the box
+                // address is derived from a session's own `drop_seed`, so reaching it means the
+                // sender holds that session — and we hold a session with them — and our chain
+                // still cannot open the message. The ratchet has been advanced by SOMETHING ELSE
+                // holding this identity: a second device on the same recovery phrase, or state
+                // restored from a backup while the live copy kept moving.
+                //
+                // It used to be a silent `None`, which is the worst possible answer, because the
+                // symptom the user gets is messages that simply do not arrive — with nothing,
+                // anywhere, saying why. KARST cannot MERGE the two states (there is no device
+                // identity in `PeerState` to merge along, which is the rest of R2-11), but it can
+                // refuse to be quiet about it.
+                //
+                // Counted rather than logged per message: a diverged channel produces one of these
+                // per message, and a log line each would bury the signal in the noise it is made
+                // of. The caller surfaces the count.
+                if self.sessions.contains_key(peer_ik) || self.inbound_sessions.contains_key(peer_ik)
+                {
+                    self.out_of_step = self.out_of_step.saturating_add(1);
                 }
                 None
             }
@@ -2723,6 +2760,56 @@ use super::LoopbackMail;
             ),
             Ok(msgs) => panic!("a truncated, empty pass reported success with {} messages", msgs.len()),
         }
+    }
+
+    /// A message from a peer we HOLD a session with that our chain cannot open is counted and
+    /// surfaced, not silently dropped (R2-11).
+    ///
+    /// That is the locally-visible symptom of a second device on this identity: the box address is
+    /// derived from the session's own seed, so reaching it proves the sender holds that session,
+    /// and our failure to open it proves something else advanced the chain. This vault cannot
+    /// merge the two — there is no device identity in `PeerState` to merge along — but the user
+    /// must not be left with "messages stop arriving" and nothing anywhere saying why.
+    ///
+    /// Discriminating against the case it must NOT fire on: an undecryptable payload for a peer we
+    /// have NO session with is an ordinary stranger's garbage and stays silent.
+    #[test]
+    fn a_message_a_known_contact_sent_that_we_cannot_open_is_reported() {
+        let relay_pub = x25519_dalek::PublicKey::from([7u8; 32]);
+        let mut peer = super::Peer::new(
+            LoopbackMail::default(),
+            Account::generate(),
+            dev_cap(),
+            relay_pub,
+        );
+        let known = dummy_ik(1);
+        peer.sessions.insert(
+            known,
+            super::SessionState {
+                session: Session::init_sender([1u8; 32], [2u8; 32]),
+                pending_initial: None,
+                drop_seed: [5u8; 32],
+                peer_mailbox_pub: [0u8; 32],
+            },
+        );
+        // A ratchet message this session cannot open — what a diverged chain produces.
+        let garbage = crate::ratchet::RatchetMessage {
+            header: crate::ratchet::Header { dh: [9u8; 32], pn: 0, n: 0, salt: [0u8; 16] },
+            ciphertext: vec![0u8; 32],
+        };
+        let payload = crate::protocol::Payload::Session(
+            crate::protocol::SessionEnvelope::Ratchet(garbage),
+        );
+
+        assert!(peer.process_for_peer(&known, &payload).is_none(), "it genuinely cannot be opened");
+        assert_eq!(peer.take_out_of_step(), 1, "a known contact's unopenable message must be told");
+        assert_eq!(peer.take_out_of_step(), 0, "reading the count resets it, so polls do not sum");
+
+        // The control: the SAME payload attributed to a peer we have no session with is an
+        // ordinary stranger's garbage and must stay quiet.
+        let stranger = dummy_ik(2);
+        assert!(peer.process_for_peer(&stranger, &payload).is_none());
+        assert_eq!(peer.take_out_of_step(), 0, "a stranger's garbage must not raise this");
     }
 
     /// The sweep does not re-walk epochs nothing can deposit into any more (#147).

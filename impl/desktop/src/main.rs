@@ -3435,6 +3435,21 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
                 Ok(p) => p,
                 Err(_) => break,
             };
+            // R2-11: a message from a contact we hold a session with that our ratchet could not
+            // open. Not garbage from a stranger — the box address comes from that session's own
+            // seed — so something else advanced the chain: another device on this recovery phrase,
+            // or state restored from a backup while the live copy kept moving. Said out loud
+            // because the alternative symptom is "messages stop arriving" with nothing anywhere
+            // explaining it, and this vault cannot merge the two states on its own.
+            if poll.out_of_step > 0 {
+                eprintln!(
+                    "KARST: {} message(s) from a known contact could not be opened — this \
+                     identity's ratchet has been advanced elsewhere (a second device on the same \
+                     recovery phrase, or state restored from a backup). Those messages will not \
+                     arrive on their own; re-establish the channel with that contact.",
+                    poll.out_of_step
+                );
+            }
             for (i, ok) in (0..relays.len()).map(|i| !poll.failed.contains(&i)).enumerate() {
                 if ok {
                     reach_any[i] = true;

@@ -365,8 +365,8 @@ fn recv_session_persists_a_fileref_as_a_pending_download() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -404,8 +404,8 @@ fn send_file_large_uploads_a_blob_that_the_recipient_downloads_byte_identical() 
     let bstore = Store::unlock(temp_dir("sfl-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
     assert!(matches!(
@@ -595,8 +595,8 @@ fn a_post_quantum_opener_carries_a_full_length_first_message() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -632,8 +632,8 @@ fn a_route_offer_round_trips_with_its_routes_and_relay_key() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -670,8 +670,8 @@ fn recv_session_persists_incoming_text_to_history() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -708,8 +708,8 @@ fn a_message_between_proxies_delivers_and_the_root_ik_never_appears() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
     bstore.create_proxy("p0", NOW).unwrap();
 
@@ -761,7 +761,7 @@ fn a_first_contact_without_a_one_time_prekey_is_recorded_as_reduced() {
     let cstore = Store::unlock(&cdir, b"pw").unwrap();
     for st in [&astore, &bstore, &cstore] {
         seed_provision(st);
-        st.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+        st.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     }
     let r = ctx(relay_addr, &relay_id);
 
@@ -809,8 +809,8 @@ fn a_proxy_message_via_a_published_opk_delivers() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
     bstore.create_proxy("p0", NOW).unwrap();
 
@@ -855,7 +855,7 @@ fn republishing_opks_never_hands_the_same_prekey_twice() {
     let bdir = temp_dir("opkrepub-b");
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&bstore);
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     bstore.create_proxy("p0", NOW).unwrap(); // mints index 0's own random secret (#207)
     let b = bstore.as_proxy(0);
     let b_ik = b.load_account().unwrap().identity_public();
@@ -901,8 +901,8 @@ fn a_story_delivers_with_its_expiry() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -940,8 +940,8 @@ fn an_avatar_delivers_and_lands_in_the_recipients_peer_profile() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -992,8 +992,8 @@ fn a_channel_migration_repoints_a_contact_and_clears_verified() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints indices' own random secrets (#207)
     astore.create_proxy("p1", NOW).unwrap();
     bstore.create_proxy("p0", NOW).unwrap();
@@ -1049,8 +1049,8 @@ fn a_queued_channel_migration_blocks_burn_until_it_is_actually_delivered() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap();
     astore.create_proxy("p1", NOW).unwrap();
     bstore.create_proxy("p0", NOW).unwrap();
@@ -1115,8 +1115,8 @@ fn a_publication_arrives_in_the_feed_not_the_chat_history() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -1168,8 +1168,8 @@ fn a_publication_image_delivers_and_reunites_with_its_post() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -1220,8 +1220,8 @@ fn send_text_reports_delivered_when_the_relay_is_up() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -1250,8 +1250,8 @@ fn a_sealed_opener_still_authenticates_the_sender_to_the_recipient() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -1290,8 +1290,8 @@ fn recv_session_acks_and_drains_the_relay_over_the_wire() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -1378,8 +1378,8 @@ fn a_failed_container_commit_leaves_the_batch_redeliverable() {
     let astore = Store::unlock(&adir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     // The container now holds the PROVISIONED, pre-message account — the state a rollback lands on.
     cv.save().unwrap();
@@ -1453,8 +1453,8 @@ fn a_control_only_batch_still_carries_a_commit_barrier() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -1536,8 +1536,8 @@ fn recv_session_multi_delivers_from_live_relays_and_flags_the_dead_one() {
     seed_provision(&bstore);
     // A credential per relay — this account multi-homes onto both, so it needs both (CRYPTO-24).
     for id in [&id1, &id2] {
-        astore.save_capability_for(id, &client::dev_capability()).unwrap();
-        bstore.save_capability_for(id, &client::dev_capability()).unwrap();
+        astore.save_shared_capability_for(id, &client::dev_capability()).unwrap();
+        bstore.save_shared_capability_for(id, &client::dev_capability()).unwrap();
     }
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -1595,7 +1595,7 @@ fn publish_all_puts_the_bundle_on_every_relay_opks_on_the_primary_only() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&bstore);
     for id in [&id1, &id2] {
-        bstore.save_capability_for(id, &client::dev_capability()).unwrap();
+        bstore.save_shared_capability_for(id, &client::dev_capability()).unwrap();
     }
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -2790,7 +2790,7 @@ fn a_loop_survives_the_client_seam_and_comes_back() {
     let dir = temp_dir("loop-seam");
     let store = Store::unlock(&dir, b"pw").unwrap();
     seed_provision(&store);
-    store.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    store.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
 
     let r = ctx(relay_addr, &relay_id);
     let back = client::send_loop(&store, &r, NOW).expect("a loop sends and reads back");
@@ -2853,7 +2853,7 @@ fn one_time_prekeys_work_and_persist_across_the_process_per_call_client() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     for s in [&astore, &a2store, &bstore] {
         seed_provision(s);
-        s.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+        s.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     }
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -2907,8 +2907,8 @@ fn two_concurrent_image_posts_both_reunite_with_their_posts() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -2980,8 +2980,8 @@ fn simultaneous_first_contact_publications_both_deliver() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -3065,8 +3065,8 @@ fn post_attachments_round_trip_images_and_file() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -3124,8 +3124,8 @@ fn three_large_attachments_all_arrive() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -3179,8 +3179,8 @@ fn contact_request_and_accept_exchange_profiles() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -3241,8 +3241,8 @@ fn post_attachment_blob_round_trips_into_the_feed_sidecar() {
     let bstore = Store::unlock(temp_dir("pab-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
@@ -3348,8 +3348,8 @@ fn gallery_blob_round_trips_and_replaces_peer_photos() {
     let bstore = Store::unlock(temp_dir("gal-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
@@ -3397,7 +3397,7 @@ fn gallery_blob_round_trips_and_replaces_peer_photos() {
     // A stranger's gallery ref is DROPPED (not a confirmed contact) — no pending, no fetch.
     let cstore = Store::unlock(temp_dir("gal-c"), b"pw").unwrap();
     seed_provision(&cstore);
-    cstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    cstore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
     let carol_ik = cstore.load_account().unwrap().identity_public();
     let _ = carol_ik;
     // (Alice is NOT Carol's contact.) Carol receives Alice's ref → nothing pending.
@@ -3426,8 +3426,8 @@ fn contact_accept_comes_from_the_proxy_that_received_the_request() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     astore.create_proxy("p0", NOW).unwrap(); // mints indices' own random secrets (#207)
     bstore.create_proxy("p0", NOW).unwrap();
     bstore.create_proxy("p1", NOW).unwrap();
@@ -3487,8 +3487,8 @@ fn posts_request_and_reply_round_trip() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let a_ik = astore.load_account().unwrap().identity_public();
     let b_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -3531,8 +3531,8 @@ fn send_multihoming_fails_over_to_a_secondary_relay() {
     let bstore = Store::unlock(temp_dir("mh-b"), b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let live = ctx(addr, &rid);
     assert!(matches!(
@@ -3570,7 +3570,7 @@ fn cover_traffic_deposits_via_the_real_path_and_is_self_addressed() {
     let (addr, rid) = spawn_relay();
     let astore = Store::unlock(temp_dir("cov-a"), b"pw").unwrap();
     seed_provision(&astore);
-    astore.save_capability_for(&rid, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&rid, &client::dev_capability()).unwrap();
     let a_ik = astore.load_account().unwrap().identity_public();
     let r = ctx(addr, &rid);
     // We must have a published bundle so the self-session's first contact can fetch it.
@@ -3603,8 +3603,8 @@ fn an_expiring_message_is_delivered_but_never_persisted() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -3643,8 +3643,8 @@ fn delete_for_everyone_reaches_the_peer_with_the_shared_timestamp() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
     let r = ctx(relay_addr, &relay_id);
@@ -3682,8 +3682,8 @@ fn clearing_a_chat_wipes_it_from_disk_across_a_reload() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     seed_provision(&astore);
     seed_provision(&bstore);
-    astore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
-    bstore.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     let alice_ik = astore.load_account().unwrap().identity_public();
     let bob_ik = bstore.load_account().unwrap().identity_public();
 
@@ -3754,7 +3754,7 @@ fn a_crash_before_the_session_commit_leaves_the_prekey_to_reopen_the_contact() {
     let bstore = Store::unlock(&bdir, b"pw").unwrap();
     for s in [&astore, &bstore] {
         seed_provision(s);
-        s.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+        s.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
     }
     let bob_ik = bstore.load_account().unwrap().identity_public();
     let r = ctx(relay_addr, &relay_id);
@@ -3873,4 +3873,178 @@ fn multi_homing_presents_each_relay_the_credential_that_relay_issued() {
 
     std::fs::remove_dir_all(&adir).ok();
     std::fs::remove_dir_all(&bdir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// A8-4 — per-channel admission credentials.
+//
+// The `capability_id` rides in the clear on every deposit. Shared across an account's channels it
+// is the one field that puts them back together — and over Tor it is the ONLY one, because
+// `Peer::scope_for` already gives each handle its own SOCKS stream-isolation token and therefore
+// its own circuit. These tests pin the four things the fix has to be: issuance really is per
+// channel, a channel never borrows a sibling's credential, a burn takes the credential with it,
+// and a credential that CANNOT be split is shared only when something explicitly asks for that.
+// ---------------------------------------------------------------------------
+
+/// A relay with the PUBLIC (self-serve) door open: `karst join` earns a credential from it by
+/// solving a proof-of-work. 1 bit keeps the solve instant — the door's difficulty is not what
+/// these tests are about.
+fn spawn_public_relay() -> (SocketAddr, client::RelayId) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut relay = RelayNode::new(NOW);
+    relay.enable_pow_issue(1);
+    let fetch_pub = relay.relay_public().to_bytes();
+    let server = RelayServer::new(relay, Arc::new(move || NOW));
+    let noise_pub = server.noise_public();
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+    (addr, client::RelayId { noise_pub, fetch_pub })
+}
+
+/// THE test for this fix: two channels of ONE account earn from ONE relay and end up presenting
+/// DIFFERENT `capability_id`s.
+///
+/// It is deliberately an over-the-wire earn rather than two writes into the store: the whole
+/// question is whether ISSUANCE distinguishes them (the store has been keyed per relay since
+/// CRYPTO-24). If `handle_join` derived the id from anything account-shaped, both channels would
+/// come back with the same id, `capabilities.dat` would gain two entries, and every storage-level
+/// assertion would still pass while the relay could link them exactly as before.
+#[test]
+fn two_channels_earn_credentials_a_relay_cannot_link() {
+    let (relay_addr, relay_id) = spawn_public_relay();
+    let dir = temp_dir("a84-earn");
+    let store = Store::unlock(&dir, b"pw").unwrap();
+    seed_provision(&store);
+    let one = store.create_proxy("one", NOW).unwrap();
+    let two = store.create_proxy("two", NOW).unwrap();
+
+    let r = ctx(relay_addr, &relay_id);
+    let back = client::earn_missing_capabilities(&store, std::slice::from_ref(&r));
+    assert_eq!(back.earned, 2, "both channels must earn: {:?}", back.still_missing);
+    assert!(back.still_missing.is_empty(), "unexpected gaps: {:?}", back.still_missing);
+
+    let c1 = store.as_proxy(one.index).load_capability_for(&relay_id).unwrap();
+    let c2 = store.as_proxy(two.index).load_capability_for(&relay_id).unwrap();
+    assert_ne!(
+        c1.capability_id, c2.capability_id,
+        "both channels present the SAME capability_id — the relay can still cluster them into \
+         one account, which is the entire finding"
+    );
+    assert_ne!(c1.secret, c2.secret, "two channels sharing a credential SECRET is worse still");
+
+    // A second pass is a no-op: it fills gaps only, so reconnect-time backfill costs nothing and
+    // does not churn a channel's identity at the relay.
+    let again = client::earn_missing_capabilities(&store, std::slice::from_ref(&r));
+    assert_eq!(again.earned, 0, "a repeat pass re-earned instead of skipping");
+    assert_eq!(
+        store.as_proxy(one.index).load_capability_for(&relay_id).unwrap().capability_id,
+        c1.capability_id,
+        "the repeat pass replaced a channel's credential"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A channel with no credential of its own does NOT quietly present a sibling's. Borrowing would
+/// restore the exact linkage the fix removes, and it would do it invisibly: the send would work.
+/// The failure has to be the loud `NotFound` that makes the caller skip the relay.
+#[test]
+fn a_channel_never_borrows_a_sibling_channels_credential() {
+    let (relay_addr, relay_id) = spawn_public_relay();
+    let dir = temp_dir("a84-borrow");
+    let store = Store::unlock(&dir, b"pw").unwrap();
+    seed_provision(&store);
+    let one = store.create_proxy("one", NOW).unwrap();
+
+    let r = ctx(relay_addr, &relay_id);
+    assert_eq!(client::earn_missing_capabilities(&store, std::slice::from_ref(&r)).earned, 1);
+    // Created AFTER the pass — the offline case, in miniature: a channel that exists but has not
+    // been to the relay yet.
+    let two = store.create_proxy("two", NOW).unwrap();
+
+    assert!(store.as_proxy(one.index).load_capability_for(&relay_id).is_ok());
+    let borrowed = store.as_proxy(two.index).load_capability_for(&relay_id);
+    assert_eq!(
+        borrowed.unwrap_err().kind(),
+        std::io::ErrorKind::NotFound,
+        "a channel with no credential of its own was handed one belonging to another channel"
+    );
+    // And the root's credential is not a fallback either, in the other direction.
+    store.save_capability_for(&relay_id, &client::dev_capability()).unwrap();
+    assert_eq!(
+        store.as_proxy(two.index).load_capability_for(&relay_id).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound,
+        "a channel fell back to the ROOT account's credential"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Burning a channel destroys its admission credential too. Credentials are keyed per slot inside
+/// one file, so the `net_file` sweep that removes a burned proxy's session state cannot reach
+/// them — only the explicit cascade can, and without it a live credential naming a dead identity
+/// stays on disk.
+#[test]
+fn burning_a_channel_destroys_its_admission_credential() {
+    let (relay_addr, relay_id) = spawn_public_relay();
+    let dir = temp_dir("a84-burn");
+    let store = Store::unlock(&dir, b"pw").unwrap();
+    seed_provision(&store);
+    let doomed = store.create_proxy("doomed", NOW).unwrap();
+    let keeper = store.create_proxy("keeper", NOW).unwrap();
+
+    let r = ctx(relay_addr, &relay_id);
+    assert_eq!(client::earn_missing_capabilities(&store, std::slice::from_ref(&r)).earned, 2);
+    let kept_before = store.as_proxy(keeper.index).load_capability_for(&relay_id).unwrap();
+
+    store.burn_proxy(doomed.index).unwrap();
+    assert!(
+        !store.as_proxy(doomed.index).has_own_capability_for(&relay_id).unwrap(),
+        "the burned channel's admission credential survived the burn"
+    );
+    // The cascade must be surgical: the other channel is untouched, not collateral.
+    assert_eq!(
+        store.as_proxy(keeper.index).load_capability_for(&relay_id).unwrap().capability_id,
+        kept_before.capability_id,
+        "burning one channel took another channel's credential with it"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A credential that cannot be split — an operator invite — is shared by every channel, and only
+/// because something asked for that in as many words. This pins the honest half of the boundary:
+/// the public/PoW door issues per channel, the invite door cannot, and the difference is visible
+/// in which method the caller had to reach for.
+#[test]
+fn an_invite_credential_is_shared_only_when_explicitly_asked_for() {
+    let (_addr, relay_id) = spawn_public_relay();
+    let dir = temp_dir("a84-invite");
+    let store = Store::unlock(&dir, b"pw").unwrap();
+    seed_provision(&store);
+    let one = store.create_proxy("one", NOW).unwrap();
+    let two = store.create_proxy("two", NOW).unwrap();
+
+    let invite = own_capability(0x77, 0x88);
+    store.save_shared_capability_for(&relay_id, &invite).unwrap();
+
+    for p in [one.index, two.index] {
+        assert_eq!(
+            store.as_proxy(p).load_capability_for(&relay_id).unwrap().capability_id,
+            invite.capability_id,
+            "a shared invite must be presentable by every channel — otherwise an invite-only \
+             relay is reachable by exactly one of them"
+        );
+        // Riding a shared credential is NOT the same as having earned one: the backfill pass must
+        // still owe this channel its own, or a relay that later opens a public door would never
+        // be asked for per-channel credentials.
+        assert!(
+            !store.as_proxy(p).has_own_capability_for(&relay_id).unwrap(),
+            "a shared credential was mistaken for the channel's own"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
 }

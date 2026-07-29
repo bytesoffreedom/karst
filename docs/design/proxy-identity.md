@@ -132,40 +132,50 @@ it is never derived from, or storable back into, the recovery phrase. Consequenc
    way to *prove* "it is still me" to a contact after you rotate a proxy without linking the two —
    which would defeat the point. Long-lived relationships keep their proxy; you rotate the
    one-time / suspect ones, and re-establish out of band when you rotate a kept one.
-6. **The admission capability is shared across every proxy — a DELIBERATE limit, not an oversight
-   (A8-4).** `Store::capability_path()` lives on the account's root path (`self.dir`), not the
-   per-proxy `net_file` namespace every network-identity file uses (`sessions.p<index>.dat`,
-   `opks.p<index>.dat`, discovery key, …). Every proxy therefore presents the SAME
-   `CapabilityProof`/`capability_id` when it sends. A relay tracks quota by that id, so it can see
-   `proxy A deposit`, `proxy B deposit`, `proxy C deposit` all carry one identical id — clustering
-   proxies back together exactly the way they were supposed to be kept apart, and letting one
-   proxy's traffic burn through another's rate budget.
+6. **The admission capability is per-proxy — FIXED (A8-4, #206).** Credentials live in one
+   `capabilities.dat` on the account's root path, but the key inside names both halves:
+   `<relay-id>:<slot>`, where slot is `root` or `p<index>`. Every channel presents the credential
+   IT earned, so a relay watching the wire sees N unrelated `capability_id`s where it used to see
+   one account, and one channel's traffic no longer burns another's rate budget.
 
-   **CORRECTION (#206, re-examined).** An earlier revision of this document argued that splitting
-   the capability "buys no real anonymity gain", because a relay serving several proxies over one
-   connection can cluster them from timing anyway. That argument does not hold for the
-   configuration this project is actually for. `Peer::scope_for(handle)` derives a SOCKS
-   stream-isolation token PER HANDLE, and handles are per-purpose, per-box, per-epoch — so over
-   Tor each request already rides its own circuit and the connection does NOT link two proxies.
-   In that configuration the shared `capability_id` is not a secondary channel behind a stronger
-   one; it is THE linkage channel, presented in the clear on every single request.
+   **What was wrong before.** An earlier revision of this document argued that splitting the
+   capability "buys no real anonymity gain", because a relay serving several proxies over one
+   connection can cluster them from timing anyway. That argument had its premise backwards.
+   `Peer::scope_for(handle)` derives a SOCKS stream-isolation token PER HANDLE, and handles are
+   per-purpose, per-box, per-epoch — so over Tor each request already rides its own circuit and
+   the connection does NOT link two proxies. The connection-level clustering the dismissal leaned
+   on is exactly what per-handle isolation had already removed, which left the shared
+   `capability_id`, sent in the clear on every deposit, as the ONLY linkage channel in the
+   configuration proxies exist to serve. Direct-connection users were linked by IP regardless;
+   Tor users were linked by this and nothing else.
 
-   The reasoning was inverted: the connection-level clustering it leaned on is exactly what the
-   per-handle isolation already removes. The cost side stands — per-proxy credentials need a
-   PoW-earn and backfill flow, a new "cannot publish, its solve failed while offline" failure
-   mode, and an N× rise in one account's addressable relay throughput, since the per-capability
-   quota is a real anti-abuse control. But those are a price to be paid, not a reason the fix is
-   pointless. The credential store is already keyed per relay (`capabilities.dat`, CRYPTO-24), so
-   the shape is (relay-id, proxy) → capability; the missing piece is issuance, not storage.
+   **How issuance works now.** `client::earn_missing_capabilities` walks (live proxy × relay) and
+   earns wherever a channel has none of its OWN — a `Store::has_own_capability_for` check, so the
+   pass fills gaps and never re-earns. It runs at unlock, when a relay is configured, and when a
+   channel is minted (before the announce: a channel with no credential is skipped by
+   `publish_all`, since creating a bundle slot is metered). `Store::burn_proxy` removes that
+   channel's credentials in the same cascade that removes its session state — they are keyed per
+   slot inside one file, so nothing else would ever reach them.
 
-   Status: OPEN and re-prioritised. Direct-connection users are linked by IP regardless, so this
-   changes nothing for them; Tor users are linked ONLY by this, which is the case the proxy
-   mechanism exists to serve.
+   **The price, paid rather than hidden.** A Public relay's door is proof-of-work, so N channels
+   means solving it N times; and because quota is metered per `capability_id`, one account's total
+   addressable throughput at that relay grows N-fold. The second is a real weakening of an
+   anti-abuse control, accepted deliberately: a per-account bound cannot exist without a
+   per-account identifier, which is the thing being removed.
 
-   **The one real consequence today is a reliability cost, not a privacy one:** a proxy sent under
-   heavy load can exhaust the ONE shared 100-request/10-minute window (`POW_CAP_QUOTA`) and starve
-   every other proxy's sends until the window rolls over. That is a known, accepted limit of the
-   current shared-capability design, not a bug to chase separately from #1.
+   **Offline is a first-class outcome, not an error.** Earning needs a round trip, so a channel
+   created without a network has no credential and will SKIP that relay when sending. Every such
+   gap is reported (`CapabilityBackfill::still_missing`) rather than swallowed, and the next
+   online pass fills it.
+
+   **The remaining honest limit: invite-only relays.** An operator invite is ONE credential,
+   resolved once and revocable as a unit (#231) — N channels cannot each hold their own unless the
+   operator mints N invites. `Store::save_shared_capability_for` stores such a credential for every
+   channel, and it is a separate method precisely so that sharing is something a caller ASKS for
+   and never what happens when per-channel issuance fails. At an invite-only relay, therefore, this
+   account's channels do still present one `capability_id` and that relay can cluster them. The
+   public/PoW door has no such limit. (The dev capability is shared too, for the opposite reason:
+   its secret is published in this repository, so it is the same id for every user of this build.)
 
 ## Relationship to what is already shipped
 

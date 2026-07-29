@@ -616,6 +616,76 @@ pub fn earn_capability(relay: &Relay) -> Result<Capability, String> {
         .map_err(|e| format!("join failed: {e}"))
 }
 
+/// What one backfill pass managed to do (see `earn_missing_capabilities`).
+#[derive(Debug, Default)]
+pub struct CapabilityBackfill {
+    /// How many `(channel, relay)` pairs earned their own credential this pass.
+    pub earned: usize,
+    /// The pairs still without one, and why — `(proxy index, relay-id prefix, reason)`. A
+    /// PRESENT list is the normal offline outcome, not an error: the channel simply cannot send
+    /// through that relay yet, and the next pass will try again.
+    pub still_missing: Vec<(u32, String, String)>,
+}
+
+/// Earn a per-channel admission credential wherever one is missing (A8-4).
+///
+/// Every live proxy needs its OWN credential at every relay, because the `capability_id` travels
+/// in the clear on each deposit and one shared across channels is what lets a relay put them back
+/// together — over Tor, where `Peer::scope_for` already gives every handle its own circuit, it is
+/// the only thing that does. Issuance is what has to change: the store is already keyed per slot.
+///
+/// The price, stated rather than hidden: a Public relay's door is proof-of-work, so N channels
+/// means solving it N times, and the account's total metered throughput at that relay grows N-fold
+/// because the quota is per `capability_id`. Both are the cost of not being linkable; neither is
+/// a reason to share one credential.
+///
+/// **Offline is a first-class outcome.** `earn_capability` needs a round trip, so a channel
+/// created without a network gets nothing — and that must not be silent, or "this proxy cannot
+/// send" reads as a bug forever. Each failure is REPORTED, and because the pass only ever fills
+/// gaps it is safe to run again on every reconnect: a channel that already has its own credential
+/// is skipped without a request, so a repeat pass costs nothing.
+///
+/// A relay whose door is invite-only has no self-serve issuance at all, so it fails here every
+/// time — that is why `import-cap` writes a SHARED credential (`Store::save_shared_capability_for`)
+/// and why doing so is an explicit call with its own doc about the linkage it reinstates.
+pub fn earn_missing_capabilities(root: &Store, relays: &[Relay]) -> CapabilityBackfill {
+    let mut out = CapabilityBackfill::default();
+    for entry in root.load_proxies() {
+        let p = root.as_proxy(entry.index);
+        for relay in relays {
+            match p.has_own_capability_for(&relay.id) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    // An unreadable credential file is loud everywhere else (see
+                    // `load_capabilities`); earning over the top of it would write a fresh map and
+                    // silently drop credentials the user still holds.
+                    out.still_missing.push((
+                        entry.index,
+                        relay.id.hex()[..16].to_string(),
+                        format!("credential store unreadable: {e}"),
+                    ));
+                    continue;
+                }
+            }
+            match earn_capability(relay) {
+                Ok(cap) => match p.save_capability_for(&relay.id, &cap) {
+                    Ok(()) => out.earned += 1,
+                    Err(e) => out.still_missing.push((
+                        entry.index,
+                        relay.id.hex()[..16].to_string(),
+                        format!("earned but not stored: {e}"),
+                    )),
+                },
+                Err(e) => {
+                    out.still_missing.push((entry.index, relay.id.hex()[..16].to_string(), e))
+                }
+            }
+        }
+    }
+    out
+}
+
 // ----- §12 4c: opt-in discovery (contact code) -----
 //
 // A user turns discovery ON to become findable by a RANDOM, rotatable, revocable contact code

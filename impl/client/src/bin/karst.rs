@@ -383,10 +383,14 @@ fn cmd_find(args: &[String]) -> Result<(), String> {
 
 /// A capability belongs to ONE relay (CRYPTO-24), so even the dev credential is written against
 /// the relay it will be presented to — there is no account-wide slot left to fall back on.
+///
+/// Written as SHARED across this account's channels (A8-4): the dev secret is published in this
+/// repository, so it is the same `capability_id` for everyone and splitting it per channel would
+/// separate nothing that is not already public.
 fn cmd_dev_cap(args: &[String]) -> Result<(), String> {
     let r = relay_arg(args)?;
     let s = store()?;
-    s.save_capability_for(&r.id, &client::dev_capability())
+    s.save_shared_capability_for(&r.id, &client::dev_capability())
         .map_err(|e| format!("writing capability: {e}"))?;
     println!("wrote the dev capability for this relay (LOCAL TEST; the secret is public)");
     Ok(())
@@ -500,8 +504,13 @@ fn cmd_import_cap(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let cap = serde_json::from_slice(&bytes).map_err(|e| format!("parsing capability: {e}"))?;
     let s = store()?;
-    s.save_capability_for(&r.id, &cap).map_err(|e| format!("writing capability: {e}"))?;
-    println!("capability imported for this relay");
+    // SHARED across this account's channels, deliberately (A8-4): an invite is ONE credential the
+    // operator minted and can revoke as a unit (#231), so N channels cannot each hold their own —
+    // only the operator can issue N invites. At an invite-only relay this account's channels do
+    // therefore present one `capability_id`, which that relay can cluster; the public/PoW door has
+    // no such limit and issues per channel (`karst join`).
+    s.save_shared_capability_for(&r.id, &cap).map_err(|e| format!("writing capability: {e}"))?;
+    println!("capability imported for this relay (shared by every channel of this account)");
     Ok(())
 }
 

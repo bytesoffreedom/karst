@@ -419,6 +419,28 @@ struct SessionFile {
     opks: Vec<[u8; 32]>,
 }
 
+/// What `capabilities.dat` holds: the admission credentials this account has, split by whether
+/// they belong to one channel or to all of them (A8-4).
+///
+/// One file rather than one per proxy on purpose. Every read is a read-modify-write of the whole
+/// map, and the "an unreadable credential file is a loud error, never treated as absent" rule is
+/// worth having in exactly one place; per-proxy files would fan that fail-closed behaviour out N
+/// ways for nothing (the file is small, and it is already sealed under the account key).
+#[derive(Serialize, Deserialize, Default)]
+struct CapabilityFile {
+    /// `"<relay-id hex>:<slot>"` → the credential THAT SLOT earned at THAT relay, where slot is
+    /// `root` or `p<index>`. This is the per-proxy issuance A8-4 asks for: nothing here is
+    /// readable by another channel, so a relay watching the wire sees N unrelated
+    /// `capability_id`s where it used to see one account.
+    per_slot: BTreeMap<String, Capability>,
+    /// `"<relay-id hex>"` → a credential that cannot be split per channel, so every one presents
+    /// it. Only two things belong here, both deliberate: an operator invite (one credential,
+    /// revocable as a unit — the operator would have to mint N) and the public dev capability
+    /// (the same id for every user of this repository, so splitting it separates nothing).
+    /// Writing here is always an explicit call — see `Store::save_shared_capability_for`.
+    shared: BTreeMap<String, Capability>,
+}
+
 /// Clone is a cheap handle (a path + the derived key), so an off-loop transfer thread
 /// can seal straight into the vault instead of staging plaintext on disk.
 #[derive(Clone)]
@@ -438,13 +460,15 @@ pub struct Store {
     /// transfer queues) and all DATA (contacts/history/feed/profile/…) stay on the root paths, one
     /// copy — a proxy is a channel, not a persona.
     ///
-    /// **A8-4, honest and DELIBERATE (see `docs/design/proxy-identity.md` § Honest limits #6):**
-    /// sharing the relay capability across every proxy means every proxy presents the SAME
-    /// `capability_id` on send, which a relay can use to cluster proxies back together — but a
-    /// relay serving several of your proxies over one connection already clusters them from fetch
-    /// timing alone (limit #1), a strictly stronger channel a per-proxy capability would not close.
-    /// Do not "fix" this in isolation — see `capability_path` and the doc for the actual tradeoff
-    /// (a real N× relay-throughput increase, for zero anonymity gain until #1 has a fix).
+    /// **A8-4 (fixed):** the relay capability USED to be shared across every proxy, so all of them
+    /// presented one `capability_id` and a relay could cluster them back into one account with no
+    /// effort at all. The dismissal written here before — "a relay already clusters them from
+    /// fetch timing over one connection" — had its premise backwards: `Peer::scope_for` derives a
+    /// SOCKS stream-isolation token per handle, and a handle is per-purpose, per-box, per-epoch,
+    /// so over Tor each request already takes its own circuit and the connection links nothing.
+    /// The shared `capability_id`, sent in the clear on every deposit, was therefore not a minor
+    /// channel behind a stronger one — it was the ONLY one, in exactly the configuration proxies
+    /// exist for. Credentials are now issued and stored per slot (see `CapabilityFile`).
     proxy: Option<u32>,
     /// At-rest CONTEXT prefix for this store (CRYPTO-05): `acct:<id>` inside a vault, `vault`
     /// for the vault's own files, `store` for a standalone single-account directory. Combined
@@ -1406,11 +1430,11 @@ impl Store {
     pub fn capability_path(&self) -> PathBuf {
         // .dat, а не .json: на диске зашифрованный blob, не JSON.
         //
-        // Deliberately `self.dir`, NOT `net_file` — unlike every IDENTITY-keyed network file
-        // (sessions/opks/discovery), the capabilities are NOT namespaced per proxy: every proxy
-        // this account has reads and presents the SAME capability_id per relay (A8-4, see the
-        // `proxy` field doc above and `docs/design/proxy-identity.md` § Honest limits #6 for why
-        // this is a named, deliberate limit rather than a gap to close here).
+        // Deliberately `self.dir`, NOT `net_file`: ONE file holds every slot's credentials, keyed
+        // `<relay-id>:<slot>` inside (see `CapabilityFile`). The per-proxy separation A8-4 asks
+        // for is in the KEY, not in the filename — which keeps the "unreadable → loud error"
+        // rule in a single place instead of N, and lets a burn remove one proxy's credentials
+        // without the rest of the file being rewritten by anything else.
         self.dir.join("capabilities.dat")
     }
 
@@ -1482,9 +1506,25 @@ impl Store {
         })
     }
 
-    /// Every admission credential this account holds, keyed by the full relay-id (128 hex,
-    /// `noise_pub ‖ fetch_pub`) of the relay that ISSUED it. Absent → none held.
-    fn load_capabilities(&self) -> io::Result<std::collections::BTreeMap<String, Capability>> {
+    /// Which SLOT of this account the current handle presents credentials as: `"root"` for the
+    /// root store, `"p<index>"` acting as a proxy. Part of the capability map's key, so a proxy
+    /// can only ever find the credential IT earned (A8-4 — see `capability_path`).
+    fn cap_slot(&self) -> String {
+        match self.proxy {
+            None => "root".to_string(),
+            Some(idx) => format!("p{idx}"),
+        }
+    }
+
+    /// Key into `CapabilityFile::per_slot`: relay-id (128 hex) ‖ `:` ‖ slot. Both halves are
+    /// required — a credential is issued BY one relay TO one slot, and neither substitution is
+    /// allowed (CRYPTO-24 for the relay half, A8-4 for the slot half).
+    fn cap_key(&self, relay: &crate::RelayId) -> String {
+        format!("{}:{}", relay.hex(), self.cap_slot())
+    }
+
+    /// Every admission credential this account holds. Absent → none held.
+    fn load_capabilities(&self) -> io::Result<CapabilityFile> {
         match std::fs::read(self.capability_path()) {
             Ok(blob) => {
                 let json = self.key.open(&self.label(&self.capability_path()), &blob).map_err(|e| {
@@ -1498,24 +1538,10 @@ impl Store {
         }
     }
 
-    /// Store an admission credential AS THE CREDENTIAL FOR ONE RELAY (import can repeat →
-    /// overwrite allowed). The secret is an admission credential, so it is encrypted at rest like
-    /// every other secret, not merely 0600. The dev capability is public, but `import-cap` takes
-    /// a real one too — one code path, no exception.
-    ///
-    /// CRYPTO-24: a capability is relay-specific in production. A Private relay mints its own
-    /// random `capability_id + secret`; a Public relay derives a stateless secret from ITS OWN
-    /// issuer key. So one account-wide credential presented to a second relay is not merely
-    /// useless there — it is rejected (`UnknownCapability`/`BadMac`), which silently broke the
-    /// two things multi-homing exists for: publishing a bundle on a backup relay (creating a slot
-    /// is metered — see `RelayNode::handle_publish`) and failing a send over to it. It also
-    /// handed every relay the SAME `capability_id`, linking one account's traffic across relays
-    /// that otherwise share nothing. Keyed by relay-id, none of that can happen by construction:
-    /// there is no way to ask for "the" capability without naming the relay it is for.
-    pub fn save_capability_for(&self, relay: &crate::RelayId, cap: &Capability) -> io::Result<()> {
-        let mut all = self.load_capabilities()?;
-        all.insert(relay.hex(), cap.clone());
-        let json = serde_json::to_vec(&all).map_err(io_err)?;
+    /// Write the whole credential file back, sealed. Callers read-modify-write so that one slot's
+    /// change never drops another's entries.
+    fn store_capabilities(&self, all: &CapabilityFile) -> io::Result<()> {
+        let json = serde_json::to_vec(all).map_err(io_err)?;
         let blob = self.key.seal(&self.label(&self.capability_path()), &json);
         let mut f = OpenOptions::new()
             .write(true)
@@ -1526,26 +1552,102 @@ impl Store {
         f.write_all(&blob)
     }
 
-    /// The credential to present to THIS relay, or `NotFound` if this account holds none for it.
-    /// Never falls back to another relay's credential (that is the whole point — see
-    /// `save_capability_for`); a caller that cannot get one must skip the relay, not substitute.
+    /// Store an admission credential AS THIS SLOT'S CREDENTIAL FOR ONE RELAY (re-earning can
+    /// repeat → overwrite allowed). The secret is an admission credential, so it is encrypted at
+    /// rest like every other secret, not merely 0600.
+    ///
+    /// CRYPTO-24: a capability is relay-specific in production. A Private relay mints its own
+    /// random `capability_id + secret`; a Public relay derives a stateless secret from ITS OWN
+    /// issuer key. So one account-wide credential presented to a second relay is not merely
+    /// useless there — it is rejected (`UnknownCapability`/`BadMac`), which silently broke the
+    /// two things multi-homing exists for: publishing a bundle on a backup relay (creating a slot
+    /// is metered — see `RelayNode::handle_publish`) and failing a send over to it. It also
+    /// handed every relay the SAME `capability_id`, linking one account's traffic across relays
+    /// that otherwise share nothing. Keyed by relay-id, none of that can happen by construction:
+    /// there is no way to ask for "the" capability without naming the relay it is for.
+    ///
+    /// A8-4: the key names the SLOT too, so `store.as_proxy(3)` writes proxy 3's credential and
+    /// nothing else can read it. The credential a proxy presents is the one that proxy earned.
+    pub fn save_capability_for(&self, relay: &crate::RelayId, cap: &Capability) -> io::Result<()> {
+        let mut all = self.load_capabilities()?;
+        all.per_slot.insert(self.cap_key(relay), cap.clone());
+        self.store_capabilities(&all)
+    }
+
+    /// Store a credential that CANNOT be split per proxy, so every slot presents the same one.
+    ///
+    /// This is the honest name for the one door where per-proxy issuance is impossible rather
+    /// than merely unimplemented: an operator invite is a single credential, resolved once and
+    /// revocable as a unit (#231), so N proxies cannot each hold their own — only the operator
+    /// can mint N of them. The dev capability is the other case, and for the opposite reason:
+    /// its secret is published in this repository, so it is the same id for every user on earth
+    /// and splitting it would separate nothing.
+    ///
+    /// The cost is exactly the A8-4 linkage: at an invite-only relay, every proxy of this account
+    /// presents one `capability_id` and the relay can cluster them. That is a property of the
+    /// invite door, not of this code, and it is why it lives behind its own method — sharing must
+    /// be something a caller ASKS for, never what happens when per-proxy issuance fails.
+    pub fn save_shared_capability_for(
+        &self,
+        relay: &crate::RelayId,
+        cap: &Capability,
+    ) -> io::Result<()> {
+        let mut all = self.load_capabilities()?;
+        all.shared.insert(relay.hex(), cap.clone());
+        self.store_capabilities(&all)
+    }
+
+    /// The credential THIS SLOT presents to THIS relay, or `NotFound` if it holds none.
+    ///
+    /// Resolution order is: this slot's own earned credential, then a credential explicitly
+    /// marked unsplittable for this relay (`save_shared_capability_for`). Never another SLOT's
+    /// credential and never another RELAY's — a caller that cannot get one must skip the relay,
+    /// not substitute. Falling back to a sibling proxy's credential is precisely the linkage
+    /// A8-4 names, so its absence here is load-bearing.
     ///
     /// An unreadable `capabilities.dat` is an ERROR here and on every save (the save reads first,
-    /// to keep the other relays' entries), so a corrupt file wedges importing too. That is
+    /// to keep the other slots' entries), so a corrupt file wedges importing too. That is
     /// deliberate — silently starting a fresh map would drop credentials the user still has and
     /// cannot tell are gone — and the exit is manual and explicit: delete `capabilities.dat` and
-    /// re-import (`karst import-cap` / `karst join`) for each relay.
+    /// re-earn (`karst join`) or re-import (`karst import-cap`) for each relay.
     pub fn load_capability_for(&self, relay: &crate::RelayId) -> io::Result<Capability> {
-        self.load_capabilities()?.remove(&relay.hex()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "no admission credential for relay {} — join it (karst join) or import its \
-                     invite (karst import-cap)",
-                    &relay.hex()[..16]
-                ),
-            )
-        })
+        let mut all = self.load_capabilities()?;
+        all.per_slot
+            .remove(&self.cap_key(relay))
+            .or_else(|| all.shared.remove(&relay.hex()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no admission credential for relay {} on channel {} — join it \
+                         (karst join) or import its invite (karst import-cap)",
+                        &relay.hex()[..16],
+                        self.cap_slot()
+                    ),
+                )
+            })
+    }
+
+    /// Whether THIS SLOT has already earned its OWN credential for `relay` — i.e. whether the
+    /// backfill pass still owes it one. Distinct from `has_capability_for`, which is satisfied by
+    /// a shared invite credential: a slot riding a shared credential should still earn its own
+    /// the moment the relay's door allows it.
+    pub fn has_own_capability_for(&self, relay: &crate::RelayId) -> io::Result<bool> {
+        Ok(self.load_capabilities()?.per_slot.contains_key(&self.cap_key(relay)))
+    }
+
+    /// Drop every credential belonging to proxy `index` (all relays). Called from `burn_proxy`:
+    /// the credentials are keyed per slot, so nothing else would ever remove them, and a burned
+    /// proxy's admission secret lingering on disk is state a burn is supposed to destroy.
+    fn forget_proxy_capabilities(&self, index: u32) -> io::Result<()> {
+        let suffix = format!(":p{index}");
+        let mut all = self.load_capabilities()?;
+        let before = all.per_slot.len();
+        all.per_slot.retain(|k, _| !k.ends_with(&suffix));
+        if all.per_slot.len() != before {
+            self.store_capabilities(&all)?;
+        }
+        Ok(())
     }
 
     // ----- Discovery key (opt-in contact code), encrypted at-rest -----
@@ -2828,6 +2930,15 @@ impl Store {
                     eprintln!("warning: could not remove burned proxy file {}: {e}", path.display());
                 }
             }
+        }
+
+        // This proxy's own admission credentials (A8-4). They live keyed-by-slot in the ONE
+        // `capabilities.dat`, not in a `net_file`, so the loop above cannot reach them and only
+        // an explicit removal will — the same cascade shape as `forget_peer` (A5-9). A burned
+        // channel's admission secret is exactly the kind of state a burn is supposed to destroy:
+        // left behind, it is a live credential naming a dead identity.
+        if let Err(e) = self.forget_proxy_capabilities(index) {
+            eprintln!("warning: could not clear burned proxy #{index}'s credentials: {e}");
         }
 
         // A contact tagged to this now-dead index would otherwise sit pointing at nothing

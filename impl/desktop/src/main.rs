@@ -832,8 +832,25 @@ fn seed_dev_capabilities(store: &Store, relays: &[Relay]) {
                  Its secret is public: anyone can forge deposits under it. Local demo only.",
                 &r.id.hex()[..16]
             );
-            let _ = store.save_capability_for(&r.id, &client::dev_capability());
+            // Shared across channels, and here that is the accurate shape rather than a
+            // concession (A8-4): the dev secret is published in this repository, so `0xCA..` is
+            // the same id for every user of this build — splitting it per proxy would separate
+            // nothing that is not already public.
+            let _ = store.save_shared_capability_for(&r.id, &client::dev_capability());
         }
+    }
+}
+
+/// Surface what a per-channel credential backfill could not do. Offline (or an invite-only relay
+/// with no self-serve door) leaves channels without their own credential, and those channels then
+/// skip that relay on send — reporting it is what keeps that from reading as an unexplained
+/// failure later. Not fatal: the next pass retries, and a channel that already has one is skipped.
+fn report_backfill(b: client::CapabilityBackfill) {
+    for (idx, relay, why) in &b.still_missing {
+        eprintln!(
+            "KARST: channel #{idx} has no admission credential of its own for relay {relay} \
+             ({why}) — it will skip that relay when sending until one is earned"
+        );
     }
 }
 
@@ -902,6 +919,13 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
     // Proxy-identity model: an account is reached only through proxies, so ensure one exists
     // (pre-proxy / fresh accounts get proxy 0 here). The root is never published.
     let _ = default_proxy(&store);
+    // Unlock is this client's "we are online again" moment, and therefore where a channel that
+    // was created offline finally earns its own credential (A8-4). Gap-filling only, so an
+    // account whose channels are all provisioned makes no request at all. Offline is the empty
+    // relay set, so this no-ops there for the same reason `do_publish` does.
+    if !offline {
+        report_backfill(client::earn_missing_capabilities(&store, &relays));
+    }
     // OFFLINE mode emits nothing — do_publish no-ops when offline (a hidden account defaults to
     // offline so it produces zero network traffic until the user deliberately syncs).
     do_publish(&store, &relays, offline);
@@ -1350,9 +1374,10 @@ fn set_relay(app: State<App>, addr: String, relay_id: String, socks5: String, mi
     // `relays_or_empty` — the ONE choke every other deposit relies on — so it must check `offline`
     // itself or Offline would still emit a request the moment a relay is configured.
     if !app.offline.load(Ordering::SeqCst) {
-        if let Ok(cap) = client::earn_capability(&relay) {
-            let _ = store.save_capability_for(&relay.id, &cap);
-        }
+        // A8-4: one pass per CHANNEL, not one for the account. Each proxy earns its own
+        // credential so the `capability_id` on the wire does not put them back together; the
+        // pass fills gaps only, so it is cheap to repeat and safe to run on every reconnect.
+        report_backfill(client::earn_missing_capabilities(&store, std::slice::from_ref(&relay)));
     }
     s.relays = build_relays(&store);
     do_publish(&store, &s.relays, app.offline.load(Ordering::SeqCst));
@@ -1423,7 +1448,15 @@ fn import_capability(app: State<App>, invite_json: String) -> Result<(), String>
     // is for is the relay this account is currently configured against. It is stored against that
     // one and presented nowhere else (CRYPTO-24).
     let primary = relays.first().ok_or("configure this account's relay before importing its invite")?;
-    store.save_capability_for(&primary.id, &cap).map_err(|e| format!("writing capability: {e}"))?;
+    // SHARED, deliberately, and the one place in the client that shares (A8-4): an invite is a
+    // single credential the operator minted and can revoke as a unit (#231) — there is no way for
+    // N channels to each hold their own without the operator issuing N invites. So at an
+    // invite-only relay every channel of this account presents one `capability_id` and that relay
+    // can cluster them. Storing it per channel instead would not change the linkage (they would
+    // all hold copies of the SAME credential) and would only make the sharing implicit.
+    store
+        .save_shared_capability_for(&primary.id, &cap)
+        .map_err(|e| format!("writing capability: {e}"))?;
     do_publish(&store, &relays, app.offline.load(Ordering::SeqCst));
     Ok(())
 }
@@ -1808,6 +1841,11 @@ fn create_proxy(app: State<App>, label: String) -> Result<Proxy, String> {
     // Announce the new channel's bundle to the relay NOW, so a contact can open a session to it
     // immediately. Without this the channel is unreachable ("bundle not published") until the next
     // unlock re-runs do_publish — the exact "send failed: bundle not published" you hit.
+    // A8-4 backfill, and it must come BEFORE the announce: a channel presents its OWN credential
+    // now, so a brand-new one holds none and `publish_all` would skip every relay (creating a
+    // bundle slot is metered). Offline this earns nothing and says so — the channel exists, is
+    // simply not yet announced anywhere, and the next `set_net`/reconnect pass fills it in.
+    report_backfill(client::earn_missing_capabilities(&store, &relays));
     let np = store.as_proxy(e.index);
     let _ = client::publish_all(&np, &relays, now_secs());
     Ok(proxy_of(&store, &e))
@@ -1877,6 +1915,9 @@ fn migrate_channel(app: State<App>, old_index: u32, contacts: Vec<String>, new_l
     let relay = relays.first().cloned().ok_or("no relay configured")?;
     // Mint + publish the new channel so contacts can open a session to it.
     let new_e = store.create_proxy(new_label.trim(), now_secs()).map_err(|e| format!("creating channel: {e}"))?;
+    // The new channel needs its OWN admission credential before it can announce anything (A8-4) —
+    // same reason as in `create_proxy`.
+    report_backfill(client::earn_missing_capabilities(&store, &relays));
     let np = store.as_proxy(new_e.index);
     let _ = client::publish_all(&np, &relays, now_secs());
     let new_ik = np.load_account().map_err(|e| e.to_string())?.identity_public();

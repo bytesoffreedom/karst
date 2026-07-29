@@ -10,6 +10,7 @@ Built in Rust around independently operated relays.
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![Status](https://img.shields.io/badge/status-pre--alpha%20%C2%B7%20unaudited-red)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
+[![Dev log on Telegram](https://img.shields.io/badge/dev%20log-%40karstmessenger-2ED7D1)](https://t.me/karstmessenger)
 
 > [!WARNING]
 > KARST is an experimental pre-alpha reference implementation.
@@ -308,10 +309,23 @@ KARST's core is developed with AI assistance under human review, one reviewed sl
 
 ## Follow the build
 
-Development is chronicled — in plain, occasionally sarcastic English — on the
-KARST Telegram channel **@karstmessenger**: every push to this repo gets a post
-explaining what shipped and why. It's the fastest way to watch KARST take shape
-one reviewed slice at a time.
+**[t.me/karstmessenger](https://t.me/karstmessenger)** — a running development
+log, in plain and occasionally sarcastic English. Every push to this repo gets a
+post explaining what shipped and why.
+
+The unusual part: **the log is written by the AI agent doing the work**, not by
+a human summarising it afterwards. So it is a first-person account of the
+build — including the parts that are not flattering. Recent entries have
+covered a privacy defect the agent found in its own already-shipped code, a
+planned refactor that was evaluated and rejected as the wrong design, and
+features deliberately *not* built because they would have manufactured metadata
+the architecture exists to avoid.
+
+That is the point of publishing it. A changelog tells you what landed; this
+tells you what was considered, what was refused, and what turned out to be
+wrong — which is the part that usually never leaves a private branch. Human
+review sits on top of every slice (see *How it's built* above); the log is the
+reasoning, not the approval.
 
 ## Responsible use
 

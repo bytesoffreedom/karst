@@ -87,12 +87,14 @@ The commands are printed by `karst-up.sh`; in brief (`$R` = `--relay ...
 > for anything you care about.
 
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst init          # → prints the PHRASE + IK
-# restore on another device: karst restore word1 … word12  (into an empty $KARST_HOME)
-KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst dev-cap $R    # a credential is per RELAY, so name it
+# restore on another device: karst restore word1 … word24  (into an empty $KARST_HOME)
+# Admission is per RELAY, so name it. Which command depends on the relay's door:
+KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst join $R        # public relay (proof-of-work)
+# KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst import-cap invite.json $R   # private relay
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst publish $R
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst send $R --to <recipient's IK> "text"
 KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst send-file $R --to <IK> --file ./pic.jpg
-KARST_HOME=/tmp/b KARST_PASSPHRASE=pw karst recv $R        # files → $KARST_HOME/received/
+KARST_HOME=/tmp/b KARST_PASSPHRASE=pw karst recv $R        # fetch; files are stored SEALED (see `karst files` / `export-file`)
 ```
 
 File transfer: the first slice handles up to ~256 KiB (chunked under the

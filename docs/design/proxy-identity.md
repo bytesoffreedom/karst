@@ -12,7 +12,7 @@ Until now a KARST identity **is** its identity key (IK): the IK is your permanen
 the thing you hand out, the thing a contact code resolves to, and the thing every session,
 publication and channel is keyed on. That has a structural flaw the model below removes:
 
-- **The IK cannot be changed.** It is derived (frozen) from your 12-word phrase — it *is* your
+- **The IK cannot be changed.** It is derived (frozen) from your 24-word phrase — it *is* your
   identity to every existing contact. So you cannot "change your primary address."
 - **Any way to reach you leaks the permanent IK.** A resolved contact code, a shared address,
   a one-time invite — all hand over the forever-IK. Whoever got it has it for good.
@@ -84,7 +84,7 @@ it is never derived from, or storable back into, the recovery phrase. Consequenc
   the secret is gone, nothing — not the recovery phrase, not the device password, nobody —  can
   reproduce that identity's keys again. That irreversibility is the fix, not a side effect.
 - **The phrase recovers the ROOT identity, not its proxies — and never the vault data either.**
-  Entering the 12 words on any device re-derives the SAME root `seal`/`account` (as always — this
+  Entering the 24 words on any device re-derives the SAME root `seal`/`account` (as always — this
   is unchanged by #207), which is all the phrase ever gave you. Contacts, history, feed and the
   proxy registry itself are vault DATA, encrypted at rest under the device password, not the
   phrase — recovering the phrase alone was never a way to get that data back, on a new device you
@@ -120,7 +120,7 @@ it is never derived from, or storable back into, the recovery phrase. Consequenc
    keys (#207).** The phrase only ever re-derives the root `seal`/`account`; vault data (profile,
    contacts, history, feed, the proxy registry) is a separate, device-password-encrypted thing the
    phrase never touched. What changed: proxy identities used to ALSO be phrase-derived (by HD
-   index), so even without the old vault you could regenerate a proxy's keys from the 12 words
+   index), so even without the old vault you could regenerate a proxy's keys from the 24 words
    alone. Now each proxy's keys come from a random secret that lives only inside that
    device-encrypted registry, so losing the vault (or burning the entry) loses the proxy for good —
    the phrase was never, and is not now, a backup for it. Restoring an account (new device, phrase

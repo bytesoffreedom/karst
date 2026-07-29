@@ -21,7 +21,11 @@ echo "== building =="
 karst_build
 
 echo "== starting relay on $ADDR =="
-KARST_RELAY_HOME="$RUN/relay" "$(karst_bin karst-relay)" "$ADDR" >"$RELAY_LOG" 2>&1 &
+# Public door with a cheap PoW: a DEFAULT (private) relay only honours capabilities it
+# issued as invites, so the hints below would fail against it (#202 removed the silent
+# fallback to a public dev credential). This script exists for local manual testing.
+KARST_RELAY_MODE=public KARST_RELAY_POW_BITS=8 \
+  KARST_RELAY_HOME="$RUN/relay" "$(karst_bin karst-relay)" "$ADDR" >"$RELAY_LOG" 2>&1 &
 echo $! >"$RUN/relay.pid"
 karst_wait_port "$ADDR" || { echo "relay did not come up; log:"; cat "$RELAY_LOG"; exit 1; }
 RID="$(karst_relay_id_from_log "$RELAY_LOG")"
@@ -37,8 +41,8 @@ relay-id: $RID
   (saved in $RUN/relay-id; log $RELAY_LOG)
 
 ── Option A: the desktop app (the product) ───────────────────────────────────
-  cd impl && KARST_DEV_CAP=1 cargo run -p desktop   # the Tauri client (dev cap: local demo only)
-  First run: "Create account" → write down the 12 words (recovery phrase) →
+  cd impl && cargo run -p desktop            # the Tauri client
+  First run: "Create account" → write down the 24 words (recovery phrase) →
   confirm the words → set a passphrase → "Create account". Point it at the relay
   address and relay-id above. Copy your IK, paste it as a contact in the other
   instance (out-of-band trust), and confirm the safety number.
@@ -47,7 +51,7 @@ relay-id: $RID
   export R="--relay $ADDR --relay-id $RID"
   # Alice:
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI init
-  KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI dev-cap \$R
+  KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI join \$R    # earn admission (PoW)
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI publish \$R
   # Bob (in another window) — same, then find each other's IK:
   KARST_HOME=/tmp/karst-alice KARST_PASSPHRASE=pw $CLI account   # → Alice's IK

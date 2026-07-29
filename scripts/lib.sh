@@ -13,9 +13,12 @@ KARST_IMPL="$KARST_ROOT/impl"
 
 # Build the needed binaries (relay + CLI). Idempotent, fast incremental.
 # The desktop GUI is the Tauri client (`impl/desktop`) and is built separately.
+# The relay binary lives in the `relay` crate, NOT in `node`: `node` is the wire protocol both
+# sides speak, `relay` is the server that must not be linked by a client (#143). Naming the wrong
+# crate here does not fail at review, it fails at `cargo build` for whoever runs a demo script.
 karst_build() {
   cargo build --manifest-path "$KARST_IMPL/Cargo.toml" \
-    -p node --bin karst-relay \
+    -p relay --bin karst-relay \
     -p client --bin karst
 }
 
@@ -62,6 +65,12 @@ karst_warn_if_not_on_path() {
 
 # Wait until HOST:PORT starts accepting connections (bind complete).
 # Returns 0 on success, 1 on timeout (~200 attempts, no sleep).
+# Wait for `host:port` to accept a connection, up to ~20 s.
+#
+# The loop used to run 200 attempts with NO delay between them, which finishes in a few
+# milliseconds — long before any relay can bind — so every script that waits on a fresh relay
+# failed on a cold start and looked like the relay was broken. A retry loop without a sleep is
+# not a wait, it is a very fast way to give up.
 karst_wait_port() {
   local addr="$1" host port
   host="${addr%:*}"; port="${addr##*:}"
@@ -71,11 +80,21 @@ karst_wait_port() {
       exec 3>&- || true
       return 0
     fi
+    sleep 0.1
   done
   return 1
 }
 
 # Extract the relay-id from the relay log (printed as the line "relay-id <hex>").
+# Pull the relay-id out of a relay's startup log.
+#
+# The relay prints it inside an aligned box (`│  relay-id        <hex>`), so the separator is
+# RUN of spaces, not one. The old pattern required exactly one and therefore matched nothing —
+# and because the caller assigns through a pipeline under `set -e -o pipefail`, the empty grep
+# killed the script before the "could not read relay-id" guard could say so. Every demo script
+# died silently right after starting a relay that was working perfectly.
+#
+# `|| true` so a miss returns empty and the CALLER's guard is what reports it, in words.
 karst_relay_id_from_log() {
-  grep -oE 'relay-id [0-9a-f]+' "$1" | awk '{print $2}' | tail -1
+  grep -oE 'relay-id[[:space:]]+[0-9a-f]{16,}' "$1" | awk '{print $2}' | tail -1 || true
 }

@@ -211,7 +211,7 @@ sha256sum -c SHA256SUMS                         # binaries match the checksums
 
 **Strongest — rebuild and compare, trusting neither the binary nor the signature.**
 A signed-but-backdoored build is still signed; a *reproduced* build provably matches
-the public source. `scripts/build-reproducible.sh` produces byte-identical binaries
+the public source. `impl/scripts/build-reproducible.sh` produces byte-identical binaries
 on the pinned toolchain (verified across build paths):
 
 ```sh
@@ -244,7 +244,7 @@ the relay). The id is stable across restarts.
 |---|---|---|
 | Listen address / port | first CLI argument, else `KARST_RELAY_ADDR` env | `127.0.0.1:9000` |
 | Node key location | `KARST_RELAY_HOME` env | `~/.config/karst-relay/relay.key` (0600) |
-| Role (the admission door) | `KARST_RELAY_MODE` env: `private` \| `public` \| `dev` | `private` — invite-only: a random per-relay secret, persisted; the relay writes `invite.json` and a peer joins with `karst import-cap <that file>`. `public` = open door (STAGED — flood-exposed until the PoW anti-spam gate lands), and it **refuses to start unless `KARST_RELAY_ALLOW_UNSAFE_PUBLIC=1`** is also set (explicit opt-in). `dev` = the known public test cap so `karst dev-cap` reaches it (local testing only). An **unknown** mode value refuses to start rather than silently defaulting |
+| Role (the admission door) | `KARST_RELAY_MODE` env: `private` \| `public` \| `dev` | `private` — invite-only: a random per-relay secret, persisted; the relay writes `invite.json` and a peer joins with `karst import-cap <that file>`. `public` = open door, **PoW-gated**: a client earns a capability with hashcash (`karst join`) and the per-capability quota bounds it, so it is spam-BOUNDED rather than spam-exposed. Difficulty via `KARST_RELAY_POW_BITS`. `dev` = the known public test capability so `karst dev-cap` reaches it (local testing only). An **unknown** mode value refuses to start rather than silently defaulting |
 | relay-id | printed on start (`relay-id …`) | derived from the node key (stable) |
 | wss carrier (WebSocket-over-TLS) | `KARST_RELAY_TLS_CERT` + `KARST_RELAY_TLS_KEY` (PEM) | off (raw TCP); set both to terminate `wss` — use a real cert for the relay's hostname |
 
@@ -294,12 +294,18 @@ frontend over the shared core). Launch with `cargo run -p desktop`.
 
 ```sh
 export KARST_HOME=/tmp/alice KARST_PASSPHRASE=pw
-karst init                       # prints your recovery phrase + address (IK)
-karst dev-cap                    # install the local dev admission capability
+karst init                       # prints your recovery phrase (24 words) + address (IK)
+
+# Earn admission to the relay. Which one depends on the relay's door:
+karst join $R                    #   public relay: earn a capability by proof-of-work
+karst import-cap invite.json $R  #   private relay: import the invite its operator gave you
+
 karst publish $R                 # announce your bundle so others can reach you
 karst send $R --to <PEER_IK> "hello"
 karst send-file $R --to <PEER_IK> --file ./pic.jpg
-karst recv $R                    # fetch inbox; files land in $KARST_HOME/received/
+karst recv $R                    # fetch inbox
+karst files                      # list received files (sealed at rest — id, size, name)
+karst export-file <id> --out ./pic.jpg   # decrypt one out to a plaintext path
 # restore on a new device (into an empty KARST_HOME): karst restore word1 … word12
 ```
 

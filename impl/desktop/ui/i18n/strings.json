@@ -846,27 +846,27 @@
     "ja": "強要パスワードを入力して削除します。",
     "id": "Masukkan kata sandi paksaan untuk menghapusnya."
   },
-  "Enter your 12-word recovery phrase into an empty profile.": {
-    "en": "Enter your 12-word recovery phrase into an empty profile.",
-    "ru": "Введите вашу фразу восстановления из 12 слов в пустой профиль.",
-    "es": "Introduce tu frase de recuperación de 12 palabras en un perfil vacío.",
-    "pt": "Digite sua frase de recuperação de 12 palavras em um perfil vazio.",
-    "de": "Gib deine 12-Wörter-Wiederherstellungsphrase in ein leeres Profil ein.",
-    "fr": "Saisissez votre phrase de récupération de 12 mots dans un profil vide.",
-    "zh": "在空白的资料中输入你的 12 词恢复助记词。",
-    "ja": "空のプロフィールに 12 語の復元フレーズを入力してください。",
-    "id": "Masukkan frasa pemulihan 12 kata Anda ke profil kosong."
+  "Enter your 24-word recovery phrase into an empty profile.": {
+    "en": "Enter your 24-word recovery phrase into an empty profile.",
+    "ru": "Введите вашу фразу восстановления из 24 слов в пустой профиль.",
+    "es": "Introduce tu frase de recuperación de 24 palabras en un perfil vacío.",
+    "pt": "Digite sua frase de recuperação de 24 palavras em um perfil vazio.",
+    "de": "Gib deine 24-Wörter-Wiederherstellungsphrase in ein leeres Profil ein.",
+    "fr": "Saisissez votre phrase de récupération de 24 mots dans un profil vide.",
+    "zh": "在空白的资料中输入你的 24 词恢复助记词。",
+    "ja": "空のプロフィールに 24 語の復元フレーズを入力してください。",
+    "id": "Masukkan frasa pemulihan 24 kata Anda ke profil kosong."
   },
-  "Enter your device password to reveal the 12 words.": {
-    "en": "Enter your device password to reveal the 12 words.",
-    "ru": "Введите пароль устройства, чтобы показать 12 слов.",
-    "es": "Introduce la contraseña del dispositivo para revelar las 12 palabras.",
-    "pt": "Digite a senha do dispositivo para revelar as 12 palavras.",
-    "de": "Gib das Gerätepasswort ein, um die 12 Wörter anzuzeigen.",
-    "fr": "Saisissez le mot de passe de l'appareil pour révéler les 12 mots.",
-    "zh": "输入设备密码以显示 12 个单词。",
-    "ja": "端末パスワードを入力して 12 語を表示します。",
-    "id": "Masukkan kata sandi perangkat untuk menampilkan 12 kata."
+  "Enter your device password to reveal the 24 words.": {
+    "en": "Enter your device password to reveal the 24 words.",
+    "ru": "Введите пароль устройства, чтобы показать 24 слова.",
+    "es": "Introduce la contraseña del dispositivo para revelar las 24 palabras.",
+    "pt": "Digite a senha do dispositivo para revelar as 24 palavras.",
+    "de": "Gib das Gerätepasswort ein, um die 24 Wörter anzuzeigen.",
+    "fr": "Saisissez le mot de passe de l'appareil pour révéler les 24 mots.",
+    "zh": "输入设备密码以显示 24 个单词。",
+    "ja": "端末パスワードを入力して 24 語を表示します。",
+    "id": "Masukkan kata sandi perangkat untuk menampilkan 24 kata."
   },
   "Entering it ERASES everything on this device, permanently": {
     "en": "Entering it ERASES everything on this device, permanently",
@@ -1253,16 +1253,16 @@
     "ja": "まだメッセージがありません — 挨拶しましょう。",
     "id": "Belum ada pesan — sapa dulu."
   },
-  "No phone number. No central server. Your identity is a key only you hold — recoverable from a 12-word phrase.": {
-    "en": "No phone number. No central server. Your identity is a key only you hold — recoverable from a 12-word phrase.",
-    "ru": "Без номера телефона. Без центрального сервера. Ваша личность — ключ, который есть только у вас, восстанавливаемый из фразы из 12 слов.",
-    "es": "Sin número de teléfono. Sin servidor central. Tu identidad es una clave que solo tú posees, recuperable con una frase de 12 palabras.",
-    "pt": "Sem número de telefone. Sem servidor central. Sua identidade é uma chave que só você tem, recuperável a partir de uma frase de 12 palavras.",
-    "de": "Keine Telefonnummer. Kein zentraler Server. Deine Identität ist ein Schlüssel, den nur du besitzt — wiederherstellbar aus einer 12-Wörter-Phrase.",
-    "fr": "Pas de numéro de téléphone. Pas de serveur central. Votre identité est une clé que vous seul détenez, récupérable à partir d'une phrase de 12 mots.",
-    "zh": "无需电话号码，无需中心服务器。你的身份是一把只有你持有的密钥——可通过 12 个单词的助记词恢复。",
-    "ja": "電話番号も中央サーバーも不要。あなたの身元はあなただけが持つ鍵であり、12語のフレーズから復元できます。",
-    "id": "Tanpa nomor telepon. Tanpa server pusat. Identitas Anda adalah kunci yang hanya Anda miliki — dapat dipulihkan dari frasa 12 kata."
+  "No phone number. No central server. Your identity is a key only you hold — recoverable from a 24-word phrase.": {
+    "en": "No phone number. No central server. Your identity is a key only you hold — recoverable from a 24-word phrase.",
+    "ru": "Без номера телефона. Без центрального сервера. Ваша личность — ключ, который есть только у вас, восстанавливаемый из фразы из 24 слов.",
+    "es": "Sin número de teléfono. Sin servidor central. Tu identidad es una clave que solo tú posees, recuperable con una frase de 24 palabras.",
+    "pt": "Sem número de telefone. Sem servidor central. Sua identidade é uma chave que só você tem, recuperável a partir de uma frase de 24 palavras.",
+    "de": "Keine Telefonnummer. Kein zentraler Server. Deine Identität ist ein Schlüssel, den nur du besitzt — wiederherstellbar aus einer 24-Wörter-Phrase.",
+    "fr": "Pas de numéro de téléphone. Pas de serveur central. Votre identité est une clé que vous seul détenez, récupérable à partir d'une phrase de 24 mots.",
+    "zh": "无需电话号码，无需中心服务器。你的身份是一把只有你持有的密钥——可通过 24 个单词的助记词恢复。",
+    "ja": "電話番号も中央サーバーも不要。あなたの身元はあなただけが持つ鍵であり、24語のフレーズから復元できます。",
+    "id": "Tanpa nomor telepon. Tanpa server pusat. Identitas Anda adalah kunci yang hanya Anda miliki — dapat dipulihkan dari frasa 24 kata."
   },
   "No relay configured": {
     "en": "No relay configured",
@@ -2177,16 +2177,16 @@
     "ja": "単語",
     "id": "Kata"
   },
-  "Write these 12 words down, in order. They are the only way to recover this account.": {
-    "en": "Write these 12 words down, in order. They are the only way to recover this account.",
-    "ru": "Запишите эти 12 слов по порядку. Это единственный способ восстановить аккаунт.",
-    "es": "Anota estas 12 palabras en orden. Son la única forma de recuperar esta cuenta.",
-    "pt": "Anote estas 12 palavras em ordem. Elas são a única forma de recuperar esta conta.",
-    "de": "Schreibe diese 12 Wörter der Reihe nach auf. Sie sind der einzige Weg, dieses Konto wiederherzustellen.",
-    "fr": "Notez ces 12 mots dans l'ordre. C'est le seul moyen de récupérer ce compte.",
-    "zh": "按顺序抄下这 12 个单词。它们是恢复此账户的唯一途径。",
-    "ja": "この 12 語を順番に書き留めてください。これがこのアカウントを復元する唯一の方法です。",
-    "id": "Tuliskan 12 kata ini secara berurutan. Itulah satu-satunya cara memulihkan akun ini."
+  "Write these 24 words down, in order. They are the only way to recover this account.": {
+    "en": "Write these 24 words down, in order. They are the only way to recover this account.",
+    "ru": "Запишите эти 24 слова по порядку. Это единственный способ восстановить аккаунт.",
+    "es": "Anota estas 24 palabras en orden. Son la única forma de recuperar esta cuenta.",
+    "pt": "Anote estas 24 palavras em ordem. Elas são a única forma de recuperar esta conta.",
+    "de": "Schreibe diese 24 Wörter der Reihe nach auf. Sie sind der einzige Weg, dieses Konto wiederherzustellen.",
+    "fr": "Notez ces 24 mots dans l'ordre. C'est le seul moyen de récupérer ce compte.",
+    "zh": "按顺序抄下这 24 个单词。它们是恢复此账户的唯一途径。",
+    "ja": "この 24 語を順番に書き留めてください。これがこのアカウントを復元する唯一の方法です。",
+    "id": "Tuliskan 24 kata ini secara berurutan. Itulah satu-satunya cara memulihkan akun ini."
   },
   "Yes": {
     "en": "Yes",
@@ -2221,16 +2221,16 @@
     "ja": "主リレーがブロックされてもこれらで受信を続けられます。送信と公開は主リレーのままです。",
     "id": "Anda tetap menerima lewat ini jika relai utama diblokir. Pengiriman dan penerbitan tetap di relai utama."
   },
-  "Your 12 words — the only way to recover this account": {
-    "en": "Your 12 words — the only way to recover this account",
-    "ru": "Ваши 12 слов — единственный способ восстановить этот аккаунт",
-    "es": "Tus 12 palabras: la única forma de recuperar esta cuenta",
-    "pt": "Suas 12 palavras — a única forma de recuperar esta conta",
-    "de": "Deine 12 Wörter — der einzige Weg, dieses Konto wiederherzustellen",
-    "fr": "Vos 12 mots — le seul moyen de récupérer ce compte",
-    "zh": "你的 12 个单词——恢复此账户的唯一途径",
-    "ja": "あなたの 12 語 — このアカウントを復元する唯一の方法",
-    "id": "12 kata Anda — satu-satunya cara memulihkan akun ini"
+  "Your 24 words — the only way to recover this account": {
+    "en": "Your 24 words — the only way to recover this account",
+    "ru": "Ваши 24 слова — единственный способ восстановить этот аккаунт",
+    "es": "Tus 24 palabras: la única forma de recuperar esta cuenta",
+    "pt": "Suas 24 palavras — a única forma de recuperar esta conta",
+    "de": "Deine 24 Wörter — der einzige Weg, dieses Konto wiederherzustellen",
+    "fr": "Vos 24 mots — le seul moyen de récupérer ce compte",
+    "zh": "你的 24 个单词——恢复此账户的唯一途径",
+    "ja": "あなたの 24 語 — このアカウントを復元する唯一の方法",
+    "id": "24 kata Anda — satu-satunya cara memulihkan akun ini"
   },
   "Your address (IK)": {
     "en": "Your address (IK)",

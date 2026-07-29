@@ -83,7 +83,7 @@ cat <<NEXT
 Done.
 
   GUI:  run '${GUI_BIN:-karst-desktop}' (or launch "KARST" from your app menu). First
-        run creates an account — write down the 12-word recovery phrase. The network
+        run creates an account — write down the 24-word recovery phrase. The network
         fields (relay address + relay-id) are prefilled from KARST_RELAY /
         KARST_RELAY_ID if set. Optional carriers: KARST_SOCKS5 (Tor/obfs4), KARST_WSS
         (look like HTTPS). Backup relays for multi-homing are configured in-app

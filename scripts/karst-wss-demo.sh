@@ -44,6 +44,7 @@ cat "$WORK/leaf.pem" "$CA" >"$CERT"   # relay presents leaf then CA
 
 echo "== starting relay with the wss carrier on $ADDR =="
 KARST_RELAY_HOME="$WORK/relay" KARST_RELAY_TLS_CERT="$CERT" KARST_RELAY_TLS_KEY="$KEY" \
+  KARST_RELAY_MODE=public KARST_RELAY_POW_BITS=8 \
   "$(karst_bin karst-relay)" "$ADDR" >"$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
 karst_wait_port "$ADDR" || { echo "relay did not come up; log:"; cat "$WORK/relay.log"; exit 1; }
@@ -61,8 +62,13 @@ echo "== both accounts init + publish (through wss) =="
 a init >/dev/null; b init >/dev/null
 ALICE_IK="$(a account)"; BOB_IK="$(b account)"
 # A capability belongs to ONE relay now, so name it (CRYPTO-24).
-a dev-cap --relay "$ADDR" --relay-id "$RID" >/dev/null
-b dev-cap --relay "$ADDR" --relay-id "$RID" >/dev/null
+# The relay's DEFAULT role is `private`: it only honours capabilities it issued as invites, so
+# `karst dev-cap` (a globally-known test credential) is rejected with `UnknownCapability` — that
+# refusal is deliberate (#202: no silent fallback to a public dev credential). A demo therefore
+# has to earn admission the way a real client does. Public mode with a low proof-of-work is the
+# cheapest honest option and exercises the actual door.
+a join --relay "$ADDR" --relay-id "$RID" >/dev/null
+b join --relay "$ADDR" --relay-id "$RID" >/dev/null
 a publish --relay "$ADDR" --relay-id "$RID"
 b publish --relay "$ADDR" --relay-id "$RID"
 

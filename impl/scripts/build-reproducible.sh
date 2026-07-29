@@ -8,5 +8,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # the impl/ workspace root
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTFLAGS="--remap-path-prefix=$PWD=/build --remap-path-prefix=$CARGO_HOME=/cargo"
-cargo build --release --locked -p client -p node
+cargo build --release --locked -p client -p relay
 sha256sum target/release/karst target/release/karst-relay

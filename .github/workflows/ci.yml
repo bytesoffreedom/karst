@@ -51,6 +51,18 @@ jobs:
       # run, which is how a conservative profile ends up quietly lowered later. The hatch is
       # behind `cfg(debug_assertions)`, so the release job below cannot be affected by it,
       # and one test still exercises the real profile end to end.
+      # The install and demo scripts ARE the first five minutes of the project, and they broke
+      # silently: the relay binary moved crates and every script that built it kept naming the old
+      # one; a stray quote made the relay installer unparseable; the admission model changed and
+      # the demo kept asking for a credential the relay no longer honours. None of it failed a
+      # test, because no test ran them. This does: the demo brings up a relay, earns admission,
+      # exchanges messages in both directions and round-trips a file, and fails CI if any step
+      # stops working. A documented command nobody executes is a documented command that rots.
+      - name: end-to-end demo scripts
+        working-directory: .
+        run: |
+          ./scripts/karst-demo.sh 127.0.0.1:9401
+          ./scripts/karst-wss-demo.sh 127.0.0.1:9402
       - name: test (default)
         run: cargo test
         env:

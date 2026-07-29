@@ -69,3 +69,45 @@ fn a_request_completes_over_quic() {
     // back rather than a transport error.
     assert!(policy.pow_bits.is_none(), "unexpected door policy: {:?}", policy.pow_bits);
 }
+
+/// A dead QUIC endpoint must not delay the request: the WSS/TCP path starts alongside after a
+/// short head start and answers (QUIC-4).
+///
+/// Discriminating on TIME, but relatively — the assertion is that the request finishes well inside
+/// a single `CONNECT_TIMEOUT`, which is what a sequential list would have cost before even trying
+/// the second path. Networks drop UDP silently, so that timeout is the common case there, not the
+/// exception.
+#[test]
+fn a_dead_quic_path_does_not_delay_the_tcp_one() {
+    let (noise_priv, noise_pub) = relay::server::generate_noise_keypair();
+    let mut relay = RelayNode::new(NOW);
+    relay.issue_capability(dev_cap());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+    let tcp_addr = listener.local_addr().expect("bound");
+    let server = relay::server::RelayServer::with_noise_keypair(
+        relay,
+        Arc::new(move || NOW),
+        noise_priv,
+        noise_pub,
+    );
+    std::thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+
+    // A UDP port with nothing behind it — the silent-drop case, in miniature.
+    let quic = Arc::new(QuicAdapter::new().expect("client endpoint"));
+    let dead_quic = Path::new(quic, Dest::new("192.0.2.1", 9));
+    let live_tcp = Path::new(
+        Arc::new(node::transport::DirectTcpAdapter::default()),
+        Dest::from(tcp_addr),
+    );
+    let transport = SocketTransport::with_paths(vec![dead_quic, live_tcp], noise_pub);
+
+    let started = std::time::Instant::now();
+    transport.get_policy().expect("the TCP path must answer");
+    assert!(
+        started.elapsed() < node::transport::CONNECT_TIMEOUT,
+        "took {:?} — the dead QUIC path was waited out instead of raced past",
+        started.elapsed()
+    );
+}

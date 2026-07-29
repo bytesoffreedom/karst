@@ -7,6 +7,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use admission::capability::Capability;
 use rand::rngs::OsRng;
@@ -39,6 +40,14 @@ use crate::wire::{
 /// is exponentially distributed, so this bounds the AVERAGE case, not a hard worst case —
 /// same caveat the rest of `pow.rs` states plainly for the mechanism as a whole.)
 const MAX_ACCEPTED_POW_BITS: u32 = 26;
+
+/// How long a QUIC attempt runs alone before the next carrier is started alongside it (QUIC-4).
+///
+/// Long enough that a healthy UDP path usually finishes first and the second connection is never
+/// made; short enough that a network silently dropping UDP costs this instead of a full
+/// `CONNECT_TIMEOUT`. That asymmetry is the point: UDP failure is typically SILENCE, so waiting
+/// for it to time out is waiting for the common case.
+const RACE_HEAD_START: Duration = Duration::from_millis(250);
 
 /// Клиентский транспорт поверх Noise-сессии. Один запрос = одно соединение +
 /// один handshake (скелет). Держит Noise-pubkey relay (аутентификация при
@@ -106,6 +115,59 @@ impl SocketTransport {
         self.round_trip_scoped_sized(req, req_max, resp_max, None)
     }
 
+    /// Start every fresh path with a stagger and take the first that completes carrier connect
+    /// AND Noise handshake. `None` = they all failed.
+    ///
+    /// QUIC goes first with no delay; the others start `RACE_HEAD_START` apart, so on a healthy
+    /// UDP network the extra connections are usually never made at all — the winner is already
+    /// back. On a network that eats UDP, the head start is the whole added latency instead of a
+    /// full connect timeout.
+    ///
+    /// The losing attempts are DETACHED, not joined. Scoped threads would wait for them, which
+    /// would make a dead UDP path cost its full connect timeout anyway — the exact thing the race
+    /// exists to avoid, hidden one level down. A loser that finishes later drops its session,
+    /// closing whatever it opened, and records its own health so a path that genuinely keeps
+    /// failing still cools down.
+    fn race_connect(
+        &self,
+        paths: &[&Path],
+        scope: Option<&str>,
+        now: u64,
+    ) -> Option<(Session<Box<dyn Channel>>, Path)> {
+        let (tx, rx) = std::sync::mpsc::channel::<(Path, io::Result<Session<Box<dyn Channel>>>)>();
+        // QUIC first, so the stagger below is in the intended order.
+        let mut ordered: Vec<Path> = paths.iter().map(|p| (*p).clone()).collect();
+        ordered.sort_by_key(|p| u8::from(p.adapter.carrier_label() != "quic"));
+
+        let relay_pub = self.relay_noise_pub;
+        let scope = scope.map(str::to_string);
+        for (rank, path) in ordered.into_iter().enumerate() {
+            let tx = tx.clone();
+            let scope = scope.clone();
+            let delay = RACE_HEAD_START * rank as u32;
+            std::thread::spawn(move || {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let r = path
+                    .adapter
+                    .connect_isolated(&path.dest, scope.as_deref())
+                    .and_then(|c| Session::connect(c, &relay_pub));
+                // A closed receiver means someone already won; the send fails and the session
+                // drops here, which closes the connection this attempt opened.
+                let _ = tx.send((path, r));
+            });
+        }
+        drop(tx);
+        for (path, result) in rx {
+            match result {
+                Ok(session) => return Some((session, path)),
+                Err(_) => path.health.record_failure(now),
+            }
+        }
+        None
+    }
+
     fn round_trip_scoped_sized(
         &self,
         req: &WireRequest,
@@ -123,6 +185,30 @@ impl SocketTransport {
         // request, while a total outage can still recover (nothing is ever excluded).
         let (fresh, cooling): (Vec<&Path>, Vec<&Path>) =
             self.paths.iter().partition(|p| p.health.usable(now));
+        // QUIC-4: when a QUIC path is present, RACE instead of walking the list. UDP is dropped
+        // silently by some networks, so a sequential list pays the full connect timeout before it
+        // ever tries WSS — and the timeout is the common case there, not the exception. The race
+        // gives QUIC a head start and starts the others alongside; the first path to complete BOTH
+        // its carrier connect and the Noise handshake wins.
+        //
+        // Only when QUIC is in the list, deliberately. Racing means opening more than one
+        // connection to the relay at once, which on a SOCKS/Tor path means more than one circuit
+        // for one request — extra exposure bought for a problem that path does not have, since
+        // TCP failure there is a connect error rather than a silent drop.
+        //
+        // The safety boundary is untouched: the race finishes BEFORE any request byte is written,
+        // so "nothing is retried once the request has been written" still holds — it is now
+        // simply reached faster.
+        if fresh.iter().any(|p| p.adapter.carrier_label() == "quic") && fresh.len() > 1 {
+            if let Some((mut session, winner)) = self.race_connect(&fresh, scope, now) {
+                winner.health.record_success();
+                session.write_msg(&req_bytes, req_max)?;
+                let resp_bytes = session.read_msg(resp_max)?;
+                return decode(&resp_bytes)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"));
+            }
+            // Every raced path failed; fall through to the cooling ones, which the race skips.
+        }
         let mut last_err: Option<io::Error> = None;
         for path in fresh.into_iter().chain(cooling) {
             // Pre-request phase: connect through the carrier, then Noise on top. A

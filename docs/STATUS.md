@@ -2111,6 +2111,21 @@ credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_l
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
 
+**Post-compromise security covers content, not the metadata trail (#208, A6-3) — a NAMED
+BOUNDARY, not a fix.** The ratchet heals message keys: a DH step on a fresh ephemeral leaves an
+adversary who read the session state unable to decrypt what follows. The ADDRESSES do not heal.
+`drop::drop_seed` derives from `root_key`, which is fixed at key agreement and no DH step touches,
+so whoever once held the session state can compute this pair's drop-box for every future epoch and
+keep observing who talks to whom, and when — indefinitely. Rotation was designed and deliberately
+not built: chaining the seed off each DH step gives real metadata PCS but has no self-recovery (one
+missed step or a state rollback puts the two sides on different chains permanently, where a wrong
+CLOCK merely has to correct itself), and adding a `root_key`-derived fallback box that both sides
+always poll restores recovery while handing the adversary exactly the address the rotation was
+meant to remove. That trade is a protocol decision, so it is stated rather than half-implemented.
+Pinned by `the_routing_seed_is_deliberately_not_healed_by_the_ratchet` — an assertion on a LIMIT,
+so that whoever eventually rotates the routing material is forced to update this paragraph in the
+same commit instead of leaving a doc describing a weakness that is gone.
+
 **The local clock's influence on routing is bounded (#224, A6-8).** Drop-box epochs are a pure
 function of the wall clock, and nothing authenticates it. Two halves, and they are not symmetric:
 

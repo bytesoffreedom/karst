@@ -60,6 +60,23 @@ const TTL_EPOCHS: u64 = crate::node::MAILBOX_TTL_SECS.div_ceil(DROP_EPOCH_SECS);
 
 /// Take a session's stable drop-box seed from its root key.
 ///
+/// **NAMED BOUNDARY (A6-3, #208): routing material does NOT heal with the ratchet.** Message keys
+/// get post-compromise security — a DH step on a fresh ephemeral makes an adversary who read the
+/// session state unable to decrypt what follows. The addresses do not: this seed comes from
+/// `root_key`, which is fixed at key agreement and never advances, so anyone who once held the
+/// session state can compute every future epoch's box for this pair and keep watching WHO talks
+/// to whom, and when, forever. Content heals; the metadata trail does not.
+///
+/// Rotating the seed along the ratchet was designed and deliberately NOT built yet, because the
+/// obvious shape defeats itself. Chaining `seed_{n+1} = KDF(seed_n, dh_out_n)` would give real
+/// metadata PCS — but a hash chain has no self-recovery: one side advancing while the other
+/// misses that step (a dropped final message, a state rollback) puts them on different chains
+/// permanently, where epochs merely need the clock to correct itself. Adding a `root_key`-derived
+/// FALLBACK box that both sides always poll restores recovery and simultaneously hands the
+/// adversary exactly the address the rotation was meant to take away. Choosing between "delivery
+/// can break forever" and "the fix is cosmetic" is a protocol decision, not a refactor, so it is
+/// stated here rather than half-done. See #208.
+///
 /// The root key is fixed at key agreement and never advances, which is exactly why the
 /// ratchet's `rk` cannot serve here: `rk` moves on every DH step, and the two sides step
 /// at different times, so they would derive different addresses. Separated by `info`
@@ -210,6 +227,46 @@ mod tests {
         // and each ordering is stable regardless of who asks.
         assert_ne!(direction(&a, &b), direction(&b, &a), "a session's two legs share a direction");
         assert_eq!(direction(&a, &b), direction(&a, &b));
+    }
+
+    /// A6-3 (#208): the routing seed does NOT change when the ratchet heals — pinned, not merely
+    /// written down.
+    ///
+    /// This asserts a LIMIT rather than a fix, which is unusual and deliberate. `docs/STATUS.md`
+    /// tells a reader that message keys get post-compromise security while the addresses do not;
+    /// a paragraph drifts away from the code silently, an assertion does not. If someone later
+    /// rotates the routing material along the ratchet — the design is sketched on `drop_seed` —
+    /// this test fails, and whoever does it is forced to update the claim in the same commit
+    /// instead of leaving the docs describing a weakness that is gone.
+    ///
+    /// The mechanism, stated once: `drop_seed` is a function of `root_key` alone. `root_key` is
+    /// fixed at key agreement and no DH step touches it, so an adversary who once held the
+    /// session state derives every future epoch's address for this pair forever.
+    #[test]
+    fn the_routing_seed_is_deliberately_not_healed_by_the_ratchet() {
+        let root = [3u8; 32];
+        let seed_now = drop_seed(&root);
+
+        // A DH step advances the ratchet's own root key — that is what heals message keys.
+        let stepped = {
+            let mut s = crate::ratchet::Session::init_sender(root, [8u8; 32]);
+            let _ = s.encrypt(b"advance the chain");
+            s.snapshot()
+        };
+        // ...and the drop-box seed is untouched by it, because it never depended on that state.
+        assert_eq!(
+            drop_seed(&root),
+            seed_now,
+            "the routing seed is derived from the FIXED root key: a healed ratchet does not move it"
+        );
+        // The address for a future epoch is therefore computable from state captured today.
+        let far_future = epoch_of(0) + 10_000;
+        assert_eq!(
+            drop_address(&seed_now, far_future, 0),
+            drop_address(&drop_seed(&root), far_future, 0),
+            "state captured once yields every future box — the metadata trail does not heal"
+        );
+        drop(stepped);
     }
 
     #[test]

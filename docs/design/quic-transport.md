@@ -126,9 +126,47 @@ first implementation: **the trust model does not move.** Relay identity is still
 `Noise_NK` against the pinned `relay_id`, QUIC remains a swappable carrier, and
 TCP, WSS and QUIC all speak the identical protocol above the adapter.
 
-Removing Noise later means relay identity moves into a pinned TLS certificate —
-a change to the one place the client decides whether it is talking to the right
-relay. That is an audit-gated decision with its own task, not an optimisation.
+### DECIDED (QUIC-9): Noise stays, and this is no longer waiting on an audit
+
+The task that held this open assumed the answer needed an audit. It does not —
+it needs the cost measured and the trust model looked at, and both now point the
+same way.
+
+**The load-bearing reason: the alternative is not buildable from here.** Removing
+Noise means relay identity moves into a pinned TLS certificate — and there is
+nothing to pin it against. A descriptor's signature covers the relay-id and not
+the unsigned remainder, which is exactly why a certificate-fingerprint field was
+REFUSED in QUIC-1 (§10). So the first step of removing Noise is not a deletion,
+it is adding a signed identity to the descriptor: a protocol and trust change.
+
+**And it would make the trust model carrier-dependent.** Relay identity is
+decided in one place today and the same way on every carrier: Noise against the
+pinned `relay_id`. A TLS-certificate identity exists only on QUIC and WSS, so a
+client would authenticate its relay differently depending on which route
+happened to win a race (QUIC-4). Two answers to "am I talking to the right
+relay" is one too many.
+
+**Supporting evidence: the cost is small and is now paid rarely.** Noise here is
+`Noise_NK` — `-> e, es` / `<- e, ee`, exactly **one round trip** — plus a few
+milliseconds of computation. A one-off measurement over loopback against a real
+QUIC relay (40 handshakes each way) put QUIC alone at 2.28 ms and QUIC + Noise
+at 5.04 ms per connection. Treat that delta as indicative, not as a pinned
+figure: over loopback it bundles Noise's computation together with its extra
+round trip, and the measurement was taken with a throwaway test that is not in
+the repository. The unambiguous part is the round trip.
+
+What made the cost look serious was *how often it was paid*. Before this batch a
+download opened a connection per CHUNK, so a large file paid the handshake tens
+of thousands of times. After QUIC-5 (pooling by scope) and QUIC-7 (one session
+per transfer) it is paid **once per transfer**. The optimisation people reach for
+when they propose removing Noise has already been made somewhere that costs
+nothing.
+
+**So: kept, deliberately and not provisionally.** Not "kept until an audit says
+otherwise" — kept because the replacement does not exist and would cost more
+than the thing it replaces. If it is ever revisited, the gate is those two
+things — a signed identity in the descriptor, and one answer to relay identity
+that holds on every carrier.
 
 ### Why this fits the existing abstraction cheaply
 

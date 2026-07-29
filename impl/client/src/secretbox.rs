@@ -50,7 +50,7 @@ pub(crate) const MAGIC: &[u8; 4] = b"KRS2";
 /// v5: the one-time prekey secrets moved INSIDE the session state file so the pair commits in
 /// one durable write (CRYPTO-26) — `sessions.dat` now holds `(generation, state, opks)` and
 /// `opks.dat` is gone.
-pub const STATE_VERSION: u16 = 5;
+pub const STATE_VERSION: u16 = 6;
 
 /// The pinned Argon2id cost parameters (see [`MasterKey::derive`]). Owned by KARST, not by the
 /// `argon2` crate's defaults, so a dependency bump cannot silently change key derivation.

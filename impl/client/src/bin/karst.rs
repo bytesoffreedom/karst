@@ -68,7 +68,7 @@ fn print_usage() {
         "karst (SKELETON, not for production)\n\
          \n\
          karst init                          create an account (prints the recovery phrase)\n\
-         karst restore <12 words>            restore an account from the phrase (into an empty $KARST_HOME)\n\
+         karst restore <24 words>            restore an account from the phrase (into an empty $KARST_HOME)\n\
          karst show-phrase                   show your recovery phrase\n\
          karst id                            print the skeleton pubkey (hex)\n\
          karst account                       print the §2.1 IK (the discovery address)\n\
@@ -139,7 +139,7 @@ fn cmd_restore(args: &[String]) -> Result<(), String> {
         None => args.iter().filter(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" "),
     };
     if phrase.trim().is_empty() {
-        return Err("provide the phrase: karst restore word1 word2 … word12".into());
+        return Err("provide the phrase: karst restore word1 word2 … word24".into());
     }
     let m = client::seed::parse_mnemonic(&phrase)?;
     let s = store()?;

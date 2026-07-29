@@ -494,7 +494,7 @@ fn a_deposit_does_not_carry_the_senders_identity_in_the_transport_fields() {
         client::dev_capability(),
         PublicKey::from([7u8; 32]),
     );
-    let bob = client::seed::derive(&[3u8; 16]).account;
+    let bob = client::seed::derive(&[3u8; client::seed::ENTROPY_BYTES]).account;
     let bob_ik = bob.identity_public();
     peer.connect_with_bundle(&bob.prekey_bundle()).expect("session opens");
     peer.send(&bob_ik, b"opener", NOW); // Initial
@@ -544,7 +544,7 @@ fn a_sealed_opener_carries_the_senders_identity_nowhere_on_the_wire() {
         client::dev_capability(),
         PublicKey::from([7u8; 32]),
     );
-    let bob = client::seed::derive(&[3u8; 16]).account;
+    let bob = client::seed::derive(&[3u8; client::seed::ENTROPY_BYTES]).account;
     peer.connect_with_bundle(&bob.prekey_bundle()).expect("session opens");
     peer.send(&bob.identity_public(), b"opener", NOW);
 

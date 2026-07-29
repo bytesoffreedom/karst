@@ -5510,7 +5510,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("karst-store-proxy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::unlock(&dir, b"pw").unwrap();
-        s.save_seed(&[3u8; 16]).unwrap(); // the root's own seed; proxies do NOT use it
+        s.save_seed(&[3u8; crate::seed::ENTROPY_BYTES]).unwrap(); // the root's own seed; proxies do NOT use it
 
         assert!(s.load_proxies().is_empty(), "no proxies initially");
         let p0 = s.create_proxy("work", 10).unwrap();
@@ -5584,7 +5584,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("karst-store-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::unlock(&dir, b"pw").unwrap();
-        s.save_seed(&[42u8; 16]).unwrap();
+        s.save_seed(&[42u8; crate::seed::ENTROPY_BYTES]).unwrap();
 
         // Control: a LIVE proxy derives the same identity across independent reloads from disk.
         let entry = s.create_proxy("keeper", 1).unwrap();
@@ -5866,7 +5866,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("karst-store-pmode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::unlock(&dir, b"pw").unwrap();
-        s.save_seed(&[7u8; 16]).unwrap();
+        s.save_seed(&[7u8; crate::seed::ENTROPY_BYTES]).unwrap();
         let e0 = s.create_proxy("p0", 1).unwrap();
         let e1 = s.create_proxy("p1", 2).unwrap();
         let p0 = s.as_proxy(e0.index);

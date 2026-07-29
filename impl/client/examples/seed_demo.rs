@@ -28,7 +28,7 @@ fn main() {
     vault.save_registry(&[AccountEntry { id: id.clone(), label: "Демо".into(), ik }]).unwrap();
 
     // Собеседник «Боб».
-    let bob = seed::derive(&[7u8; 16]).account.identity_public();
+    let bob = seed::derive(&[7u8; seed::ENTROPY_BYTES]).account.identity_public();
     store.save_contacts(&[ContactRecord { name: "Боб".into(), ik: bob, verified: true }]).unwrap();
 
     // Переписка.

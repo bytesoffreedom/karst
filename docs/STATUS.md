@@ -13,6 +13,48 @@ Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
+## What landed since the last reconcile (2026-07-29, fourth batch)
+
+The QUIC carrier's two remaining buildable slices. Both were blocked on each other
+and on a design question that turned out to have a cheaper answer than the plan
+recorded.
+
+- **The connection pool is keyed by the scope the caller already declares — and there is no
+  pool without one** (`eecfd7d`, QUIC-5). The value of QUIC is one connection carrying many
+  requests; the hazard is that "many requests" quietly becomes "requests from compartments that
+  must not be joined". A relay serving two requests on one connection knows they came from one
+  party with certainty — stronger than the same-IP inference it could already make, and it
+  survives the address changing.
+
+  The plan said to key on proxy identity, which meant rebuilding `Relay` per channel across ~35
+  call sites. That was **rejected, not deferred**: the per-request scope already threaded through
+  `connect_isolated` is strictly FINER than a per-proxy key, needs no plumbing, and is what the
+  SOCKS carrier already folds into its circuit credential. On the direct path the extra
+  granularity costs connections, not unlinkability — there is no circuit to separate, which is the
+  same observation that put QUIC on the direct path to begin with.
+
+  The load-bearing half is the ABSENT scope. Pooling on "unknown" would merge every unscoped
+  request in the process onto one connection, which is the A8-4 join rebuilt in the transport and
+  worse than no pool at all. So: no scope, no pool. A rule with no setting behind it. Pinned at
+  the relay rather than by a client-side counter — one scope's requests share one connection and
+  therefore share `MAX_UNADMITTED_REQUESTS`, so the ninth is refused while nine unpooled requests
+  are all answered.
+
+- **Every chunk of a download now rides one connection** (QUIC-7). This one was half built
+  already, in a lopsided way worth naming: an UPLOAD has held a single session per file since FT4,
+  while a DOWNLOAD paid a fresh connect and a fresh Noise handshake **per chunk** — so a large file
+  cost tens of thousands of handshakes to fetch and one to send. `BlobSession::get` is the missing
+  half, and on the QUIC carrier a session is literally one stream, so this is what makes "one blob,
+  one stream" true. Small feed media stays one-shot on purpose (bounded, usually one chunk — a
+  session setup to save nothing). Reopening is the normal case, not the exception, since
+  `MAX_REQUESTS_PER_CONN` ends the relay's run on any large file, so a failed reopen degrades to
+  the old one-shot fetch rather than breaking a download that used to work.
+
+**Still not reachable in production**, and worth repeating so the batch is not oversold: QUIC is
+not wired into `build_paths` and `QuicAdapter` is built only by tests. QUIC-7's download-session
+win is carrier-independent and does apply today; the pool is plumbing plus a rule that keeps a
+future slice from being unsafe.
+
 ## What landed since the last reconcile (2026-07-29, third batch)
 
 One commit, and it is the kind that matters most: a privacy defect the revision pass found in

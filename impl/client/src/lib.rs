@@ -1224,6 +1224,59 @@ impl RelayId {
     }
 }
 
+/// One download's connection to the relay, reused across its chunks (QUIC-7).
+///
+/// An UPLOAD has amortized its handshakes since FT4: `open_blob_session` opens one connection and
+/// streams every chunk over it. A download did not — each chunk paid a fresh connect and a fresh
+/// Noise handshake, so a 2 GiB file cost tens of thousands of handshakes to fetch and one to send.
+/// This is the missing half, and it is what makes "one file, one stream" true on the QUIC carrier
+/// as well: a session IS one bidirectional stream there.
+///
+/// **Never fails a download that would otherwise have worked.** `MAX_REQUESTS_PER_CONN` ends the
+/// relay's run on any large file, so reopening is the NORMAL case here, not the exception — and if
+/// reopening fails too, this falls back to the one-shot `blob_get` that every chunk used before
+/// this existed. The fallback is safe because the relay's cookie is bound to
+/// `(client_addr, carrier_id)` and not to the connection, so the caller's cookie survives a
+/// redial; a chunk fetch is idempotent, so a retry costs a round trip and nothing else.
+struct ChunkFetcher {
+    transport: SocketTransport,
+    /// The compartment this transfer belongs to — the pool key a carrier uses to keep it apart
+    /// from other transfers (`QuicAdapter::pool`), and part of the circuit credential on SOCKS.
+    /// Derived from the download's own `client_addr`, which is already fresh per download
+    /// (`blob_get_addr`), so it separates transfers without introducing a second identifier.
+    scope: String,
+    session: Option<karst_transport::socket::BlobSession>,
+}
+
+impl ChunkFetcher {
+    fn new(transport: SocketTransport, addr: &[u8]) -> Self {
+        let scope = addr.iter().map(|b| format!("{b:02x}")).collect();
+        ChunkFetcher { transport, scope, session: None }
+    }
+
+    /// Fetch one chunk, opening or reopening the session as needed.
+    fn get(&mut self, req: &BlobGetRequest) -> BlobResponse {
+        for _ in 0..2 {
+            let session = match self.session.as_mut() {
+                Some(s) => s,
+                None => match self.transport.open_blob_session_scoped(Some(&self.scope)) {
+                    Ok(s) => self.session.insert(s),
+                    // No session to be had (the path is down, or the relay refused): the one-shot
+                    // path is exactly what this replaced, so degrade to it rather than fail.
+                    Err(_) => return self.transport.blob_get(req),
+                },
+            };
+            match session.get(req) {
+                Ok(resp) => return resp,
+                // The session is spent (the relay's bounded run ended) or the link dropped. Drop it
+                // and let the loop open a fresh one; the second failure falls through.
+                Err(_) => self.session = None,
+            }
+        }
+        self.transport.blob_get(req)
+    }
+}
+
 /// The `client_addr` a blob DOWNLOAD presents: **fresh random bytes per download**.
 ///
 /// This field used to be `Relay::pseudonym`, minted once per `Relay` — and a `Relay` is built from
@@ -2567,6 +2620,9 @@ pub fn download_post_attachment(
     let mut hasher = sha2::Sha256::new();
     for index in 0..ppa.chunks {
         let ct = loop {
+            // One-shot on purpose: this media is bounded by MAX_POST_IMAGE_BYTES and is usually a
+            // single chunk, so a reusable session (QUIC-7, `ChunkFetcher`) would add a connection
+            // setup to save nothing. The multi-chunk paths are where it pays.
             let req = BlobGetRequest {
                 client_addr: blob_addr.clone(),
                 carrier_id: BLOB_CARRIER.to_vec(),
@@ -2652,6 +2708,9 @@ pub fn download_gallery(
     let mut hasher = sha2::Sha256::new();
     for index in 0..pg.chunks {
         let ct = loop {
+            // One-shot on purpose: this media is bounded by MAX_POST_IMAGE_BYTES and is usually a
+            // single chunk, so a reusable session (QUIC-7, `ChunkFetcher`) would add a connection
+            // setup to save nothing. The multi-chunk paths are where it pays.
             let req = BlobGetRequest {
                 client_addr: blob_addr.clone(),
                 carrier_id: BLOB_CARRIER.to_vec(),
@@ -3041,8 +3100,8 @@ pub fn blob_download_with<W: std::io::Write>(
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<W, String> {
     use std::sync::atomic::Ordering::Relaxed;
-    let transport = relay.transport();
     let blob_addr = blob_get_addr();
+    let mut fetcher = ChunkFetcher::new(relay.transport(), &blob_addr);
     let mut rx = blob::BlobReceiver::new(key, id, count, expected_hash, out);
     let mut cookie: Option<admission::cookie::Cookie> = None;
     let mut done: u64 = 0;
@@ -3059,7 +3118,7 @@ pub fn blob_download_with<W: std::io::Write>(
                 blob_id: id,
                 index,
             };
-            match transport.blob_get(&req) {
+            match fetcher.get(&req) {
                 BlobResponse::NeedCookie(c) => cookie = Some(c),
                 BlobResponse::Chunk(Some(ct)) => {
                     rx.feed(index, &ct)?;
@@ -3157,7 +3216,7 @@ pub fn download_blob(
         sha2::Sha256::new()
     };
 
-    let transport = relay.transport();
+    let mut fetcher = ChunkFetcher::new(relay.transport(), &blob_addr);
     let mut cookie: Option<admission::cookie::Cookie> = None;
     let mut on_progress = on_progress;
     let mut done = (chunks_done as u64 * blob::BLOB_CHUNK as u64).min(pd.size);
@@ -3177,7 +3236,7 @@ pub fn download_blob(
                 blob_id: pd.blob_id,
                 index,
             };
-            match transport.blob_get(&req) {
+            match fetcher.get(&req) {
                 BlobResponse::NeedCookie(c) => cookie = Some(c),
                 BlobResponse::Chunk(Some(ct)) => break ct,
                 BlobResponse::Chunk(None) => {

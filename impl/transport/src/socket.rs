@@ -354,11 +354,18 @@ impl SocketTransport {
         }
     }
 
-    /// Open a REUSABLE session for streaming many `BlobPut`s over ONE Noise handshake (§15 / FT4).
+    /// Open a REUSABLE session for streaming many blob requests over ONE Noise handshake
+    /// (§15 / FT4).
     /// Tries paths in health order (like `round_trip`); the relay then accepts a bounded run of
-    /// requests on this single connection, so a chunked upload amortizes the per-chunk TCP + Noise
-    /// handshake instead of paying it every chunk. Dropping the returned session closes it.
-    pub fn open_blob_session(&self) -> io::Result<BlobSession> {
+    /// requests on this single connection, so a chunked transfer amortizes the per-chunk TCP +
+    /// Noise handshake instead of paying it every chunk. Dropping the returned session closes it.
+    ///
+    /// `scope` names the compartment this transfer belongs to. It is what stops a pooling carrier
+    /// from putting two unrelated transfers on one connection (see `QuicAdapter::pool`), and on a
+    /// SOCKS carrier it is folded into the circuit credential. Pass a value that is fresh per
+    /// TRANSFER: a blob download already has one in the `client_addr` it presents
+    /// (`client::blob_get_addr`), which is minted per download for the same reason.
+    pub fn open_blob_session_scoped(&self, scope: Option<&str>) -> io::Result<BlobSession> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -369,7 +376,7 @@ impl SocketTransport {
         for path in fresh.into_iter().chain(cooling) {
             match path
                 .adapter
-                .connect_isolated(&path.dest, None)
+                .connect_isolated(&path.dest, scope)
                 .and_then(|channel| Session::connect(channel, &self.relay_noise_pub))
             {
                 Ok(session) => {
@@ -385,12 +392,18 @@ impl SocketTransport {
         Err(last_err
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "transport: no paths configured")))
     }
+
+    /// `open_blob_session_scoped` with no compartment — the upload path, which already opens one
+    /// session per file and so needs no key to keep files apart.
+    pub fn open_blob_session(&self) -> io::Result<BlobSession> {
+        self.open_blob_session_scoped(None)
+    }
 }
 
-/// A reusable client connection for blob uploads (§15 / FT4): one Noise handshake, then many
-/// `put`s over the same session. `Err` from `put` means the session is dead (the relay closed it
-/// after its bounded run, or the link dropped) — the caller opens a fresh one and retries the
-/// chunk, which is idempotent at the relay.
+/// A reusable client connection for a blob TRANSFER (§15 / FT4): one Noise handshake, then many
+/// chunk requests over the same session. `Err` from `put`/`get` means the session is dead (the
+/// relay closed it after its bounded run, or the link dropped) — the caller opens a fresh one and
+/// retries the chunk, which is idempotent at the relay in both directions.
 pub struct BlobSession {
     session: Session<Box<dyn Channel>>,
 }
@@ -406,6 +419,23 @@ impl BlobSession {
         match decode(&resp_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"))? {
             WireResponse::Blob(b) => Ok(b),
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on BlobPut")),
+        }
+    }
+
+    /// Download one chunk over the reused session — the mirror of [`BlobSession::put`], and the
+    /// half that was missing: an upload has amortized its handshakes since FT4, while every chunk
+    /// of a DOWNLOAD paid a fresh connection and a fresh Noise handshake.
+    ///
+    /// The frame ceilings are swapped, because the direction is: a get sends a tight request and
+    /// receives a chunk-sized response.
+    pub fn get(&mut self, req: &BlobGetRequest) -> io::Result<BlobResponse> {
+        let req_bytes = encode(&WireRequest::BlobGet(req.clone()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encode"))?;
+        self.session.write_msg(&req_bytes, MAX_REQUEST_FRAME)?;
+        let resp_bytes = self.session.read_msg(MAX_BLOB_FRAME)?;
+        match decode(&resp_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"))? {
+            WireResponse::Blob(b) => Ok(b),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on BlobGet")),
         }
     }
 }

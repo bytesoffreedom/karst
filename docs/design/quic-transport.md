@@ -229,7 +229,19 @@ without touching the layers above.
 server notices, graceful shutdown, backpressure and checkpoint announcements.
 
 **One blob, one stream** — never a stream per chunk, which would multiply
-stream state into the thousands. The stream header carries operation id, blob
+stream state into the thousands. *Built (QUIC-7), and it turned out to be half
+built already:* an UPLOAD has held one session for a whole file since FT4, so on
+this carrier it was already one stream. A DOWNLOAD was not — every chunk paid a
+fresh connect and a fresh Noise handshake, so a large file cost tens of thousands
+of handshakes to fetch and one to send. `BlobSession::get` is the missing half,
+and a download now scopes its session by its own `client_addr` (fresh per
+download since #248), which is what keeps two transfers off one pooled
+connection. Small feed media stays one-shot on purpose: bounded by
+`MAX_POST_IMAGE_BYTES` and usually a single chunk, it would pay a session setup
+to save nothing. Reopening is the NORMAL case, not the exception —
+`MAX_REQUESTS_PER_CONN` ends the relay's run on any large file — so a failed
+reopen degrades to the old one-shot fetch rather than failing a download that
+would otherwise have worked. The stream header carries operation id, blob
 id, total size, chunk range, content hash and the capability proof; the chunks
 follow as binary. Everything the blob path already guarantees stays: per-chunk
 salt and content-bound upload id (CRYPTO-31), resumable uploads (A4-1), state

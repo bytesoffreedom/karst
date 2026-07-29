@@ -195,3 +195,65 @@ fn stale_resume_records_are_swept_once_their_blob_is_gone() {
     assert_eq!(client::sweep_pending_uploads(&store, past), 2, "both stale records dropped");
     assert!(store.list_pending_uploads().unwrap().is_empty());
 }
+
+/// **A download reuses ONE connection for all its chunks** (QUIC-7).
+///
+/// An upload has amortized its handshakes since FT4; a download paid a fresh connect and a fresh
+/// Noise handshake per chunk, so a large file cost tens of thousands of handshakes to FETCH and one
+/// to send. `ChunkFetcher` closes that.
+///
+/// DISCRIMINATING without a handshake counter, by using the QUIC pool as the observable: the pool
+/// only ever holds connections a caller SCOPED (QUIC-5, "no scope, no pool"). A download that opens
+/// a scoped session leaves exactly one entry there; the old per-chunk path went through the
+/// unscoped `blob_get` and would leave zero. The upload in the same test is the control — it also
+/// uses one session per file, deliberately unscoped, so it must contribute nothing.
+#[test]
+fn every_chunk_of_a_download_rides_one_connection() {
+    use karst_transport::quic::QuicAdapter;
+    use karst_transport::transport::{Dest, Path as TPath};
+
+    let blob_dir = temp_dir("one-conn");
+    let (noise_priv, noise_pub) = relay::server::generate_noise_keypair();
+    let mut relay = RelayNode::new(NOW);
+    relay.issue_capability(client::dev_capability());
+    relay.enable_blobs(blob_dir.clone(), NOW, relay::node::BlobPersistence::Durable).unwrap();
+    let fetch_pub = relay.relay_public().to_bytes();
+    let server = relay::quic_server::QuicServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(std::sync::RwLock::new(relay)),
+        Arc::new(move || NOW),
+        noise_priv,
+    )
+    .expect("bind quic");
+    let quic_addr = server.local_addr().expect("bound");
+    thread::spawn(move || {
+        let _ = server.serve();
+    });
+
+    let quic = Arc::new(QuicAdapter::new().expect("client endpoint"));
+    let mut r = client::Relay::new(quic_addr, client::RelayId { noise_pub, fetch_pub }, None);
+    r.set_paths_for_test(vec![TPath::new(quic.clone(), Dest::from(quic_addr))]);
+
+    // Three chunks, so "one connection" is a claim about several requests and not about one.
+    let data: Vec<u8> =
+        (0..(client::blob::BLOB_CHUNK * 2 + 77)).map(|i| (i.wrapping_mul(17)) as u8).collect();
+    let (id, key, hash, count) = client::blob_upload(
+        &r,
+        &client::dev_capability(),
+        std::io::Cursor::new(&data),
+        data.len() as u64,
+    )
+    .expect("upload");
+    assert_eq!(count, 3);
+    assert_eq!(quic.pooled(), 0, "an upload session is deliberately unscoped and must not pool");
+
+    let mut out = Vec::new();
+    client::blob_download(&r, id, key, count, hash, &mut out).expect("download");
+    assert_eq!(out, data, "the bytes must survive the reused session unchanged");
+    assert_eq!(
+        quic.pooled(),
+        1,
+        "three chunks left {} connections behind — the download did not reuse its session",
+        quic.pooled()
+    );
+}

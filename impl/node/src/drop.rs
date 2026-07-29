@@ -191,7 +191,7 @@ pub fn sweep_epochs(now: u64) -> Vec<u64> {
 ///
 /// Only the SLOW sweep is widened — the hot window runs every cycle, and latency-critical mail
 /// comes from senders whose clocks are close to ours by construction.
-const FUTURE_SLACK_EPOCHS: u64 = 2;
+pub const FUTURE_SLACK_EPOCHS: u64 = 2;
 
 /// How often the complete window is swept. Bounds worst-case delivery latency for mail
 /// that arrived while we were away — it is already old, so minutes do not matter, and the

@@ -53,14 +53,14 @@ pub(crate) const MAGIC: &[u8; 4] = b"KRS2";
 /// (CRYPTO-32). v7: `PeerState` carries the drop-box epoch high-water mark (A6-8). v8: a one-time
 /// prekey is one UNIT — the X25519 secret plus its ML-KEM seed (CRYPTO-33) — so the `opks` entries
 /// inside `sessions.dat` went from 32 to 96 bytes, and `capabilities.dat` keys per (relay, channel)
-/// rather than per relay (A8-4).
+/// rather than per relay (A8-4). v9: `PeerState` carries the drop-box sweep cursor (#147).
 ///
 /// The v7→v8 case is exactly what this version exists for. Postcard is not self-describing: an old
 /// `opks` vector is `varint(N) ‖ 32N` and the new decoder reads `N` then demands `96N`, so without
 /// the version the file surfaces as "secrets unreadable" — which this store deliberately treats as
 /// a loud, wedging error telling the user to delete and re-provision. With it, the failure names
 /// itself: written by an older KARST.
-pub const STATE_VERSION: u16 = 8;
+pub const STATE_VERSION: u16 = 9;
 
 /// The pinned Argon2id cost parameters (see [`MasterKey::derive`]). Owned by KARST, not by the
 /// `argon2` crate's defaults, so a dependency bump cannot silently change key derivation.

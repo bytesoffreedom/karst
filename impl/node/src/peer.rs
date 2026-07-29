@@ -241,6 +241,20 @@ pub struct PeerState {
     /// When the complete drop-box window was last swept. Persisted because the CLI/GUI
     /// runs a fresh `Peer` per poll: in memory it would reset every cycle, turning the
     /// slow sweep into an every-cycle one and multiplying fetch cost by `TTL_EPOCHS`.
+    /// The highest drop-box epoch that has been fully swept AND can no longer receive anything —
+    /// the sweep's durable cursor (#147).
+    ///
+    /// Without it, every sweep re-fetched ten epochs' worth of boxes for every session, forever.
+    /// Most of those cannot receive: a sender deposits into ITS OWN epoch, which is at most
+    /// `FUTURE_SLACK_EPOCHS` ahead of ours, so once our epoch has moved past `E + slack` nothing
+    /// can ever land in epoch `E` again. Re-fetching it is a round trip that is guaranteed to come
+    /// back empty — and the sweep is `sessions × epochs` of them.
+    ///
+    /// Only advanced when a sweep pass completed with NO box error and was not truncated by the
+    /// receive budget: a cursor moved past a box that was never actually read would lose that
+    /// box's mail permanently, which is the one failure this must not have. A session created
+    /// after the cursor is safe by construction — it had no boxes in those epochs to miss.
+    swept_through: u64,
     last_sweep: u64,
     /// The highest drop-box epoch this client has ever acted on (A6-8, #224).
     ///
@@ -297,6 +311,7 @@ impl PeerState {
             // Zero means "never swept", so the first poll sweeps. A client returning from
             // a long absence collects its backlog immediately rather than after the first
             // interval.
+            swept_through: 0,
             last_sweep: 0,
             epoch_hwm: 0,
             outbox: Vec::new(),
@@ -460,6 +475,8 @@ pub struct Peer<T: Transport> {
     /// persisted state: it describes how long THIS process is willing to wait, not anything about
     /// the conversation. Tests shrink it to prove the loop actually stops.
     receive_budget: Duration,
+    /// See `PeerState::swept_through` (#147).
+    swept_through: u64,
     /// See `PeerState::last_sweep`.
     last_sweep: u64,
     /// See `PeerState::epoch_hwm` (A6-8, #224).
@@ -589,6 +606,7 @@ impl<T: Transport> Peer<T> {
             handles: HashMap::new(),
             cookies: HashMap::new(),
             receive_budget: RECEIVE_BUDGET,
+            swept_through: 0,
             last_sweep: 0,
             epoch_hwm: 0,
             sessions: HashMap::new(),
@@ -712,6 +730,7 @@ impl<T: Transport> Peer<T> {
             // handles/cookies are not lost when one relay's Peer saves back.
             handles: self.handles.iter().map(|((r, k), v)| (*r, k.clone(), *v)).collect(),
             cookies: self.cookies.iter().map(|((r, k), v)| (*r, k.clone(), *v)).collect(),
+            swept_through: self.swept_through,
             last_sweep: self.last_sweep,
             epoch_hwm: self.epoch_hwm,
             outbox: self.outbox.clone(),
@@ -724,6 +743,7 @@ impl<T: Transport> Peer<T> {
         self.nonce_ctr = state.nonce_ctr;
         self.handles = state.handles.into_iter().map(|(r, k, v)| ((r, k), v)).collect();
         self.cookies = state.cookies.into_iter().map(|(r, k, v)| ((r, k), v)).collect();
+        self.swept_through = state.swept_through;
         self.last_sweep = state.last_sweep;
         self.epoch_hwm = state.epoch_hwm;
         self.outbox = state.outbox;
@@ -1352,12 +1372,24 @@ impl<T: Transport> Peer<T> {
         // cycle would multiply fetch cost by TTL_EPOCHS for mail that is old by
         // definition; never sweeping loses that mail outright.
         let sweep_due = now.saturating_sub(self.last_sweep) >= crate::drop::SWEEP_INTERVAL_SECS;
-        let epochs: Vec<u64> = if sweep_due {
+        let window: Vec<u64> = if sweep_due {
             self.last_sweep = now;
             crate::drop::sweep_epochs(now)
         } else {
             crate::drop::poll_epochs(now).to_vec()
         };
+        // #147: drop the epochs the cursor has already closed. A sender deposits into ITS OWN
+        // epoch, at most `FUTURE_SLACK_EPOCHS` ahead of ours, so an epoch below the cursor cannot
+        // receive anything ever again — fetching it is a round trip guaranteed to come back empty,
+        // multiplied by every session in the table. This is the whole cost reduction: on a steady
+        // account the ten-epoch sweep collapses to the epochs that are actually still open.
+        let epochs: Vec<u64> = window.into_iter().filter(|e| *e > self.swept_through).collect();
+        // What the cursor WOULD become if this pass completes cleanly. Computed before the fetches
+        // so a clock that moves during the pass cannot advance it further than the window we
+        // actually walked.
+        let closable = crate::drop::epoch_of(now)
+            .saturating_sub(crate::drop::FUTURE_SLACK_EPOCHS)
+            .saturating_sub(1);
         let me = self.identity();
 
         // Every session's INBOUND box, as a BLINDED drop-box: its address is my own mailbox point
@@ -1413,6 +1445,13 @@ impl<T: Transport> Peer<T> {
                 }
                 Err(e) => box_err = Some(e),
             }
+        }
+        // Advance the cursor ONLY on a pass that actually walked every box it meant to. A cursor
+        // moved past a box that was never read would lose that box's mail permanently — the one
+        // failure mode this must not have — so a box error, a budget truncation, or a
+        // non-sweep cycle all leave it where it was.
+        if sweep_due && box_err.is_none() && skipped == 0 && closable > self.swept_through {
+            self.swept_through = closable;
         }
         if skipped > 0 {
             // Reported through the same channel a failed box uses, and for the same reason: the
@@ -1865,6 +1904,7 @@ mod outbox_state_tests {
             nonce_ctr: 3,
             handles: Vec::new(),
             cookies: Vec::new(),
+            swept_through: 0,
             last_sweep: 0,
             epoch_hwm: 0,
             outbox: vec![OutboxEntry {
@@ -2683,6 +2723,71 @@ use super::LoopbackMail;
             ),
             Ok(msgs) => panic!("a truncated, empty pass reported success with {} messages", msgs.len()),
         }
+    }
+
+    /// The sweep does not re-walk epochs nothing can deposit into any more (#147).
+    ///
+    /// A sender deposits into ITS OWN epoch, at most `FUTURE_SLACK_EPOCHS` ahead of ours, so once
+    /// our epoch has moved past `E + slack` nothing can ever land in epoch `E` again. Before the
+    /// cursor, every sweep re-fetched the full ten-epoch window for every session — round trips
+    /// guaranteed to come back empty, multiplied by the session table.
+    ///
+    /// Discriminating on the SECOND sweep, not the first: the first legitimately walks the whole
+    /// window (nothing is known closed yet), so a test that only looked at one pass would pass
+    /// with the cursor removed.
+    #[test]
+    fn a_second_sweep_skips_the_epochs_that_can_no_longer_receive() {
+        let relay_pub = x25519_dalek::PublicKey::from([7u8; 32]);
+        let seen = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
+        let transport = SlowTransport {
+            inner: LoopbackMail::default(),
+            per_request: Duration::from_millis(0),
+            seen: seen.clone(),
+        };
+        let mut peer = super::Peer::new(transport, Account::generate(), dev_cap(), relay_pub);
+        const SESSIONS: u64 = 4;
+        for i in 0..SESSIONS {
+            peer.sessions.insert(
+                dummy_ik(i),
+                super::SessionState {
+                    session: Session::init_sender([1u8; 32], [2u8; 32]),
+                    pending_initial: None,
+                    drop_seed: [i as u8; 32],
+                    peer_mailbox_pub: [0u8; 32],
+                },
+            );
+        }
+
+        // First sweep: `last_sweep` is 0 and NOW is far from it, so the full window is walked.
+        peer.receive(NOW).expect("first sweep");
+        let first = seen.borrow().len();
+        let window = crate::drop::sweep_epochs(NOW).len();
+        assert!(
+            first > 1 + (SESSIONS as usize) * 3,
+            "precondition: the first sweep really did walk the wide window ({first} boxes, \
+             {window} epochs)"
+        );
+
+        // Second sweep, one interval later and still inside the same epoch: everything the first
+        // pass closed is now off the list.
+        seen.borrow_mut().clear();
+        let later = NOW + crate::drop::SWEEP_INTERVAL_SECS;
+        peer.receive(later).expect("second sweep");
+        let second = seen.borrow().len();
+        assert!(
+            second < first,
+            "the second sweep walked {second} boxes, the first {first} — the cursor closed nothing"
+        );
+        // Concretely: only the epochs that are still open, plus the identity mailbox.
+        let open = crate::drop::sweep_epochs(later)
+            .into_iter()
+            .filter(|e| *e > crate::drop::epoch_of(later) - crate::drop::FUTURE_SLACK_EPOCHS - 1)
+            .count();
+        assert_eq!(
+            second,
+            1 + (SESSIONS as usize) * open,
+            "the second sweep should visit exactly the still-open epochs of each session"
+        );
     }
 
     /// The control arm: with a budget it can meet, the SAME pass fetches every box. Without this,

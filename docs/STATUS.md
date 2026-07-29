@@ -13,6 +13,57 @@ Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
+## What landed since the last reconcile (2026-07-27 → 2026-07-29)
+
+Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests green, CI green on
+each pushed commit):
+
+- **An admission credential per channel, not per account (A8-4, `6a79547` + `ab2b623`).** Every
+  proxy of one account presented the SAME `capability_id`, in the clear, on every deposit — so a
+  relay could read one field and put the channels back together. The justification recorded for
+  leaving it that way was INVERTED: it argued a relay clusters proxies from connection timing
+  anyway, but `Peer::scope_for` derives a SOCKS stream-isolation token per handle, and handles are
+  per-purpose, per-box, per-epoch, so over Tor each request already rides its own circuit and the
+  connection links nothing. The clustering the dismissal leaned on was exactly what per-handle
+  isolation had already removed, which left the shared id as the ONLY linkage channel in the
+  configuration proxies exist for. Credentials now key on `<relay-id>:<slot>`, and
+  `earn_missing_capabilities` walks (live channel × relay) filling gaps — at unlock (off-thread: a
+  public door is proof-of-work and grinding it inline would not open the window), when a relay is
+  configured, when a backup is added, and when a channel is minted (before its announce, since a
+  channel with no credential is skipped by `publish_all`). A channel never falls back to a
+  sibling's or the root's — that fallback IS the linkage — so the failure is a loud `NotFound` that
+  makes the caller skip the relay. `burn_proxy` removes the burned channel's credentials in the
+  same cascade that removes its session state. **The price, paid not hidden:** N channels means N
+  proof-of-work solves, and quota meters per `capability_id`, so the account's addressable
+  throughput at that relay grows N-fold — a real weakening of an anti-abuse control, accepted
+  because a per-account bound cannot exist without a per-account identifier. **Offline is a
+  first-class outcome:** a channel created without a network has no credential and skips that
+  relay; every gap is reported (`CapabilityBackfill::still_missing`) and the next online pass fills
+  it. **Remaining honest limit:** an operator invite is ONE credential, revocable as a unit, so N
+  channels cannot each hold their own — `save_shared_capability_for` is a separate method precisely
+  so sharing is asked for, never what happens when issuance fails. See
+  `docs/design/proxy-identity.md` § Honest limits #6, rewritten with the correction.
+- **One receive pass is bounded in wall-clock time (R2-12, `474a9a1`).** A pass fetches the
+  identity mailbox and then every session's inbound drop-box, one epoch at a time — each its own
+  connect, handshake and request — and had NO time bound. A blackholed relay fails fast (the
+  identity fetch's `?`), but one that accepts the connection and then stalls does not: box errors
+  are collected rather than propagated, deliberately, so one bad box cannot discard mail already
+  drained — so every remaining box pays its own 15 s read timeout. A few dozen sessions on a sweep
+  cycle is hours inside one call, and multi-homed the relays are polled in sequence (the ratchet is
+  one conversation, so state threads through them in order), so one such relay holds every other
+  relay's mail behind it. `RECEIVE_BUDGET` (20 s) is checked before each fetch. Stopping early is
+  safe in the direction that matters — an unfetched box is not a drained one, its mail stays on the
+  relay and the next cycle collects it — and the truncation is reported through the same channel a
+  failed box uses. **Bounds one relay's pass, not the total work**; fewer round trips per poll is
+  the separate polling-cost item.
+- **A message we invented a timestamp for is refused (`e5d7ac2`).** The timestamp-less `Content::Text`
+  decode path had no producer left, but was still accepted with arrival time substituted for the
+  missing field — and arrival time feeds `msg_id`, so the two sides computed different ids for one
+  message and reactions, replies and edits silently referenced an id the peer had never seen. The
+  variant stays reserved (postcard numbers variants positionally and the §14 vectors pin those
+  numbers). Also removed: a `create_post` parameter the frontend never passed, and three
+  `#[serde(default)]` attributes on fields no stored or wire record can be missing.
+
 ## What landed since the last reconcile (2026-07-24 → 2026-07-25)
 
 Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests green):

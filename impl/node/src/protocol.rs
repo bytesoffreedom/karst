@@ -336,8 +336,8 @@ pub fn blob_put_nonce(blob_id: &[u8; 32], index: u32) -> Vec<u8> {
 /// `capability_id` (that is what lets it be metered as one budget), so up to ~35_000 chunks of a
 /// large file are linkable to each other by whoever holds the relay — and if the same capability
 /// is also used for messaging, blob traffic links to message traffic under that capability. The
-/// blob path's `client_addr` was deliberately made a fresh per-session pseudonym for exactly the
-/// opposite reason (`Relay::pseudonym`, client/src/lib.rs) — charging a capability is in tension
+/// blob path's `client_addr` is deliberately fresh per DOWNLOAD for exactly the opposite reason
+/// (`blob_get_addr`, client/src/lib.rs) — charging a capability is in tension
 /// with that, not a free win. Accepted here because the alternative (no capability at all) is the
 /// bug this closes; a client that wants blob traffic unlinked from its messaging must hold a
 /// SEPARATE capability for uploads (mint one PoW solve per upload session) rather than reusing

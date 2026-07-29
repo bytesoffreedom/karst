@@ -53,7 +53,7 @@ fn relay_with_blobs(dir: &std::path::Path) -> RelayNode {
 }
 
 /// `handle_blob_put` requires `client_addr` to decode as exactly 32 bytes (it becomes the
-/// blob-store `sender`) — a real client sends its pseudonym (see `Relay::pseudonym`); tests
+/// blob-store `sender`) — a real client sends the blob's owner handle (`blob::owner_token`); tests
 /// just need any fixed 32 bytes.
 fn addr32(tag: u8) -> Vec<u8> {
     let mut a = [0u8; 32];

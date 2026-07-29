@@ -309,18 +309,6 @@ pub struct Relay {
     /// account's traffic rides its own Tor circuit (see `Socks5Adapter::isolation`).
     /// Two accounts sharing a circuit would be linked however different their keys are.
     isolation: String,
-    /// **Per-session pseudonym** sent as `client_addr` on blob DOWNLOADS (and the durability
-    /// spot check). Fresh random bytes, never persisted, never derived from an identity key.
-    ///
-    /// It used to be the uploader's IK on put and the downloader's IK on get — against
-    /// the same `blob_id`, which handed the relay both ends of every large-file
-    /// transfer: "IK_A sent a file to IK_B". Only the cookie needs this field on the get
-    /// path, and a stable-per-session pseudonym satisfies a cookie just as well.
-    ///
-    /// It is no longer used on PUT. The blob store reads `client_addr` there as a durable
-    /// owner handle (first-writer-wins), which a per-process value cannot be — see
-    /// `blob::owner_token` and A4-1.
-    pseudonym: [u8; 32],
     /// `proxy` is a mixnet (Nym) client's SOCKS port, not a bare SOCKS5/Tor proxy. Transport is
     /// identical (SOCKS5 to that port); this only makes the carrier read as `mixnet` and keeps
     /// the failover ladder inside the mixnet. Set with [`Relay::with_mixnet`].
@@ -354,7 +342,7 @@ impl Relay {
         let addr = addr.into();
         let isolation = isolation_token();
         let paths = build_paths(addr.clone(), proxy, routes, &isolation);
-        Relay { addr, id, proxy, paths, pseudonym: blob::random32(), isolation, mixnet: false }
+        Relay { addr, id, proxy, paths, isolation, mixnet: false }
     }
 
     /// Replace the route list — TEST SEAM (A4-10, #217).
@@ -1234,6 +1222,29 @@ impl RelayId {
         node::protocol::RelayDescriptor { noise_pub: self.noise_pub, fetch_pub: self.fetch_pub, addrs: vec![], quic_addrs: Vec::new() }
             .relay_id_hex()
     }
+}
+
+/// The `client_addr` a blob DOWNLOAD presents: **fresh random bytes per download**.
+///
+/// This field used to be `Relay::pseudonym`, minted once per `Relay` — and a `Relay` is built from
+/// the account's settings, so every download an account ever made, across every channel and every
+/// restart of that process, carried one constant label. A relay serving downloads could group them
+/// with no cryptography at all: "the party that fetched the blob X uploaded is the same party that
+/// fetched the blob Y uploaded". Found by the #233 revision while costing out connection pooling.
+///
+/// A fresh value per download costs nothing, which is why this is the right size of fix rather than
+/// a smaller one. The relay uses `client_addr` on this path for exactly one thing — as the label a
+/// stateless cookie HMAC is bound to (`admit_blob_get`); `blob_get_chunk` reads only `blob_id` and
+/// `index`, and nothing meters or rate-limits a GET by this field. Each download already begins
+/// with `cookie: None` and takes the challenge round-trip, so there is not even a cookie to reuse.
+/// It has to stay stable *within* one download (every chunk presents the same cookie), which is why
+/// this is called once per download and not once per chunk.
+///
+/// **What this does not fix:** one `Relay` still means one `isolation` scope, so a relay groups an
+/// account's downloads by CONNECTION whatever the plaintext says. This closes grouping ACROSS
+/// connections and restarts. The residual is the shared `Relay` itself — see #241.
+fn blob_get_addr() -> Vec<u8> {
+    blob::random32().to_vec()
 }
 
 /// Отправить одно сообщение получателю `to_pub` через `relay` (внутри
@@ -2525,6 +2536,7 @@ pub fn download_post_attachment(
     ppa: &store::PendingPostAttachment,
     now: u64,
 ) -> DownloadOutcome {
+    let blob_addr = blob_get_addr();
     // A TERMINAL give-up: record a failure marker (so the feed shows an error tile instead of the
     // attachment silently disappearing) AND drop the pending entry (no forever-retry). Retries stay
     // silent — only an unrecoverable end records the marker.
@@ -2556,7 +2568,7 @@ pub fn download_post_attachment(
     for index in 0..ppa.chunks {
         let ct = loop {
             let req = BlobGetRequest {
-                client_addr: relay.pseudonym.to_vec(),
+                client_addr: blob_addr.clone(),
                 carrier_id: BLOB_CARRIER.to_vec(),
                 cookie,
                 blob_id: ppa.blob_id,
@@ -2618,6 +2630,7 @@ pub fn download_gallery(
     pg: &store::PendingGallery,
     now: u64,
 ) -> DownloadOutcome {
+    let blob_addr = blob_get_addr();
     let give_up = |why: String| -> DownloadOutcome {
         // No failure MARKER (a gallery has no error tile) — just drop the pending entry so a swept
         // blob can't retry forever; the peer's previous gallery stays untouched.
@@ -2640,7 +2653,7 @@ pub fn download_gallery(
     for index in 0..pg.chunks {
         let ct = loop {
             let req = BlobGetRequest {
-                client_addr: relay.pseudonym.to_vec(),
+                client_addr: blob_addr.clone(),
                 carrier_id: BLOB_CARRIER.to_vec(),
                 cookie,
                 blob_id: pg.blob_id,
@@ -2806,8 +2819,8 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
     let rx = std::sync::Mutex::new(rx);
     let to_upload = count.saturating_sub(next);
     // A4-1: the blob store owns a blob by the `client_addr` of its FIRST chunk, so this field is a
-    // storage identity, not a transport one — and `relay.pseudonym` is minted fresh per `Relay`,
-    // i.e. per process. A resume after a client restart therefore arrived as a stranger and was
+    // storage identity, not a transport one — and the download path's `client_addr` is minted fresh
+    // per download. A resume after a client restart therefore arrived as a stranger and was
     // rejected forever. The handle is derived from the blob's own key instead (see
     // `blob::owner_token`), which the resume record already persists.
     //
@@ -2866,7 +2879,7 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
                         let req = BlobPutRequest {
                             request_nonce: nonce.clone(),
                             capability_proof: cap.prove(&nonce, 0),
-                            // The blob's durable owner handle, NOT the session pseudonym (A4-1).
+                            // The blob's durable owner handle, NOT a per-process value (A4-1).
                             // The cookie is bound to whatever address asked for it, and each
                             // worker starts with `cookie: None`, so every cookie on this path is
                             // minted against this same handle — none is ever carried across two
@@ -2955,9 +2968,10 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
 ///
 /// This check runs immediately after every upload, on the SAME `blob_id` — so whatever address it
 /// carries is, by construction, tied to the blob that was just put. It therefore uses the blob's
-/// own owner handle rather than `relay.pseudonym`: the session pseudonym would have re-linked every
-/// blob an uploader parked ("put X from T_x, get X from P; put Y from T_y, get Y from P") and
-/// handed back exactly the cross-blob correlation the per-blob handle removes. Nothing is weakened:
+/// own owner handle rather than a fresh download address: an address SHARED across downloads would
+/// have re-linked every blob an uploader parked ("put X from T_x, get X from P; put Y from T_y, get
+/// Y from P"), which is the cross-blob correlation the per-blob handle removes. That is the same
+/// hazard `blob_get_addr` closes on the ordinary get path, reached from the other side. Nothing is weakened:
 /// the get path is cookie-gated only (bearer-by-id, never ownership-checked), the cookie is minted
 /// against whatever address asks, and this caller holds `key` by definition.
 pub fn verify_durability(relay: &Relay, blob_id: [u8; 32], key: [u8; 32], count: u32) -> Result<bool, String> {
@@ -3028,6 +3042,7 @@ pub fn blob_download_with<W: std::io::Write>(
 ) -> Result<W, String> {
     use std::sync::atomic::Ordering::Relaxed;
     let transport = relay.transport();
+    let blob_addr = blob_get_addr();
     let mut rx = blob::BlobReceiver::new(key, id, count, expected_hash, out);
     let mut cookie: Option<admission::cookie::Cookie> = None;
     let mut done: u64 = 0;
@@ -3038,7 +3053,7 @@ pub fn blob_download_with<W: std::io::Write>(
         }
         loop {
             let req = BlobGetRequest {
-                client_addr: relay.pseudonym.to_vec(),
+                client_addr: blob_addr.clone(),
                 carrier_id: BLOB_CARRIER.to_vec(),
                 cookie,
                 blob_id: id,
@@ -3099,6 +3114,7 @@ pub fn download_blob(
     cancel: &std::sync::atomic::AtomicBool,
     on_progress: impl FnMut(u64, u64),
 ) -> DownloadOutcome {
+    let blob_addr = blob_get_addr();
     // Already done? (crash after record, before the pending entry was dropped.)
     if pd.blob_id != [0u8; 32] {
         if let Some(f) = store
@@ -3155,7 +3171,7 @@ pub fn download_blob(
         }
         let ct = loop {
             let req = BlobGetRequest {
-                client_addr: relay.pseudonym.to_vec(),
+                client_addr: blob_addr.clone(),
                 carrier_id: BLOB_CARRIER.to_vec(),
                 cookie,
                 blob_id: pd.blob_id,
@@ -4523,5 +4539,71 @@ mod tests {
             "a different sender's ordinary traffic must free an abandoned sender's stale slot, \
              not only that same sender sending something new"
         );
+    }
+}
+
+/// Nothing long-lived may be presented as `client_addr` on a blob GET.
+///
+/// The defect this guards against had no runtime seam: `Relay::transport()` hands back a concrete
+/// `SocketTransport`, so a test cannot observe what a download actually puts on the wire, and a
+/// unit test on `blob_get_addr` would only re-assert that a CSPRNG returns different bytes. What
+/// went wrong was not a computation — it was a *binding*: a field that happened to be reused. So
+/// the guard reads the source and pins the binding, the same way `at_rest_shape_guard` pins the
+/// storage format and `lock_order_guard` pins the lock hierarchy in the desktop.
+#[cfg(test)]
+mod blob_get_addr_guard {
+    /// The only two expressions a blob-GET `client_addr` may carry, and why each is safe:
+    ///
+    /// - `blob_addr.clone()` — bound once per download from [`super::blob_get_addr`], so it is
+    ///   fresh and dies with the call.
+    /// - `owner.clone()` — the blob's OWN owner handle, derived from that blob's key
+    ///   (`blob::owner_token`). Used by `verify_durability`, which runs against the single
+    ///   `blob_id` just uploaded; a per-blob value cannot correlate two blobs.
+    const ALLOWED: &[&str] = &["blob_addr.clone()", "owner.clone()"];
+
+    /// Every `client_addr:` expression inside a blob-GET request literal, in source order.
+    fn get_request_addrs(src: &str) -> Vec<String> {
+        // Split so the needle never appears verbatim in this file — otherwise the guard matches
+        // its own source and reports itself.
+        let needle = concat!("BlobGetRequest", " {");
+        src.match_indices(needle)
+            .map(|(at, _)| {
+                let body = &src[at..];
+                let field = body.find("client_addr:").expect("a get request names client_addr");
+                let rest = &body[field + "client_addr:".len()..];
+                let end = rest.find(',').expect("field ends with a comma");
+                rest[..end].trim().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_blob_download_never_presents_a_value_that_outlives_it() {
+        let src = include_str!("lib.rs");
+        let addrs = get_request_addrs(src);
+        assert!(addrs.len() >= 5, "expected every download site to be seen, saw {}", addrs.len());
+        for a in &addrs {
+            assert!(
+                ALLOWED.contains(&a.as_str()),
+                "`{a}` is presented as client_addr on a blob GET. If it is a fresh per-download \
+                 value, bind it from `blob_get_addr()` and name it `blob_addr`; if it is anything \
+                 that outlives the download (a field, a stored handle, an identity key), it hands \
+                 the relay a label to group this account's downloads by — see `blob_get_addr`."
+            );
+        }
+        // `blob_addr` is only as good as what it is bound from: allowing the NAME without pinning
+        // the BINDING would let the next edit point it at a cached value and still pass.
+        let bind = concat!("let blob_addr", " = "); // split for the same reason as `needle`
+        let bindings: Vec<&str> = src
+            .match_indices(bind)
+            .map(|(at, _)| {
+                let rest = &src[at + bind.len()..];
+                &rest[..rest.find(';').expect("binding ends with a semicolon")]
+            })
+            .collect();
+        assert!(!bindings.is_empty(), "the guard must see the bindings it is guarding");
+        for b in bindings {
+            assert_eq!(b, "blob_get_addr()", "blob_addr must come from blob_get_addr()");
+        }
     }
 }

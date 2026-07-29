@@ -6,8 +6,8 @@
 //! is rebuilt purely from disk), download it back byte-identical.
 //!
 //! Client side (A4-1): the uploader's own restart is the harder half, because the relay owns a blob
-//! by the `client_addr` of its first chunk and the client's session pseudonym does not survive a
-//! restart. Both halves are exercised here against a real socket relay.
+//! by the `client_addr` of its first chunk, and the per-process address the client used to send did
+//! not survive a restart. Both halves are exercised here against a real socket relay.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -83,15 +83,15 @@ fn a_parked_blob_survives_a_relay_restart() {
 /// A4-1: an upload interrupted by a CLIENT restart resumes from the relay's watermark.
 ///
 /// The restart is simulated the only way that proves anything — every piece of in-memory client
-/// state is DROPPED (the `Relay`, so its session pseudonym is gone for good, and the `Store` handle
+/// state is DROPPED (the `Relay`, so anything it held is gone for good, and the `Store` handle
 /// with the `blob_id`/`key` it was holding), and the second attempt is rebuilt from what is on disk
 /// plus the file itself: the resume record, found under an `upload_id` re-derived from
 /// (recipient, name, size, content hash).
 ///
 /// DISCRIMINATING: before the fix this test failed at the resume, not at the assertions after it.
-/// The put path sent `relay.pseudonym` as `client_addr`, the relay's blob store had recorded the
-/// FIRST attempt's pseudonym as the blob's owner, and the restarted client — necessarily a new
-/// random pseudonym — was rejected ("blob owned by another sender"), permanently, since every retry
+/// The put path sent a per-`Relay` random value as `client_addr`, the relay's blob store had
+/// recorded the FIRST attempt's value as the blob's owner, and the restarted client — necessarily
+/// holding a new one — was rejected ("blob owned by another sender"), permanently, since every retry
 /// minted another stranger. The single `Relay` reused across attempts in
 /// `blob_upload_resumes_from_the_relay_watermark` is exactly what hid it. Nothing here would pass
 /// under the old behaviour: the resume returns `Err` and the watermark never leaves 2.
@@ -140,7 +140,7 @@ fn an_upload_resumes_after_the_client_itself_restarts() {
         .get_pending_upload(&upload_id)
         .unwrap()
         .expect("the resume record survived the restart");
-    let r2 = ctx(addr, &rid); // a NEW Relay → a new session pseudonym, as a new process has
+    let r2 = ctx(addr, &rid); // a NEW Relay, holding nothing from the first, as a new process has
 
     let (id, key, hash, count) = client::blob_upload_resumable(
         &r2,

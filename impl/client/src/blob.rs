@@ -73,8 +73,8 @@ fn chunk_aead(key: &BlobKey, index: u32, salt: &[u8; CHUNK_SALT]) -> ([u8; 32], 
 /// The blob's DURABLE owner handle — what a `BlobPut` puts in `client_addr`. The relay's blob
 /// store is first-writer-wins: it records the `sender` of a blob's first chunk and rejects later
 /// chunks from anyone else ("blob owned by another sender"). That check needs an identity that
-/// outlives the process, and the transport pseudonym is the opposite of one — `Relay::configured`
-/// mints a fresh random pseudonym per instance and deliberately never persists it. So an upload
+/// outlives the process, and the transport-level address was the opposite of one — a random value
+/// minted per `Relay` and deliberately never persisted. So an upload
 /// interrupted by a CLIENT restart could never be continued: the resume record survived, the
 /// identity that owned the bytes did not, and every retry minted another stranger (A4-1). The
 /// upload stayed stuck until the relay's 7-day TTL swept the partial blob.
@@ -82,15 +82,15 @@ fn chunk_aead(key: &BlobKey, index: u32, salt: &[u8; CHUNK_SALT]) -> ([u8; 32], 
 /// Deriving the handle from the file key kills that class rather than the instance: the one thing
 /// a resume already has to persist (`K`, in `PendingUpload`) now IS the proof of ownership, so
 /// ownership is durable exactly when and because resumability is, with no second secret to keep in
-/// sync. It is also per-blob, where the session pseudonym it replaces was per-process: no field the
+/// sync. It is also per-blob, where the value it replaces was per-process: no field the
 /// uploader sends now repeats across two of its blobs (`verify_durability`, which runs on the same
-/// `blob_id` right after each upload, uses this handle too — leaving the pseudonym there would have
-/// re-linked the blobs it had just separated).
+/// `blob_id` right after each upload, uses this handle too — a value shared across uploads would
+/// have re-linked the blobs it had just separated).
 ///
 /// Honest limits. (1) This is NOT anonymity: the relay still sees one connection uploading blob
 /// after blob, so IP + timing correlate them however the addressing field is derived — this removes
 /// a stable identifier the client was handing over for free, nothing more. The recipient's
-/// downloads still carry their own session pseudonym. (2) It is a bearer token, not a
+/// downloads carry a fresh address per download for the same reason (`blob_get_addr`). (2) It is a bearer token, not a
 /// challenge-response proof: the relay compares bytes, so anyone who learns the token can append to
 /// an INCOMPLETE blob. Deriving it needs `K`, which only the uploader has until the `FileRef` goes
 /// out — and by then the blob is complete and frozen. (3) The relay's per-sender caps

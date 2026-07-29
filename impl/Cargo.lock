@@ -871,7 +871,6 @@ dependencies = [
  "base64 0.22.1",
  "client",
  "hex",
- "node",
  "serde",
  "serde_json",
  "tauri",

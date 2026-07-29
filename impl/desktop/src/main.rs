@@ -710,7 +710,7 @@ struct Net {
 fn parse_relay(addr: &str, relay_id: &str, socks5: &str, routes: &str, mixnet: bool) -> Option<Relay> {
     // A Dest, not a SocketAddr, so a `<b32>.b32.i2p:port` (or any hostname) relay is accepted —
     // it is resolved by the SOCKS bridge (i2pd), never by clearnet DNS here.
-    let addr = node::transport::Dest::parse(addr.trim()).ok()?;
+    let addr = client::Dest::parse(addr.trim()).ok()?;
     let id = RelayId::parse(relay_id).ok()?;
     let proxy: Option<SocketAddr> = match socks5.trim() {
         "" => None,
@@ -1531,7 +1531,7 @@ fn safety_number(app: State<App>, peer_ik: String) -> Result<String, String> {
         .load_account()
         .map_err(|e| format!("loading account: {e}"))?
         .identity_public();
-    Ok(node::safety::safety_number(&own, &peer))
+    Ok(client::safety_number(&own, &peer))
 }
 
 #[tauri::command]
@@ -3456,7 +3456,7 @@ async fn poll(app: State<'_, App>) -> Result<PollOut, String> {
         dirty |= replayed;
         let drained: Vec<_> = parked
             .into_iter()
-            .map(|q| node::peer::Received {
+            .map(|q| client::Received {
                 sender: q.sender,
                 plaintext: q.plaintext,
                 msg_id: [0u8; 32], // replayed, not freshly leased: nothing to ack

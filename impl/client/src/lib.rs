@@ -31,6 +31,20 @@ pub mod secretbox;
 pub mod seed;
 pub mod store;
 
+// ----- What a UI is allowed to reach for (#143) -----
+//
+// The desktop used to depend on `node` directly, for three things: a decrypted message, a safety
+// number, and an address parser. All three are client-side, and none of them needed a dependency
+// that also carries the RELAY — a UI able to name `RelayNode` is a UI able to bypass this crate's
+// API and drive relay internals, which is the coupling the crate split exists to remove.
+//
+// Re-exported here rather than left as a direct dependency so the boundary is stated in one place:
+// what the UI may use is what this crate hands it. Adding to this list should feel like a
+// decision, because it is one.
+pub use node::peer::Received;
+pub use node::safety::safety_number;
+pub use node::transport::Dest;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -51,11 +65,11 @@ use node::node::{
     BlobGetRequest, BlobPutRequest, BlobResponse, Client, PublishResponse, Recipient, Response,
     Transport,
 };
-use node::peer::{ForwardSecrecy, Peer, PeerState, Received};
+use node::peer::{ForwardSecrecy, Peer, PeerState};
 use node::pqxdh::Account;
 use node::seal::Identity;
 use node::socket::{BlobSession, SocketTransport};
-use node::transport::{isolation_token, Dest, DirectTcpAdapter, Path, Socks5Adapter, TransportAdapter};
+use node::transport::{isolation_token, DirectTcpAdapter, Path, Socks5Adapter, TransportAdapter};
 use node::wss::WssAdapter;
 
 /// The §15 carrier `transport()` selects, given the SOCKS proxy setting and the

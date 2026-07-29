@@ -414,12 +414,17 @@ impl Account {
         self.ik.public.to_bytes()
     }
 
-    /// Sign the code→IK binding for an opt-in discovery record: an XEdDSA signature by the IK over
-    /// `(discovery_pub, ik, location, expiry)`. A resolver verifies it (`discovery::verify_binding`)
-    /// and thereby trusts that this contact code belongs to this IK — the relay never vouches.
-    pub fn sign_discovery(&self, discovery_pub: &[u8; 32], location: &crate::node::RelayDescriptor, expiry: u64, single_use: bool) -> Vec<u8> {
-        let msg = crate::discovery::binding_msg(discovery_pub, &self.identity_public(), location, expiry, single_use);
-        crate::discovery::sign(&self.ik.to_secret_bytes(), &msg)
+    /// The identity key's SECRET, for the one signature that is not made here.
+    ///
+    /// `sign_discovery` used to live on this type, and it was the only thing in the whole PQXDH
+    /// module that reached for `discovery` and `protocol` — which made the module graph circular
+    /// (`protocol` needs `PreKeyBundle` from here, and `discovery` needs `RelayDescriptor` from
+    /// there). Legal inside one crate, impossible once these sit on either side of the trust
+    /// boundary. The signature now lives in `discovery`, where the message it covers is defined,
+    /// and this accessor is what it needs. Crate-visible only: an identity secret is not something
+    /// to hand out beyond the crate that owns the key material (#143).
+    pub(crate) fn ik_secret_bytes(&self) -> [u8; 32] {
+        self.ik.to_secret_bytes()
     }
 
     /// Долговременный identity-ключ (для отправки: sender_ik) — внутри крейта,

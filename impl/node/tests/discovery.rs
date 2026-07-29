@@ -37,7 +37,7 @@ fn signed_record_su(acct: &Account, dsecret: &[u8; 32], expiry: u64, single_use:
     let dpub = discovery::public_of(dsecret);
     let ik = acct.identity_public();
     let location = loc();
-    let ik_sig = acct.sign_discovery(&dpub, &location, expiry, single_use);
+    let ik_sig = node::discovery::sign_binding(acct, &dpub, &location, expiry, single_use);
     let write_sig = discovery::sign(dsecret, &discovery::write_msg(&dpub, &ik, &location, expiry, single_use));
     (DiscoveryRecord { discovery_pub: dpub, ik, location, expiry, single_use, ik_sig }, write_sig)
 }

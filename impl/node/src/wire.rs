@@ -16,10 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::DiscoveryRecord;
-use crate::node::{
-    AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, FetchRequest, JoinRequest, Payload,
-    PublishRequest, RelayDescriptor, RelayPolicy, WireMessage,
-};
+use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, FetchRequest, JoinRequest, Payload, PublishRequest, RelayDescriptor, RelayPolicy, WireMessage};
 use crate::pqxdh::PreKeyBundle;
 
 /// Потолок кадра ЗАПРОСА (client→server) — самый враждебный вход. Полезная
@@ -29,10 +26,6 @@ use crate::pqxdh::PreKeyBundle;
 /// для скелет-пути в docs/STATUS.md.
 pub const MAX_REQUEST_FRAME: usize = MAX_PACKET_SIZE + 512;
 
-/// Mailbox STORAGE ceiling (backpressure at insert, `MailboxFull`). Independent of
-/// how many seals leave per fetch — a full mailbox now drains `FETCH_CAP` at a time
-/// over several polls.
-pub const MAX_FETCH_SEALS: usize = 256;
 
 /// Count cap: at most this many seals leave per fetch. The rest stay in the mailbox
 /// for the next poll. This is a metadata-hardening knob (§2.2): a fetch response is
@@ -87,14 +80,14 @@ const PREKEY_BUNDLE_WIRE: usize = 32 + 32 + 1184 + SIGNED_OPK_WIRE + 64 + 32 + 1
 /// max-size ack, so this is that class's OWN ceiling — derived from the same cap the
 /// handler enforces, not hand-picked, so a future change to `MAX_ACK_IDS` moves this with
 /// it instead of silently drifting out of sync.
-pub const MAX_ACK_FRAME: usize = crate::node::MAX_ACK_IDS * 32 + 256;
+pub const MAX_ACK_FRAME: usize = crate::protocol::MAX_ACK_IDS * 32 + 256;
 
 /// `PublishBundle` frame ceiling. One bundle plus up to `node::MAX_OPKS_PER_IK`
 /// freshly-signed one-time prekeys — a well-behaved client never sends more (the relay
 /// only ever stores that many, see `RelayNode::handle_publish`), so anything past this is
 /// never a legitimate publish, only padding.
 pub const MAX_PUBLISH_FRAME: usize =
-    PREKEY_BUNDLE_WIRE + crate::node::MAX_OPKS_PER_IK * SIGNED_OPK_WIRE + 256;
+    PREKEY_BUNDLE_WIRE + crate::protocol::MAX_OPKS_PER_IK * SIGNED_OPK_WIRE + 256;
 
 // Compile-time, not test-only: a class ceiling that isn't actually LARGER than the tight
 // default is a no-op, and `MAX_BLOB_FRAME` must stay the largest bucket. Catches a bad edit
@@ -194,7 +187,7 @@ pub enum WireRequest {
     /// §12: забрать bundle ВМЕСТЕ с one-time prekey. Admission-gated like a send, because
     /// handing out an OPK destroys a scarce resource the recipient cannot replace until its next
     /// publish (R2-3). See `node::BundleOpkRequest`.
-    FetchBundleOpk(crate::node::BundleOpkRequest),
+    FetchBundleOpk(crate::protocol::BundleOpkRequest),
     /// §15: upload one ciphertext chunk of a large-file blob.
     BlobPut(BlobPutRequest),
     /// §15: download one ciphertext chunk of a large-file blob.

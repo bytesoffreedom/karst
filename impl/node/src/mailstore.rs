@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::node::{payload_id, Payload};
+use crate::protocol::{payload_id, Payload};
 
 /// Magic + version of the mail log. `KML1` = this record layout.
 const LOG_MAGIC: &[u8; 4] = b"KML1";

@@ -723,7 +723,7 @@ pub fn discovery_publish(store: &Store, relay: &Relay, now: u64) -> Result<Strin
     let dpub = discovery::public_of(&secret);
     let location = relay_descriptor(relay);
     let expiry = now.saturating_add(discovery::DEFAULT_TTL_SECS);
-    let ik_sig = acct.sign_discovery(&dpub, &location, expiry, false);
+    let ik_sig = node::discovery::sign_binding(&acct, &dpub, &location, expiry, false);
     let record = discovery::DiscoveryRecord {
         discovery_pub: dpub,
         ik: acct.identity_public(),
@@ -785,7 +785,7 @@ pub fn discovery_one_time(store: &Store, relay: &Relay, now: u64) -> Result<Stri
     store
         .add_invite(crate::store::InviteRecord { secret, created_at: now, expiry }, now)
         .map_err(|e| format!("recording the invite: {e}"))?;
-    let ik_sig = acct.sign_discovery(&dpub, &location, expiry, false);
+    let ik_sig = node::discovery::sign_binding(&acct, &dpub, &location, expiry, false);
     let record = discovery::DiscoveryRecord {
         discovery_pub: dpub,
         ik: acct.identity_public(),

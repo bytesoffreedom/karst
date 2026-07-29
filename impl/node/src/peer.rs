@@ -36,11 +36,7 @@ use admission::capability::Capability;
 use admission::cookie::Cookie;
 use x25519_dalek::PublicKey;
 
-use crate::node::{
-    fetch_proof, payload_id, publish_proof, AckRequest, AckResponse, BundleOpkRequest,
-    BundleOpkResponse, FetchRequest, FetchResponse, Payload, PublishRequest, PublishResponse,
-    Response, SessionEnvelope, Transport, WireMessage,
-};
+use crate::protocol::{fetch_proof, payload_id, publish_proof, AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, Payload, PublishRequest, PublishResponse, Response, SessionEnvelope, Transport, WireMessage};
 use crate::pqxdh::{initiate_key_agreement, Account, KeyAgreement, PreKeyBundle};
 
 /// How much forward secrecy the FIRST message of a new session actually got.
@@ -179,7 +175,7 @@ const MAX_PENDING_ACKS: usize = 1_024;
 /// recipient's mailbox TTL bounds how long a deposit could survive anyway, and a ratchet
 /// step likely made the exact ciphertext undeliverable well before — so retrying past this
 /// wastes effort on mail no one can read.
-const OUTBOX_TTL_SECS: u64 = crate::node::MAILBOX_TTL_SECS;
+const OUTBOX_TTL_SECS: u64 = crate::protocol::MAILBOX_TTL_SECS;
 
 /// One message encrypted and durably queued, awaiting delivery to the relay. Holds the
 /// EXACT ciphertext (`envelope`) so a failed transmit retries the identical bytes rather
@@ -1821,7 +1817,7 @@ impl<T: Transport> Peer<T> {
 #[cfg(test)]
 mod outbox_state_tests {
     use super::{OutboxEntry, PeerState, PersistedSession};
-    use crate::node::SessionEnvelope;
+    use crate::protocol::SessionEnvelope;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::cookie::Cookie;
 
@@ -1974,7 +1970,8 @@ mod outbox_state_tests {
     /// LOUD ("re-establish") instead of dropping mail into the void.
     #[test]
     fn a_stale_session_without_a_mailbox_point_fails_loud_on_send() {
-        use crate::node::{InMemoryTransport, RelayNode, Response};
+        use crate::protocol::{Response};
+use crate::node::{InMemoryTransport, RelayNode};
         use crate::pqxdh::Account;
         use crate::ratchet::Session;
         use admission::capability::{Capability, Quota, Scope};
@@ -2014,7 +2011,8 @@ mod outbox_state_tests {
 /// SEC-33: unbounded session growth as a trial-decryption DoS amplifier.
 #[cfg(test)]
 mod session_cap_tests {
-    use crate::node::{InMemoryTransport, Payload, RelayNode, Response, SessionEnvelope};
+    use crate::protocol::{Payload, Response, SessionEnvelope};
+use crate::node::{InMemoryTransport, RelayNode};
     use crate::pqxdh::Account;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
@@ -2287,7 +2285,8 @@ mod session_cap_tests {
 #[cfg(test)]
 mod convergence_route_tests {
     use super::{SessionEnvelope, SessionState};
-    use crate::node::{InMemoryTransport, RelayNode, Response};
+    use crate::protocol::{Response};
+use crate::node::{InMemoryTransport, RelayNode};
     use crate::pqxdh::Account;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
@@ -2549,11 +2548,8 @@ mod convergence_route_tests {
 /// R2-12: one receive pass is bounded in wall-clock time.
 #[cfg(test)]
 mod receive_budget_tests {
-    use crate::node::{
-        AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse,
-        InMemoryTransport, PublishRequest, PublishResponse, RelayNode, Response, Transport,
-        WireMessage,
-    };
+    use crate::protocol::{AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, PublishRequest, PublishResponse, Response, Transport, WireMessage};
+use crate::node::{InMemoryTransport, RelayNode};
     use crate::pqxdh::PreKeyBundle;
     use crate::pqxdh::Account;
     use crate::ratchet::Session;

@@ -56,7 +56,7 @@ pub const DROP_EPOCH_SECS: u64 = 24 * 3600;
 /// How many epochs of history can still hold live mail: the relay's `MAILBOX_TTL_SECS`,
 /// rounded up. Derived rather than hardcoded — if either constant moves, the sweep window
 /// must move with it or mail goes quietly unreachable.
-const TTL_EPOCHS: u64 = crate::node::MAILBOX_TTL_SECS.div_ceil(DROP_EPOCH_SECS);
+const TTL_EPOCHS: u64 = crate::protocol::MAILBOX_TTL_SECS.div_ceil(DROP_EPOCH_SECS);
 
 /// Take a session's stable drop-box seed from its root key.
 ///
@@ -329,7 +329,7 @@ mod tests {
         // the sweep OR lengthening the TTL without the other reddens.
         let now = 500 * DROP_EPOCH_SECS;
         let sweep = sweep_epochs(now);
-        let oldest_live = epoch_of(now - crate::node::MAILBOX_TTL_SECS);
+        let oldest_live = epoch_of(now - crate::protocol::MAILBOX_TTL_SECS);
         assert!(sweep.contains(&oldest_live), "a box still inside the TTL is never polled");
         assert!(sweep.contains(&(epoch_of(now) + 1)), "the sweep must cover the skew epoch too");
     }

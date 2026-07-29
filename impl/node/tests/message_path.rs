@@ -13,7 +13,8 @@ use node::node::{
     Response, Transport, WireMessage,
 };
 use node::seal::Identity;
-use node::wire::{FETCH_CAP, MAX_FETCH_SEALS};
+use node::protocol::MAX_FETCH_SEALS;
+use node::wire::FETCH_CAP;
 use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;

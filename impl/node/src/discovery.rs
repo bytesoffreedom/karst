@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::node::RelayDescriptor;
+use crate::protocol::RelayDescriptor;
 
 /// Lifetime a client stamps on a record. Discovery is **persistent-until-off**: the code stays
 /// findable until the user rotates or turns it off, so the TTL is a long safety bound (not a
@@ -101,6 +101,26 @@ pub fn binding_msg(discovery_pub: &[u8; 32], ik: &[u8; 32], loc: &RelayDescripto
 /// Message the discovery key signs to authorise a write (create / rotate).
 pub fn write_msg(discovery_pub: &[u8; 32], ik: &[u8; 32], loc: &RelayDescriptor, expiry: u64, single_use: bool) -> Vec<u8> {
     tagged(b"KARST-disc-write-v1", discovery_pub, ik, loc, expiry, single_use)
+}
+
+/// Sign the code→IK binding for an opt-in discovery record: an XEdDSA signature by the account's
+/// identity key over `(discovery_pub, ik, location, expiry, single_use)`. A resolver verifies it
+/// with [`verify_binding`] and thereby trusts that this contact code belongs to this IK — the
+/// relay never vouches for the pairing.
+///
+/// A free function here rather than a method on `Account` (#143): the message it covers is
+/// defined in this module and the location type it binds is protocol vocabulary, so putting the
+/// signature on the crypto type made PQXDH depend on both and closed a cycle around the module
+/// graph. The key material never leaves the crate — `ik_secret_bytes` is crate-visible.
+pub fn sign_binding(
+    account: &crate::pqxdh::Account,
+    discovery_pub: &[u8; 32],
+    location: &crate::protocol::RelayDescriptor,
+    expiry: u64,
+    single_use: bool,
+) -> Vec<u8> {
+    let msg = binding_msg(discovery_pub, &account.identity_public(), location, expiry, single_use);
+    sign(&account.ik_secret_bytes(), &msg)
 }
 
 /// Message the discovery key signs to authorise a delete (turn discovery off).

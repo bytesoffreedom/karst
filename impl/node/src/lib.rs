@@ -25,6 +25,7 @@ pub mod gossip;
 pub mod mailstore;
 pub mod node;
 pub mod peer;
+pub mod protocol;
 pub mod pqxdh;
 pub mod ratchet;
 pub mod safety;

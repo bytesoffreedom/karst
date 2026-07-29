@@ -19,7 +19,8 @@ use std::collections::HashSet;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock};
 
-use crate::node::{RelayDescriptor, RelayNode};
+use crate::protocol::{RelayDescriptor};
+use crate::node::{RelayNode};
 use crate::socket::SocketTransport;
 use crate::transport::Dest;
 

@@ -24,11 +24,8 @@ use rand::RngCore;
 use snow::Builder;
 
 use crate::discovery::DiscoveryRecord;
-use crate::node::{
-    AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest,
-    BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse,
-    RelayDescriptor, RelayNode, RelayPolicy, Response, Transport, WireMessage,
-};
+use crate::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, Transport, WireMessage};
+use crate::node::{RelayNode};
 use crate::pqxdh::PreKeyBundle;
 use crate::session::{Session, NOISE_PARAMS};
 use crate::transport::{Channel, Dest, DirectTcpAdapter, Path, TransportAdapter};

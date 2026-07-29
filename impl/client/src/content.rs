@@ -133,7 +133,7 @@ pub fn blob_ref_shape_ok(size: u64, chunks: u32, max_bytes: usize) -> bool {
 /// little headroom for other mail queued in the same mailbox.
 pub fn gallery_fits_inline(packed_len: usize) -> bool {
     let chunks = packed_len.div_ceil(MAX_CHUNK_PAYLOAD);
-    chunks + 2 < node::wire::MAX_FETCH_SEALS
+    chunks + 2 < node::protocol::MAX_FETCH_SEALS
 }
 
 /// Домен для канонического идентификатора сообщения (разделение доменов — как у

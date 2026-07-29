@@ -18,6 +18,30 @@ publications/stories, the session simultaneous-first-contact fix, duress Tier 1,
 Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests green, CI green on
 each pushed commit):
 
+- **The post-quantum leg of a first contact gets a one-time key (CRYPTO-33, `529b981`).** The
+  bundle's ML-KEM key is minted once and never rotated, and the ratchet's forward secrecy begins
+  AFTER the handshake — so every recorded opener stayed decryptable by whoever later obtained the
+  account's secret material. A one-time prekey is now ONE unit carrying both halves, the X25519
+  key and its own ML-KEM-768 encapsulation key, signed together; the sender encapsulates against
+  the one-time key and the recipient destroys its seed on the same commit that consumes the
+  classical half (the existing consume-after-the-first-AEAD-verifies path, CRYPTO-03). One unit
+  rather than two stores because separate batches drift and "classical half present, PQ half
+  exhausted" is a per-leg downgrade a merged unit cannot express — and because it inherits the
+  one-per-fetch handout (#159), the republish fix (#139), corrupt-batch-is-loud (#160) and the
+  atomic commit (CRYPTO-26) unchanged. Held as the 64-byte KEM seed, so a batch costs 96 bytes
+  per unit at rest. **Costs, none hidden:** `MAX_OPKS_PER_IK` drops 256 → 40 (a unit is ~1288 wire
+  bytes and `MAX_OPKS_PER_IK * unit` sets `MAX_PUBLISH_FRAME`, which a compile-time assert keeps
+  under `MAX_BLOB_FRAME` — raising the batch fails the build); a shallower batch serves fewer
+  first contacts between publishes; and exhaustion falls back to the static last-resort key, which
+  is REPORTED (`ForwardSecrecy::NoOneTimePrekey`, now documenting both legs). Found on the way:
+  `SocketTransport::publish_bundle` was sending under the tight Send/Fetch frame ceiling, which fit
+  only while a unit was ~104 bytes. **Not claimed:** the long-lived `kem_ek` still does not rotate
+  — naive rotation moves the published mailbox point `M = m·G`, since `mailbox_secret` derives from
+  the same account secret bytes, so real rotation needs (prekey, KEM) split from the stable
+  (ik, mailbox) material into deletable generations. Named residual, its own task.
+  `STATE_VERSION` 7 → 8: the `opks` entries inside `sessions.dat` went from 32 to 96 bytes and
+  `capabilities.dat` re-keyed, and postcard is not self-describing.
+
 - **An admission credential per channel, not per account (A8-4, `6a79547` + `ab2b623`).** Every
   proxy of one account presented the SAME `capability_id`, in the clear, on every deposit — so a
   relay could read one field and put the channels back together. The justification recorded for

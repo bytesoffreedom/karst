@@ -362,7 +362,7 @@ if [ "$MODE" = private ]; then
   echo "             mint:   ${POWPFX}karst-relay invite new NAME"
   echo "             list:   ${POWPFX}karst-relay invite list"
   echo "             revoke: ${POWPFX}karst-relay invite revoke ID   (effective at once)"
-  echo "             a peer joins with: karst import-cap <that file> --relay $PEER_ADDR --relay-id $RELAY_ID""
+  echo "             a peer joins with: karst import-cap <that file> --relay $PEER_ADDR --relay-id $RELAY_ID"
 elif [ "$MODE" = public ]; then
   if [ "${POW_BITS:-20}" = 0 ]; then
     echo "  door:      OPEN (no PoW) — peers join with: karst join --relay $PEER_ADDR --relay-id $RELAY_ID"

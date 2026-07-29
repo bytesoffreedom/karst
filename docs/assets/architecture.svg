@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 700" width="1240" height="700" font-family="Inter, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2ED7D1"/>
+    </marker>
+    <marker id="arrowDim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7d84"/>
+    </marker>
+    <style>
+      .card   { fill:#171c1f; stroke:#2b3438; stroke-width:1.5; rx:14; }
+      .relay  { fill:#181113; stroke:#4a3138; stroke-width:1.5; rx:14; }
+      .inner  { fill:#1e2529; stroke:#2f3a3f; stroke-width:1; rx:9; }
+      .title  { fill:#e8eef0; font-size:19px; font-weight:600; }
+      .sub    { fill:#7d8f96; font-size:12.5px; }
+      .item   { fill:#cfdadd; font-size:13.5px; }
+      .note   { fill:#8a9aa1; font-size:12px; }
+      .edge   { fill:#2ED7D1; font-size:12.5px; font-weight:500; }
+      .warn   { fill:#e0776a; font-size:12.5px; font-weight:600; letter-spacing:.04em; }
+      .mono   { font-family: ui-monospace, 'DejaVu Sans Mono', monospace; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1240" height="700" fill="#0f1416"/>
+
+  <!-- ─────────── Alice ─────────── -->
+  <rect class="card" x="40" y="70" width="300" height="290"/>
+  <text class="title" x="64" y="106">Alice’s device</text>
+  <text class="sub"   x="64" y="127">everything secret stays here</text>
+
+  <rect class="inner" x="64" y="146" width="252" height="52"/>
+  <text class="item" x="80" y="169">Identity from 24 words</text>
+  <text class="note" x="80" y="187">no account, no phone number</text>
+
+  <rect class="inner" x="64" y="208" width="252" height="52"/>
+  <text class="item" x="80" y="231">Vault encrypted at rest</text>
+  <text class="note" x="80" y="249">Argon2id + XChaCha20-Poly1305</text>
+
+  <rect class="inner" x="64" y="270" width="252" height="66"/>
+  <text class="item" x="80" y="293">Disposable channels</text>
+  <text class="note" x="80" y="311">the root identity has no address;</text>
+  <text class="note" x="80" y="327">burn one and the rest are untouched</text>
+
+  <!-- ─────────── Relay ─────────── -->
+  <rect class="relay" x="470" y="70" width="300" height="290"/>
+  <text class="title" x="494" y="106">Relay</text>
+  <text class="warn"  x="558" y="106">UNTRUSTED</text>
+  <text class="sub"   x="494" y="127">anyone can run one; nobody must</text>
+
+  <rect class="inner" x="494" y="146" width="252" height="52"/>
+  <text class="item" x="510" y="169">Admission gate</text>
+  <text class="note" x="510" y="187">cookie → capability → quota</text>
+
+  <rect class="inner" x="494" y="208" width="252" height="52"/>
+  <text class="item" x="510" y="231">Blinded drop-boxes</text>
+  <text class="note" x="510" y="249">addresses rotate every 24 h</text>
+
+  <rect class="inner" x="494" y="270" width="252" height="66"/>
+  <text class="item" x="510" y="293">Blob store</text>
+  <text class="note" x="510" y="311">large files, chunked and sealed</text>
+  <text class="note" x="510" y="327">per chunk; resumable</text>
+
+  <!-- ─────────── Bob ─────────── -->
+  <rect class="card" x="900" y="70" width="300" height="290"/>
+  <text class="title" x="924" y="106">Bob’s device</text>
+  <text class="sub"   x="924" y="127">holds the only other set of keys</text>
+
+  <rect class="inner" x="924" y="146" width="252" height="52"/>
+  <text class="item" x="940" y="169">Identity from 24 words</text>
+  <text class="note" x="940" y="187">recoverable, never uploaded</text>
+
+  <rect class="inner" x="924" y="208" width="252" height="52"/>
+  <text class="item" x="940" y="231">Vault encrypted at rest</text>
+  <text class="note" x="940" y="249">history readable only on device</text>
+
+  <rect class="inner" x="924" y="270" width="252" height="66"/>
+  <text class="item" x="940" y="293">Disposable channels</text>
+  <text class="note" x="940" y="311">one per contact is the most</text>
+  <text class="note" x="940" y="327">unlinkable arrangement</text>
+
+  <!-- ─────────── Flow arrows ─────────── -->
+  <path d="M 344 200 L 462 200" stroke="#2ED7D1" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <text class="edge" x="403" y="180" text-anchor="middle">sealed</text>
+  <text class="edge" x="403" y="196" text-anchor="middle">envelope</text>
+  <text class="note" x="403" y="224" text-anchor="middle">deposit</text>
+
+  <path d="M 778 200 L 892 200" stroke="#2ED7D1" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <text class="edge" x="835" y="180" text-anchor="middle">fetch</text>
+  <text class="edge" x="835" y="196" text-anchor="middle">+ ACK</text>
+  <text class="note" x="835" y="224" text-anchor="middle">owner-proved</text>
+
+  <text class="note" x="620" y="386" text-anchor="middle">PQXDH (X25519 + ML-KEM-768) establishes the session · Double Ratchet carries every message after it</text>
+
+  <!-- E2E span -->
+  <path d="M 190 406 L 190 430 L 1050 430 L 1050 406" stroke="#2ED7D1" stroke-width="1.5" fill="none" stroke-dasharray="5 5"/>
+  <rect x="452" y="414" width="336" height="32" rx="8" fill="#0f1416"/>
+  <text class="edge" x="620" y="435" text-anchor="middle">end-to-end encryption closes here</text>
+
+  <!-- ─────────── Transports ─────────── -->
+  <rect class="card" x="40" y="470" width="500" height="180"/>
+  <text class="title" x="64" y="506">How the bytes travel</text>
+  <text class="sub"   x="64" y="527">the user picks; the protocol above is identical</text>
+  <text class="item mono" x="64" y="559">direct TCP</text>
+  <text class="item mono" x="64" y="583">wss:// (WebSocket over TLS)</text>
+  <text class="item mono" x="64" y="607">SOCKS5 → Tor · I2P · mixnet</text>
+  <text class="note" x="300" y="559">fastest, reveals your address</text>
+  <text class="note" x="300" y="583">looks like ordinary web traffic</text>
+  <text class="note" x="300" y="607">hides the address, costs latency</text>
+  <text class="note" x="64" y="633">A dead path is raced past, not waited out.</text>
+
+  <!-- ─────────── Multi-homing ─────────── -->
+  <rect class="card" x="580" y="470" width="620" height="180"/>
+  <text class="title" x="604" y="506">No relay is load-bearing</text>
+  <text class="sub"   x="604" y="527">a client is multi-homed and receives from all of them</text>
+
+  <rect class="relay" x="604" y="548" width="150" height="76"/>
+  <text class="item" x="622" y="574">Relay A</text>
+  <text class="note" x="622" y="594">your own</text>
+  <text class="note" x="622" y="610">one binary</text>
+
+  <rect class="relay" x="774" y="548" width="150" height="76"/>
+  <text class="item" x="792" y="574">Relay B</text>
+  <text class="note" x="792" y="594">a friend’s</text>
+  <text class="note" x="792" y="610">invite-only</text>
+
+  <rect class="relay" x="944" y="548" width="150" height="76"/>
+  <text class="item" x="962" y="574">Relay C</text>
+  <text class="note" x="962" y="594">public</text>
+  <text class="note" x="962" y="610">proof-of-work door</text>
+
+  <path d="M 1114 586 L 1176 586" stroke="#6b7d84" stroke-width="1.5" fill="none" marker-end="url(#arrowDim)"/>
+  <text class="note" x="1120" y="574">…</text>
+
+  <text class="note" x="604" y="644">Losing one costs a route, not an identity — the identity never lived on a relay.</text>
+</svg>

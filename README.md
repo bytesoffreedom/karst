@@ -77,14 +77,41 @@ See [`RESPONSIBLE_USE.md`](RESPONSIBLE_USE.md) for the project's intended purpos
 
 ## Architecture
 
-A Rust workspace of four crates:
+### How a message actually travels
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="How a KARST message travels: sender, untrusted relay, recipient, transports and multi-homing" width="1000">
+</p>
+
+**What the relay can and cannot do.** It stores and forwards sealed envelopes and
+charges an admission proof for every scarce resource. It cannot read message
+content — the Double Ratchet closes end to end, and the relay never holds those
+keys. It *can* see the metadata its own job requires, and
+[`docs/STATUS.md`](docs/STATUS.md) writes that out field by field rather than
+leaving it to the reader's optimism.
+
+**What is deliberately absent.** No account server. No phone number. No
+directory that must be consulted to reach someone. No presence or typing
+signals — that decision, and the one shape a reversal could take, is written
+down in [`docs/design/presence-and-typing.md`](docs/design/presence-and-typing.md).
+
+### The workspace
+
+Eight crates. The split is not tidiness — it is where the trust boundaries are,
+so that "the relay is untrusted" is a fact about the dependency graph and not a
+sentence in a README. The `client` cannot depend on `relay`, and the compiler
+enforces it.
 
 | Crate (binary) | Role |
 |----------------|------|
-| `admission` | Cryptographic admission path (§7): stateless cookie, capability, RLN quota core, DTN class, threshold ring. |
-| `node` (`karst-relay`) | Relay node **and** the end-to-end session layer — PQXDH key agreement, Double Ratchet, safety number, relay-mediated discovery. |
-| `client` (`karst`) | CLI and library: identity from a BIP39 recovery phrase, encrypted at-rest vault, persistent sessions. |
-| `desktop` (`karst-desktop`) | Desktop client (Tauri: web frontend in a native webview over the shared `client`/`node` core): accounts, chats, relay + invite config, safety-number verification, file transfer with progress/cancel, profiles. |
+| `karst-crypto` | The primitives that must not vary by carrier: PQXDH key agreement, Double Ratchet, sealing, blinded addresses, safety numbers. |
+| `karst-transport` | Carriers and framing: direct TCP, `wss://`, SOCKS5 (Tor / I2P / mixnet), QUIC, path failover and per-request stream isolation. |
+| `admission` | The cryptographic admission path (§7): stateless cookie, capability, RLN quota core, DTN class, threshold ring. |
+| `node` | The wire protocol both sides speak — request and response types, frame ceilings per request class, relay descriptors. |
+| `relay` (`karst-relay`) | The relay itself: mailboxes, blob store, gossip, admission enforcement, TCP and QUIC listeners. **Nothing a client links.** |
+| `karst-client-core` | Client-side protocol logic independent of any UI: peers, sessions, drop-box scheduling. |
+| `client` (`karst`) | CLI and library: identity from a BIP39 recovery phrase, encrypted at-rest vault, persistent sessions, file transfer. |
+| `desktop` (`karst-desktop`) | The desktop client (Tauri: web frontend in a native webview over the shared client core): accounts, chats, feed, relay and invite config, safety-number verification, file transfer with progress and cancel, profiles, duress features. |
 
 ### Security properties and their maturity
 
@@ -295,13 +322,62 @@ See [`docs/RUNNING.md`](docs/RUNNING.md) for the full local walkthrough and the
 ## Repository layout
 
 ```
-impl/            Rust workspace: admission, node, client, gui
-docs/            STATUS.md (maturity map) · RUNNING.md (local run)
-scripts/         local-run helpers
-KARST_SPEC.md   protocol specification — normative protocol design
+impl/            Rust workspace — see "The workspace" above for the eight crates
+docs/            STATUS.md (maturity map) · SECURITY_CLAIMS.md (the claims ceiling)
+                 ROADMAP.md · RUNNING.md (local run) · design/ (decision records)
+scripts/         local-run helpers (install, relay up/down, end-to-end demo)
+KARST_SPEC.md    protocol specification — normative protocol design
 ```
 
 > `KARST_SPEC.md` is the normative protocol design and code must conform to it; [`docs/STATUS.md`](docs/STATUS.md) is authoritative on what is actually implemented, stubbed, or blocked so far. Where the spec describes a design the code has not reached yet, STATUS says so.
+
+## Where it runs
+
+| | Status |
+|---|---|
+| **Linux desktop** | Builds and runs — the platform every screenshot above was taken on. |
+| **Linux relay** | Builds and runs. A relay is one binary and one command. |
+| **CLI (`karst`)** | Builds and runs wherever the Rust toolchain does; not separately tested per OS. |
+| **Windows / macOS desktop** | Not tested. Tauri supports both and nothing in the code is Linux-specific by design, but nobody has run it there — treat it as unknown, not as supported. |
+| **Mobile** | Does not exist. Not started. |
+
+Testing on an untested platform is one of the most useful things a contributor
+can do right now, and it needs no cryptographic background.
+
+## How KARST differs from what you already use
+
+Not a claim to be better — a statement of what is actually different, so you can
+decide whether it is worth your time.
+
+- **vs Signal** — Signal is audited, mature, and has a mandatory central service
+  and a phone number. KARST is unaudited and pre-alpha, with no account server
+  and no phone number. If you need a secure messenger *today*, use Signal. KARST
+  is a research direction, not a replacement.
+- **vs Matrix** — Matrix federates between servers that hold accounts and
+  history. A KARST relay holds no accounts, is not a home for anyone, and any
+  client can walk away from it without losing an identity.
+- **vs SimpleX** — the closest in spirit: no user identifiers, queue-based
+  delivery. KARST differs mainly in identity handling (one recovery phrase
+  behind many disposable channels, rather than per-contact addresses) and in a
+  hybrid post-quantum key agreement. SimpleX is far more mature.
+- **vs Briar** — Briar is peer-to-peer and offline-first over Tor. KARST keeps a
+  relay as the primary path and treats direct P2P as an explicit opt-in, because
+  a direct connection tells the other side your address.
+
+## What is not built yet
+
+Short version; [`docs/STATUS.md`](docs/STATUS.md) is the authoritative one.
+
+- **No independent audit.** The single biggest caveat, repeated on purpose.
+- **No group messaging.** One-to-one and a broadcast feed only.
+- **No voice or video calls.** The buttons in the UI are placeholders.
+- **No mobile client.**
+- **Anonymous rate limiting is half-built** — the quota core is real, the
+  zero-knowledge membership circuit is stubbed, and the path returns
+  `RlnNotImplemented` rather than pretending.
+- **Metadata protection is partial.** A relay learns more than the end state
+  intends; the proxy-identity model is the direction of travel and STATUS says
+  exactly where it stands.
 
 ## How it's built
 

@@ -739,12 +739,23 @@ fn build_relays(store: &Store) -> Vec<Relay> {
             false,
         )
     };
+    // What each relay last said its own QUIC endpoints are (QUIC-12). A CACHE: an empty or absent
+    // entry simply means no QUIC path is built for that relay, which is the correct behaviour for
+    // one that does not offer it and the safe behaviour before the first refresh has run.
+    let quic: std::collections::HashMap<String, Vec<String>> =
+        store.load_quic_endpoints().unwrap_or_default().into_iter().collect();
+    let with_quic = |r: Relay| -> Relay {
+        match quic.get(&r.id.hex()) {
+            Some(eps) if !eps.is_empty() => r.with_quic(eps.clone()),
+            _ => r,
+        }
+    };
     let mut relays = Vec::new();
     if let Some(r) = parse_relay(&addr, &id, &socks, &routes, mixnet) {
-        relays.push(r);
+        relays.push(with_quic(r));
         for (a, i) in store.load_extra_relays().unwrap_or_default() {
             if let Some(r) = parse_relay(&a, &i, &socks, "", mixnet) {
-                relays.push(r);
+                relays.push(with_quic(r));
             }
         }
     }
@@ -936,6 +947,19 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
             report_backfill(b);
             if earned > 0 {
                 do_publish(&bstore, &brelays, false);
+            }
+            // Ask each relay what UDP endpoints it says it answers QUIC on, and cache the answer
+            // (QUIC-12). Off the UI thread and after the credential work, because it is a plain
+            // node-list round trip whose only consequence is which carriers the NEXT unlock races
+            // — never whether a message can be sent. A relay that is unreachable keeps whatever
+            // was cached; one that answers "none" has that recorded, which stops the client asking
+            // again every unlock.
+            let n = client::refresh_quic_endpoints(&bstore, &brelays);
+            if n > 0 {
+                eprintln!(
+                    "KARST: {n} relay(s) changed their QUIC endpoints — the new routes apply from \
+                     the next unlock"
+                );
             }
         });
     }

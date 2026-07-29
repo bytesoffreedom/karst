@@ -313,6 +313,15 @@ pub struct Relay {
     /// identical (SOCKS5 to that port); this only makes the carrier read as `mixnet` and keeps
     /// the failover ladder inside the mixnet. Set with [`Relay::with_mixnet`].
     mixnet: bool,
+    /// The configured extra routes, kept so the path list can be REBUILT when a QUIC endpoint is
+    /// learned later (`with_quic`). Without it that rebuild would silently drop the user's
+    /// alternates — and `build_paths` has to stay the one place that decides what a path list
+    /// contains, or the direct-path-only rule would need a second home.
+    routes: String,
+    /// UDP endpoints this relay declared for ITSELF (`RelayDescriptor::quic_addrs`), learned from
+    /// its own node-list entry rather than from anyone else's claim about it (CRYPTO-23). Empty
+    /// is both the normal state and the honest default.
+    quic_addrs: Vec<String>,
 }
 
 impl Relay {
@@ -341,8 +350,50 @@ impl Relay {
     ) -> Self {
         let addr = addr.into();
         let isolation = isolation_token();
-        let paths = build_paths(addr.clone(), proxy, routes, &isolation);
-        Relay { addr, id, proxy, paths, isolation, mixnet: false }
+        let quic_addrs = Vec::new();
+        let paths = build_paths(addr.clone(), proxy, routes, &isolation, &quic_addrs);
+        Relay {
+            addr,
+            id,
+            proxy,
+            paths,
+            isolation,
+            mixnet: false,
+            routes: routes.to_string(),
+            quic_addrs,
+        }
+    }
+
+    /// Add the UDP endpoints this relay declared for itself, so a QUIC path can be raced against
+    /// the others (QUIC-12).
+    ///
+    /// The endpoints come from the relay's OWN node-list entry, which it vouches for with the key
+    /// the Noise handshake just authenticated — not from a third party's claim about it
+    /// (CRYPTO-23). Passing rubbish here costs a connection attempt the race absorbs; it cannot
+    /// change who the relay is, because identity is still established by Noise against the pinned
+    /// relay-id on whichever carrier wins.
+    ///
+    /// **A proxied relay gets no QUIC path, whatever it advertised.** That is enforced in
+    /// `build_paths` rather than here, so it holds for every construction route and not only for
+    /// callers who remembered.
+    pub fn with_quic(mut self, endpoints: Vec<String>) -> Self {
+        self.quic_addrs = endpoints;
+        self.paths = build_paths(
+            self.addr.clone(),
+            self.proxy,
+            &self.routes,
+            &self.isolation,
+            &self.quic_addrs,
+        );
+        self
+    }
+
+    /// The carriers this relay currently has a path for, in the order they are tried.
+    ///
+    /// `carrier()` names the one that actually carried the last request; this names what is
+    /// AVAILABLE, which is a different question and the one a test about path construction asks.
+    pub fn carriers(&self) -> Vec<&'static str> {
+        self.paths.iter().map(|p| p.adapter.carrier_label()).collect()
     }
 
     /// Replace the route list — TEST SEAM (A4-10, #217).
@@ -481,12 +532,43 @@ fn build_paths(
     proxy: Option<SocketAddr>,
     routes: &str,
     isolation: &str,
+    quic_addrs: &[String],
 ) -> Vec<Path> {
     let intent = active_carrier(proxy);
     let host = std::env::var("KARST_WSS").ok().filter(|h| !h.is_empty());
     let adapter = carrier_adapter(proxy, isolation);
 
-    let mut paths = vec![Path::new(adapter.clone(), addr)];
+    let mut paths = Vec::new();
+
+    // QUIC first in the list, which is where the race also puts it — a head start on the carrier
+    // most likely to win, with the others running beside it rather than behind it (QUIC-4).
+    //
+    // **A RULE, NOT A SETTING: no QUIC when a proxy is configured.** Tor does not implement
+    // SOCKS5 `UDP ASSOCIATE`, so this could not work there anyway — but the reason it is a rule
+    // is the other one: QUIC's value is a long multiplexed connection, and pooling one re-clusters
+    // the handles that per-circuit isolation keeps apart, which is the linkage #206 removed
+    // (docs/design/quic-transport.md §1). There is deliberately no flag that turns this on.
+    if proxy.is_none() {
+        for a in quic_addrs {
+            match Dest::parse(a) {
+                // A name is refused by the QUIC adapter itself (resolving it here would leak the
+                // lookup), so only an address becomes a path. A relay that advertises a name for
+                // QUIC simply does not get a QUIC path.
+                Ok(dest) if dest.as_ip().is_some() => {
+                    // A UDP socket that will not bind is a local problem, not a reason to fail the
+                    // whole path list: say so and carry on with the carriers that do work.
+                    match karst_transport::quic::QuicAdapter::new() {
+                        Ok(a) => paths.push(Path::new(Arc::new(a), dest)),
+                        Err(e) => eprintln!("routes: no QUIC endpoint could be opened locally: {e}"),
+                    }
+                }
+                Ok(_) => eprintln!("routes: QUIC endpoint {a} is a name, not an address — skipped"),
+                Err(e) => eprintln!("routes: bad QUIC endpoint {a:?}: {e} — skipped"),
+            }
+        }
+    }
+
+    paths.push(Path::new(adapter.clone(), addr));
     // Same-carrier alternates need no allowlist check: they ARE the chosen carrier.
     let (specs, alts) = split_routes(routes);
     paths.extend(alts.into_iter().map(|dest| Path::new(adapter.clone(), dest)));
@@ -1079,6 +1161,58 @@ pub fn discover_relays(relay: &Relay) -> Result<Vec<node::protocol::RelayDescrip
         .transport()
         .get_node_list()
         .map_err(|e| format!("node-list fetch failed: {e}"))
+}
+
+/// Ask a relay which UDP endpoints IT says it answers QUIC on (QUIC-12).
+///
+/// Taken from the relay's OWN entry in the node-list it serves — the one descriptor it vouches
+/// for with the key the Noise handshake just authenticated. A third party's claim about it is not
+/// used, for the same reason `verified_self_address` refuses one (CRYPTO-23): a transparent proxy
+/// in front of an honest relay passes every check while inserting its own address.
+///
+/// Worth being clear about what this is NOT: an endpoint here is an availability hint with the
+/// standing of any address, not an identity claim. Whatever answers on it still has to complete
+/// `Noise_NK` against the pinned relay-id, exactly as on TCP — so a wrong endpoint costs a
+/// connection attempt the race absorbs, and can never cost a conversation with the wrong relay.
+///
+/// `Ok(vec![])` is the ordinary answer for a relay that does not offer QUIC, and is not an error.
+pub fn quic_endpoints(relay: &Relay) -> Result<Vec<String>, String> {
+    let list = relay
+        .transport()
+        .get_node_list()
+        .map_err(|e| format!("node-list fetch failed: {e}"))?;
+    let self_entry = list
+        .iter()
+        .find(|e| e.noise_pub == relay.id.noise_pub && e.fetch_pub == relay.id.fetch_pub);
+    Ok(self_entry.map(|e| e.quic_addrs.clone()).unwrap_or_default())
+}
+
+/// Refresh the cached QUIC endpoints for every relay in `relays`, and report what changed.
+///
+/// Best-effort by design: a relay that is unreachable right now keeps whatever was cached, and a
+/// relay that answers with an empty list has that recorded too — "I do not offer QUIC" is an
+/// answer, and caching it stops the client re-asking on every unlock.
+///
+/// Returns the number of relays whose answer DIFFERED from the cache, so a caller can decide
+/// whether the path lists are worth rebuilding.
+pub fn refresh_quic_endpoints(store: &Store, relays: &[Relay]) -> usize {
+    let mut changed = 0;
+    for r in relays {
+        let Ok(found) = quic_endpoints(r) else { continue };
+        let id = r.id.hex();
+        let cached = store
+            .load_quic_endpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, v)| v);
+        if cached.as_deref() != Some(found.as_slice())
+            && store.set_quic_endpoints(&id, &found).is_ok()
+        {
+            changed += 1;
+        }
+    }
+    changed
 }
 
 /// Dial a heard descriptor's address hint and return an address the relay declares for ITSELF.
@@ -4260,6 +4394,55 @@ mod tests {
         assert!(!is_i2p_host("relay.example.com"));
         assert!(!is_i2p_host("evil-i2p.com")); // ".i2p" must be the suffix, not a substring
         assert_eq!(Carrier::I2p.label(), "i2p");
+    }
+
+    /// **A proxied relay gets no QUIC path, whatever it advertised** (QUIC-12).
+    ///
+    /// A rule, not a setting. Tor implements no SOCKS5 `UDP ASSOCIATE`, so it could not work
+    /// there in any case — but the reason it is a rule is the other one: QUIC's value is one long
+    /// multiplexed connection, and pooling one re-clusters the handles per-circuit isolation keeps
+    /// apart. That is the linkage #206 removed, and it would come back through the transport.
+    ///
+    /// DISCRIMINATING: drop the `proxy.is_none()` guard in `build_paths` and this goes red.
+    #[test]
+    fn a_relay_reached_through_a_proxy_is_never_given_a_quic_path() {
+        let addr = Dest::parse("203.0.113.7:9000").unwrap();
+        let id = RelayId { noise_pub: [1; 32], fetch_pub: [2; 32] };
+        let quic = vec!["203.0.113.7:9000".to_string()];
+
+        let direct = Relay::configured(addr.clone(), id, None, "").with_quic(quic.clone());
+        assert!(
+            direct.paths.iter().any(|p| p.adapter.carrier_label() == "quic"),
+            "a DIRECT relay that advertises QUIC should get a QUIC path"
+        );
+
+        let socks: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let proxied = Relay::configured(addr, id, Some(socks), "").with_quic(quic);
+        assert!(
+            !proxied.paths.iter().any(|p| p.adapter.carrier_label() == "quic"),
+            "a relay reached through a proxy was given a QUIC path — Tor carries no UDP, and a \
+             pooled QUIC connection re-links the handles circuit isolation separates"
+        );
+    }
+
+    /// A QUIC endpoint given as a NAME becomes no path at all.
+    ///
+    /// The adapter refuses a name rather than resolving it — a local lookup would either fail or
+    /// leak the query to a DNS server the user never chose — so admitting one here would only
+    /// build a path guaranteed to fail. Better to not build it.
+    #[test]
+    fn a_quic_endpoint_that_is_a_name_is_not_turned_into_a_path() {
+        let r = Relay::configured(
+            Dest::parse("203.0.113.7:9000").unwrap(),
+            RelayId { noise_pub: [1; 32], fetch_pub: [2; 32] },
+            None,
+            "",
+        )
+        .with_quic(vec!["relay.example.net:9000".to_string()]);
+        assert!(
+            !r.paths.iter().any(|p| p.adapter.carrier_label() == "quic"),
+            "a name was accepted as a QUIC endpoint"
+        );
     }
 
     #[test]

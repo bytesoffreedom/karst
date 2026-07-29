@@ -2223,6 +2223,46 @@ impl Store {
         self.write_session_file(&state, opks)
     }
 
+    fn quic_endpoints_path(&self) -> PathBuf {
+        self.dir.join("quic_endpoints.dat")
+    }
+
+    /// UDP endpoints each relay declared for ITSELF, cached as `(relay_id_hex, endpoints)`.
+    ///
+    /// A CACHE, not configuration: it holds an availability hint the relay gave about itself, and
+    /// losing it costs one node-list round trip, never a message. Kept as its own sidecar so a
+    /// relay learning QUIC does not rewrite `NetSettings`, whose postcard-positional layout is a
+    /// bad place to grow a field, and so a stale entry can simply be dropped.
+    ///
+    /// It is worth being explicit about what a corrupted or hostile entry here could do: send the
+    /// client at a wrong UDP address. That costs a connection attempt the transport race absorbs.
+    /// It cannot reach a different relay, because identity is still `Noise_NK` against the pinned
+    /// relay-id over whichever carrier answers.
+    pub fn load_quic_endpoints(&self) -> io::Result<Vec<(String, Vec<String>)>> {
+        match std::fs::read(self.quic_endpoints_path()) {
+            Ok(blob) => Ok(self
+                .key
+                .open(&self.label(&self.quic_endpoints_path()), &blob)
+                .ok()
+                .and_then(|b| postcard::from_bytes(&b).ok())
+                .unwrap_or_default()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record what `relay_id_hex` says its QUIC endpoints are. An empty list is meaningful and is
+    /// stored: it is the relay saying "I do not offer QUIC", which should stop the client trying.
+    pub fn set_quic_endpoints(&self, relay_id_hex: &str, endpoints: &[String]) -> io::Result<()> {
+        let mut all = self.load_quic_endpoints()?;
+        match all.iter_mut().find(|(id, _)| id == relay_id_hex) {
+            Some((_, v)) => *v = endpoints.to_vec(),
+            None => all.push((relay_id_hex.to_string(), endpoints.to_vec())),
+        }
+        let plain = postcard::to_stdvec(&all).map_err(io_err)?;
+        self.write_sealed(&self.quic_endpoints_path(), &plain)
+    }
+
     fn extra_relays_path(&self) -> PathBuf {
         self.dir.join("extra_relays.dat")
     }

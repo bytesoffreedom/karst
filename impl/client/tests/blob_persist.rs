@@ -257,3 +257,51 @@ fn every_chunk_of_a_download_rides_one_connection() {
         quic.pooled()
     );
 }
+
+/// **A client learns a relay's QUIC endpoint from the relay itself** (QUIC-12).
+///
+/// End to end through the pieces that carry it: the relay advertises (QUIC-11), the client asks
+/// for the node list and reads the relay's OWN entry — never a third party's claim about it
+/// (CRYPTO-23) — and a direct relay turns that into a QUIC path it can race.
+#[test]
+fn a_client_learns_the_quic_endpoint_a_relay_declares_for_itself() {
+    let (noise_priv, noise_pub) = relay::server::generate_noise_keypair();
+    let mut node = RelayNode::new(NOW);
+    node.issue_capability(client::dev_capability());
+    let fetch_pub = node.relay_public().to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // What the binary does after its UDP bind succeeds: record the endpoint on its own descriptor.
+    let advertised = "203.0.113.9:9000".to_string();
+    let desc = node::protocol::RelayDescriptor {
+        noise_pub,
+        fetch_pub,
+        addrs: vec![addr.to_string()],
+        quic_addrs: vec![advertised.clone()],
+    };
+    node.add_relay(desc.clone());
+    node.set_self_descriptor(desc);
+
+    let server = relay::server::RelayServer::with_noise_keypair(
+        node,
+        Arc::new(move || NOW),
+        noise_priv,
+        noise_pub,
+    );
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+
+    let rid = client::RelayId { noise_pub, fetch_pub };
+    let r = client::Relay::new(addr, rid, None);
+    let found = client::quic_endpoints(&r).expect("the relay answered its node list");
+    assert_eq!(found, vec![advertised.clone()], "the client did not learn the declared endpoint");
+
+    // …and that endpoint becomes a path the race can pick up.
+    let with_quic = client::Relay::new(addr, rid, None).with_quic(found);
+    assert!(
+        with_quic.carriers().contains(&"quic"),
+        "the learned endpoint did not become a QUIC path"
+    );
+}

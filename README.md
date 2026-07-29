@@ -129,6 +129,7 @@ Each claim is hedged to match [`docs/STATUS.md`](docs/STATUS.md) — the authori
 | Transport — message-size hardening | length padding to fixed buckets + fixed-size fetches (queue depth hidden), inside the session | Real |
 | Transport — WebSocket-over-TLS carrier | Carries the encrypted KARST protocol over standards-compliant `wss://` (`rustls` + `tungstenite`), opt-in, needs a real cert; a transport encapsulation, not a security property. Does not guarantee traffic indistinguishability — IP, SNI, and behavioural characteristics may remain observable | Real · wired · SNI still cleartext |
 | Transport — external PT | SOCKS5 route to Tor / obfs4 | Wired |
+| Transport — QUIC | A relay advertises its UDP endpoint; a client learns it from the relay's own node-list entry and races that path against TCP/WSS. **Direct path only** — a relay reached through SOCKS never gets a QUIC path, enforced in path construction rather than by convention: Tor carries no UDP, and a pooled QUIC connection would re-cluster the handles circuit isolation keeps apart | Wired · direct path only |
 
 `docs/STATUS.md` also names the three **external walls** — an RLN zk-circuit, an audit of the threshold ring, and a Poseidon substitution — where the reference stops and production work would begin.
 

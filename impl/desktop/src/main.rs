@@ -948,6 +948,16 @@ fn enter(app: &App, vault: Vault, id: String, decoy: bool, offline: bool) -> Me 
     // success). Sweep them now, at unlock BEFORE any download starts, so an in-progress
     // partial is never touched. Any pending downloads left behind are re-driven by `poll`.
     let _ = store.sweep_orphan_files();
+    // Residue from a burn interrupted by a crash (#144). `burn_proxy` destroys the secret FIRST —
+    // the property that matters when the button is pressed under duress — so an interrupted burn
+    // leaves the identity correctly gone and its files, credentials and contact tags behind. This
+    // is where they are collected; unlock is the natural point because it is the one moment the
+    // registry is known good.
+    match store.sweep_orphaned_proxy_state() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("KARST: swept {n} leftover item(s) from an interrupted channel burn"),
+        Err(e) => eprintln!("warning: could not sweep burned-channel residue: {e}"),
+    }
     *app.session.lock().unwrap() = Some(Session { vault, id, relays, decoy });
     me
 }

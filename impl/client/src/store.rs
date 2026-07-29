@@ -2954,6 +2954,74 @@ impl Store {
         Ok(())
     }
 
+    /// Remove state belonging to proxy indices the registry no longer knows (#144).
+    ///
+    /// `burn_proxy` destroys the registry entry — the proxy's only secret — FIRST, and only then
+    /// removes its namespaced files, credentials and contact tags. That order is deliberate and
+    /// stays: burning is the action taken under duress, and the property that matters is that the
+    /// identity becomes unrecoverable as early as possible, not that the cleanup is tidy. A crash
+    /// mid-burn therefore leaves the identity correctly gone and the residue behind — a
+    /// `sessions.p7.dat` and an admission credential naming a channel that no longer exists.
+    ///
+    /// Reordering to fix that would trade the duress property for a housekeeping one, which is
+    /// the wrong trade. Sweeping at unlock keeps both: the burn is still secret-first and
+    /// irreversible, and the residue is collected the next time the vault opens.
+    ///
+    /// Returns how many stray items were removed. Errors on individual removals are reported and
+    /// skipped rather than aborting: a sweep that gives up halfway is worse than one that gets
+    /// most of the way.
+    pub fn sweep_orphaned_proxy_state(&self) -> io::Result<usize> {
+        let live: std::collections::HashSet<u32> =
+            self.try_load_proxies()?.into_iter().map(|p| p.index).collect();
+        let mut removed = 0usize;
+
+        // Namespaced network files: `<stem>.p<index>.<ext>` (see `net_file`).
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(idx) = name
+                    .split('.')
+                    .find_map(|part| part.strip_prefix('p').and_then(|n| n.parse::<u32>().ok()))
+                else {
+                    continue;
+                };
+                if live.contains(&idx) {
+                    continue;
+                }
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(e) => eprintln!("warning: could not sweep orphaned {name}: {e}"),
+                }
+            }
+        }
+
+        // Admission credentials keyed per slot — they live inside ONE file, so the sweep is a
+        // read-modify-write rather than an unlink (A8-4).
+        let mut caps = self.load_capabilities()?;
+        let before = caps.per_slot.len();
+        caps.per_slot.retain(|k, _| match k.rsplit_once(":p") {
+            Some((_, idx)) => idx.parse::<u32>().map(|i| live.contains(&i)).unwrap_or(true),
+            None => true, // the root slot, or a key shape we do not own
+        });
+        if caps.per_slot.len() != before {
+            removed += before - caps.per_slot.len();
+            self.store_capabilities(&caps)?;
+        }
+
+        // Contact tags pointing at a dead channel: harmless but they would keep a contact routed
+        // to nothing (indices are never reused, so it can never reattach to a newer identity).
+        let mut map = self.load_contact_proxy();
+        let before = map.len();
+        map.retain(|_, v| live.contains(v));
+        if map.len() != before {
+            removed += before - map.len();
+            let plain = postcard::to_stdvec(&map).map_err(io_err)?;
+            self.write_sealed(&self.contact_proxy_path(), &plain)?;
+        }
+        Ok(removed)
+    }
+
     /// The derived identity (seal ‖ account) for proxy `index` — derived from THAT PROXY'S OWN
     /// random secret in the registry, never from the seed/phrase (#207, A6-4). `Err` if `index`
     /// names no live entry (burned, or never created) OR if the registry itself cannot be
@@ -7056,5 +7124,57 @@ mod at_rest_shape_guard {
              If you did bump it: this is the regeneration step, not a failure.\n",
             crate::secretbox::STATE_VERSION
         );
+    }
+}
+
+#[cfg(test)]
+mod orphan_sweep_tests {
+    use super::*;
+
+    /// A burn interrupted after the registry write leaves the identity gone and its state behind;
+    /// the next unlock must collect it (#144).
+    ///
+    /// Simulated exactly the way a crash would leave it: write the proxy's files and credential,
+    /// then remove ONLY the registry entry — which is the first thing `burn_proxy` does and the
+    /// last thing a crash can interrupt before.
+    #[test]
+    fn an_interrupted_burn_leaves_residue_that_the_next_unlock_collects() {
+        let dir = std::env::temp_dir().join(format!(
+            "karst-orphan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        let e = s.create_proxy("doomed", 0).unwrap();
+        let keeper = s.create_proxy("keeper", 0).unwrap();
+        let victim = s.as_proxy(e.index);
+
+        let relay = crate::RelayId { noise_pub: [1u8; 32], fetch_pub: [2u8; 32] };
+        victim.save_capability_for(&relay, &crate::dev_capability()).unwrap();
+        s.as_proxy(keeper.index).save_capability_for(&relay, &crate::dev_capability()).unwrap();
+        victim.save_discovery(&[9u8; 32]).unwrap();
+        s.set_contact_proxy([7u8; 32], e.index).unwrap();
+        assert!(victim.net_file("discovery.key").exists(), "precondition: the file is there");
+
+        // The crash: registry entry gone, nothing else touched.
+        let mut reg = s.load_registry().unwrap();
+        reg.entries.retain(|p| p.index != e.index);
+        s.save_registry(&reg).unwrap();
+
+        let swept = s.sweep_orphaned_proxy_state().unwrap();
+        assert!(swept >= 3, "expected the file, the credential and the tag, swept {swept}");
+        assert!(!victim.net_file("discovery.key").exists(), "the burned channel's file survived");
+        assert!(
+            !victim.has_own_capability_for(&relay).unwrap(),
+            "the burned channel's admission credential survived"
+        );
+        assert!(s.contact_proxy(&[7u8; 32]).is_none(), "the tag still points at a dead channel");
+
+        // Surgical: the channel that is still alive keeps everything.
+        assert!(
+            s.as_proxy(keeper.index).has_own_capability_for(&relay).unwrap(),
+            "the sweep took a LIVE channel's credential with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -262,6 +262,12 @@ pub enum WireError {
     Io(io::Error),
     FrameTooLarge { len: usize, max: usize },
     Decode,
+    /// The peer speaks a different wire version (#144). Named rather than folded into `Decode`,
+    /// because "we disagree about the protocol" and "these bytes are malformed" call for
+    /// completely different responses from an operator.
+    ProtocolVersion { got: u16, want: u16 },
+    /// The peer set a feature bit this build does not implement. Refused, not ignored.
+    UnknownFeatureBits(u32),
 }
 
 impl std::fmt::Display for WireError {
@@ -272,6 +278,12 @@ impl std::fmt::Display for WireError {
                 write!(f, "frame too large: {len} > {max}")
             }
             WireError::Decode => write!(f, "decode failed"),
+            WireError::ProtocolVersion { got, want } => {
+                write!(f, "peer speaks wire protocol v{got}, this build speaks v{want}")
+            }
+            WireError::UnknownFeatureBits(b) => {
+                write!(f, "peer requested unimplemented wire features (bits {b:#x})")
+            }
         }
     }
 }
@@ -284,15 +296,52 @@ impl From<io::Error> for WireError {
     }
 }
 
+/// The protocol version this build speaks. Bump on ANY change to the MEANING of the wire — a
+/// renamed variant, a reordered field, a changed unit.
+///
+/// It exists because postcard is positional and carries no self-description: without a version,
+/// two builds that disagree about a shape decode each other's bytes into plausible nonsense and
+/// fail somewhere far from the cause. With it, the mismatch names itself at the first frame.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// What actually goes on the wire: a version, a feature word, and the encoded request/response.
+///
+/// **No `message_type` field, deliberately.** The payload is already a tagged enum
+/// (`WireRequest`/`WireResponse`), so a type field would restate the tag — and two places saying
+/// the same thing are two places that can disagree, the interesting case being an attacker who
+/// picks the disagreement. The tag inside the payload stays the single source.
+///
+/// `feature_bits` is reserved and MUST be zero; unknown bits are refused (see `decode`).
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    protocol_version: u16,
+    feature_bits: u32,
+    payload: Vec<u8>,
+}
+
 /// postcard-сериализация без кадрирования (длину/bounded держит слой сессии
 /// поверх Noise). Используется, когда байты уходят в зашифрованный сеанс.
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, WireError> {
-    postcard::to_stdvec(msg).map_err(|_| WireError::Decode)
+    let payload = postcard::to_stdvec(msg).map_err(|_| WireError::Decode)?;
+    postcard::to_stdvec(&Envelope { protocol_version: PROTOCOL_VERSION, feature_bits: 0, payload })
+        .map_err(|_| WireError::Decode)
 }
 
-/// postcard-десериализация.
+/// postcard-десериализация — through the versioned envelope (#144).
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
-    postcard::from_bytes(bytes).map_err(|_| WireError::Decode)
+    let env: Envelope = postcard::from_bytes(bytes).map_err(|_| WireError::Decode)?;
+    if env.protocol_version != PROTOCOL_VERSION {
+        return Err(WireError::ProtocolVersion { got: env.protocol_version, want: PROTOCOL_VERSION });
+    }
+    // Fail CLOSED on bits we do not understand. A peer setting one is asking for behaviour this
+    // build does not implement, and the safe answer to "please also do X" for an unknown X is to
+    // refuse rather than proceed pretending X was honoured. That is what makes the field usable
+    // from the first release instead of decorative: the day a bit means something, an older build
+    // SAYS so rather than silently ignoring it.
+    if env.feature_bits != 0 {
+        return Err(WireError::UnknownFeatureBits(env.feature_bits));
+    }
+    postcard::from_bytes(&env.payload).map_err(|_| WireError::Decode)
 }
 
 /// Записать один кадр: `u32` LE длина + postcard-тело. Отказ, если тело больше

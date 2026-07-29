@@ -75,6 +75,14 @@ impl QuicAdapter {
         transport.max_idle_timeout(Some(
             READ_TIMEOUT.try_into().map_err(|_| io::Error::other("idle timeout out of range"))?,
         ));
+        // QUIC-6: connection MIGRATION is refused, and it is refused BY THE RELAY
+        // (`relay::quic_server`), not here. Whether a session may follow a client to a new address
+        // is the receiver's decision, and putting it there means the property does not depend on
+        // every client being well-behaved.
+        //
+        // Nothing to migrate on this side yet in any case: without connection pooling (QUIC-5) a
+        // connection carries one request and is gone. When pooling lands, a pooled connection must
+        // be DROPPED on a local network change rather than carried across it.
         client.transport_config(Arc::new(transport));
 
         let mut endpoint = quinn::Endpoint::client("[::]:0".parse().expect("valid bind address"))?;

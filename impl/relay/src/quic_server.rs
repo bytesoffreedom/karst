@@ -108,7 +108,22 @@ impl QuicServer {
             u32::try_from(MAX_UNADMITTED_STREAMS_PER_CONN * 4).expect("small").into(),
         );
         transport.max_concurrent_uni_streams(0u32.into()); // nothing here uses unidirectional streams
+        // QUIC-6: a session does NOT follow a client to a new address. QUIC can carry one across a
+        // Wi-Fi → LTE switch or a NAT remap, which is genuinely useful on mobile — and which tells
+        // this relay that the old address and the new address are the same client. The RFC warns
+        // about exactly that linkage. For a messenger built on disposable channels it is a gift to
+        // whoever is watching the relay, so the private posture is the DEFAULT: a network change
+        // ends the session, and the client starts a new one with a new pseudonym and a new route.
+        //
+        // Refused here rather than declined by the client on purpose. Whether a session may move
+        // is the receiver's decision; enforcing it at the endpoint that would do the correlating
+        // means the property does not rest on every client behaving well.
+        //
+        // Turning it on later is a deliberate choice with a stated cost — the same shape as the
+        // rule that direct P2P is opt-in and never an automatic "safe" fallback.
+        transport.allow_spin(false); // no spin bit: an observable RTT signal nobody here needs
         cfg.transport_config(Arc::new(transport));
+        cfg.migration(false);
 
         let endpoint = quinn::Endpoint::server(cfg, addr)?;
         Ok(QuicServer { endpoint, relay, clock, noise_private, runtime })

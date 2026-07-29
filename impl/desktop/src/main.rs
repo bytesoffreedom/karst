@@ -4816,3 +4816,136 @@ mod tests {
         );
     }
 }
+
+/// The lock hierarchy of the Tauri backend, enforced by reading the source (#146).
+///
+/// The backend holds one global `App` with eight independent mutexes. Nothing stops two of them
+/// being taken in one order here and the opposite order there, and the day that happens the app
+/// deadlocks — on a user action, in the field, with no error and no log line. It is the classic
+/// failure of shared-state UI backends, and review is a poor defence because the two halves are
+/// usually added months and files apart.
+///
+/// So the acquisition graph is extracted from the source and checked to be ACYCLIC. As of this
+/// commit it has exactly two edges — `container → session` (unlocking clears the session under the
+/// container guard) and `transfers → in_flight` (`reset_transient` cancels transfers then clears
+/// the in-flight set) — and no cycle, so the current code cannot deadlock on these locks. What the
+/// test buys is the future: adding `session → container` anywhere turns it RED with the pair
+/// named, instead of shipping a deadlock.
+///
+/// **Read honestly.** This parses Rust with regexes, so it knows about `let`-bound guards and
+/// temporaries taken in a statement, tracked by brace depth — and it does NOT know about a guard
+/// moved into a closure, passed to a function, or stored in a struct. It is a cheap guard against
+/// the common shape, not a proof. The expensive, complete answer is the service decomposition this
+/// task also describes: state owned by one actor cannot be locked out of order because there is
+/// nothing to order.
+#[cfg(test)]
+mod lock_order_guard {
+    /// Every independently-lockable field of `App`.
+    const LOCKS: &[&str] = &[
+        "session",
+        "reasm",
+        "in_flight",
+        "pending_sends",
+        "hidden",
+        "container",
+        "posts_reply",
+        "transfers",
+    ];
+
+    /// `(outer, inner)` pairs this file is KNOWN to take, in this order. A new pair is not a
+    /// failure by itself — it is a prompt to check the direction against this list before adding
+    /// it here.
+    const KNOWN: &[(&str, &str)] = &[("container", "session"), ("transfers", "in_flight")];
+
+    /// Extract `(outer, inner)` for every place a lock is taken while another is still held.
+    fn acquisition_pairs() -> Vec<(String, String)> {
+        let src = include_str!("main.rs");
+        let mut held: Vec<(&str, i64)> = Vec::new();
+        let mut depth: i64 = 0;
+        let mut pairs: std::collections::BTreeSet<(String, String)> = Default::default();
+        for line in src.lines() {
+            // A comment line mentioning `.session.lock()` is prose, not an acquisition.
+            let code = line.split("//").next().unwrap_or("");
+            for f in LOCKS {
+                if code.contains(&format!(".{f}.lock()")) {
+                    for (h, _) in &held {
+                        if h != f {
+                            pairs.insert(((*h).to_string(), (*f).to_string()));
+                        }
+                    }
+                }
+            }
+            // A guard that OUTLIVES its statement is one bound with `let`; anything else is a
+            // temporary, held only for the statement — which the pass above already accounted for.
+            let bound: Vec<&str> = LOCKS
+                .iter()
+                .filter(|f| {
+                    let pat = format!(".{f}.lock()");
+                    code.trim_start().starts_with("let ") && code.contains(&pat)
+                })
+                .copied()
+                .collect();
+            depth += code.matches('{').count() as i64 - code.matches('}').count() as i64;
+            held.retain(|(_, d)| *d <= depth);
+            for f in bound {
+                held.push((f, depth));
+            }
+        }
+        pairs.into_iter().collect()
+    }
+
+    #[test]
+    fn the_backend_locks_form_a_hierarchy_with_no_cycle() {
+        let pairs = acquisition_pairs();
+        let mut edges: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for (a, b) in &pairs {
+            edges.entry(a.as_str()).or_default().push(b.as_str());
+        }
+        fn walk<'a>(
+            n: &'a str,
+            stack: &mut Vec<&'a str>,
+            edges: &std::collections::BTreeMap<&'a str, Vec<&'a str>>,
+        ) -> Option<Vec<String>> {
+            for m in edges.get(n).into_iter().flatten() {
+                if let Some(i) = stack.iter().position(|s| s == m) {
+                    let mut c: Vec<String> = stack[i..].iter().map(|s| s.to_string()).collect();
+                    c.push((*m).to_string());
+                    return Some(c);
+                }
+                stack.push(m);
+                if let Some(c) = walk(m, stack, edges) {
+                    return Some(c);
+                }
+                stack.pop();
+            }
+            None
+        }
+        for start in edges.keys() {
+            let mut stack = vec![*start];
+            if let Some(cycle) = walk(start, &mut stack, &edges) {
+                panic!(
+                    "\n\nLOCK ORDER CYCLE: {}\n\
+                     Two of the backend's mutexes are taken in opposite orders on different paths, \
+                     which deadlocks the app the moment both run at once — no error, no log line.\n\
+                     Pick one order and make both sites follow it.\n",
+                    cycle.join(" -> ")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_lock_pairing_has_to_be_declared() {
+        let pairs = acquisition_pairs();
+        let known: std::collections::BTreeSet<(String, String)> =
+            KNOWN.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let found: std::collections::BTreeSet<(String, String)> = pairs.into_iter().collect();
+        assert_eq!(
+            found, known,
+            "\n\nThe set of nested lock acquisitions changed.\n\
+             Check the DIRECTION of each new pair against the rest before adding it to `KNOWN` — \
+             the acyclicity test above only catches the cycle once BOTH directions exist, and by \
+             then the deadlock is already shipped in one of them.\n"
+        );
+    }
+}

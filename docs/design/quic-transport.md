@@ -164,9 +164,29 @@ nothing.
 
 **So: kept, deliberately and not provisionally.** Not "kept until an audit says
 otherwise" — kept because the replacement does not exist and would cost more
-than the thing it replaces. If it is ever revisited, the gate is those two
-things — a signed identity in the descriptor, and one answer to relay identity
-that holds on every carrier.
+than the thing it replaces.
+
+**And enforced, not remembered.** `transport/src/identity_guard.rs` fails the
+build if any carrier starts establishing relay identity for itself — running the
+handshake, pinning a certificate, comparing a fingerprint — or if the QUIC
+certificate verifier stops being the deliberate no-op its name advertises. The
+risk this guards is not a deliberate reversal after reading this file; it is a
+second mechanism appearing quietly because, on the one carrier somebody is
+working on, it looks like an obvious improvement. Then the carrier that wins the
+race (§8) decides how the relay was authenticated, the weaker mechanism becomes
+the security level, and an attacker picks which one you use by making the other
+path fail.
+
+The guard's failure message carries the three conditions a reversal needs — a
+signed identity in the descriptor, one answer that holds on every carrier, and a
+reproducible cost figure — so whoever tries meets them at the moment they are
+useful rather than in a document they did not know to open.
+
+Note what is NOT prohibited: the `wss` carrier verifies its TLS certificate
+against the webpki roots. That authenticates a hostname so the tunnel is a
+well-formed `wss://` connection — encapsulation, with the relay still
+authenticated by Noise inside it. The rule is about identity, not about whether a
+carrier may use TLS.
 
 ### Why this fits the existing abstraction cheaply
 

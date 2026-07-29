@@ -9,6 +9,12 @@
 //! adapter drop in without a single change above the adapter seam — and putting it behind a crate
 //! boundary is what keeps it true.
 
+// Enforces the one-identity-mechanism rule the carriers all rest on (QUIC-9, #245).
+// Test-only: it reads this crate's own source and asserts a property, so it compiles away
+// entirely in a release build.
+#[cfg(test)]
+mod identity_guard;
+
 pub mod quic;
 pub mod socket;
 pub mod transport;

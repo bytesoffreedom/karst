@@ -33,6 +33,27 @@ pub struct ContactRecord {
     pub verified: bool,
 }
 
+/// An invite this identity minted and has not retired: the discovery secret that owns its row at
+/// the relay, plus when it was made and when the row lapses on its own. `secret` authorises
+/// rewriting/deleting exactly that one discovery row — nothing decrypts with it (see the invite
+/// section on `Store`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteRecord {
+    pub secret: [u8; 32],
+    pub created_at: u64,
+    pub expiry: u64,
+}
+
+/// Where a contact said they are reachable: the relay descriptor that rode INSIDE the contact
+/// code's IK-signed binding, plus when we resolved it. Provenance is the point — this descriptor
+/// is signed by the contact's own identity key, unlike a gossiped node-list hint (CRYPTO-23),
+/// which is why it is adoptable as a route for THAT contact and a hint is not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactEndpoint {
+    pub relay: node::node::RelayDescriptor,
+    pub discovered_at: u64,
+}
+
 /// SELF-DECLARED profile. Own profile lives in `profile.dat`; contacts' profiles in
 /// the `peer_profiles.dat` sidecar (keyed by IK). NOT identity: the trust anchor is
 /// the safety number + the local label/`verified` in `ContactRecord`; a received
@@ -1571,6 +1592,80 @@ impl Store {
         }
     }
 
+    // ----- Invite codes (one discovery row each), encrypted at-rest -----
+    //
+    // An invite is a SECOND discovery row published under its own fresh random secret, so it
+    // neither touches nor rotates the persistent contact code. That secret used to be thrown away
+    // at mint time, which left the RELAY as the only party able to retire the row — and the relay
+    // learns only that someone read it, never whether the invitee actually finished adding you
+    // (A10-4). Keeping the secret moves the retire decision to the party that can know.
+    //
+    // What the secret authorises is exactly one thing: rewriting or deleting THAT discovery row
+    // (`discovery::write_msg` / `delete_msg` are signed with it). It decrypts nothing, it is not
+    // an identity key, and it cannot be used to publish a row pointing at a different IK — the
+    // relay checks the IK's own signature over the binding.
+
+    fn invites_path(&self) -> PathBuf {
+        self.net_file("invites.dat")
+    }
+
+    /// How many outstanding invites one identity may hold. Each is a discovery row at the relay
+    /// (bounded there by `MAX_BUNDLES`), so the cap keeps a stuck "mint invite" loop from filling
+    /// the relay's discovery map — and keeps this file small.
+    pub const MAX_INVITES: usize = 32;
+
+    /// Every outstanding invite, oldest first. Absent file = none. An UNREADABLE file is an error,
+    /// not "none": treating it as empty would silently drop the only keys that can revoke rows
+    /// still published under this identity (same rule as `capabilities.dat`).
+    pub fn load_invites(&self) -> io::Result<Vec<InviteRecord>> {
+        match std::fs::read(self.invites_path()) {
+            Ok(blob) => {
+                let plain = self.key.open(&self.label(&self.invites_path()), &blob).map_err(|e| {
+                    io_err(format!(
+                        "invite list unreadable ({e}) — refusing to treat it as empty; those \
+                         invites would stay published with nothing able to revoke them"
+                    ))
+                })?;
+                postcard::from_bytes(&plain).map_err(io_err)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn save_invites(&self, invites: &[InviteRecord]) -> io::Result<()> {
+        let plain = postcard::to_stdvec(invites).map_err(io_err)?;
+        self.write_sealed(&self.invites_path(), &plain)
+    }
+
+    /// Record a freshly minted invite. Expired entries are dropped first (their rows are gone at
+    /// the relay too), so the cap counts only invites that can still resolve.
+    pub fn add_invite(&self, invite: InviteRecord, now: u64) -> io::Result<()> {
+        let mut all = self.load_invites()?;
+        all.retain(|i| i.expiry > now);
+        if all.len() >= Self::MAX_INVITES {
+            return Err(io_err(format!(
+                "already holding {} outstanding invites — revoke one (or let it expire) first",
+                Self::MAX_INVITES
+            )));
+        }
+        all.push(invite);
+        self.save_invites(&all)
+    }
+
+    /// Forget the invite with this secret (after its row is gone at the relay). Returns whether
+    /// one was held.
+    pub fn remove_invite(&self, secret: &[u8; 32]) -> io::Result<bool> {
+        let mut all = self.load_invites()?;
+        let before = all.len();
+        all.retain(|i| &i.secret != secret);
+        if all.len() == before {
+            return Ok(false);
+        }
+        self.save_invites(&all)?;
+        Ok(true)
+    }
+
     // ----- Контакты (имена + флаг сверки), шифрованы at-rest -----
 
     fn contacts_path(&self) -> PathBuf {
@@ -2852,6 +2947,15 @@ impl Store {
             let plain = postcard::to_stdvec(&profiles).map_err(io_err)?;
             self.write_sealed(&self.peer_profiles_path(), &plain)?;
         }
+        // Carry their known relay across too: a migration changes which KEY reaches them, not
+        // which relay they sit on, and dropping the route here would quietly send the next message
+        // to the primary relay instead of theirs.
+        let mut routes = self.load_contact_endpoints();
+        if let Some(ep) = routes.remove(&old) {
+            routes.insert(new, ep);
+            let plain = postcard::to_stdvec(&routes).map_err(io_err)?;
+            self.write_sealed(&self.contact_relays_path(), &plain)?;
+        }
         Ok(true)
     }
 
@@ -2896,6 +3000,68 @@ impl Store {
         map.insert(ik, index);
         let plain = postcard::to_stdvec(&map).map_err(io_err)?;
         self.write_sealed(&self.contact_proxy_path(), &plain)
+    }
+
+    // ----- Where a contact is reachable (their signed relay descriptor), encrypted at-rest -----
+    //
+    // A contact code resolves to IK **and** a `location` — the relay the contact says they are on
+    // — and that half used to be dropped on the floor at the point of adding them (A10-6). The
+    // contact model had nowhere to put a route, so discovery could carry one and the application
+    // could not use it. This sidecar is that place: it is keyed by IK like `contact_proxy.dat`,
+    // and it holds the descriptor exactly as the contact's own IK signed it.
+
+    fn contact_relays_path(&self) -> PathBuf {
+        self.dir.join("contact_relays.dat")
+    }
+
+    /// Map of contact IK → where their contact code said they are. Same rule as the proxy map: an
+    /// unreadable file warns rather than silently reading as "no routes known".
+    fn load_contact_endpoints(&self) -> BTreeMap<[u8; 32], ContactEndpoint> {
+        match std::fs::read(self.contact_relays_path()) {
+            Ok(b) => self
+                .key
+                .open(&self.label(&self.contact_relays_path()), &b)
+                .map_err(|e| format!("fails authentication: {e}"))
+                .and_then(|plain| postcard::from_bytes(&plain).map_err(|e| format!("malformed: {e}")))
+                .unwrap_or_else(|e| {
+                    eprintln!("warning: contact→relay map unreadable ({e}) — not assuming empty");
+                    BTreeMap::new()
+                }),
+            Err(_) => BTreeMap::new(),
+        }
+    }
+
+    /// Where this contact's code said they are reachable, if we ever resolved one.
+    pub fn contact_endpoint(&self, ik: &[u8; 32]) -> Option<ContactEndpoint> {
+        self.load_contact_endpoints().get(ik).cloned()
+    }
+
+    /// Remember where a contact's code said they are. Overwrite is intended: resolving a newer
+    /// code for the same person is how a MOVED contact's route gets corrected. Bounded by
+    /// `MAX_CONTACTS` like the proxy map — past the cap the route is simply not remembered
+    /// (routing falls back to the primary relay), never a failed add.
+    pub fn set_contact_endpoint(&self, ik: [u8; 32], ep: &ContactEndpoint) -> io::Result<()> {
+        let mut map = self.load_contact_endpoints();
+        if map.get(&ik).map(|e| &e.relay) == Some(&ep.relay) {
+            return Ok(()); // same route — do not rewrite the file just to move `discovered_at`
+        }
+        if !map.contains_key(&ik) && map.len() >= MAX_CONTACTS {
+            eprintln!("warning: contact→relay map at cap ({MAX_CONTACTS}) — not recording a new route");
+            return Ok(());
+        }
+        map.insert(ik, ep.clone());
+        let plain = postcard::to_stdvec(&map).map_err(io_err)?;
+        self.write_sealed(&self.contact_relays_path(), &plain)
+    }
+
+    /// Forget where a contact was reachable (removing them from the roster). Idempotent.
+    pub fn remove_contact_endpoint(&self, ik: &[u8; 32]) -> io::Result<()> {
+        let mut map = self.load_contact_endpoints();
+        if map.remove(ik).is_none() {
+            return Ok(());
+        }
+        let plain = postcard::to_stdvec(&map).map_err(io_err)?;
+        self.write_sealed(&self.contact_relays_path(), &plain)
     }
 
     /// Shared atomic blob write (temp 0600 -> fsync -> rename). The sole writer is

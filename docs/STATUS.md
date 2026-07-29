@@ -17,6 +17,55 @@ publications/stories, the session simultaneous-first-contact fix, duress Tier 1,
 
 Newest batch first (all in `impl/client` + `impl/node` + `impl/desktop`, tests green):
 
+- **An invite is retired by its owner, not burned on read (A10-4).** A one-time invite used to be
+  published `single_use`, so the relay deleted the discovery row inside the FIRST lookup. The relay
+  is the one party that cannot know whether the invitee finished adding the contact, so anything
+  between the lookup and the local commit destroyed the invite for good: a lost response, a crash, a
+  failed `save_contacts`, a retry after an ambiguous network error — or a stranger who has the code
+  resolving it first, which is a one-request denial of someone else's invite. An invite is now an
+  ordinary short-lived row (`INVITE_TTL_SECS` = 2 days, down from 7), so resolving it is idempotent
+  BY CONSTRUCTION — there is no state at the relay for a retry to consume — and its discovery secret,
+  previously thrown away at mint time, is kept in `invites.dat` so the person who can actually tell
+  the invite did its job can retire it (`karst discovery invite | invites | revoke`, and a
+  per-invite **Revoke** in the desktop). That secret authorises exactly one thing: rewriting or
+  deleting that one discovery row. **The trade, stated plainly:** a captured code now resolves until
+  it is revoked or lapses, instead of until its first read. Burn-on-read was never a guarantee (the
+  relay is not trusted and a hostile one could always re-serve a consumed row), so this trades a
+  best-effort property for a real reliability one — the code→IK binding stays IK-signed either way,
+  so an invite can never resolve to a *different* identity, only to this one for longer. **Residual,
+  relay-side:** the strictly better answer is a two-phase redeem (lookup returns a signed reservation
+  ticket; a separate idempotent `RedeemInvite` retires the row), which needs a wire change and is
+  therefore not attempted here. Pinned by `an_invite_still_resolves_after_it_has_been_read` (RED
+  under `single_use: true`) and `revoking_an_invite_retires_it_and_leaves_the_others_alone` (RED with
+  the secret unpersisted).
+- **Contact codes resolve across the relay set, and the relay they name is kept (A10-6).** The
+  finding is two claims and they are NOT equally live, so take them apart.
+  **The live bug** was that resolving a code only ever asked `relays[0]`: a contact whose home relay
+  is one of your BACKUPS came back "no one is published under that code" while you were connected to
+  the very relay holding the row. `find_contact_multi` now asks the whole set, reports "unknown code"
+  when a relay actually answered without it (a second relay being down must not turn that into a
+  network error), and decodes the code once instead of per relay.
+  **The other half is an accurate finding that today's code cannot yet reach.** The signed record
+  carries a `location` and `add_by_code` dropped it (`let (ik, _loc)`) — but our publisher always
+  signs the relay it is publishing to (`discovery_publish`), so a record's location and the relay
+  serving it coincide, and nothing was lost in practice. What was missing is a PLACE to put a route:
+  the record format can point at a relay other than its host, and the contact model had nowhere to
+  hold that. It does now (`contact_relays.dat`, `Store::contact_endpoint`), and `relays_for_contact`
+  puts that relay first when reaching them (used by the desktop's send/file/profile/subscribe paths).
+  Treat this half as the prerequisite it is, not as a repair.
+  The preference fires only for a relay we already hold AND hold a credential for — `send_session`
+  hard-fails without one, so an unconditional preference would turn working sends into failures, and
+  adopting a relay a peer named stays a deliberate user action (auto-earning admission on discovery
+  remains a non-goal). Provenance is what makes it adoptable at all: the descriptor is signed by the
+  contact's own IK, unlike the gossiped hints CRYPTO-23 refuses to store. The local commit also moved
+  into one place (`client::add_contact_by_code`) that propagates every step's error instead of the
+  desktop's four calls, two of them `let _ = …`. Pinned end to end by
+  `a_contact_code_routes_the_message_to_the_relay_it_named` (Bob published only on Alice's backup
+  relay; RED both ways — unfindable with a primary-only lookup, misrouted with the location dropped)
+  and `a_relay_we_hold_no_credential_for_is_not_preferred`; the sidecar's coverage is JOINT with the
+  multi-relay lookup, since a record whose location differs from its host cannot be produced by this
+  client. **Honest limit:** a stored route is a snapshot of what their code said — a contact who
+  later moves relays is reached at the old one until they hand out a fresh code.
 - **Session — simultaneous first contact fixed.** Two peers who each PQXDH-initiated before either
   received used to split (invisible messages, orphaned image chunks, OOM). Now both halves are held
   per peer (outbound in `sessions`, the peer's responder in `inbound_sessions`), re-delivered openers

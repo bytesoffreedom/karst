@@ -3035,27 +3035,27 @@
     "ja": "更新",
     "id": "Ganti"
   },
-  "One-time invite": {
-    "en": "One-time invite",
-    "ru": "Одноразовое приглашение",
-    "es": "Invitación de un solo uso",
-    "pt": "Convite de uso único",
-    "de": "Einmal-Einladung",
-    "fr": "Invitation à usage unique",
-    "zh": "一次性邀请",
-    "ja": "使い捨て招待",
-    "id": "Undangan sekali pakai"
+  "Invite code": {
+    "en": "Invite code",
+    "ru": "Код-приглашение",
+    "es": "Código de invitación",
+    "pt": "Código de convite",
+    "de": "Einladungscode",
+    "fr": "Code d'invitation",
+    "zh": "邀请码",
+    "ja": "招待コード",
+    "id": "Kode undangan"
   },
-  "A code that works for exactly one person, then burns. Best for adding one contact privately.": {
-    "en": "A code that works for exactly one person, then burns. Best for adding one contact privately.",
-    "ru": "Код, который сработает ровно у одного человека, а потом сгорит. Лучший способ приватно добавить один контакт.",
-    "es": "Un código que funciona para exactamente una persona y luego se quema. Ideal para añadir un contacto en privado.",
-    "pt": "Um código que funciona para exatamente uma pessoa e depois se apaga. Ideal para adicionar um contato em privado.",
-    "de": "Ein Code, der für genau eine Person funktioniert und dann verfällt. Ideal, um einen Kontakt privat hinzuzufügen.",
-    "fr": "Un code qui fonctionne pour une seule personne, puis disparaît. Idéal pour ajouter un contact en privé.",
-    "zh": "仅对一个人有效、用后即毁的代码。最适合私下添加一个联系人。",
-    "ja": "ちょうど一人にだけ有効で、その後消える使い捨てコード。連絡先を1人プライベートに追加するのに最適。",
-    "id": "Kode yang berfungsi untuk tepat satu orang, lalu hangus. Terbaik untuk menambah satu kontak secara privat."
+  "A separate code to hand to one person. It lapses in 2 days, and you can revoke it the moment they have added you.": {
+    "en": "A separate code to hand to one person. It lapses in 2 days, and you can revoke it the moment they have added you.",
+    "ru": "Отдельный код для одного человека. Он истекает через 2 дня, и его можно отозвать сразу, как только вас добавили.",
+    "es": "Un código aparte para entregar a una sola persona. Caduca en 2 días y puedes revocarlo en cuanto te hayan añadido.",
+    "pt": "Um código separado para entregar a uma pessoa. Expira em 2 dias e você pode revogá-lo assim que ela te adicionar.",
+    "de": "Ein eigener Code für genau eine Person. Er läuft nach 2 Tagen ab, und du kannst ihn widerrufen, sobald sie dich hinzugefügt hat.",
+    "fr": "Un code distinct à donner à une seule personne. Il expire au bout de 2 jours et vous pouvez le révoquer dès qu'elle vous a ajouté.",
+    "zh": "给一个人的独立邀请码。2 天后失效，对方添加你之后即可随时撤销。",
+    "ja": "一人に渡すための別個のコード。2 日で失効し、相手が追加し終えたらすぐ取り消せます。",
+    "id": "Kode terpisah untuk diberikan kepada satu orang. Kedaluwarsa dalam 2 hari, dan bisa kamu cabut begitu mereka menambahkanmu."
   },
   "Create": {
     "en": "Create",
@@ -3068,16 +3068,16 @@
     "ja": "作成",
     "id": "Buat"
   },
-  "Single-use is enforced by the relay (best-effort) — it can never resolve to another identity.": {
-    "en": "Single-use is enforced by the relay (best-effort) — it can never resolve to another identity.",
-    "ru": "Одноразовость обеспечивает реле (best-effort) — но подменить личность код никогда не сможет.",
-    "es": "El uso único lo aplica el relé (best-effort), pero nunca puede resolver a otra identidad.",
-    "pt": "O uso único é aplicado pelo relé (best-effort), mas nunca pode resolver para outra identidade.",
-    "de": "Einmaligkeit erzwingt das Relay (best-effort) — es kann aber nie zu einer anderen Identität auflösen.",
-    "fr": "L'usage unique est appliqué par le relais (best-effort) — mais il ne peut jamais mener à une autre identité.",
-    "zh": "一次性由中继尽力保证，但绝不会解析到其他身份。",
-    "ja": "使い捨てはリレーがベストエフォートで担保します。ただし別の身元に解決されることは決してありません。",
-    "id": "Sekali pakai dijaga oleh relai (best-effort) — tetapi tidak akan pernah mengarah ke identitas lain."
+  "Looking it up does NOT consume it, so the person you gave it to can retry if something failed — revoke it once they are added. It can never resolve to another identity.": {
+    "en": "Looking it up does NOT consume it, so the person you gave it to can retry if something failed — revoke it once they are added. It can never resolve to another identity.",
+    "ru": "Просмотр кода НЕ расходует его: тот, кому вы его дали, может повторить попытку, если что-то не удалось — отзовите код, когда вас добавят. Он никогда не приведёт к другой личности.",
+    "es": "Consultarlo NO lo consume: la persona a la que se lo diste puede reintentarlo si algo falló; revócalo cuando ya te haya añadido. Nunca puede resolverse a otra identidad.",
+    "pt": "Consultá-lo NÃO o consome: quem o recebeu pode tentar de novo se algo falhar — revogue-o assim que te adicionar. Ele nunca resolve para outra identidade.",
+    "de": "Ein Abruf verbraucht ihn NICHT: Wer ihn hat, kann es erneut versuchen, wenn etwas fehlschlug — widerrufe ihn, sobald du hinzugefügt wurdest. Er kann nie auf eine andere Identität zeigen.",
+    "fr": "Le consulter ne le consomme PAS : la personne à qui vous l'avez donné peut réessayer si quelque chose a échoué — révoquez-le une fois ajouté. Il ne peut jamais renvoyer vers une autre identité.",
+    "zh": "查询不会消耗它，对方失败后可以重试——等对方添加你之后再撤销。它永远不会解析到另一个身份。",
+    "ja": "参照してもコードは消費されません。相手は失敗しても再試行できます — 追加され次第、取り消してください。別の身元に解決されることは決してありません。",
+    "id": "Menelusurinya TIDAK menghabiskannya, jadi orang yang kamu beri kode bisa mencoba lagi jika gagal — cabut setelah mereka menambahkanmu. Kode ini tidak pernah bisa mengarah ke identitas lain."
   },
   "Address or contact code": {
     "en": "Address or contact code",
@@ -3485,5 +3485,38 @@
     "zh": "无效图片",
     "ja": "無効な画像",
     "id": "gambar tidak valid"
+  },
+  "Revoke": {
+    "en": "Revoke",
+    "ru": "Отозвать",
+    "es": "Revocar",
+    "pt": "Revogar",
+    "de": "Widerrufen",
+    "fr": "Révoquer",
+    "zh": "撤销",
+    "ja": "取り消す",
+    "id": "Cabut"
+  },
+  "lapses in": {
+    "en": "lapses in",
+    "ru": "истекает через",
+    "es": "caduca en",
+    "pt": "expira em",
+    "de": "läuft ab in",
+    "fr": "expire dans",
+    "zh": "剩余",
+    "ja": "あと",
+    "id": "kedaluwarsa dalam"
+  },
+  "Invite revoked": {
+    "en": "Invite revoked",
+    "ru": "Приглашение отозвано",
+    "es": "Invitación revocada",
+    "pt": "Convite revogado",
+    "de": "Einladung widerrufen",
+    "fr": "Invitation révoquée",
+    "zh": "邀请已撤销",
+    "ja": "招待を取り消しました",
+    "id": "Undangan dicabut"
   }
 }

@@ -602,32 +602,58 @@ pub fn discovery_publish(store: &Store, relay: &Relay, now: u64) -> Result<Strin
     Ok(discovery::encode_code(&dpub))
 }
 
-/// TTL for a ONE-TIME invite code — short (unlike the year-long persistent code), so an unused
-/// invite lapses instead of lingering.
-const ONE_TIME_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// TTL for an invite code — short (unlike the year-long persistent code), so an unused invite
+/// lapses instead of lingering. Since the row is no longer destroyed by the first read (see
+/// [`discovery_one_time`]), this TTL, together with an explicit revoke, is what bounds how long a
+/// leaked invite keeps resolving — hence days, not a week.
+pub const INVITE_TTL_SECS: u64 = 2 * 24 * 60 * 60;
 
-/// Mint a ONE-TIME invite code: a FRESH ephemeral discovery key (never stored, doesn't touch the
-/// persistent discovery code) published `single_use`, so the relay drops the record after the
-/// first resolve. Returns the code to hand to exactly one person. Honest limit: single-use is
-/// relay-enforced (best-effort) — a hostile relay could re-serve it, but the code→IK binding is
-/// IK-signed, so it can never resolve to a different identity.
+/// Mint an INVITE code: a fresh random discovery key of its own (it does not touch, and cannot
+/// rotate, the persistent contact code), published as a second discovery row at `relay`. Returns
+/// the code to hand to one person.
+///
+/// **A10-4 — the row is retired by its OWNER, not burned on read.** This used to be published
+/// `single_use`, which made the relay delete it the moment anyone resolved it: the relay is the
+/// one party that cannot know whether the invitee actually finished adding the contact, so a lost
+/// response, a crash, a disk error during the local commit, a retry after an ambiguous network
+/// failure — or simply an eavesdropper on the code getting there first — destroyed the invite for
+/// good, and the invitee's only recourse was to ask for a new one. The invite is now an ordinary
+/// short-lived row, so resolving it is IDEMPOTENT by construction (there is no state at the relay
+/// for a retry to consume), and the secret that owns the row is KEPT so the person who can
+/// actually tell it worked — the inviter — can retire it with [`revoke_invite`].
+///
+/// The trade, stated plainly: a captured code now resolves until it is revoked or expires
+/// (`INVITE_TTL_SECS`) instead of until its first read. Burn-on-read was never a guarantee — the
+/// relay is not trusted, and a hostile one could always re-serve a consumed row — so this trades a
+/// best-effort property for a real one, and the code→IK binding stays IK-signed either way: an
+/// invite can never resolve to a different identity, only to this one for longer.
+///
+/// The relay-side answer that would restore both halves is a two-phase redeem (lookup returns a
+/// ticket; a separate idempotent redeem retires the row), which needs a wire change — recorded as
+/// a residual in `docs/STATUS.md`, not attempted here.
 pub fn discovery_one_time(store: &Store, relay: &Relay, now: u64) -> Result<String, String> {
     use node::discovery;
     let acct = store.load_account().map_err(|e| format!("account: {e}"))?;
-    let secret = crate::blob::random32(); // ephemeral — not persisted
+    let secret = crate::blob::random32();
     let dpub = discovery::public_of(&secret);
     let location = relay_descriptor(relay);
-    let expiry = now.saturating_add(ONE_TIME_TTL_SECS);
-    let ik_sig = acct.sign_discovery(&dpub, &location, expiry, true);
+    let expiry = now.saturating_add(INVITE_TTL_SECS);
+    // Persist BEFORE publishing. The failure this ordering picks is the harmless one: a stored
+    // secret whose publish never landed revokes a row that does not exist (a no-op), whereas the
+    // reverse order can leave a row published at the relay with nothing on disk able to retire it.
+    store
+        .add_invite(crate::store::InviteRecord { secret, created_at: now, expiry }, now)
+        .map_err(|e| format!("recording the invite: {e}"))?;
+    let ik_sig = acct.sign_discovery(&dpub, &location, expiry, false);
     let record = discovery::DiscoveryRecord {
         discovery_pub: dpub,
         ik: acct.identity_public(),
         location: location.clone(),
         expiry,
-        single_use: true,
+        single_use: false,
         ik_sig,
     };
-    let write_sig = discovery::sign(&secret, &discovery::write_msg(&dpub, &record.ik, &location, expiry, true));
+    let write_sig = discovery::sign(&secret, &discovery::write_msg(&dpub, &record.ik, &location, expiry, false));
     let ok = relay
         .transport()
         .publish_discovery(&record, &write_sig)
@@ -636,6 +662,57 @@ pub fn discovery_one_time(store: &Store, relay: &Relay, now: u64) -> Result<Stri
         return Err("the relay rejected the invite".into());
     }
     Ok(discovery::encode_code(&dpub))
+}
+
+/// One outstanding invite, as the UI lists them: its code, when it was minted, when it lapses.
+pub struct Invite {
+    pub code: String,
+    pub created_at: u64,
+    pub expiry: u64,
+}
+
+/// The invites minted from this identity that can still resolve, oldest first. Local only — no
+/// relay is contacted. Lapsed ones are omitted (their rows are gone at the relay too); they are
+/// swept from disk the next time one is minted.
+pub fn invites(store: &Store, now: u64) -> Result<Vec<Invite>, String> {
+    let all = store.load_invites().map_err(|e| format!("invite list: {e}"))?;
+    Ok(all
+        .into_iter()
+        .filter(|i| i.expiry > now)
+        .map(|i| Invite {
+            code: node::discovery::encode_code(&node::discovery::public_of(&i.secret)),
+            created_at: i.created_at,
+            expiry: i.expiry,
+        })
+        .collect())
+}
+
+/// Retire an invite: delete its row at `relay`, then forget its secret. Returns whether the relay
+/// actually removed a row now (`false` = it had none — already lapsed, or never landed).
+///
+/// The relay half runs FIRST and its failure is NOT swallowed, for the same reason as
+/// `discovery_off`: the stored secret is the only thing that can authorise the deletion, so
+/// dropping it on a failed call would leave the invite published with nothing able to retire it,
+/// while telling the user it is gone.
+pub fn revoke_invite(store: &Store, relay: &Relay, code: &str, now: u64) -> Result<bool, String> {
+    use node::discovery;
+    let dpub = discovery::decode_code(code).ok_or("that is not a valid KARST invite code")?;
+    let held = store.load_invites().map_err(|e| format!("invite list: {e}"))?;
+    let invite = held
+        .into_iter()
+        .find(|i| discovery::public_of(&i.secret) == dpub)
+        .ok_or("no invite of yours matches that code")?;
+    let removed = if invite.expiry > now {
+        let del_sig = discovery::sign(&invite.secret, &discovery::delete_msg(&dpub));
+        relay
+            .transport()
+            .delete_discovery(dpub, &del_sig)
+            .map_err(|e| format!("revoking the invite ({e}) — it is NOT revoked; try again"))?
+    } else {
+        false // already lapsed: the relay drops it on the next lookup, nothing to retire
+    };
+    store.remove_invite(&invite.secret).map_err(|e| format!("forgetting the invite: {e}"))?;
+    Ok(removed)
 }
 
 /// Delete the discovery record at `relay` (best-effort; needs the current key). Returns whether a
@@ -684,21 +761,26 @@ pub fn discovery_rotate(store: &Store, relay: &Relay, now: u64) -> Result<String
 /// makes us more lenient: a record is refused solely when it is expired even after the allowance.
 pub const DISCOVERY_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
-/// Resolve a contact code at `relay` to the IK + location it points at. Verifies the code→IK
-/// binding itself (the relay never vouches), so a tampered or wrong-code record is refused, and
-/// enforces the record's own `expiry` against `now`.
-pub fn find_contact(
+/// What a resolver says when every relay it could ask answered, and none of them holds the row.
+const CODE_UNKNOWN: &str = "no one is published under that code (it may have expired or been turned off)";
+
+/// One relay's verified answer for `dpub`. `Ok(None)` means THAT RELAY ANSWERED and has no such
+/// row — a definite "unknown code" — while `Err` means we got no usable answer from it (it was
+/// unreachable, or the row it served failed verification). Keeping the two apart is what lets a
+/// multi-relay lookup report the accurate reason instead of whichever relay failed last.
+fn lookup_verified(
     relay: &Relay,
-    code: &str,
+    dpub: [u8; 32],
     now: u64,
-) -> Result<([u8; 32], node::node::RelayDescriptor), String> {
+) -> Result<Option<node::discovery::DiscoveryRecord>, String> {
     use node::discovery;
-    let dpub = discovery::decode_code(code).ok_or("that is not a valid KARST contact code")?;
-    let rec = relay
+    let Some(rec) = relay
         .transport()
         .lookup_discovery(discovery::discovery_pseudonym(&dpub))
         .map_err(|e| format!("discovery lookup: {e}"))?
-        .ok_or("no one is published under that code (it may have expired or been turned off)".to_string())?;
+    else {
+        return Ok(None);
+    };
     if rec.discovery_pub != dpub {
         return Err("the relay returned a record for a different code — refusing".into());
     }
@@ -708,7 +790,7 @@ pub fn find_contact(
     // `expiry` rides INSIDE the signed binding, but the relay is not a trusted anchor: an honest
     // one drops stale records, a hostile one can replay an old — still validly signed — record
     // forever. Without this check expiry had no client-side force at all, so retiring a location,
-    // limiting a one-time invite, and revocation-by-expiry were all unenforceable (CRYPTO-21).
+    // limiting an invite, and revocation-by-expiry were all unenforceable (CRYPTO-21).
     if rec.expiry.saturating_add(DISCOVERY_CLOCK_SKEW_SECS) <= now {
         return Err("that contact code has expired — ask for a fresh one".into());
     }
@@ -717,7 +799,125 @@ pub fn find_contact(
     if rec.expiry > now.saturating_add(discovery::MAX_TTL_SECS + DISCOVERY_CLOCK_SKEW_SECS) {
         return Err("that record claims an impossible lifetime — refusing".into());
     }
+    Ok(Some(rec))
+}
+
+/// Resolve a contact code at `relay` to the IK + location it points at. Verifies the code→IK
+/// binding itself (the relay never vouches), so a tampered or wrong-code record is refused, and
+/// enforces the record's own `expiry` against `now`.
+pub fn find_contact(
+    relay: &Relay,
+    code: &str,
+    now: u64,
+) -> Result<([u8; 32], node::node::RelayDescriptor), String> {
+    let dpub = node::discovery::decode_code(code).ok_or("that is not a valid KARST contact code")?;
+    let rec = lookup_verified(relay, dpub, now)?.ok_or_else(|| CODE_UNKNOWN.to_string())?;
     Ok((rec.ik, rec.location))
+}
+
+/// Resolve a contact code across the WHOLE relay set, not just the primary. A discovery row lives
+/// at the relay its owner published it to, so a contact whose home relay is one of your BACKUPS
+/// was simply unfindable while the lookup only ever asked `relays[0]` — the code was reported as
+/// "no one is published under that" even though you were connected to the relay holding it.
+///
+/// Returns the resolved IK and the location the record itself is signed for. The first relay that
+/// has it wins. Failure reporting follows what was actually learned: if ANY relay answered and had
+/// no such row, the code is genuinely unknown and that is what the user is told — a second relay
+/// being down must not turn "nobody is published under this code" into a network error, which
+/// reads as "your connection is broken" for a code that simply does not exist. Only when no relay
+/// gave a usable answer does a transport/verification error surface.
+pub fn find_contact_multi(
+    relays: &[Relay],
+    code: &str,
+    now: u64,
+) -> Result<([u8; 32], node::node::RelayDescriptor), String> {
+    // Decoded ONCE: a malformed code is not a per-relay failure, and repeating the same complaint
+    // as many times as there are relays would only confuse where it came from.
+    let dpub = node::discovery::decode_code(code).ok_or("that is not a valid KARST contact code")?;
+    let mut answered_without_it = false;
+    let mut first_err: Option<String> = None;
+    for relay in relays {
+        match lookup_verified(relay, dpub, now) {
+            Ok(Some(rec)) => return Ok((rec.ik, rec.location)),
+            Ok(None) => answered_without_it = true,
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    if answered_without_it {
+        return Err(CODE_UNKNOWN.to_string());
+    }
+    Err(first_err.unwrap_or_else(|| "no relay configured".to_string()))
+}
+
+/// Add a contact from a contact/invite code: resolve it across the relay set and commit the whole
+/// local record in ONE place — the roster row, the confirmed flag, which proxy of yours reaches
+/// them, and WHERE they said they are ([`store::ContactEndpoint`]).
+///
+/// **A10-4 / A10-6, the local half.** This commit used to be four separate calls in the desktop
+/// command, the last two with their errors dropped (`let _ = …`), so a failure past the roster
+/// write left a contact that is added but not confirmed, or confirmed but untagged, and said
+/// nothing. Every step here propagates, and every step is idempotent, so the honest answer to a
+/// half-finished add is to run it again with the same code: resolving is now repeatable
+/// (`discovery_one_time` no longer publishes a row the first read destroys), and re-committing an
+/// already-committed step is a no-op. That is what makes "retry" a real recovery instead of the
+/// advice that used to strand the invite.
+///
+/// Returns the contact's IK.
+pub fn add_contact_by_code(
+    store: &Store,
+    relays: &[Relay],
+    code: &str,
+    name: &str,
+    proxy: u32,
+    now: u64,
+) -> Result<[u8; 32], String> {
+    let (ik, location) = find_contact_multi(relays, code.trim(), now)?;
+    let mut cs = store.load_contacts().map_err(|e| format!("contacts: {e}"))?;
+    if !cs.iter().any(|c| c.ik == ik) {
+        // Empty name resolves to the peer's own profile name / a short IK at display time.
+        cs.push(store::ContactRecord { name: name.trim().to_string(), ik, verified: false });
+        store.save_contacts(&cs).map_err(|e| format!("saving contacts: {e}"))?;
+    }
+    // Looking someone up by their code is an EXPLICIT add → a confirmed contact (unlocks their
+    // name/posts as they arrive), not a mere conversation.
+    store.set_unconfirmed(ik, false).map_err(|e| format!("confirming the contact: {e}"))?;
+    store.set_contact_proxy(ik, proxy).map_err(|e| format!("tagging the contact's channel: {e}"))?;
+    // The route the CONTACT signed for themselves — see `relays_for_contact` for what uses it.
+    store
+        .set_contact_endpoint(ik, &store::ContactEndpoint { relay: location, discovered_at: now })
+        .map_err(|e| format!("recording where they are reachable: {e}"))?;
+    Ok(ik)
+}
+
+/// Order the relay set for reaching `ik`: the relay their contact code named goes FIRST, then the
+/// rest in their existing order.
+///
+/// This is the routing half of A10-6. Their signed `location` is the only statement about where
+/// they poll; without it a first contact is attempted at OUR primary, where a contact who homes
+/// elsewhere has no prekey bundle and no mailbox anyone reads — the send fails for a reason that
+/// looks like "the relay doesn't know them" rather than "we asked the wrong relay".
+///
+/// Two conditions, both load-bearing. The relay must be one we already hold: a descriptor is a
+/// route candidate, not an instruction to dial an address on a peer's say-so, and adopting an
+/// unknown relay is a deliberate, separate, user-driven step (auto-earning admission on discovery
+/// is a stated non-goal). And we must hold a credential for it: `send_session` hard-fails without
+/// one, so preferring a relay we cannot present a capability to would turn a working send into a
+/// failure — the preference must only ever be able to help.
+pub fn relays_for_contact(store: &Store, relays: &[Relay], ik: &[u8; 32]) -> Vec<Relay> {
+    let mut out = relays.to_vec();
+    let Some(ep) = store.contact_endpoint(ik) else { return out };
+    let held = out.iter().position(|r| {
+        r.id.noise_pub == ep.relay.noise_pub && r.id.fetch_pub == ep.relay.fetch_pub
+    });
+    if let Some(pos) = held {
+        if pos > 0 && store.has_capability_for(&out[pos].id) {
+            let theirs = out.remove(pos);
+            out.insert(0, theirs);
+        }
+    }
+    out
 }
 
 /// Ask a relay to advertise its policy (blob persistence/TTL/caps, PoW door). Operator-declared —

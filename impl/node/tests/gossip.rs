@@ -25,7 +25,7 @@ fn spawn(others: Vec<RelayDescriptor>, advertise_self: bool) -> (String, [u8; 32
     let fetch_pub = fetch.public.to_bytes();
     let mut relay = RelayNode::with_identity(NOW, fetch);
     if advertise_self {
-        relay.add_relay(RelayDescriptor { noise_pub: npub, fetch_pub, addrs: vec![addr.clone()] });
+        relay.add_relay(RelayDescriptor { noise_pub: npub, fetch_pub, addrs: vec![addr.clone()], quic_addrs: Vec::new() });
     }
     for d in others {
         relay.add_relay(d);
@@ -38,7 +38,7 @@ fn spawn(others: Vec<RelayDescriptor>, advertise_self: bool) -> (String, [u8; 32
 }
 
 fn desc(noise: [u8; 32], fetch: [u8; 32], addr: &str) -> RelayDescriptor {
-    RelayDescriptor { noise_pub: noise, fetch_pub: fetch, addrs: vec![addr.into()] }
+    RelayDescriptor { noise_pub: noise, fetch_pub: fetch, addrs: vec![addr.into()], quic_addrs: Vec::new() }
 }
 
 #[test]
@@ -147,6 +147,7 @@ fn advertisement_rotates_and_a_new_address_replaces_the_oldest() {
         noise_pub: [n; 32],
         fetch_pub: [n; 32],
         addrs: vec![addr.to_string()],
+        quic_addrs: Vec::new(),
     };
     for n in 1..=6u8 {
         relay.add_relay(desc(n, &format!("198.51.100.{n}:9000")));

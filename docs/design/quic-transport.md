@@ -285,24 +285,41 @@ that direct P2P is opt-in only, never a default and never an automatic
 
 ## 10. Descriptor additions
 
-`RelayDescriptor` today is `{ noise_pub, fetch_pub, addrs }`. QUIC needs:
+`RelayDescriptor` gains ONE field:
 
 ```rust
-quic_addrs: Vec<String>,
-quic_alpn: Vec<u8>,               // "karst-relay/1"
-quic_cert_fingerprint: Option<[u8; 32]>,
-supported_transports: TransportBits,
+quic_addrs: Vec<String>,   // UDP endpoints where this relay also answers QUIC
 ```
 
-Two constraints carried over from existing findings. Addresses in a descriptor
-are operator **claims**, not proofs (CRYPTO-23), and gossiped `addrs` are
-already bounded in length and count because unbounded ones were an SSRF and a
-memory-growth vector (A3-12, A3-13) — the new fields go through the same bounds.
-And the fingerprint must be covered by the descriptor's signature: an unsigned
-fingerprint is a fingerprint the relay in the middle substitutes, which makes
-pinning decorative.
+Bounded exactly like `addrs` (`MAX_ADDRS_PER_RELAY`, `MAX_ADDR_LEN`, swept on
+gossip and on discovery-record storage), for exactly the same reasons: these are
+operator **claims**, not proofs (CRYPTO-23), and an unbounded list is both an
+SSRF vector and a memory-growth one (A3-12, A3-13).
 
----
+**The sketch for this work proposed three more fields. On inspection, none of
+them should exist:**
+
+- **`quic_alpn`.** The ALPN is a protocol CONSTANT (`karst-relay/1`), not
+  per-relay data. Advertising it per relay would let a relay name a different
+  one — a negotiation nobody asked for, at the layer that decides which protocol
+  is spoken.
+- **`quic_cert_fingerprint`.** It would be unverifiable today. The descriptor's
+  signature covers the relay-id and NOTHING else (`discovery::location_id`
+  deliberately excludes `addrs`, because dial hints are availability, not
+  identity). A fingerprint would therefore sit in the unsigned part, where a
+  relay in the middle substitutes it — a field that invites exactly the trust it
+  cannot carry. It becomes meaningful only if QUIC's TLS ever REPLACES Noise as
+  how relay identity is established, which is §6's audit-gated decision. Add it
+  *then*, together with signing it.
+- **`supported_transports`.** It would restate "is `quic_addrs` non-empty" — a
+  second place saying the same thing, hence a second place that can disagree with
+  the first, with an attacker choosing the disagreement. Same reasoning that kept
+  `message_type` out of the wire envelope.
+
+Relay identity is not established by an address in any case: it is `Noise_NK`
+against the pinned relay-id, over whichever carrier the bytes arrived on. That is
+what makes a QUIC address safe to publish unsigned — the worst a forged one
+achieves is a failed handshake.
 
 ## 11. Summary of the trade
 

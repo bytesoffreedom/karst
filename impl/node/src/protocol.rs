@@ -496,6 +496,29 @@ pub struct RelayDescriptor {
     pub noise_pub: [u8; 32],
     pub fetch_pub: [u8; 32],
     pub addrs: Vec<String>,
+    /// UDP endpoints where this relay also answers QUIC, if any (QUIC-1, see
+    /// `docs/design/quic-transport.md`). Empty = this relay offers TCP/WSS only, which is the
+    /// answer for anything reached through Tor regardless, since Tor carries no UDP.
+    ///
+    /// A HINT with exactly the standing of `addrs`, and bounded the same way: these are operator
+    /// claims, not proofs (CRYPTO-23), and an unbounded list is an SSRF and a memory-growth vector
+    /// (A3-12, A3-13). Relay identity is not established by an address — it is `Noise_NK` against
+    /// the pinned relay-id, over whichever carrier the bytes arrived on.
+    ///
+    /// **Deliberately NOT accompanied by an ALPN string, a certificate fingerprint, or a
+    /// supported-transport bitfield**, all three of which the sketch for this work proposed:
+    ///
+    /// - The ALPN is a protocol CONSTANT (`karst-relay/1`), not per-relay data. Advertising it
+    ///   per relay would let a relay name a different one, which is a negotiation nobody asked
+    ///   for.
+    /// - A certificate fingerprint would be unverifiable today. The descriptor's signature covers
+    ///   the relay-id and nothing else (see `discovery::location_id`), so a fingerprint would sit
+    ///   in the unsigned part where a relay in the middle substitutes it — a field that invites
+    ///   trust it cannot carry. It becomes meaningful only if QUIC's TLS ever REPLACES Noise as
+    ///   the way relay identity is established, which is audit-gated and its own decision.
+    /// - `supported_transports` would restate "is `quic_addrs` non-empty" — a second place saying
+    ///   the same thing, and therefore a second place that can disagree with the first.
+    pub quic_addrs: Vec<String>,
 }
 impl RelayDescriptor {
     /// The relay-id bytes (`noise_pub ‖ fetch_pub`) — the dedup key.

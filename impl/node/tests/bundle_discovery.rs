@@ -485,6 +485,7 @@ fn an_expired_discovery_record_is_swept_even_if_nobody_looks_it_up() {
             noise_pub: [seed; 32],
             fetch_pub: [seed.wrapping_add(2); 32],
             addrs: vec!["127.0.0.1:1".into()],
+            quic_addrs: Vec::new(),
         };
         let rec = DiscoveryRecord {
             discovery_pub: dpub,

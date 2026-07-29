@@ -1,6 +1,12 @@
 # Rust build artefacts (workspace под impl/)
 /impl/target/
 **/target/
+# The local CI script keeps a SEPARATE target dir per (checker x feature set) — clippy and rustc
+# are different compilers to cargo's fingerprints, so sharing one rebuilds the workspace on every
+# alternation. Those dirs are named `target-clippy`, `target-unaudited`, `target-check`, …, none of
+# which the patterns above match — and a `git add impl` then stages twelve thousand build
+# artefacts. Ignore the whole family, not each name.
+**/target-*/
 
 # Локальное состояние запуска (relay-id, каталоги профилей демо)
 /impl/.run/

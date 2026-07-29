@@ -34,7 +34,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn id_hex(noise: [u8; 32], fetch: [u8; 32]) -> String {
-    RelayDescriptor { noise_pub: noise, fetch_pub: fetch, addrs: vec![] }.relay_id_hex()
+    RelayDescriptor { noise_pub: noise, fetch_pub: fetch, addrs: vec![], quic_addrs: Vec::new() }.relay_id_hex()
 }
 
 /// Spawn a real self-advertising relay seeded with `others`. Returns (addr, noise_pub, fetch_pub).
@@ -65,7 +65,7 @@ fn spawn_cfg(
     let fetch = Identity::generate();
     let fpub = fetch.public.to_bytes();
     let mut relay = RelayNode::with_identity(NOW, fetch);
-    relay.add_relay(RelayDescriptor { noise_pub: npub, fetch_pub: fpub, addrs: vec![addr.clone()] });
+    relay.add_relay(RelayDescriptor { noise_pub: npub, fetch_pub: fpub, addrs: vec![addr.clone()], quic_addrs: Vec::new() });
     for d in others {
         relay.add_relay(d);
     }
@@ -83,16 +83,16 @@ fn spawn_cfg(
 }
 
 fn desc(addr: &str, np: [u8; 32], fp: [u8; 32]) -> RelayDescriptor {
-    RelayDescriptor { noise_pub: np, fetch_pub: fp, addrs: vec![addr.to_string()] }
+    RelayDescriptor { noise_pub: np, fetch_pub: fp, addrs: vec![addr.to_string()], quic_addrs: Vec::new() }
 }
 
 #[test]
 fn import_adds_only_verified_relays() {
     // C: a real self-advertising relay the client should learn and multi-home onto.
     let (c_addr, c_np, c_fp) = spawn(vec![]);
-    let c = RelayDescriptor { noise_pub: c_np, fetch_pub: c_fp, addrs: vec![c_addr.clone()] };
+    let c = RelayDescriptor { noise_pub: c_np, fetch_pub: c_fp, addrs: vec![c_addr.clone()], quic_addrs: Vec::new() };
     // Poison: a random relay-id at a dead address (stand-in for a victim IP).
-    let poison = RelayDescriptor { noise_pub: [9; 32], fetch_pub: [9; 32], addrs: vec!["127.0.0.1:2".into()] };
+    let poison = RelayDescriptor { noise_pub: [9; 32], fetch_pub: [9; 32], addrs: vec!["127.0.0.1:2".into()], quic_addrs: Vec::new() };
     // A (the client's primary): knows C + poison, self-advertises.
     let (a_addr, a_np, a_fp) = spawn(vec![c.clone(), poison.clone()]);
 

@@ -26,7 +26,7 @@ fn dev_cap() -> Capability {
 }
 
 fn loc() -> RelayDescriptor {
-    RelayDescriptor { noise_pub: [1u8; 32], fetch_pub: [2u8; 32], addrs: vec!["relay.example:9000".into()] }
+    RelayDescriptor { noise_pub: [1u8; 32], fetch_pub: [2u8; 32], addrs: vec!["relay.example:9000".into()], quic_addrs: Vec::new() }
 }
 
 /// Build a valid record + its write signature for `acct`, under discovery secret `dsecret`.

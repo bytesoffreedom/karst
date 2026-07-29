@@ -903,6 +903,10 @@ impl RelayNode {
     pub fn add_relay(&mut self, mut d: RelayDescriptor) {
         d.addrs.truncate(MAX_ADDRS_PER_RELAY);
         d.addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
+        // Same bounds for the QUIC hints, for the same reason: attacker-controlled, unsigned,
+        // free-form (QUIC-1).
+        d.quic_addrs.truncate(MAX_ADDRS_PER_RELAY);
+        d.quic_addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
         if d.addrs.is_empty() {
             return; // a descriptor with no dial hint is useless (and would poison the list)
         }
@@ -964,6 +968,8 @@ impl RelayNode {
         let mut record = record.clone();
         record.location.addrs.truncate(MAX_ADDRS_PER_RELAY);
         record.location.addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
+        record.location.quic_addrs.truncate(MAX_ADDRS_PER_RELAY);
+        record.location.quic_addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
         self.discovery.insert(pseudonym, record);
         true
     }

@@ -272,7 +272,7 @@ mod tests {
     use super::*;
 
     fn desc() -> RelayDescriptor {
-        RelayDescriptor { noise_pub: [3u8; 32], fetch_pub: [4u8; 32], addrs: vec!["1.2.3.4:9".into()] }
+        RelayDescriptor { noise_pub: [3u8; 32], fetch_pub: [4u8; 32], addrs: vec!["1.2.3.4:9".into()], quic_addrs: Vec::new() }
     }
 
     #[test]

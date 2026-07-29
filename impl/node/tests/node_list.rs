@@ -14,7 +14,7 @@ use node::socket::{SocketTransport};
 const NOW: u64 = 1_000_000;
 
 fn desc(n: u8, addr: &str) -> RelayDescriptor {
-    RelayDescriptor { noise_pub: [n; 32], fetch_pub: [n; 32], addrs: vec![addr.into()] }
+    RelayDescriptor { noise_pub: [n; 32], fetch_pub: [n; 32], addrs: vec![addr.into()], quic_addrs: Vec::new() }
 }
 
 #[test]
@@ -32,11 +32,11 @@ fn add_relay_dedups_by_id_and_unions_addrs() {
 #[test]
 fn empty_addr_descriptors_are_dropped_and_addrs_are_capped() {
     let mut r = RelayNode::new(NOW);
-    r.add_relay(RelayDescriptor { noise_pub: [9; 32], fetch_pub: [9; 32], addrs: vec![] });
+    r.add_relay(RelayDescriptor { noise_pub: [9; 32], fetch_pub: [9; 32], addrs: vec![], quic_addrs: Vec::new() });
     assert!(r.node_list().is_empty(), "a descriptor with no dial hint is useless → dropped");
 
     let many: Vec<String> = (0..MAX_ADDRS_PER_RELAY + 3).map(|i| format!("h:{i}")).collect();
-    r.add_relay(RelayDescriptor { noise_pub: [8; 32], fetch_pub: [8; 32], addrs: many });
+    r.add_relay(RelayDescriptor { noise_pub: [8; 32], fetch_pub: [8; 32], addrs: many, quic_addrs: Vec::new() });
     assert_eq!(r.node_list()[0].addrs.len(), MAX_ADDRS_PER_RELAY, "addr hints are bounded");
 }
 
@@ -46,7 +46,7 @@ fn the_known_set_is_bounded() {
     for i in 0..(MAX_KNOWN_RELAYS as u32 + 20) {
         let mut nb = [0u8; 32];
         nb[..4].copy_from_slice(&i.to_be_bytes());
-        r.add_relay(RelayDescriptor { noise_pub: nb, fetch_pub: [0; 32], addrs: vec![format!("h:{i}")] });
+        r.add_relay(RelayDescriptor { noise_pub: nb, fetch_pub: [0; 32], addrs: vec![format!("h:{i}")], quic_addrs: Vec::new() });
     }
     assert!(r.node_list().len() <= MAX_KNOWN_RELAYS, "the served list never exceeds the bound");
 }
@@ -66,7 +66,7 @@ fn self_survives_the_frame_trim_when_seeded_first() {
         nb[..4].copy_from_slice(&i.to_be_bytes());
         nb[31] = 2; // distinct from self ([1;32])
         let long_addr = format!("{}{i}.example:9000", "x".repeat(230)); // force the trim
-        r.add_relay(RelayDescriptor { noise_pub: nb, fetch_pub: [0; 32], addrs: vec![long_addr] });
+        r.add_relay(RelayDescriptor { noise_pub: nb, fetch_pub: [0; 32], addrs: vec![long_addr], quic_addrs: Vec::new() });
     }
     let served = r.node_list();
     assert!(served.len() < 128, "the frame trim must actually engage for this to be meaningful");

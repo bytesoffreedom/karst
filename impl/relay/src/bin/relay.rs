@@ -392,6 +392,7 @@ fn parse_peers(spec: &str) -> Vec<RelayDescriptor> {
                     noise_pub,
                     fetch_pub,
                     addrs: vec![addr.trim().to_string()],
+                    quic_addrs: Vec::new(),
                 }),
                 Err(e) => eprintln!("WARNING: node-list peer '{entry}' skipped: {e}"),
             },
@@ -917,7 +918,8 @@ fn run_relay(addr: String) -> io::Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| addr.clone());
     if is_routable_advertise(&advertise) {
-        let self_desc = RelayDescriptor { noise_pub, fetch_pub, addrs: vec![advertise.clone()] };
+        let self_desc =
+            RelayDescriptor { noise_pub, fetch_pub, addrs: vec![advertise.clone()], quic_addrs: Vec::new() };
         relay.add_relay(self_desc.clone());
         // §12 4c — the directory records "user X is reachable HERE" using this descriptor as
         // the node_hint; only meaningful when we have a routable address to hand out.

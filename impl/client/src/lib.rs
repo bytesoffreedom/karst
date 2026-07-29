@@ -714,6 +714,7 @@ fn relay_descriptor(relay: &Relay) -> node::protocol::RelayDescriptor {
         noise_pub: relay.id.noise_pub,
         fetch_pub: relay.id.fetch_pub,
         addrs: vec![relay.addr.to_string()],
+        quic_addrs: Vec::new(),
     }
 }
 
@@ -1147,6 +1148,7 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
         noise_pub: from.id.noise_pub,
         fetch_pub: from.id.fetch_pub,
         addrs: vec![],
+        quic_addrs: Vec::new(),
     }
     .relay_id_hex();
     let mut known: std::collections::HashSet<String> = std::iter::once(primary_id).collect();
@@ -1229,7 +1231,7 @@ impl RelayId {
     /// relay-scoped is stored under. Same string `RelayDescriptor::relay_id_hex` produces, so a
     /// discovered relay and a configured one land on the same key.
     pub fn hex(&self) -> String {
-        node::protocol::RelayDescriptor { noise_pub: self.noise_pub, fetch_pub: self.fetch_pub, addrs: vec![] }
+        node::protocol::RelayDescriptor { noise_pub: self.noise_pub, fetch_pub: self.fetch_pub, addrs: vec![], quic_addrs: Vec::new() }
             .relay_id_hex()
     }
 }

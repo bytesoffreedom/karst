@@ -1389,6 +1389,8 @@ impl<T: Transport> Peer<T> {
         // cycle would multiply fetch cost by TTL_EPOCHS for mail that is old by
         // definition; never sweeping loses that mail outright.
         let sweep_due = now.saturating_sub(self.last_sweep) >= crate::drop::SWEEP_INTERVAL_SECS;
+        // Read BEFORE `last_sweep` is stamped below, or the deep-sweep test compares now with now.
+        let previous_sweep = self.last_sweep;
         let window: Vec<u64> = if sweep_due {
             self.last_sweep = now;
             crate::drop::sweep_epochs(now)
@@ -1396,11 +1398,30 @@ impl<T: Transport> Peer<T> {
             crate::drop::poll_epochs(now).to_vec()
         };
         // #147: drop the epochs the cursor has already closed. A sender deposits into ITS OWN
-        // epoch, at most `FUTURE_SLACK_EPOCHS` ahead of ours, so an epoch below the cursor cannot
-        // receive anything ever again — fetching it is a round trip guaranteed to come back empty,
-        // multiplied by every session in the table. This is the whole cost reduction: on a steady
-        // account the ten-epoch sweep collapses to the epochs that are actually still open.
-        let epochs: Vec<u64> = window.into_iter().filter(|e| *e > self.swept_through).collect();
+        // epoch, and a sender whose clock agrees with ours to within `FUTURE_SLACK_EPOCHS` cannot
+        // reach a box below the cursor — fetching it is a round trip guaranteed to come back
+        // empty, multiplied by every session in the table.
+        //
+        // **The assumption that buys this, and the DEEP SWEEP that covers it.** The cursor is only
+        // sound while sender clocks are close to ours. A sender whose clock is several days SLOW
+        // deposits into a past epoch, and would land below the cursor — mail that then rots at an
+        // address nobody asks for again, which is precisely the silent loss `sweep_epochs` was
+        // built to prevent. (The offline-recipient case is safe by construction: no sweep runs
+        // while offline, so the cursor does not move past the epochs the mail arrived in.)
+        //
+        // So the cursor is IGNORED once per epoch — the first sweep of each new day walks the full
+        // window regardless. That keeps the full `TTL_EPOCHS` tolerance for a badly-skewed sender
+        // while still removing ~99% of the repeated fetches: with a ten-minute sweep interval it is
+        // one full walk per day instead of one every ten minutes.
+        //
+        // Derived from `last_sweep`, which is already persisted, rather than a second timestamp:
+        // one more piece of at-rest state for a once-a-day decision is not worth the format churn.
+        let deep = crate::drop::epoch_of(now) > crate::drop::epoch_of(previous_sweep);
+        let epochs: Vec<u64> = if deep {
+            window
+        } else {
+            window.into_iter().filter(|e| *e > self.swept_through).collect()
+        };
         // What the cursor WOULD become if this pass completes cleanly. Computed before the fetches
         // so a clock that moves during the pass cannot advance it further than the window we
         // actually walked.
@@ -2760,6 +2781,60 @@ use super::LoopbackMail;
             ),
             Ok(msgs) => panic!("a truncated, empty pass reported success with {} messages", msgs.len()),
         }
+    }
+
+    /// The cursor is IGNORED on the first sweep of a new epoch, so a sender whose clock is days
+    /// SLOW is still reached (#147, found by the #233 revision).
+    ///
+    /// The cursor's soundness rests on sender clocks being close to ours: a sender deposits into
+    /// ITS OWN epoch, and one running several days behind lands in a box below the cursor. Without
+    /// this, that mail would rot at an address nobody asks for again — exactly the silent loss the
+    /// full sweep window exists to prevent, reintroduced by an optimisation.
+    ///
+    /// Discriminating on the SECOND sweep inside one epoch versus the first sweep of the next: the
+    /// cheap path must skip closed epochs, and the deep path must not.
+    #[test]
+    fn the_first_sweep_of_a_new_epoch_ignores_the_cursor() {
+        let relay_pub = x25519_dalek::PublicKey::from([7u8; 32]);
+        let seen = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
+        let transport = SlowTransport {
+            inner: LoopbackMail::default(),
+            per_request: Duration::from_millis(0),
+            seen: seen.clone(),
+        };
+        let mut peer = super::Peer::new(transport, Account::generate(), dev_cap(), relay_pub);
+        peer.sessions.insert(
+            dummy_ik(1),
+            super::SessionState {
+                session: Session::init_sender([1u8; 32], [2u8; 32]),
+                pending_initial: None,
+                drop_seed: [5u8; 32],
+                peer_mailbox_pub: [0u8; 32],
+            },
+        );
+
+        peer.receive(NOW).expect("first sweep walks everything and sets the cursor");
+
+        // A second sweep in the SAME epoch takes the cheap path.
+        seen.borrow_mut().clear();
+        peer.receive(NOW + crate::drop::SWEEP_INTERVAL_SECS).expect("second sweep");
+        let shallow = seen.borrow().len();
+
+        // The first sweep of the NEXT epoch walks the whole window again.
+        seen.borrow_mut().clear();
+        peer.receive(NOW + crate::drop::DROP_EPOCH_SECS).expect("deep sweep");
+        let deep = seen.borrow().len();
+
+        assert!(
+            deep > shallow,
+            "the first sweep of a new epoch visited {deep} boxes and the mid-epoch one {shallow} — \
+             the cursor was not ignored, so a sender with a slow clock stays unreachable"
+        );
+        assert_eq!(
+            deep,
+            1 + crate::drop::sweep_epochs(NOW + crate::drop::DROP_EPOCH_SECS).len(),
+            "a deep sweep should walk the identity mailbox plus the full window for the session"
+        );
     }
 
     /// A message from a peer we HOLD a session with that our chain cannot open is counted and

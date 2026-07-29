@@ -6900,3 +6900,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&db);
     }
 }
+
+/// A change to any PERSISTED shape must move `STATE_VERSION` — enforced here, because nothing
+/// else can (#144).
+///
+/// The failure this closes happened twice in one day. `OneTimeSecret` widened the `opks` entries
+/// inside `sessions.dat` from 32 bytes to 96 (CRYPTO-33), and `capabilities.dat` re-keyed per
+/// channel (A8-4), and both landed with `STATE_VERSION` untouched. No test could have caught it:
+/// every test writes a fresh vault into a temp directory, so nothing in the suite ever opens an
+/// old file with a new binary. The version is the ONLY thing standing between a shape change and
+/// "secrets unreadable" — a loud, wedging error that tells the user to delete and re-provision —
+/// and it was being maintained by memory.
+///
+/// **What it hashes: the SOURCE TEXT of the type declarations**, not an encoding of sample values.
+/// Postcard encodes values, so a golden-vector approach would miss a renamed field, and would miss
+/// any change in a variant a chosen sample does not exercise. Hashing the declarations catches
+/// field ADDITION, REMOVAL, REORDERING, RETYPING and RENAMING — every one of which changes either
+/// the bytes or the meaning of the bytes. Comments and whitespace are stripped first, so writing
+/// documentation does not trip it.
+///
+/// **What it does NOT catch, stated so nobody over-trusts it:** a change in a type this list does
+/// not name (add the type here when you add a persisted one — the list IS the inventory of what
+/// this vault writes), and a change in a NESTED type's declaration reached only through a field
+/// (those are listed separately for the same reason). It also cannot know whether a change is
+/// backward compatible; it only insists the version move.
+#[cfg(test)]
+mod at_rest_shape_guard {
+    /// Every top-level shape this vault serializes, and the file it lives in. Adding a persisted
+    /// type without adding it here is the one hole in the guard, so treat this list as part of
+    /// the storage format rather than as test scaffolding.
+    const PERSISTED: &[(&str, &str)] = &[
+        // client/src/store.rs — the vault's own records
+        ("store", "ContactRecord"),
+        ("store", "InviteRecord"),
+        ("store", "ContactEndpoint"),
+        ("store", "Profile"),
+        ("store", "HistoryRecord"),
+        ("store", "FeedRecord"),
+        ("store", "StoredAttachment"),
+        ("store", "QuarantinedMessage"),
+        ("store", "PendingSend"),
+        ("store", "StrandedSend"),
+        ("store", "ChannelConfig"),
+        ("store", "Subscriber"),
+        ("store", "StoredHistory"),
+        ("store", "ReceivedFile"),
+        ("store", "PendingDownload"),
+        ("store", "PendingPostAttachment"),
+        ("store", "PendingGallery"),
+        ("store", "PendingUpload"),
+        ("store", "SessionFile"),
+        ("store", "CapabilityFile"),
+        ("store", "MsgMeta"),
+        ("store", "AccountEntry"),
+        ("store", "ProxyEntry"),
+        ("store", "ProxyRegistry"),
+        ("store", "NetSettings"),
+        ("store", "Prefs"),
+        ("store", "RelayPrefs"),
+        ("store", "Deadman"),
+        ("store", "SlotEntry"),
+        ("store", "SlotRole"),
+        // Written INTO the vault by the session layer — a change here rewrites `sessions.dat`
+        // just as surely as a change above does.
+        ("peer", "PeerState"),
+        ("ratchet", "SessionSnapshot"),
+        ("ratchet", "SkippedKey"),
+        ("pqxdh", "OneTimeSecret"),
+    ];
+
+    /// The pinned digest. Regenerate ONLY together with a `STATE_VERSION` bump: run the test, take
+    /// the "actual" value from the failure, and move both in the same commit.
+    const SHAPE_DIGEST: &str = "3bd06299865917df";
+
+    fn source(module: &str) -> &'static str {
+        match module {
+            "store" => include_str!("store.rs"),
+            "peer" => include_str!("../../node/src/peer.rs"),
+            "ratchet" => include_str!("../../node/src/ratchet.rs"),
+            "pqxdh" => include_str!("../../node/src/pqxdh.rs"),
+            other => panic!("no source registered for module {other}"),
+        }
+    }
+
+    /// The declaration body of `struct NAME { … }` or `enum NAME { … }`, with comments and all
+    /// whitespace removed — so the digest tracks the SHAPE and ignores prose.
+    fn declaration(src: &str, name: &str) -> String {
+        let mut found = None;
+        for kw in ["struct ", "enum "] {
+            let needle = format!("{kw}{name} ");
+            for (i, _) in src.match_indices(&needle) {
+                // Must start a top-level item: the line is `pub struct X {` or `struct X {`.
+                let line_start = src[..i].rfind('\n').map(|n| n + 1).unwrap_or(0);
+                let prefix = src[line_start..i].trim();
+                if prefix.is_empty() || prefix == "pub" || prefix.starts_with("pub(") {
+                    found = Some(i + needle.len() - 1);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let start = found.unwrap_or_else(|| panic!("no top-level declaration of `{name}`"));
+        let bytes = src.as_bytes();
+        let open = start + src[start..].find('{').expect("a braced declaration");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (k, b) in bytes[open..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + k + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[open..end]
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(c) => &l[..c],
+                None => l,
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect()
+    }
+
+    /// FNV-1a, so the guard needs no dependency of its own. Collision resistance is irrelevant
+    /// here: the input is our own source, not attacker-chosen.
+    fn digest(s: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{h:016x}")
+    }
+
+    #[test]
+    fn a_persisted_shape_cannot_change_without_moving_state_version() {
+        let joined: String =
+            PERSISTED.iter().map(|(m, n)| format!("{n}{}", declaration(source(m), n))).collect();
+        let actual = digest(&joined);
+        assert_eq!(
+            actual, SHAPE_DIGEST,
+            "\n\nA PERSISTED SHAPE CHANGED (at-rest format v{}).\n\
+             Bump `secretbox::STATE_VERSION` and set SHAPE_DIGEST to {actual:?} in the SAME commit.\n\
+             Without the bump, an existing vault decodes the new shape from old bytes and surfaces \
+             as \"secrets unreadable\" instead of naming itself.\n\
+             If you did bump it: this is the regeneration step, not a failure.\n",
+            crate::secretbox::STATE_VERSION
+        );
+    }
+}

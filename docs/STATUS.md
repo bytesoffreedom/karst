@@ -2111,6 +2111,24 @@ credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_l
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
 
+**The local clock's influence on routing is bounded (#224, A6-8).** Drop-box epochs are a pure
+function of the wall clock, and nothing authenticates it. Two halves, and they are not symmetric:
+
+* **Backwards is fixed.** `PeerState` now carries an epoch high-water mark, so our own epoch is
+  monotonic. A bad NTP step, a restored VM snapshot or a timezone correction used to move our
+  deposits back into a box we had already moved past while the peer polled the newer one —
+  splitting one conversation across addresses with no error anywhere. Pinned by
+  `a_backwards_clock_jump_does_not_move_our_drop_box`, which discriminates on the ADDRESS: route
+  a message, roll the clock back three epochs, route again, same box.
+* **Forwards is NOT fixed, and cannot be locally.** A SENDER whose clock is fast deposits into a
+  box we would not otherwise ask for, and no local check can tell that from time genuinely having
+  passed without an authenticated time source. What the receiver can do is be forgiving in the
+  direction that costs only round trips: the slow sweep now reaches `FUTURE_SLACK_EPOCHS` (2 days)
+  past our own epoch, which covers the ordinary "date is off by a day or two" machine. A sender
+  wrong by a month is still lost mail until the relay's TTL. Pinned by
+  `the_sweep_reaches_a_sender_whose_clock_is_days_fast`, with a control asserting the HOT window
+  does not already cover it — otherwise the slack could be deleted and the test would stay green.
+
 **Key material is zeroized on drop, with the limit stated (#157, CRYPTO-09).** `MasterKey`, the
 ratchet `Session` (root key, both chain keys, every stored skipped message key) and
 `SessionSnapshot` now carry `ZeroizeOnDrop`, and the intermediate KDF buffers in `seed::derive`

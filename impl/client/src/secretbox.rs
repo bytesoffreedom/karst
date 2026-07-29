@@ -49,8 +49,9 @@ pub(crate) const MAGIC: &[u8; 4] = b"KRS2";
 /// данные. Пользователей нет, миграций нет (см. docs/POSITIONING.md), ломать сейчас дёшево.
 /// v5: the one-time prekey secrets moved INSIDE the session state file so the pair commits in
 /// one durable write (CRYPTO-26) — `sessions.dat` now holds `(generation, state, opks)` and
-/// `opks.dat` is gone.
-pub const STATE_VERSION: u16 = 6;
+/// `opks.dat` is gone. v6: the recovery phrase widened to 24 words, so the seed file is 32 bytes
+/// (CRYPTO-32). v7: `PeerState` carries the drop-box epoch high-water mark (A6-8).
+pub const STATE_VERSION: u16 = 7;
 
 /// The pinned Argon2id cost parameters (see [`MasterKey::derive`]). Owned by KARST, not by the
 /// `argon2` crate's defaults, so a dependency bump cannot silently change key derivation.

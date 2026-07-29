@@ -215,6 +215,17 @@ pub struct PeerState {
     /// runs a fresh `Peer` per poll: in memory it would reset every cycle, turning the
     /// slow sweep into an every-cycle one and multiplying fetch cost by `TTL_EPOCHS`.
     last_sweep: u64,
+    /// The highest drop-box epoch this client has ever acted on (A6-8, #224).
+    ///
+    /// Epochs come from the LOCAL wall clock, which nothing authenticates. A clock that jumps
+    /// BACKWARDS — a bad NTP step, a restored snapshot, a user fixing a timezone — would
+    /// otherwise make us deposit into a box we already moved past and poll boxes we have already
+    /// drained, quietly splitting a conversation across addresses. Keeping the high-water mark
+    /// makes our own epoch monotonic, which is the half of the problem a client CAN fix about
+    /// itself. Persisted for the same reason `last_sweep` is: a fresh `Peer` per poll would reset
+    /// it every cycle and the guarantee would be worth nothing.
+    #[serde(default)]
+    epoch_hwm: u64,
     /// Messages encrypted (ratchet advanced) but not yet accepted by a relay, so the exact
     /// ciphertext can be retransmitted after a transport failure instead of being lost with
     /// the advanced ratchet. Persisted IN this state so it commits atomically with the
@@ -261,6 +272,7 @@ impl PeerState {
             // a long absence collects its backlog immediately rather than after the first
             // interval.
             last_sweep: 0,
+            epoch_hwm: 0,
             outbox: Vec::new(),
             outbox_next_id: 0,
             inbound_sessions: Vec::new(),
@@ -420,6 +432,8 @@ pub struct Peer<T: Transport> {
     handles: HashMap<([u8; 32], Handle), [u8; 32]>,
     /// See `PeerState::last_sweep`.
     last_sweep: u64,
+    /// See `PeerState::epoch_hwm` (A6-8, #224).
+    epoch_hwm: u64,
     /// One cookie per handle, keyed by `(relay, client_addr)` — cookies are MAC-bound to
     /// `client_addr` AND issued by a specific relay, so R1's cookie is meaningless at R2.
     cookies: HashMap<([u8; 32], Vec<u8>), Cookie>,
@@ -545,6 +559,7 @@ impl<T: Transport> Peer<T> {
             handles: HashMap::new(),
             cookies: HashMap::new(),
             last_sweep: 0,
+            epoch_hwm: 0,
             sessions: HashMap::new(),
             inbound_sessions: HashMap::new(),
             pending_ack: Vec::new(),
@@ -553,6 +568,26 @@ impl<T: Transport> Peer<T> {
             sessions_refused: 0,
             decrypt_attempts_for_test: 0,
         }
+    }
+
+    /// This client's drop-box epoch, forced monotonic (A6-8, #224).
+    ///
+    /// `drop::epoch_of(now)` is a pure function of the local wall clock, and nothing authenticates
+    /// that clock. Going FORWARD is normal (time passes, and a long offline stretch is a big
+    /// legitimate jump). Going BACKWARDS is not: it makes us deposit into a box we have already
+    /// moved past and poll boxes we already drained, so one conversation ends up split across
+    /// addresses with no error anywhere. The high-water mark refuses the backwards half.
+    ///
+    /// It does NOT fix the other half — a clock wrong in the FORWARD direction still puts our
+    /// deposits into a box the peer may not look in. Nothing local can catch that without an
+    /// authenticated time source; the receiving side's `drop::FUTURE_SLACK_EPOCHS` is what
+    /// tolerates it, and only up to a point.
+    fn local_epoch(&mut self, now: u64) -> u64 {
+        let e = crate::drop::epoch_of(now);
+        if e > self.epoch_hwm {
+            self.epoch_hwm = e;
+        }
+        self.epoch_hwm
     }
 
     /// The relay this `Peer` talks to, as the namespace key for handles and cookies.
@@ -639,6 +674,7 @@ impl<T: Transport> Peer<T> {
             handles: self.handles.iter().map(|((r, k), v)| (*r, k.clone(), *v)).collect(),
             cookies: self.cookies.iter().map(|((r, k), v)| (*r, k.clone(), *v)).collect(),
             last_sweep: self.last_sweep,
+            epoch_hwm: self.epoch_hwm,
             outbox: self.outbox.clone(),
             outbox_next_id: self.outbox_next_id,
         }
@@ -650,6 +686,7 @@ impl<T: Transport> Peer<T> {
         self.handles = state.handles.into_iter().map(|(r, k, v)| ((r, k), v)).collect();
         self.cookies = state.cookies.into_iter().map(|(r, k, v)| ((r, k), v)).collect();
         self.last_sweep = state.last_sweep;
+        self.epoch_hwm = state.epoch_hwm;
         self.outbox = state.outbox;
         self.outbox_next_id = state.outbox_next_id;
         let restore = |v: Vec<PersistedSession>| -> HashMap<[u8; 32], SessionState> {
@@ -1077,7 +1114,7 @@ impl<T: Transport> Peer<T> {
     /// against the relay itself this is only cover when the two legs ride independent
     /// paths.
     pub fn send_loop(&mut self, now: u64) -> Response {
-        let epoch = crate::drop::epoch_of(now);
+        let epoch = self.local_epoch(now);
         let recipient = self.loop_box(epoch).public.to_bytes();
         // A short text's ciphertext, so a loop sits in the same size class as the traffic
         // it is hiding. Imperfect: the E2E layer does not pad, so real messages vary and a
@@ -1134,7 +1171,7 @@ impl<T: Transport> Peer<T> {
     /// [`Peer::transmit_envelope_routed`]). `None` uses the CURRENT session, correct only when
     /// nothing could have mutated it since encryption (the immediate-send path).
     fn route_for(
-        &self,
+        &mut self,
         peer_ik: &[u8; 32],
         envelope: &SessionEnvelope,
         routing: Option<([u8; 32], [u8; 32])>,
@@ -1152,7 +1189,7 @@ impl<T: Transport> Peer<T> {
                         (st.drop_seed, st.peer_mailbox_pub)
                     }
                 };
-                let epoch = crate::drop::epoch_of(now);
+                let epoch = self.local_epoch(now);
                 // Deposit into the OUTBOUND box (me → peer): the peer's mailbox point blinded for
                 // this session/epoch. The peer fetches the same address with its own fetch secret;
                 // I never hold that secret, so depositing does not let me read the box.
@@ -1766,6 +1803,7 @@ mod outbox_state_tests {
             handles: Vec::new(),
             cookies: Vec::new(),
             last_sweep: 0,
+            epoch_hwm: 0,
             outbox: vec![OutboxEntry {
                 id: 5,
                 peer_ik: [2u8; 32],
@@ -2274,6 +2312,63 @@ mod convergence_route_tests {
             live_addr, correct_address,
             "routed WITHOUT the snapshot: drifts to whatever `sessions[peer_ik]` holds NOW — \
              exactly the hazard `OutboxEntry`'s snapshot exists to close"
+        );
+    }
+
+    /// A6-8 (#224): a clock that jumps BACKWARDS must not move our drop-box address.
+    ///
+    /// Epochs are a pure function of the local wall clock and nothing authenticates it. A bad NTP
+    /// step, a restored VM snapshot or a user correcting a timezone can move the clock back —
+    /// and if the address followed, we would deposit into a box we already moved past while the
+    /// peer polls the newer one, splitting a conversation across addresses with no error
+    /// anywhere. The high-water mark makes our own epoch monotonic.
+    ///
+    /// Discriminating on the ADDRESS, not on the counter: the message is routed at a late `now`,
+    /// then again after the clock falls back three epochs, and both must land in the same box.
+    /// Drop the high-water mark and the second address differs — RED.
+    ///
+    /// The forward direction is deliberately NOT asserted here: a clock that runs fast is a real
+    /// hazard this cannot fix (see `local_epoch`), and the receiving side's
+    /// `drop::FUTURE_SLACK_EPOCHS` is what tolerates it.
+    #[test]
+    fn a_backwards_clock_jump_does_not_move_our_drop_box() {
+        let (transport, relay_pub) = shared();
+        let mut peer = super::Peer::new(transport, Account::generate(), dev_cap(), relay_pub);
+        let peer_ik = [9u8; 32];
+        let seed = [4u8; 32];
+        let mailbox_pub = crate::blind::MailboxSecret::generate().public();
+        peer.sessions.insert(
+            peer_ik,
+            SessionState {
+                session: Session::init_sender([7u8; 32], [8u8; 32]),
+                pending_initial: None,
+                drop_seed: seed,
+                peer_mailbox_pub: mailbox_pub,
+            },
+        );
+        let envelope = SessionEnvelope::Ratchet(RatchetMessage {
+            header: Header { dh: [3u8; 32], pn: 0, n: 0, salt: [4u8; 16] },
+            ciphertext: vec![5u8; 32],
+        });
+
+        let late = 40 * crate::drop::DROP_EPOCH_SECS;
+        let (addr_before, _) =
+            peer.route_for(&peer_ik, &envelope, None, late).expect("routes at the later time");
+
+        // The clock falls back three days.
+        let rolled_back = late - 3 * crate::drop::DROP_EPOCH_SECS;
+        assert_ne!(
+            crate::drop::epoch_of(rolled_back),
+            crate::drop::epoch_of(late),
+            "the fixture must really cross epochs"
+        );
+        let (addr_after, _) = peer
+            .route_for(&peer_ik, &envelope, None, rolled_back)
+            .expect("routes after the clock moved back");
+
+        assert_eq!(
+            addr_before, addr_after,
+            "a backwards clock must not change the box we deposit into"
         );
     }
 

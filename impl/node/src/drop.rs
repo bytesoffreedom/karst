@@ -156,8 +156,25 @@ pub fn poll_epochs(now: u64) -> [u64; 3] {
 /// that is the real bill.
 pub fn sweep_epochs(now: u64) -> Vec<u64> {
     let e = epoch_of(now);
-    (e.saturating_sub(TTL_EPOCHS)..=e + 1).collect()
+    (e.saturating_sub(TTL_EPOCHS)..=e + FUTURE_SLACK_EPOCHS).collect()
 }
+
+/// How far AHEAD of our own clock the slow sweep still looks (A6-8, #224).
+///
+/// A sender deposits into the box of the epoch ITS clock says it is, and nothing authenticates
+/// that clock. A machine with the wrong date — a dead RTC battery, a bad timezone, a VM restored
+/// from a snapshot — deposits into a box its recipient does not consider current, and the mail
+/// sits there unread until the relay's TTL sweeps it: no error anywhere, the relay honest, the
+/// message simply at an address nobody asks for.
+///
+/// We cannot fix the sender's clock, and there is no authenticated time here to check it against.
+/// What we CAN do is make the receiver's window forgiving in the direction that costs only round
+/// trips. Two epochs of slack covers the common "date is off by a day or two" case; a sender
+/// wrong by a month is still lost mail, and that is stated rather than papered over.
+///
+/// Only the SLOW sweep is widened — the hot window runs every cycle, and latency-critical mail
+/// comes from senders whose clocks are close to ours by construction.
+const FUTURE_SLACK_EPOCHS: u64 = 2;
 
 /// How often the complete window is swept. Bounds worst-case delivery latency for mail
 /// that arrived while we were away — it is already old, so minutes do not matter, and the
@@ -201,6 +218,32 @@ mod tests {
         let a = drop_seed(&[1u8; 32]);
         let b = drop_seed(&[2u8; 32]);
         assert_ne!(drop_address(&a, 5, 0), drop_address(&b, 5, 0));
+    }
+
+    /// A6-8 (#224): a sender whose CLOCK is wrong by a day or two — not merely skewed across a
+    /// boundary — still lands inside the window we sweep.
+    ///
+    /// Nothing authenticates a sender's clock. A dead RTC battery, a wrong timezone or a VM
+    /// restored from a snapshot puts its deposit into a box we would never ask for, and the mail
+    /// rots until the relay's TTL with no error anywhere. The slow sweep therefore reaches
+    /// `FUTURE_SLACK_EPOCHS` past our own epoch.
+    ///
+    /// Discriminating on the DAY-scale case rather than the boundary case: the hot window already
+    /// covers `e+1`, so a test using a one-epoch-ahead sender would pass with the slack removed.
+    #[test]
+    fn the_sweep_reaches_a_sender_whose_clock_is_days_fast() {
+        let now = 40 * DROP_EPOCH_SECS;
+        let e = epoch_of(now);
+        let two_days_fast = epoch_of(now + 2 * DROP_EPOCH_SECS);
+        assert_eq!(two_days_fast, e + 2, "the fixture must really be two epochs ahead");
+        assert!(
+            !poll_epochs(now).contains(&two_days_fast),
+            "control: the hot window does NOT cover this — the slack has to come from the sweep"
+        );
+        assert!(
+            sweep_epochs(now).contains(&two_days_fast),
+            "a sender two days fast must still be reachable by the slow sweep"
+        );
     }
 
     #[test]

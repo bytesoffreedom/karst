@@ -16,7 +16,6 @@
 //! - **overall**: `MAX_DIALS_PER_ROUND` caps every connection attempt in a round.
 
 use std::collections::HashSet;
-use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock};
 
 use node::protocol::{RelayDescriptor};

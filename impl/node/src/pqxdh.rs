@@ -429,7 +429,7 @@ impl Account {
 
     /// Долговременный identity-ключ (для отправки: sender_ik) — внутри крейта,
     /// сессионный слой берёт приватный ключ отсюда.
-    pub(crate) fn ik(&self) -> &Identity {
+    pub fn ik(&self) -> &Identity {
         &self.ik
     }
 

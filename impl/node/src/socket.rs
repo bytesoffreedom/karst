@@ -6,20 +6,16 @@
 //! `relay` crate; nothing here can name a `RelayNode`.
 
 use std::io;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
 
 use admission::capability::Capability;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use snow::Builder;
 
 use crate::discovery::DiscoveryRecord;
 use crate::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, Transport, WireMessage};
 use crate::pqxdh::PreKeyBundle;
-use crate::session::{Session, NOISE_PARAMS};
+use crate::session::Session;
 use crate::transport::{Channel, Dest, DirectTcpAdapter, Path, TransportAdapter};
 use crate::wire::{
     decode, encode, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME,
@@ -421,25 +417,3 @@ impl Transport for SocketTransport {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn conn_limiter_caps_and_releases_via_raii() {
-        // Deterministic (no sockets): the cap holds, a released slot is reusable, and
-        // dropping every permit returns the live count to zero. Neuter `try_acquire`
-        // to ignore `max` (always Some) and the capacity assertions go red.
-        let l = ConnLimiter::new(2);
-        let a = l.try_acquire().expect("slot 1");
-        let _b = l.try_acquire().expect("slot 2");
-        assert!(l.try_acquire().is_none(), "at capacity → None");
-        assert_eq!(l.live(), 2);
-        drop(a);
-        let c = l.try_acquire().expect("freed slot reusable");
-        assert!(l.try_acquire().is_none(), "full again");
-        drop(_b);
-        drop(c);
-        assert_eq!(l.live(), 0, "RAII released every slot");
-    }
-}

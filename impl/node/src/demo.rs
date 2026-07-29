@@ -14,7 +14,7 @@ use admission::cookie::Cookie;
 use x25519_dalek::PublicKey;
 
 use crate::protocol::{
-    fetch_proof, payload_id, AckRequest, AckResponse, FetchRequest, FetchResponse, Payload,
+    fetch_proof, payload_id, AckRequest, FetchRequest, FetchResponse, Payload,
     Response, Transport, WireMessage,
 };
 use crate::seal::{Identity, SkeletonSeal};

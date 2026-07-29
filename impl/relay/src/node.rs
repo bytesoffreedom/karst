@@ -27,7 +27,7 @@ use x25519_dalek::PublicKey;
 pub use node::protocol::*;
 use node::discovery::{self, DiscoveryRecord};
 use node::pqxdh::PreKeyBundle;
-use node::seal::{Identity, SkeletonSeal};
+use node::seal::Identity;
 
 /// Потолок числа опубликованных bundle (§12): при полноте — отказ на публикацию
 /// нового IK, НЕ тихий сброс (та же дисциплина, что `MAX_FETCH_SEALS`).
@@ -1619,6 +1619,8 @@ impl Transport for InMemoryTransport {
 
 #[cfg(test)]
 mod tests {
+    use node::demo::{Client, Recipient};
+    use node::seal::SkeletonSeal;
     /// A capability the in-crate tests can present when a publish CREATES a slot (CRYPTO-18).
     fn publish_cap() -> Capability {
         Capability {

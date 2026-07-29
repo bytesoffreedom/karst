@@ -1971,15 +1971,15 @@ mod outbox_state_tests {
     #[test]
     fn a_stale_session_without_a_mailbox_point_fails_loud_on_send() {
         use crate::protocol::{Response};
-use relay::node::{InMemoryTransport, RelayNode};
+use super::LoopbackMail;
         use crate::pqxdh::Account;
         use crate::ratchet::Session;
         use admission::capability::{Capability, Quota, Scope};
-        use std::cell::RefCell;
-        use std::rc::Rc;
+        
+        
 
-        let relay = Rc::new(RefCell::new(RelayNode::new(0)));
-        let relay_pub = relay.borrow().relay_public();
+        // A stand-in relay key: this test never reaches a relay (#143).
+        let relay_pub = x25519_dalek::PublicKey::from([7u8; 32]);
         let cap = Capability {
             capability_id: [0xCA; 16],
             scope: Scope::MessageDelivery,
@@ -1988,7 +1988,7 @@ use relay::node::{InMemoryTransport, RelayNode};
             not_after: u32::MAX,
             secret: [0x33; 32],
         };
-        let mut peer = super::Peer::new(InMemoryTransport::new(relay), Account::generate(), cap, relay_pub);
+        let mut peer = super::Peer::new(LoopbackMail::default(), Account::generate(), cap, relay_pub);
 
         let bob_ik = [9u8; 32];
         peer.sessions.insert(
@@ -2012,12 +2012,12 @@ use relay::node::{InMemoryTransport, RelayNode};
 #[cfg(test)]
 mod session_cap_tests {
     use crate::protocol::{Payload, Response, SessionEnvelope};
-use relay::node::{InMemoryTransport, RelayNode};
+use super::LoopbackMail;
     use crate::pqxdh::Account;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    
+    
     use x25519_dalek::PublicKey;
 
     fn dev_cap() -> Capability {
@@ -2031,14 +2031,13 @@ use relay::node::{InMemoryTransport, RelayNode};
         }
     }
 
-    fn shared() -> (InMemoryTransport, PublicKey) {
-        let mut relay = RelayNode::new(0);
-        relay.issue_capability(dev_cap());
-        let relay_pub = relay.relay_public();
-        (InMemoryTransport::new(Rc::new(RefCell::new(relay))), relay_pub)
+    fn shared() -> (LoopbackMail, PublicKey) {
+        // A stand-in relay key: nothing here talks to a relay, and the tests that do live in
+        // `tests/` where a real one is available (#143).
+        (LoopbackMail::default(), PublicKey::from([7u8; 32]))
     }
 
-    fn mk_peer(transport: &InMemoryTransport, relay_pub: PublicKey) -> super::Peer<InMemoryTransport> {
+    fn mk_peer(transport: &LoopbackMail, relay_pub: PublicKey) -> super::Peer<LoopbackMail> {
         super::Peer::new(transport.clone(), Account::generate(), dev_cap(), relay_pub)
     }
 
@@ -2059,7 +2058,7 @@ use relay::node::{InMemoryTransport, RelayNode};
         Session::init_sender([1u8; 32], [2u8; 32])
     }
 
-    fn insert_dummy(peer: &mut super::Peer<InMemoryTransport>, ik: [u8; 32], template: &Session) {
+    fn insert_dummy(peer: &mut super::Peer<LoopbackMail>, ik: [u8; 32], template: &Session) {
         peer.sessions.insert(
             ik,
             super::SessionState {
@@ -2286,12 +2285,12 @@ use relay::node::{InMemoryTransport, RelayNode};
 mod convergence_route_tests {
     use super::{SessionEnvelope, SessionState};
     use crate::protocol::{Response};
-use relay::node::{InMemoryTransport, RelayNode};
+use super::LoopbackMail;
     use crate::pqxdh::Account;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    
+    
     use x25519_dalek::PublicKey;
 
     const NOW: u64 = 1_000_000;
@@ -2310,20 +2309,19 @@ use relay::node::{InMemoryTransport, RelayNode};
     /// A relay + transport shared by TWO peers, so they can actually reach each other — the
     /// routing test below needs neither (it never touches the network), but the healing and
     /// disk-reload tests do.
-    fn shared() -> (InMemoryTransport, PublicKey) {
-        let mut relay = RelayNode::new(NOW);
-        relay.issue_capability(dev_cap());
-        let relay_pub = relay.relay_public();
-        (InMemoryTransport::new(Rc::new(RefCell::new(relay))), relay_pub)
+    fn shared() -> (LoopbackMail, PublicKey) {
+        // A stand-in relay key: nothing here talks to a relay, and the tests that do live in
+        // `tests/` where a real one is available (#143).
+        (LoopbackMail::default(), PublicKey::from([7u8; 32]))
     }
 
-    fn mk_peer(transport: &InMemoryTransport, relay_pub: PublicKey) -> super::Peer<InMemoryTransport> {
+    fn mk_peer(transport: &LoopbackMail, relay_pub: PublicKey) -> super::Peer<LoopbackMail> {
         super::Peer::new(transport.clone(), Account::generate(), dev_cap(), relay_pub)
     }
 
     /// A standalone peer with its OWN relay — for the routing test, which never sends or
     /// receives anything over the network (it calls `route_for` directly).
-    fn mk_lone_peer() -> super::Peer<InMemoryTransport> {
+    fn mk_lone_peer() -> super::Peer<LoopbackMail> {
         let (transport, relay_pub) = shared();
         mk_peer(&transport, relay_pub)
     }
@@ -2549,7 +2547,7 @@ use relay::node::{InMemoryTransport, RelayNode};
 #[cfg(test)]
 mod receive_budget_tests {
     use crate::protocol::{AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, PublishRequest, PublishResponse, Response, Transport, WireMessage};
-use relay::node::{InMemoryTransport, RelayNode};
+use super::LoopbackMail;
     use crate::pqxdh::PreKeyBundle;
     use crate::pqxdh::Account;
     use crate::ratchet::Session;
@@ -2565,7 +2563,7 @@ use relay::node::{InMemoryTransport, RelayNode};
     /// independent of how fast the machine running it happens to be.
     #[derive(Clone)]
     struct SlowTransport {
-        inner: InMemoryTransport,
+        inner: LoopbackMail,
         per_request: Duration,
         /// Which mailbox ADDRESSES the pass actually reached. Counting requests instead would
         /// count each box's `NeedCookie` retry as well, which says nothing about how much of the
@@ -2642,12 +2640,10 @@ use relay::node::{InMemoryTransport, RelayNode};
     /// others' mail — the head-of-line half of R2-12.
     #[test]
     fn a_slow_relay_cannot_stretch_one_receive_pass_without_end() {
-        let mut relay = RelayNode::new(0);
-        relay.issue_capability(dev_cap());
-        let relay_pub = relay.relay_public();
+        let relay_pub = x25519_dalek::PublicKey::from([7u8; 32]);
         let seen = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let transport = SlowTransport {
-            inner: InMemoryTransport::new(Rc::new(RefCell::new(relay))),
+            inner: LoopbackMail::default(),
             per_request: Duration::from_millis(20),
             seen: seen.clone(),
         };
@@ -2693,12 +2689,10 @@ use relay::node::{InMemoryTransport, RelayNode};
     /// a bug that stopped after one box would pass the test above.
     #[test]
     fn an_unhurried_pass_still_visits_every_box() {
-        let mut relay = RelayNode::new(0);
-        relay.issue_capability(dev_cap());
-        let relay_pub = relay.relay_public();
+        let relay_pub = x25519_dalek::PublicKey::from([7u8; 32]);
         let seen = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let transport = SlowTransport {
-            inner: InMemoryTransport::new(Rc::new(RefCell::new(relay))),
+            inner: LoopbackMail::default(),
             per_request: Duration::from_millis(0),
             seen: seen.clone(),
         };
@@ -2727,5 +2721,67 @@ use relay::node::{InMemoryTransport, RelayNode};
             "an unhurried empty pass must not report a fault: {}",
             got.err().unwrap_or_default()
         );
+    }
+}
+
+/// A LOOPBACK mailbox for unit tests: deposits go into a map, fetches drain it. No admission, no
+/// quota, no relay (#143).
+///
+/// Two reasons this exists rather than the relay's in-memory transport. First, the relay is
+/// another crate now, and a dev-dependency on it does NOT reach a unit test: Cargo builds this
+/// crate twice — with and without `cfg(test)` — so a relay type implements the `Transport` trait
+/// from the OTHER build. Same name, different type; no import fixes it.
+///
+/// Second, and more to the point: these tests are about the CLIENT's session logic — routing
+/// arithmetic, the session-table cap, split-session convergence, the receive budget. What they
+/// need from the far end is that a deposit comes back on a fetch. Admission, cookies and quota
+/// were incidental scaffolding, and testing against a full relay meant a failure in the relay
+/// could red a client test for reasons the test does not name. The relay's own behaviour is
+/// covered by the integration tests in `tests/`, where a real one is available.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct LoopbackMail {
+    boxes: std::rc::Rc<std::cell::RefCell<HashMap<[u8; 32], Vec<Payload>>>>,
+    #[allow(clippy::type_complexity)]
+    bundles: std::rc::Rc<
+        std::cell::RefCell<HashMap<[u8; 32], (PreKeyBundle, Vec<crate::pqxdh::SignedOpk>)>>,
+    >,
+}
+
+#[cfg(test)]
+impl Transport for LoopbackMail {
+    fn send(&self, msg: &WireMessage, _now: u64) -> Response {
+        self.boxes.borrow_mut().entry(msg.recipient).or_default().push(msg.payload.clone());
+        Response::Accepted
+    }
+    fn fetch(&self, req: &FetchRequest, _now: u64) -> FetchResponse {
+        let drained = self.boxes.borrow_mut().remove(&req.mailbox).unwrap_or_default();
+        FetchResponse::Fetched(drained)
+    }
+    fn publish_bundle(&self, req: &PublishRequest, _now: u64) -> PublishResponse {
+        self.bundles
+            .borrow_mut()
+            .insert(req.bundle.ik_pub, (req.bundle.clone(), req.opks.clone()));
+        PublishResponse::Published
+    }
+    fn fetch_bundle(&self, ik: &[u8; 32], _now: u64) -> Result<Option<PreKeyBundle>, String> {
+        Ok(self.bundles.borrow().get(ik).map(|(b, _)| b.clone()))
+    }
+    /// One-time prekeys are handed out ONE per fetch and never twice — the property the client
+    /// side depends on, and the only part of the relay's bundle handling these tests care about.
+    fn fetch_bundle_opk(
+        &self,
+        req: &BundleOpkRequest,
+        _now: u64,
+    ) -> Result<BundleOpkResponse, String> {
+        let mut all = self.bundles.borrow_mut();
+        Ok(match all.get_mut(&req.ik) {
+            None => BundleOpkResponse::Bundle(None),
+            Some((bundle, opks)) => {
+                let mut out = bundle.clone();
+                out.opk = opks.pop();
+                BundleOpkResponse::Bundle(Some(out))
+            }
+        })
     }
 }

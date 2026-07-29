@@ -16,19 +16,14 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use admission::capability::Capability;
-use rand::rngs::OsRng;
-use rand::RngCore;
 use snow::Builder;
 
-use node::discovery::DiscoveryRecord;
-use node::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, Transport, WireMessage};
+use node::protocol::{AckResponse, BlobResponse, BundleOpkResponse, FetchResponse, PublishResponse, Response};
 use crate::node::{RelayNode};
-use node::pqxdh::PreKeyBundle;
 use node::session::{Session, NOISE_PARAMS};
-use node::transport::{Channel, Dest, DirectTcpAdapter, Path, TransportAdapter};
+use node::transport::Channel;
 use node::wire::{
-    decode, encode, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME,
+    decode, encode, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_RESPONSE_FRAME,
 };
 
 /// Часы сервера: возвращают текущее время в секундах.
@@ -483,4 +478,27 @@ fn handle_conn(
         session.write_msg(&resp_bytes, resp_max)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conn_limiter_caps_and_releases_via_raii() {
+        // Deterministic (no sockets): the cap holds, a released slot is reusable, and
+        // dropping every permit returns the live count to zero. Neuter `try_acquire`
+        // to ignore `max` (always Some) and the capacity assertions go red.
+        let l = ConnLimiter::new(2);
+        let a = l.try_acquire().expect("slot 1");
+        let _b = l.try_acquire().expect("slot 2");
+        assert!(l.try_acquire().is_none(), "at capacity → None");
+        assert_eq!(l.live(), 2);
+        drop(a);
+        let c = l.try_acquire().expect("freed slot reusable");
+        assert!(l.try_acquire().is_none(), "full again");
+        drop(_b);
+        drop(c);
+        assert_eq!(l.live(), 0, "RAII released every slot");
+    }
 }

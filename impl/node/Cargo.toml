@@ -39,9 +39,14 @@ webpki-roots = "0.26"
 rustls-pemfile = "2"
 
 [dev-dependencies]
-# A dev-dependency cycle, and a legal one: the relay crate depends on this one, and this one's
-# TESTS drive a live relay. Cargo supports exactly this shape. What it does NOT allow — and what
-# the split exists to prevent — is the library itself depending on the relay.
+# A dev-dependency cycle, and a legal one for INTEGRATION tests: `tests/*.rs` link the ordinary
+# (non-`cfg(test)`) build of this crate, which is the same one `relay` links, so the types match.
+#
+# It does NOT extend to unit tests inside `src/`. Cargo builds this crate twice — once with
+# `cfg(test)` for its own unit tests, once without for `relay` to depend on — so a relay type
+# implements the `Transport` trait from the OTHER build. Same name, different type, and no import
+# fixes it. Unit tests that only needed *a* transport use `peer::QuietRelay` instead; the ones that
+# genuinely need a relay live in `tests/`.
 relay = { path = "../relay" }
 # Self-signed cert/key generation for wss carrier tests (test-only trust root).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

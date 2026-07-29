@@ -277,16 +277,17 @@ pub struct Relay {
     /// account's traffic rides its own Tor circuit (see `Socks5Adapter::isolation`).
     /// Two accounts sharing a circuit would be linked however different their keys are.
     isolation: String,
-    /// **Per-session pseudonym** sent as `client_addr` on the blob path. Fresh random
-    /// bytes, never persisted, never derived from an identity key.
+    /// **Per-session pseudonym** sent as `client_addr` on blob DOWNLOADS (and the durability
+    /// spot check). Fresh random bytes, never persisted, never derived from an identity key.
     ///
     /// It used to be the uploader's IK on put and the downloader's IK on get — against
     /// the same `blob_id`, which handed the relay both ends of every large-file
-    /// transfer: "IK_A sent a file to IK_B". Only the cookie needs this field; the blob
-    /// store uses it as an opaque owner handle (first-writer-wins + per-sender caps),
-    /// which a stable-per-session pseudonym satisfies just as well. Those caps were
-    /// already best-effort (the self-declared sender was forgeable), so nothing that was
-    /// actually holding is weakened.
+    /// transfer: "IK_A sent a file to IK_B". Only the cookie needs this field on the get
+    /// path, and a stable-per-session pseudonym satisfies a cookie just as well.
+    ///
+    /// It is no longer used on PUT. The blob store reads `client_addr` there as a durable
+    /// owner handle (first-writer-wins), which a per-process value cannot be — see
+    /// `blob::owner_token` and A4-1.
     pseudonym: [u8; 32],
     /// `proxy` is a mixnet (Nym) client's SOCKS port, not a bare SOCKS5/Tor proxy. Transport is
     /// identical (SOCKS5 to that port); this only makes the carrier read as `mixnet` and keeps
@@ -1919,6 +1920,7 @@ pub fn send_file(
     // recipient downloads from) has been delivered. The id covers the CONTENT, so a resume can
     // only ever continue the same bytes — see `upload_id_for`.
     let upload_id = upload_id_for(to_ik, name, size, &blob::plaintext_hash(bytes));
+    sweep_pending_uploads(store, now);
     let (blob_id, key) = match store.get_pending_upload(&upload_id).map_err(|e| format!("pending uploads: {e}"))? {
         Some(pu) => (pu.blob_id, pu.key),
         None => {
@@ -1966,6 +1968,32 @@ pub fn upload_id_for(to_ik: &[u8; 32], name: &str, size: u64, content: &[u8; 32]
     // ciphertexts under one key+nonce. Editing a file now starts its own transfer.
     h.update(content);
     h.finalize().into()
+}
+
+/// Drop resume records whose blob the relay has certainly forgotten: a partial blob is swept at
+/// `BLOB_TTL_SECS`, so past that the record points at nothing and resuming from it would re-upload
+/// every chunk anyway (safe — the per-chunk salt makes reusing `K` harmless — but pointless).
+///
+/// This exists because the record store is BOUNDED (`MAX_PENDING_UPLOADS`) and a full one silently
+/// stops recording NEW uploads, i.e. quietly turns resumability off. Cancelled and abandoned sends
+/// keep their record on purpose (that is what a later resume needs), so without a sweep they
+/// accumulate for the life of the account. Returns how many were dropped. `now` is passed in, never
+/// read from the clock, so this is testable on counts alone.
+///
+/// The TTL used is our own default, not the `blob_ttl_secs` a relay advertises (a record is not
+/// bound to the relay it was uploading to). Against a relay that keeps blobs LONGER, this drops a
+/// record that was still resumable — the cost is one full re-upload, never a lost file.
+pub fn sweep_pending_uploads(store: &Store, now: u64) -> usize {
+    let Ok(pending) = store.list_pending_uploads() else { return 0 };
+    let mut dropped = 0;
+    for pu in pending {
+        if now.saturating_sub(pu.queued_at) > node::blobstore::BLOB_TTL_SECS
+            && store.remove_pending_upload(&pu.upload_id).is_ok()
+        {
+            dropped += 1;
+        }
+    }
+    dropped
 }
 
 /// Send our AVATAR to one contact: manifest + chunks (same transport as a file, but
@@ -2420,6 +2448,23 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
     let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>, usize)>(PIPELINE_DEPTH);
     let rx = std::sync::Mutex::new(rx);
     let to_upload = count.saturating_sub(next);
+    // A4-1: the blob store owns a blob by the `client_addr` of its FIRST chunk, so this field is a
+    // storage identity, not a transport one — and `relay.pseudonym` is minted fresh per `Relay`,
+    // i.e. per process. A resume after a client restart therefore arrived as a stranger and was
+    // rejected forever. The handle is derived from the blob's own key instead (see
+    // `blob::owner_token`), which the resume record already persists.
+    //
+    // What this costs, stated plainly: `sender` is also the relay's per-sender quota bucket, and a
+    // per-blob handle makes `MAX_BLOBS_PER_SENDER` vacuous and collapses the per-sender byte
+    // aggregate into the per-blob one for HONEST clients (a hostile one always minted a fresh
+    // `client_addr` per blob at zero cost — blobstore.rs says so in its own header). What still
+    // binds: the per-blob size cap, the global store cap, and `BLOB_CAP_QUOTA` — which meters by
+    // `capability_id`, so it is unaffected by this change. Note the last is a RATE (bytes per
+    // window), not a residency bound, so it limits how fast one credential can push bytes, not how
+    // much it can have parked at once. Aggregating a client's blobs without a durable, linkable
+    // per-client address needs the relay to treat ownership as a proof and meter by capability —
+    // a relay-side change, not one this side can make alone.
+    let owner = blob::owner_token(&key, &blob_id).to_vec();
 
     let hash: [u8; 32] = std::thread::scope(|scope| -> Result<[u8; 32], String> {
         for _ in 0..PIPELINE_DEPTH {
@@ -2464,7 +2509,12 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
                         let req = BlobPutRequest {
                             request_nonce: nonce.clone(),
                             capability_proof: cap.prove(&nonce, 0),
-                            client_addr: relay.pseudonym.to_vec(),
+                            // The blob's durable owner handle, NOT the session pseudonym (A4-1).
+                            // The cookie is bound to whatever address asked for it, and each
+                            // worker starts with `cookie: None`, so every cookie on this path is
+                            // minted against this same handle — none is ever carried across two
+                            // different addresses.
+                            client_addr: owner.clone(),
                             carrier_id: BLOB_CARRIER.to_vec(),
                             cookie,
                             blob_id,
@@ -2545,16 +2595,25 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
 /// dropped the upload, was swept, or claimed "durable" but isn't). This is how a client turns a
 /// relay's DURABLE claim into a checked fact. Note the asymmetry: the reverse ("ephemeral — I
 /// forgot it") is NOT provable remotely, so only `durable` is verifiable this way.
+///
+/// This check runs immediately after every upload, on the SAME `blob_id` — so whatever address it
+/// carries is, by construction, tied to the blob that was just put. It therefore uses the blob's
+/// own owner handle rather than `relay.pseudonym`: the session pseudonym would have re-linked every
+/// blob an uploader parked ("put X from T_x, get X from P; put Y from T_y, get Y from P") and
+/// handed back exactly the cross-blob correlation the per-blob handle removes. Nothing is weakened:
+/// the get path is cookie-gated only (bearer-by-id, never ownership-checked), the cookie is minted
+/// against whatever address asks, and this caller holds `key` by definition.
 pub fn verify_durability(relay: &Relay, blob_id: [u8; 32], key: [u8; 32], count: u32) -> Result<bool, String> {
     if count == 0 {
         return Ok(true);
     }
     let index = u32::from_le_bytes(blob::random32()[..4].try_into().unwrap()) % count;
     let transport = relay.transport();
+    let owner = blob::owner_token(&key, &blob_id).to_vec();
     let mut cookie: Option<admission::cookie::Cookie> = None;
     loop {
         let req = BlobGetRequest {
-            client_addr: relay.pseudonym.to_vec(),
+            client_addr: owner.clone(),
             carrier_id: BLOB_CARRIER.to_vec(),
             cookie,
             blob_id,

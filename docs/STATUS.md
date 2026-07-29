@@ -373,8 +373,9 @@ undetected; a plaintext SHA-256 is the end-to-end backstop, verified incremental
 Both directions **stream to/from disk** (peak RAM O(chunk), not O(file)). A small
 `FileRef {blob_id, K, hash, name, size, count}` travels inline over the session; the
 recipient downloads + decrypts + verifies. `BlobStore` is disk-backed, per-blob /
-per-sender / global byte-capped, and TTL-swept (7 days) like the mailbox; uploads +
-downloads are cookie-gated. The **index is DURABLE and chunks may arrive
+per-sender / global byte-capped, and TTL-swept (7 days) like the mailbox; downloads are
+cookie-gated, uploads are cookie- **and capability-gated** + metered (see the DoS-attribution
+bullet below). The **index is DURABLE and chunks may arrive
 OUT OF ORDER** — each chunk is its own file (`<id>.c<index>`) written atomically (temp + fsync +
 rename, so a chunk file is whole or absent, never torn), plus a small `<id>.meta` header sidecar;
 `BlobStore::open` rebuilds the index by scanning which chunk files survived (across gaps), drops
@@ -383,10 +384,37 @@ and the client can **pipeline** several chunks in flight at once. The **upload i
 continues from the relay's watermark after a crash) and rides **one Noise session per file**
 (reused, hard-bounded connection) instead of a fresh handshake per chunk. Recovery is client-crash- AND
 relay-restart-safe; a relay that wipes its disk still loses the blob (no recovery
-possible). Tests: crypto tamper cases (byte-flip / wrong key / swap / truncate /
+possible).
+
+**Resume across a CLIENT restart (A4-1, fixed).** The relay owns a blob by the `client_addr` on
+its FIRST chunk, and that address used to be the client's *session pseudonym* — fresh random bytes
+per `Relay`, i.e. per process, deliberately never persisted. So a restarted client came back as a
+stranger and was rejected ("blob owned by another sender") on every retry until the 7-day TTL swept
+the partial: the resume record survived, the identity that owned the bytes did not. The put path
+now sends `blob::owner_token(K, blob_id)` instead — derived from the per-file key the resume record
+*already* persists, so ownership is durable exactly when resumability is, and is per-blob where the
+pseudonym was per-process (the post-upload `verify_durability` spot check uses the same handle, since
+leaving the pseudonym on that GET would have re-linked the very blobs the handle separates). That is
+**not** anonymity: one connection uploading blob after blob still correlates by IP and timing; what
+it removes is a stable identifier the client was handing over for free. Ordinary downloads — the
+recipient's side — still carry a session pseudonym. The desktop upload path was worse than that: it called the non-resumable entry with a
+fresh random `blob_id`+`key` every time and wrote no record, so the GUI had no resume at all; it now
+keys the same persisted record the CLI does. **Honest limits:** the GUI receives file bytes from the
+webview, not a path, so it cannot resume unattended on restart — the user re-picks the same file and
+the record (keyed by content hash) continues from the watermark. And the relay's per-sender caps
+(`MAX_SENDER_BYTES`, `MAX_BLOBS_PER_SENDER`) stop binding honest clients, since each blob is now its
+own "sender"; what still bounds a relay is the per-blob cap, the global store cap, and the
+per-capability blob quota (a RATE, not a residency bound). A hostile client always minted a fresh
+`client_addr` per blob at zero cost, so nothing that was actually holding is lost — but keeping
+per-client aggregation *and* durable ownership *and* cross-blob unlinkability needs the relay to
+treat ownership as a proof and meter by `capability_id`, which is a relay-side change.
+
+Tests: crypto tamper cases (byte-flip / wrong key / swap / truncate /
 forged-count all detected), an end-to-end blob round-trip through the real relay
 socket, **a parked blob recovered + downloaded byte-identical through a restarted
-relay**, store-level recovery/torn-tail/TTL-on-recovery/junk cases, a ~745 KiB file
+relay**, **an upload resumed after the CLIENT restarted** (all in-memory state dropped, rebuilt
+from disk — RED before the fix with "blob owned by another sender"),
+store-level recovery/torn-tail/TTL-on-recovery/junk cases, a ~745 KiB file
 through the full GUI worker path (`Cmd::SendFile` → blob → `FileRef` → download)
 byte-identical, and a ~150 KiB file that guards the old inline/blob dead zone.
 
@@ -402,10 +430,19 @@ byte-identical, and a ~150 KiB file that guards the old inline/blob dead zone.
   this slightly: a 48–240 KiB file that used to hide as padded mailbox seals now rides
   the blob wire class and leaks its "file-ness". Strictly better than the prior state,
   where those files silently failed rather than transferring at all.
-- **Blob-store DoS attribution is STUBBED.** With the skeleton's public dev-cap
-  anyone can authenticate, so per-sender caps are best-effort (self-declared sender);
-  the per-blob + global caps + TTL are the real bounds. Real cost attribution needs
-  the capability-provisioning layer that does not exist yet.
+- **Blob-store DoS attribution, stated as it now is (CRYPTO-15 / A5-1 — closed).** The upload
+  path is no longer cookie-only: `admit_blob_put` verifies a **capability proof** and meters the
+  chunk's bytes against a **separate per-`capability_id` blob quota** before any file I/O. It does
+  this without the `Scope::BlobUpload` the audit asked for — the proof is verified under
+  `Scope::MessageDelivery` and the classes are kept apart by the required `blob_put_nonce` SHAPE,
+  checked *before* the HMAC, so a proof minted for the message path cannot be replayed here and
+  vice versa. Deliberate residuals: (a) the quota is a rate over a tumbling window, so it bounds how
+  fast one credential pushes bytes, not how much it keeps parked for the 7-day TTL; (b) `client_addr`
+  is still self-declared and now per-blob, so the per-sender caps bound nothing an attacker cares
+  about — the per-blob cap, the global cap and the TTL do; (c) blob **downloads** stay cookie-only
+  by design (egress bandwidth is a different resource with its own attribution question, named in
+  `handle_blob_get` rather than folded in). With the public dev-cap anyone can still authenticate,
+  so on a dev relay this meters rather than gates.
 - **Transfer no longer blocks the worker thread (DONE).** The long, ratchet-free blob
   work (`blob_upload`/`blob_download`) runs on a spawned thread; the worker keeps
   polling/sending, and only the tiny final `FileRef` uses the ratchet (still on the

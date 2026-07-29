@@ -1,8 +1,13 @@
-//! §15 blob persistence across a relay restart. The relay's blob index is durable, so a large
-//! upload parked on the relay survives a restart instead of vanishing (the reliability gate before
-//! raising the size limit). Here: upload a multi-chunk blob to a relay, bring up a SECOND relay
-//! node over the SAME on-disk blob directory (a restart — its index is rebuilt purely from disk),
-//! and download the blob back byte-identical through it.
+//! §15 blob persistence across a restart — of the RELAY, and of the CLIENT.
+//!
+//! Relay side: the relay's blob index is durable, so a large upload parked on the relay survives a
+//! restart instead of vanishing (the reliability gate before raising the size limit). Upload a
+//! multi-chunk blob, bring up a SECOND relay node over the SAME on-disk blob directory (its index
+//! is rebuilt purely from disk), download it back byte-identical.
+//!
+//! Client side (A4-1): the uploader's own restart is the harder half, because the relay owns a blob
+//! by the `client_addr` of its first chunk and the client's session pseudonym does not survive a
+//! restart. Both halves are exercised here against a real socket relay.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -63,4 +68,120 @@ fn a_parked_blob_survives_a_relay_restart() {
     let mut out = Vec::new();
     client::blob_download(&ctx(addr2, &rid2), id, key, count, hash, &mut out).expect("download after restart");
     assert_eq!(out, data, "the parked blob survived the restart byte-for-byte");
+}
+
+/// A4-1: an upload interrupted by a CLIENT restart resumes from the relay's watermark.
+///
+/// The restart is simulated the only way that proves anything — every piece of in-memory client
+/// state is DROPPED (the `Relay`, so its session pseudonym is gone for good, and the `Store` handle
+/// with the `blob_id`/`key` it was holding), and the second attempt is rebuilt from what is on disk
+/// plus the file itself: the resume record, found under an `upload_id` re-derived from
+/// (recipient, name, size, content hash).
+///
+/// DISCRIMINATING: before the fix this test failed at the resume, not at the assertions after it.
+/// The put path sent `relay.pseudonym` as `client_addr`, the relay's blob store had recorded the
+/// FIRST attempt's pseudonym as the blob's owner, and the restarted client — necessarily a new
+/// random pseudonym — was rejected ("blob owned by another sender"), permanently, since every retry
+/// minted another stranger. The single `Relay` reused across attempts in
+/// `blob_upload_resumes_from_the_relay_watermark` is exactly what hid it. Nothing here would pass
+/// under the old behaviour: the resume returns `Err` and the watermark never leaves 2.
+#[test]
+fn an_upload_resumes_after_the_client_itself_restarts() {
+    let blob_dir = temp_dir("client-restart-blobs");
+    let vault_dir = temp_dir("client-restart-vault");
+    let (addr, rid) = spawn(&blob_dir);
+
+    let chunk = client::blob::BLOB_CHUNK;
+    let data: Vec<u8> = (0..(chunk * 3 + 9)).map(|i| (i.wrapping_mul(7)) as u8).collect(); // 4 chunks
+    let size = data.len() as u64;
+    let peer = [9u8; 32];
+    let upload_id = client::upload_id_for(&peer, "big.bin", size, &client::blob::plaintext_hash(&data));
+
+    // ---- Client process #1: records the upload, gets 2 of 4 chunks up, then dies. ----
+    {
+        let store = client::store::Store::unlock(vault_dir.clone(), b"pw").unwrap();
+        let (blob_id, key) = (client::blob::random32(), client::blob::random32());
+        store
+            .add_pending_upload(&client::store::PendingUpload {
+                upload_id,
+                blob_id,
+                key,
+                to_ik: peer,
+                name: "big.bin".into(),
+                size,
+                queued_at: NOW,
+                path: None,
+            })
+            .unwrap();
+        let r = ctx(addr, &rid);
+        // A reader holding only the first two chunks: stores 0 and 1, then errors — a crash
+        // mid-upload, with the same effect on the relay.
+        let partial = std::io::Cursor::new(data[..2 * chunk].to_vec());
+        assert!(
+            client::blob_upload_resumable(&r, &client::dev_capability(), partial, size, blob_id, key).is_err(),
+            "the interrupted attempt fails mid-upload"
+        );
+        assert_eq!(client::blob_stat(&r, blob_id).unwrap(), Some((2, 4, false)), "2 chunks parked");
+    }
+
+    // ---- Client process #2: nothing but the disk and the user's file. ----
+    let store = client::store::Store::unlock(vault_dir, b"pw").unwrap();
+    let pu = store
+        .get_pending_upload(&upload_id)
+        .unwrap()
+        .expect("the resume record survived the restart");
+    let r2 = ctx(addr, &rid); // a NEW Relay → a new session pseudonym, as a new process has
+
+    let (id, key, hash, count) = client::blob_upload_resumable(
+        &r2,
+        &client::dev_capability(),
+        std::io::Cursor::new(&data),
+        size,
+        pu.blob_id,
+        pu.key,
+    )
+    .expect("the restarted client resumes its own upload");
+
+    assert_eq!((id, key), (pu.blob_id, pu.key), "it continued the SAME blob, not a fresh one");
+    assert_eq!(client::blob_stat(&r2, id).unwrap(), Some((4, 4, true)), "resumed to complete");
+
+    // And the resumed blob is the file: the two chunks from the dead process and the two from the
+    // live one decrypt into one byte-identical whole under one key.
+    let mut out = Vec::new();
+    client::blob_download(&r2, id, key, count, hash, &mut out).expect("download the resumed blob");
+    assert_eq!(out, data, "the resumed upload is byte-identical to the original");
+
+    store.remove_pending_upload(&upload_id).unwrap();
+    assert!(store.list_pending_uploads().unwrap().is_empty(), "the record clears on completion");
+}
+
+/// The resume-record store is bounded, and a full one silently stops recording new uploads — so
+/// records for blobs the relay has certainly swept must not sit there forever. `now` is passed in
+/// (no wall clock), and the assertion is on which records remain, not on elapsed time.
+#[test]
+fn stale_resume_records_are_swept_once_their_blob_is_gone() {
+    let dir = temp_dir("upload-sweep");
+    let store = client::store::Store::unlock(dir, b"pw").unwrap();
+    let rec = |tag: u8, queued_at: u64| client::store::PendingUpload {
+        upload_id: [tag; 32],
+        blob_id: [tag; 32],
+        key: [tag; 32],
+        to_ik: [tag; 32],
+        name: "big.bin".into(),
+        size: 1_000_000,
+        queued_at,
+        path: None,
+    };
+    store.add_pending_upload(&rec(1, NOW)).unwrap();
+    store.add_pending_upload(&rec(2, NOW)).unwrap();
+
+    // One second inside the relay's blob TTL: the blob may still be there, so the record stays.
+    let inside = NOW + node::blobstore::BLOB_TTL_SECS;
+    assert_eq!(client::sweep_pending_uploads(&store, inside), 0, "nothing swept while resumable");
+    assert_eq!(store.list_pending_uploads().unwrap().len(), 2);
+
+    // Past it, the relay has dropped the partial blob — the record can only point at nothing.
+    let past = NOW + node::blobstore::BLOB_TTL_SECS + 1;
+    assert_eq!(client::sweep_pending_uploads(&store, past), 2, "both stale records dropped");
+    assert!(store.list_pending_uploads().unwrap().is_empty());
 }

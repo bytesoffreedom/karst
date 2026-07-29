@@ -122,6 +122,15 @@ impl QuicAdapter {
         // is the receiver's decision, and putting it there means the property does not depend on
         // every client being well-behaved.
         //
+        // NO `keep_alive_interval`, deliberately (QUIC-8, docs/design/presence-and-typing.md).
+        // With pooling in place this will read as a defect the first time somebody profiles it:
+        // idle pooled connections keep going cold and getting redialled. Keeping them warm costs a
+        // periodic packet PER SCOPE, sent while the user is doing nothing — which is presence, at a
+        // lower resolution, arriving through the back door of a performance setting. A redial costs
+        // one handshake on the next request; a heartbeat costs a graph of when the client was
+        // running. If a future pass wants warm connections, the trade is argued in that document
+        // first, not settled here.
+        //
         // The client side of that rule is in `connect_isolated`: a pooled connection that has died
         // — which is what a local network change looks like from here, since the relay refuses to
         // migrate it — is EVICTED and redialled, never handed to the next caller as live.
@@ -368,6 +377,27 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("leak the lookup"), "the refusal must say why: {err}");
+    }
+
+    /// **No keepalive on a pooled connection**, and it is a decision rather than an omission
+    /// (docs/design/presence-and-typing.md). A heartbeat per pooled connection is a heartbeat per
+    /// SCOPE — presence at a lower resolution, introduced as a performance setting. An idle
+    /// connection is meant to die and be redialled.
+    ///
+    /// Pinned as a test because the plausible "fix" is one line on the transport config that no
+    /// reviewer would question, and the property it removes is invisible at the call site.
+    #[test]
+    fn a_pooled_connection_is_left_to_die_rather_than_kept_warm() {
+        let src = include_str!("quic.rs");
+        // The needle is split so this assertion does not match its own source.
+        let setter = concat!("keep_alive", "_interval(");
+        assert!(
+            !src.contains(setter),
+            "a keepalive was added to the client transport config. That is a packet per pooled \
+             connection — i.e. per scope — emitted while the user is idle, which is the presence \
+             signal QUIC-8 decided not to emit. Argue it in docs/design/presence-and-typing.md \
+             before changing this."
+        );
     }
 
     /// Connecting to a UDP port with nothing behind it fails within the connect timeout instead of

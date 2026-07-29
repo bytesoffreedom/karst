@@ -318,10 +318,22 @@ reliable streams.
 
 Note what this actually proposes: presence and typing are **new metadata
 disclosures**. KARST has none today. Whether they exist, and who can see them,
-is a product decision that must be made before the transport makes them cheap —
-and off by default. Call signalling additionally sits under the standing rule
-that direct P2P is opt-in only, never a default and never an automatic
-"safe" fallback; the relay remains the primary mode.
+is a product decision that must be made before the transport makes them cheap.
+Call signalling additionally sits under the standing rule that direct P2P is
+opt-in only, never a default and never an automatic "safe" fallback; the relay
+remains the primary mode.
+
+**DECIDED (QUIC-8): they are not emitted — not "off by default", not built.**
+See `docs/design/presence-and-typing.md` for the reasoning, for the one shape a
+reversal could take (the ordinary message path, never a datagram — a datagram is
+distinguishable, which is the specific problem), and for why neither side sets a
+QUIC keepalive: a heartbeat per pooled connection is a heartbeat per scope, i.e.
+presence at a lower resolution introduced as a performance setting. That
+absence is pinned by a test, because the "fix" for it is one unremarkable line.
+
+That leaves nothing in this section to build. Call signalling has no calls to
+signal yet, and latency measurement is QUIC's own. So QUIC-8 ships as a decision
+rather than as a datagram path with nothing safe to carry.
 
 ---
 

@@ -25,6 +25,7 @@ pub mod drop;
 pub mod peer;
 pub mod protocol;
 pub mod pqxdh;
+pub mod quic;
 pub mod ratchet;
 pub mod safety;
 pub mod seal;

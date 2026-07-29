@@ -43,9 +43,19 @@ in QUIC-4 had nothing to race. Five slices closed that:
   have reported its carrier as `direct` — the wrong-indicator failure A4-10 exists to prevent,
   reappearing for a new carrier.
 
-**Honest limit:** the CLI still builds no QUIC path. It has no vault handle where it constructs a
-relay, and fetching endpoints there would put a node-list round trip in front of every command.
-The desktop is where QUIC is exercised.
+- **QUIC-15** — the CLI reaches QUIC too, and the demo proves it. The gap recorded above ("the CLI
+  builds no QUIC path") rested on a wrong premise: that the CLI needed the desktop's MECHANISM (a
+  vault-backed cache) rather than its own. It does not. `--relay` is already user-supplied, so
+  `--relay-quic IP:PORT` is the same trust position, needs no vault, and costs no extra round trip.
+  Trust is unchanged: CRYPTO-23 forbids believing a THIRD PARTY's claim about where a relay lives,
+  not an operator naming their own; Noise still authenticates against `--relay-id` whichever
+  carrier wins. `scripts/karst-demo.sh` now asserts BOTH halves — that a request reports `quic` as
+  what carried it, and that adding `--socks5` builds no QUIC path at all (an unreachable proxy must
+  make the request FAIL; success there would mean the client escaped the proxy over UDP).
+
+  It also exposed a live instance of the defect QUIC-14 caught: `karst` printed `carrier: direct`
+  from argument parsing, before anything was sent. Accurate before QUIC existed, misleading once
+  paths race. Now split — `carrier (configured)` at parse time, `carried by:` after the request.
 
 ## What landed since the last reconcile (2026-07-29, fifth batch)
 

@@ -89,4 +89,38 @@ else
   exit 1
 fi
 
-echo "== DONE: end-to-end text exchange in both directions + file transfer =="
+echo "== QUIC: the same relay, reached over UDP instead of TCP =="
+# QUIC spent months fully written, fully tested and completely unreachable, because nothing
+# outside its own unit tests ever asked it to carry a byte. So this step asks the PRODUCT, not
+# the adapter: take the UDP address the relay says it bound, hand it to the CLI the same way the
+# relay's TCP address is handed over, and require the client to report that QUIC is what actually
+# carried the request — not merely that a QUIC path existed.
+QADDR="$(sed -n 's/^quic: on, UDP \([^ ]*\).*/\1/p' "$RELAY_LOG" | head -1)"
+if [ -z "$QADDR" ]; then
+  # Not a failure: a host that blocks UDP is a supported environment, and the relay is designed
+  # to keep serving TCP there. Say so loudly rather than passing in silence.
+  echo "   SKIPPED: this relay bound no UDP socket — $(grep -m1 '^quic:' "$RELAY_LOG" || echo 'no quic line')"
+else
+  echo "   relay's UDP endpoint: $QADDR"
+  CARRIED="$(a relay-info --relay "$ADDR" --relay-id "$RID" --relay-quic "$QADDR" \
+    | sed -n 's/^carried by: //p' | head -1)"
+  [ "$CARRIED" = "quic" ] || {
+    echo "   ERROR: the request completed over '${CARRIED:-<nothing reported>}', not quic —"
+    echo "          a QUIC path was configured and lost its own race, or the carrier indicator lies."
+    exit 1
+  }
+  echo "   carried by: quic ✓"
+  # THE PROPERTY THAT MATTERS MORE THAN SPEED: with a proxy configured, no QUIC path is built at
+  # all — not 'tried and fell back'. Tor implements no UDP, and a pooled QUIC connection would
+  # re-cluster the handles per-circuit isolation keeps apart. Success here would mean the client
+  # quietly escaped the proxy, which is worse than the failure this asserts.
+  if a relay-info --relay "$ADDR" --relay-id "$RID" --relay-quic "$QADDR" \
+       --socks5 127.0.0.1:1 >/dev/null 2>&1; then
+    echo "   ERROR: a request with --socks5 SUCCEEDED while the proxy was unreachable — the only"
+    echo "          way that happens is a QUIC path built beside the proxy, escaping it."
+    exit 1
+  fi
+  echo "   with --socks5: no QUIC path built, request refused rather than escaping the proxy ✓"
+fi
+
+echo "== DONE: end-to-end text exchange in both directions + file transfer + QUIC =="

@@ -98,6 +98,8 @@ fn print_usage() {
          karst export-chat --to HEX [--out FILE]  write the local chat with a peer to a text file\n\
          \n\
          send/recv also: --socks5 HOST:PORT (route via Tor/obfs4/…)\n\
+         --relay-quic IP:PORT[,IP:PORT] race QUIC beside TCP (karst-relay prints its UDP\n\
+         \u{20}                       address; ignored when --socks5 is set — no UDP over Tor)\n\
          relay-id is printed when karst-relay starts\n\
          directory: $KARST_HOME (or ~/.config/karst)"
     );
@@ -428,6 +430,11 @@ fn cmd_relays(args: &[String]) -> Result<(), String> {
 fn cmd_relay_info(args: &[String]) -> Result<(), String> {
     let r = relay_arg(args)?;
     let p = client::relay_policy(&r)?;
+    // The `carrier:` line at parse time names what was CONFIGURED. This one names what actually
+    // carried the request that just finished — the only version worth acting on when several paths
+    // race (QUIC-4), and the distinction A4-10 exists to keep: an indicator that can be wrong is
+    // worse than no indicator.
+    println!("carried by: {}", r.carrier().label());
     println!("relay policy (advertised by the operator — trust each line per its note):\n");
     match p.blob_persistence {
         None => println!("large-file blobs: disabled on this relay"),
@@ -794,13 +801,23 @@ fn relay_arg(args: &[String]) -> Result<client::Relay, String> {
     if mixnet && proxy.is_none() {
         return Err("--mixnet needs the Nym SOCKS client: pass --socks5 127.0.0.1:1080".into());
     }
-    // HONEST GAP: the CLI builds no QUIC path (QUIC-12). Doing so needs the account's cached
-    // endpoints, and `relay_arg` has no vault handle — it runs before, and for commands that never
-    // open one. Fetching them here instead would put a node-list round trip in front of every
-    // single command to decide a carrier, which is a bad trade for a headless tool. The desktop,
-    // which does hold a store and refreshes off the UI thread, is where QUIC is exercised; adding
-    // it here means threading a store through `relay_arg`, and that is its own change.
-    let r = client::Relay::new(addr, id, proxy).with_mixnet(mixnet);
+    // The QUIC endpoint arrives the same way the relay's own address does: from whoever typed the
+    // command. The desktop caches what a relay said about itself and refreshes off the UI thread;
+    // a CLI process lives for one command, so a cache would cost a node-list round trip before
+    // every invocation just to pick a carrier. A flag costs nothing and fits how this tool already
+    // works — `--relay` is user-supplied too.
+    //
+    // This is NOT a weaker trust position than the desktop's. CRYPTO-23 is about believing a THIRD
+    // PARTY's claim about where a relay lives; an operator naming their own relay is not that. And
+    // whichever carrier wins, Noise still authenticates the relay against `--relay-id`, so a wrong
+    // address costs a failed path, never a wrong peer.
+    let quic: Vec<String> = flag(args, "--relay-quic")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    // Deliberately NOT filtered here for the proxy case: `build_paths` refuses QUIC whenever a
+    // proxy is set, and that refusal stays in ONE place. A second check here would be a second
+    // opinion about a rule that must have exactly one.
+    let r = client::Relay::new(addr, id, proxy).with_mixnet(mixnet).with_quic(quic);
     if r.path_count() > 1 {
         eprintln!("paths: {} (failover across configured routes)", r.path_count());
     }
@@ -812,7 +829,10 @@ fn parse_socks5(args: &[String]) -> Result<Option<SocketAddr>, String> {
         None => None,
         Some(a) => Some(a.parse().map_err(|e| format!("socks5 address: {e}"))?),
     };
-    eprintln!("carrier: {}", client::active_carrier(proxy).label());
+    // CONFIGURED, not observed: nothing has been sent yet. Named as such because with several
+    // paths racing (QUIC-4) the two genuinely differ, and a reader who takes this for the answer
+    // is being misled by a line that was accurate before QUIC existed.
+    eprintln!("carrier (configured): {}", client::active_carrier(proxy).label());
     Ok(proxy)
 }
 

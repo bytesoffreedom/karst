@@ -923,6 +923,20 @@ impl RelayNode {
                 }
                 existing.addrs.push(a);
             }
+            // The QUIC hints were bounded above but never MERGED, so a relay already in the list
+            // could never learn that it also speaks QUIC — the field would be sanitised and then
+            // dropped, and a gossiped QUIC endpoint would silently go nowhere (QUIC-1 built the
+            // shape; this is the half that carries it). Same eviction rule as `addrs`: newest-last,
+            // oldest out at the cap.
+            for a in d.quic_addrs {
+                if existing.quic_addrs.contains(&a) {
+                    continue;
+                }
+                if existing.quic_addrs.len() >= MAX_ADDRS_PER_RELAY {
+                    existing.quic_addrs.remove(0);
+                }
+                existing.quic_addrs.push(a);
+            }
         } else if self.known_relays.len() < MAX_KNOWN_RELAYS {
             self.known_relays.push(d);
         }
@@ -938,6 +952,15 @@ impl RelayNode {
     /// only when the relay advertises a routable address.
     pub fn set_self_descriptor(&mut self, d: RelayDescriptor) {
         self.self_descriptor = Some(d);
+    }
+
+    /// This relay's own descriptor, if it advertises one.
+    ///
+    /// Needed so a listener that comes up AFTER the descriptor was built can amend it rather than
+    /// rebuild it from scratch — the QUIC endpoint is only true once its bind succeeded, so the
+    /// claim is added then and not before (QUIC-11).
+    pub fn self_descriptor(&self) -> Option<RelayDescriptor> {
+        self.self_descriptor.clone()
     }
 
     /// §12 4c — publish (or rotate) an opt-in discovery record. Accepts iff (a) the slot matches

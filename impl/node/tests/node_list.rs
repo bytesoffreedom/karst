@@ -95,3 +95,73 @@ fn get_node_list_travels_over_the_socket() {
     assert_eq!(got[0].addrs, vec!["peer.example:9000".to_string()]);
     assert_eq!(got[0].relay_id_hex(), "07".repeat(64));
 }
+
+/// **A known relay can LEARN that it also speaks QUIC** (QUIC-11).
+///
+/// `add_relay` merged `addrs` for an entry it already had but silently dropped `quic_addrs` —
+/// bounded on the way in, then thrown away. A relay you already knew could therefore never
+/// acquire a QUIC endpoint, so a gossiped one went nowhere and the field stayed empty forever
+/// no matter who advertised what.
+///
+/// DISCRIMINATING: remove the quic_addrs merge and the second descriptor's endpoint vanishes.
+#[test]
+fn a_second_descriptor_can_add_a_quic_endpoint_to_a_relay_already_known() {
+    let mut r = RelayNode::new(0);
+    r.add_relay(RelayDescriptor {
+        noise_pub: [7; 32],
+        fetch_pub: [7; 32],
+        addrs: vec!["relay.example:9000".into()],
+        quic_addrs: Vec::new(),
+    });
+    // Same relay-id, now also offering QUIC — exactly what a re-advertise or a gossip round brings.
+    r.add_relay(RelayDescriptor {
+        noise_pub: [7; 32],
+        fetch_pub: [7; 32],
+        addrs: vec!["relay.example:9000".into()],
+        quic_addrs: vec!["relay.example:9000".into()],
+    });
+    let entry = r
+        .known_relays()
+        .into_iter()
+        .find(|d| d.noise_pub == [7; 32])
+        .expect("the relay is still listed");
+    assert_eq!(
+        entry.quic_addrs,
+        vec!["relay.example:9000".to_string()],
+        "a relay already in the list never learned its QUIC endpoint"
+    );
+    assert_eq!(entry.addrs.len(), 1, "the TCP address must not be duplicated by the second add");
+}
+
+/// A duplicate QUIC endpoint is not stored twice, and the cap evicts oldest-first — the same
+/// rule `addrs` follows, so a relay that changes UDP address is still reachable at the new one.
+#[test]
+fn quic_endpoints_dedup_and_evict_like_addresses() {
+    let mut r = RelayNode::new(0);
+    for i in 0..8 {
+        r.add_relay(RelayDescriptor {
+            noise_pub: [8; 32],
+            fetch_pub: [8; 32],
+            addrs: vec!["relay.example:9000".into()],
+            quic_addrs: vec![format!("q{i}.example:9000")],
+        });
+    }
+    // …and one repeat, which must not create a second copy.
+    r.add_relay(RelayDescriptor {
+        noise_pub: [8; 32],
+        fetch_pub: [8; 32],
+        addrs: vec!["relay.example:9000".into()],
+        quic_addrs: vec!["q7.example:9000".into()],
+    });
+    let e = r.known_relays().into_iter().find(|d| d.noise_pub == [8; 32]).expect("listed");
+    assert!(e.quic_addrs.len() <= 4, "quic hints are unbounded: {}", e.quic_addrs.len());
+    assert!(
+        e.quic_addrs.contains(&"q7.example:9000".to_string()),
+        "the newest endpoint was evicted instead of the oldest"
+    );
+    assert_eq!(
+        e.quic_addrs.iter().filter(|a| *a == "q7.example:9000").count(),
+        1,
+        "a repeated endpoint was stored twice"
+    );
+}

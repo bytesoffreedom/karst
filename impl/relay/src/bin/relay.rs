@@ -946,6 +946,17 @@ fn run_relay(addr: String) -> io::Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| addr.clone());
+    // Where to tell clients this relay answers QUIC. Its own variable because the UDP port can
+    // differ from the TCP one behind a NAT or a load balancer; unset falls back to the TCP
+    // advertise address, which is right for the common case where they share a port number.
+    //
+    // COMPUTED here, APPLIED only after the listener actually binds (below). Advertising a UDP
+    // endpoint that is not listening would send every client down a path that must time out
+    // before it falls back — the exact cost QUIC-4 exists to avoid, handed out by the relay.
+    let quic_advertise = std::env::var("KARST_RELAY_QUIC_ADVERTISE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| advertise.clone());
     if is_routable_advertise(&advertise) {
         let self_desc =
             RelayDescriptor { noise_pub, fetch_pub, addrs: vec![advertise.clone()], quic_addrs: Vec::new() };
@@ -1033,7 +1044,28 @@ fn run_relay(addr: String) -> io::Result<()> {
                         eprintln!("WARNING: the QUIC listener stopped: {e} — TCP is unaffected");
                     }
                 });
-                format!("on, UDP {bound}")
+                // Only NOW does the claim become true, so only now is it made (QUIC-11). A relay
+                // that is not routable advertises nothing at all — same rule the TCP address
+                // already follows, for the same reason (A3-12/A3-13).
+                let advertised = if is_routable_advertise(&quic_advertise) {
+                    let node = server.shared_node();
+                    let mut n = node.write().expect("relay lock");
+                    if let Some(mut d) = n.self_descriptor() {
+                        d.quic_addrs = vec![quic_advertise.clone()];
+                        n.add_relay(d.clone());
+                        n.set_self_descriptor(d);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if advertised {
+                    format!("on, UDP {bound} — advertised as {quic_advertise}")
+                } else {
+                    format!("on, UDP {bound} — not advertised (no routable address)")
+                }
             }
             Err(e) => format!("OFF — could not bind UDP: {e} (TCP is unaffected)"),
         }

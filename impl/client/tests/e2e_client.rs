@@ -7,7 +7,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -143,7 +143,7 @@ fn ctx(addr: SocketAddr, id: &client::RelayId) -> client::Relay {
 /// Like `spawn_relay`, but also hands back a handle to the shared relay state so a test
 /// can assert what the mailbox holds AFTER the serving thread has processed requests —
 /// the only way to tell a working over-the-wire ACK (drained) from a no-op (still leased).
-fn spawn_relay_handle() -> (SocketAddr, client::RelayId, Arc<Mutex<RelayNode>>) {
+fn spawn_relay_handle() -> (SocketAddr, client::RelayId, Arc<RwLock<RelayNode>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let mut relay = RelayNode::new(NOW);
@@ -858,7 +858,7 @@ fn republishing_opks_never_hands_the_same_prekey_twice() {
     // Drain every OPK the relay will hand out; each must be distinct, then the batch exhausts
     // (opk_pub == None → 3-DH fallback). A repeat means a republished duplicate is being served.
     let mut seen = std::collections::HashSet::new();
-    let mut node = relay.lock().unwrap();
+    let mut node = relay.write().unwrap();
     // Via the ADMISSION-GATED path: the public read never hands out a one-time prekey any more
     // (R2-3), so draining now costs a capability — which is the point.
     while let Some(bundle) = drain_one_opk(&mut node, &b_ik, NOW) {
@@ -1290,13 +1290,13 @@ fn recv_session_acks_and_drains_the_relay_over_the_wire() {
 
     client::send_text(&astore, &r, &bob_ik, b"ack me", NOW, NOW).unwrap();
     // Message is now queued in Bob's mailbox on the relay.
-    assert!(!relay.lock().unwrap().all_slots_for_test().is_empty(), "message deposited");
+    assert!(!relay.write().unwrap().all_slots_for_test().is_empty(), "message deposited");
 
     let got = client::recv_session(&bstore, &r, NOW).unwrap();
     assert_eq!(got.into_iter().flatten().count(), 1, "Bob received it");
     // The ACK deleted it over the wire: nothing lingers leased on the relay.
     assert!(
-        relay.lock().unwrap().all_slots_for_test().is_empty(),
+        relay.write().unwrap().all_slots_for_test().is_empty(),
         "recv_session ACKed over the socket and the relay dropped the message"
     );
 
@@ -1307,7 +1307,7 @@ fn recv_session_acks_and_drains_the_relay_over_the_wire() {
 /// Like `spawn_relay_handle`, but the relay's clock is an atomic a test can ADVANCE — the only
 /// way to observe a lease timing out, since lease visibility is decided by the RELAY's clock.
 /// Advanced in units of `node::node::LEASE_SECS`, never by sleeping: no wall-clock threshold.
-fn spawn_relay_handle_clock() -> (SocketAddr, client::RelayId, Arc<Mutex<RelayNode>>, Arc<AtomicU64>) {
+fn spawn_relay_handle_clock() -> (SocketAddr, client::RelayId, Arc<RwLock<RelayNode>>, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let mut relay = RelayNode::new(NOW);
@@ -1392,7 +1392,7 @@ fn a_failed_container_commit_leaves_the_batch_redeliverable() {
     assert!(err.contains("budget") || err.contains("cap"), "expected a capacity refusal, got: {err}");
     // THE finding: the commit failed, so NOTHING was acked and the relay still holds the message.
     assert!(
-        !relay.lock().unwrap().all_slots_for_test().is_empty(),
+        !relay.write().unwrap().all_slots_for_test().is_empty(),
         "a failed container commit must not have acked — the relay's copy is the only one left"
     );
 
@@ -1418,7 +1418,7 @@ fn a_failed_container_commit_leaves_the_batch_redeliverable() {
     // …and a commit that SUCCEEDS acks, so the relay finally drops it.
     poll2.acks.commit_then_send(NOW, || cv2.save().map_err(|e| e.to_string())).unwrap();
     assert!(
-        relay.lock().unwrap().all_slots_for_test().is_empty(),
+        relay.write().unwrap().all_slots_for_test().is_empty(),
         "a successful container commit does ack — the barrier gates the ack, it doesn't block it"
     );
 
@@ -1465,11 +1465,11 @@ fn a_control_only_batch_still_carries_a_commit_barrier() {
     // …and yet the batch is leased, so it MUST be committed before it may be acked.
     assert!(!poll.acks.is_empty(), "control-only mail still holds leases that need committing");
     assert!(
-        !relay.lock().unwrap().all_slots_for_test().is_empty(),
+        !relay.write().unwrap().all_slots_for_test().is_empty(),
         "receiving alone acked nothing — the ack is the committer's to send"
     );
     poll.acks.commit_then_send(NOW, || Ok(())).unwrap();
-    assert!(relay.lock().unwrap().all_slots_for_test().is_empty(), "committed ⇒ acked");
+    assert!(relay.write().unwrap().all_slots_for_test().is_empty(), "committed ⇒ acked");
 
     std::fs::remove_dir_all(&adir).ok();
     std::fs::remove_dir_all(&bdir).ok();

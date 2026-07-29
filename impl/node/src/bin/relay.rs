@@ -15,7 +15,7 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -442,37 +442,37 @@ fn is_stop_command(line: &str) -> bool {
 /// Apply one admin command line to the running relay, returning the reply line. Pure over the
 /// shared relay + the parsed line, so it is unit-tested. `stop` is handled by the caller (it
 /// exits the process), so it never reaches here — the error text still lists it for discovery.
-fn apply_admin_command(relay: &Arc<Mutex<RelayNode>>, line: &str, ctx: &InviteCtx) -> String {
+fn apply_admin_command(relay: &Arc<RwLock<RelayNode>>, line: &str, ctx: &InviteCtx) -> String {
     let mut parts = line.split_whitespace();
     match (parts.next(), parts.next()) {
         (Some("pow"), Some("status")) | (Some("pow"), None) => {}
-        (Some("pow"), Some("off")) => relay.lock().expect("relay mutex").set_pow_issue(None),
-        (Some("pow"), Some("open")) => relay.lock().expect("relay mutex").set_pow_issue(Some(0)),
+        (Some("pow"), Some("off")) => relay.write().expect("relay lock").set_pow_issue(None),
+        (Some("pow"), Some("open")) => relay.write().expect("relay lock").set_pow_issue(Some(0)),
         (Some("pow"), Some("on")) => {
             let bits = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(DEFAULT_POW_BITS);
-            relay.lock().expect("relay mutex").set_pow_issue(Some(bits));
+            relay.write().expect("relay lock").set_pow_issue(Some(bits));
         }
         // Live quota ceiling (§7.2): `quota status | off | set REQ BYTES WINDOW | preset NAME`.
         // Applied immediately, existing capabilities included (clamped on each request).
         (Some("quota"), sub) => {
             match sub {
                 None | Some("status") => {}
-                Some("off") | Some("unlimited") => relay.lock().expect("relay mutex").set_quota_policy(None),
+                Some("off") | Some("unlimited") => relay.write().expect("relay lock").set_quota_policy(None),
                 Some("set") => {
                     let spec = parts.collect::<Vec<_>>().join(",");
                     match parse_quota_spec(&spec) {
-                        Ok(q @ Some(_)) => relay.lock().expect("relay mutex").set_quota_policy(q),
+                        Ok(q @ Some(_)) => relay.write().expect("relay lock").set_quota_policy(q),
                         Ok(None) => return "error: quota set REQUESTS BYTES WINDOW_SECS".into(),
                         Err(e) => return format!("error: {e}"),
                     }
                 }
                 Some("preset") => match parts.next().and_then(quota_preset) {
-                    Some(q) => relay.lock().expect("relay mutex").set_quota_policy(q),
+                    Some(q) => relay.write().expect("relay lock").set_quota_policy(q),
                     None => return "error: quota preset chat-only|media-friendly|bytes-only|unlimited".into(),
                 },
                 _ => return "error: quota status|off|set REQ BYTES WINDOW|preset NAME".into(),
             }
-            let cur = relay.lock().expect("relay mutex").quota_policy();
+            let cur = relay.read().expect("relay lock").quota_policy();
             return format!("quota: {}", describe_quota(cur));
         }
         // CRYPTO-25: per-invite credentials an operator can actually manage. `new` mints a fresh
@@ -485,7 +485,7 @@ fn apply_admin_command(relay: &Arc<Mutex<RelayNode>>, line: &str, ctx: &InviteCt
             )
         }
     }
-    let now = relay.lock().expect("relay mutex").pow_difficulty();
+    let now = relay.read().expect("relay lock").pow_difficulty();
     format!("pow: {}", describe_pow(now))
 }
 
@@ -500,7 +500,7 @@ struct InviteCtx {
 
 /// `invite list | new LABEL | revoke ID`.
 fn invite_command(
-    relay: &Arc<Mutex<RelayNode>>,
+    relay: &Arc<RwLock<RelayNode>>,
     sub: Option<&str>,
     arg: Option<&str>,
     ctx: &InviteCtx,
@@ -539,7 +539,7 @@ fn invite_command(
                 // restart is worse than one that was never minted.
                 return format!("error: could not save invites: {e}");
             }
-            relay.lock().expect("relay mutex").issue_capability(inv.cap.clone());
+            relay.write().expect("relay lock").issue_capability(inv.cap.clone());
             match write_invite_file(&inv, &ctx.relay_id, &ctx.addr) {
                 Ok(p) => format!("invite {} ({}) → {}", invite_id_hex(&inv.cap), inv.label, p.display()),
                 Err(e) => format!(
@@ -564,7 +564,7 @@ fn invite_command(
                 return format!("error: could not save invites: {e}");
             }
             // Live effect, and the file goes too — it is a bearer secret with no purpose left.
-            relay.lock().expect("relay mutex").revoke_capability(&cap_id);
+            relay.write().expect("relay lock").revoke_capability(&cap_id);
             let _ = std::fs::remove_file(key_dir().join("invites").join(format!("{id_hex}.json")));
             format!("invite {id_hex} ({label}) revoked")
         }
@@ -629,7 +629,7 @@ fn describe_quota(q: Option<Quota>) -> String {
 
 /// Bind the admin socket and serve it on a background thread. A stale socket from a prior run
 /// is removed first (a crash leaves the file behind).
-fn spawn_admin_socket(relay: Arc<Mutex<RelayNode>>, ctx: InviteCtx) -> io::Result<()> {
+fn spawn_admin_socket(relay: Arc<RwLock<RelayNode>>, ctx: InviteCtx) -> io::Result<()> {
     let path = admin_socket_path();
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -1348,7 +1348,7 @@ mod tests {
         shell_quote, Role,
     };
     use node::node::{BlobPersistence, RelayNode};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, RwLock};
 
     #[test]
     fn node_list_peer_parsing_and_routable_checks() {
@@ -1375,26 +1375,26 @@ mod tests {
         // The owner's runtime control: off / open / on N / status, applied to a live relay.
         // Discriminating: each command must move `pow_difficulty()` to the right state, and an
         // unknown command must error WITHOUT changing it.
-        let relay = Arc::new(Mutex::new(RelayNode::new(1_000_000)));
-        assert_eq!(relay.lock().unwrap().pow_difficulty(), None, "a fresh relay issues nothing");
+        let relay = Arc::new(RwLock::new(RelayNode::new(1_000_000)));
+        assert_eq!(relay.write().unwrap().pow_difficulty(), None, "a fresh relay issues nothing");
 
         assert!(apply_admin_command(&relay, "pow open", &InviteCtx::default()).contains("open"));
-        assert_eq!(relay.lock().unwrap().pow_difficulty(), Some(0), "open → issue without PoW");
+        assert_eq!(relay.write().unwrap().pow_difficulty(), Some(0), "open → issue without PoW");
 
         assert!(apply_admin_command(&relay, "pow on 22", &InviteCtx::default()).contains("22"));
-        assert_eq!(relay.lock().unwrap().pow_difficulty(), Some(22));
+        assert_eq!(relay.write().unwrap().pow_difficulty(), Some(22));
 
         // status reports without mutating.
         assert!(apply_admin_command(&relay, "pow status", &InviteCtx::default()).contains("22"));
-        assert_eq!(relay.lock().unwrap().pow_difficulty(), Some(22));
+        assert_eq!(relay.write().unwrap().pow_difficulty(), Some(22));
 
         apply_admin_command(&relay, "pow off", &InviteCtx::default());
-        assert_eq!(relay.lock().unwrap().pow_difficulty(), None, "off → issuance disabled");
+        assert_eq!(relay.write().unwrap().pow_difficulty(), None, "off → issuance disabled");
 
         // An unknown command errors and leaves the policy untouched.
-        let before = relay.lock().unwrap().pow_difficulty();
+        let before = relay.write().unwrap().pow_difficulty();
         assert!(apply_admin_command(&relay, "pow frobnicate", &InviteCtx::default()).starts_with("error"));
-        assert_eq!(relay.lock().unwrap().pow_difficulty(), before, "a bad command must not change state");
+        assert_eq!(relay.write().unwrap().pow_difficulty(), before, "a bad command must not change state");
         // The unknown-command help lists `stop` so an operator can discover the no-kill shutdown.
         assert!(apply_admin_command(&relay, "bogus", &InviteCtx::default()).contains("stop"));
 
@@ -1425,22 +1425,22 @@ mod tests {
 
     #[test]
     fn admin_quota_commands_set_the_live_ceiling() {
-        let relay = Arc::new(Mutex::new(RelayNode::new(1_000_000)));
-        assert_eq!(relay.lock().unwrap().quota_policy(), None, "off by default");
+        let relay = Arc::new(RwLock::new(RelayNode::new(1_000_000)));
+        assert_eq!(relay.write().unwrap().quota_policy(), None, "off by default");
 
         assert!(apply_admin_command(&relay, "quota preset media-friendly", &InviteCtx::default()).contains("ceiling"));
-        assert!(relay.lock().unwrap().quota_policy().is_some(), "preset set a ceiling");
+        assert!(relay.write().unwrap().quota_policy().is_some(), "preset set a ceiling");
 
         assert!(apply_admin_command(&relay, "quota set 500 64M 600", &InviteCtx::default()).contains("500"));
-        assert_eq!(relay.lock().unwrap().quota_policy().unwrap().max_requests, 500);
+        assert_eq!(relay.write().unwrap().quota_policy().unwrap().max_requests, 500);
 
         apply_admin_command(&relay, "quota off", &InviteCtx::default());
-        assert_eq!(relay.lock().unwrap().quota_policy(), None, "off → no ceiling");
+        assert_eq!(relay.write().unwrap().quota_policy(), None, "off → no ceiling");
 
         // status reports without mutating; a bad subcommand errors and leaves state alone.
         assert!(apply_admin_command(&relay, "quota status", &InviteCtx::default()).starts_with("quota:"));
         assert!(apply_admin_command(&relay, "quota preset bogus", &InviteCtx::default()).starts_with("error"));
-        assert_eq!(relay.lock().unwrap().quota_policy(), None);
+        assert_eq!(relay.write().unwrap().quota_policy(), None);
     }
 
     #[test]

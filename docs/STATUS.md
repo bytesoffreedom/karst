@@ -2066,6 +2066,17 @@ a production build that refuses to start without an audited verifier — meaning
 verifier exists; today the honest statement is that the relay has none and admits nothing on its
 behalf.
 
+**Reads no longer queue behind reads (#142).** The relay handle is an `RwLock`, not a `Mutex`.
+The read-only handlers — bundle lookup (which happens on every first contact), node list, policy,
+blob stat, PoW policy — only read published state, and under one mutex they waited for each other
+and for every send. Writers still exclude everything, which is correct: admission mutates the
+replay filter, the quota windows and the epoch. Two things had to move for this: the node-list
+rotation cursor became an `AtomicUsize` (a `Cell` is not `Sync`, so it would have made the whole
+relay unshareable for reads), and the discovery LOOKUP stays a writer because a single-use record
+is consumed on read. Pinned by `a_reader_does_not_block_another_reader`, which holds a read guard
+for the whole assertion and requires a bundle lookup to still be answered — structural, not
+timed; under a `Mutex` that shape is a deadlock.
+
 **Mail work is off the global relay lock too (#142).** The queues and their durable log moved
 into a `MailStore` behind its own lock, and the serve loop now takes the relay lock only to ADMIT
 a send/fetch/ACK — cookie, replay, capability HMAC, quota, ownership proof, all pure relay state —

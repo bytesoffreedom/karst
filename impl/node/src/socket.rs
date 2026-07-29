@@ -14,7 +14,7 @@
 
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -183,7 +183,12 @@ impl ConnLimiter {
 /// Noise-static (транспортный ключ, отдельный от fetch-auth relay_identity —
 /// переиспользование Noise-static вне Noise ломает его анализ безопасности).
 pub struct RelayServer {
-    relay: Arc<Mutex<RelayNode>>,
+    /// `RwLock`, not `Mutex` (#142): the read-only handlers — bundle lookup, node list, policy,
+    /// blob stat — are pure reads of relay state, and a bundle lookup happens on every first
+    /// contact. Under one mutex they queued behind each other and behind every send. Writers
+    /// (admission, publish, discovery mutations) still exclude everything, which is correct:
+    /// they mutate the replay filter, quota windows and the epoch.
+    relay: Arc<RwLock<RelayNode>>,
     clock: Clock,
     noise_private: [u8; 32],
     noise_public: [u8; 32],
@@ -210,7 +215,7 @@ impl RelayServer {
         noise_public: [u8; 32],
     ) -> Self {
         RelayServer {
-            relay: Arc::new(Mutex::new(relay)),
+            relay: Arc::new(RwLock::new(relay)),
             clock,
             noise_private,
             noise_public,
@@ -234,7 +239,7 @@ impl RelayServer {
     /// A handle to the shared relay state, so a test can inspect it after handing the
     /// server to a serving thread (e.g. assert a mailbox drained after a wire ACK). The
     /// serving thread holds its own clone of the same `Arc`.
-    pub fn relay_handle(&self) -> Arc<Mutex<RelayNode>> {
+    pub fn relay_handle(&self) -> Arc<RwLock<RelayNode>> {
         Arc::clone(&self.relay)
     }
 
@@ -271,7 +276,7 @@ impl RelayServer {
 
 fn handle_conn(
     stream: TcpStream,
-    relay: Arc<Mutex<RelayNode>>,
+    relay: Arc<RwLock<RelayNode>>,
     clock: Clock,
     noise_priv: [u8; 32],
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -345,7 +350,7 @@ fn handle_conn(
             // and, on a durable relay, an fsync. Under one mutex every client's admission queued
             // behind someone else's write barrier. The `admitted` binding is what forces the
             // guard to drop before the deposit runs — inlining it would hold the lock across it.
-            let admitted = relay.lock().expect("relay mutex").admit_send(&msg, now);
+            let admitted = relay.write().expect("relay lock").admit_send(&msg, now);
             match admitted {
                 Ok(a) => match a.deposit(&msg.payload, now) {
                     Response::NeedCookie(c) => WireResponse::NeedCookie(c),
@@ -359,7 +364,7 @@ fn handle_conn(
         }
         WireRequest::Fetch(freq) => {
             let now = (clock)();
-            let admitted = relay.lock().expect("relay mutex").admit_fetch(&freq, now);
+            let admitted = relay.write().expect("relay lock").admit_fetch(&freq, now);
             match admitted {
                 // Serialize the drained seals into a constant-size page: the
                 // response length no longer reveals how much mail was queued.
@@ -373,7 +378,7 @@ fn handle_conn(
         }
         WireRequest::Ack(areq) => {
             let now = (clock)();
-            let admitted = relay.lock().expect("relay mutex").admit_ack(&areq, now);
+            let admitted = relay.write().expect("relay lock").admit_ack(&areq, now);
             match admitted {
                 Ok(a) => {
                     a.apply();
@@ -386,7 +391,7 @@ fn handle_conn(
         }
         WireRequest::PublishBundle(preq) => {
             let now = (clock)();
-            match relay.lock().expect("relay mutex").handle_publish(&preq, now) {
+            match relay.write().expect("relay lock").handle_publish(&preq, now) {
                 PublishResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
                 PublishResponse::Published => WireResponse::BundlePublished,
                 PublishResponse::Rejected(s) => WireResponse::Rejected(s),
@@ -395,14 +400,14 @@ fn handle_conn(
         WireRequest::FetchBundle(ik) => {
             // Публичный read; время серверу не нужно — этот путь НИКОГДА не выдаёт one-time
             // prekey, поэтому у него нет разрушающего побочного эффекта (R2-3).
-            let bundle = relay.lock().expect("relay mutex").get_bundle(&ik);
+            let bundle = relay.read().expect("relay lock").get_bundle(&ik);
             WireResponse::Bundle(bundle)
         }
         WireRequest::FetchBundleOpk(req) => {
             // Consumes a one-time prekey → full admission, so it needs the real clock (cookie
             // freshness, capability validity window, quota epoch) exactly like a send.
             let now = (clock)();
-            match relay.lock().expect("relay mutex").handle_fetch_bundle_opk(&req, now) {
+            match relay.write().expect("relay lock").handle_fetch_bundle_opk(&req, now) {
                 BundleOpkResponse::NeedCookie(c) => WireResponse::NeedCookie(c),
                 BundleOpkResponse::Bundle(b) => WireResponse::Bundle(b),
                 BundleOpkResponse::Rejected(e) => WireResponse::Rejected(e),
@@ -415,7 +420,7 @@ fn handle_conn(
             // operations. Doing both under one mutex meant one slow chunk stalled every other
             // client's mail on the whole relay. The `admitted` binding is what forces the guard
             // to drop before `put` runs — inlining it would extend the borrow across the write.
-            let admitted = relay.lock().expect("relay mutex").admit_blob_put(&breq, now);
+            let admitted = relay.write().expect("relay lock").admit_blob_put(&breq, now);
             WireResponse::Blob(match admitted {
                 Ok(a) => a.put(&breq, now),
                 Err(refusal) => refusal,
@@ -423,7 +428,7 @@ fn handle_conn(
         }
         WireRequest::BlobGet(breq) => {
             let now = (clock)();
-            let admitted = relay.lock().expect("relay mutex").admit_blob_get(&breq, now);
+            let admitted = relay.write().expect("relay lock").admit_blob_get(&breq, now);
             WireResponse::Blob(match admitted {
                 Ok(store) => crate::node::blob_get_chunk(&store, &breq),
                 Err(refusal) => refusal,
@@ -431,7 +436,7 @@ fn handle_conn(
         }
         WireRequest::JoinChallenge => {
             let now = (clock)();
-            let guard = relay.lock().expect("relay mutex");
+            let guard = relay.read().expect("relay lock");
             match guard.pow_policy(now) {
                 Some((bucket, difficulty_bits)) => WireResponse::PowRequired {
                     bucket,
@@ -443,38 +448,38 @@ fn handle_conn(
         }
         WireRequest::Join(jreq) => {
             let now = (clock)();
-            match relay.lock().expect("relay mutex").handle_join(&jreq, now) {
+            match relay.write().expect("relay lock").handle_join(&jreq, now) {
                 Ok(cap) => WireResponse::Issued(cap),
                 Err(s) => WireResponse::Rejected(s),
             }
         }
         WireRequest::GetNodeList => {
             // Public read of the discovery plane; no time needed.
-            WireResponse::NodeList(relay.lock().expect("relay mutex").node_list())
+            WireResponse::NodeList(relay.read().expect("relay lock").node_list())
         }
         WireRequest::GetPolicy => {
-            WireResponse::Policy(relay.lock().expect("relay mutex").policy())
+            WireResponse::Policy(relay.read().expect("relay lock").policy())
         }
         WireRequest::BlobStat(blob_id) => {
             // Public read, and it takes the BLOB lock — so it is taken outside the relay lock
             // too (#142): a stat stuck behind a chunk write must not also be holding up mail.
-            let store = relay.lock().expect("relay mutex").blob_store();
+            let store = relay.read().expect("relay lock").blob_store();
             WireResponse::BlobStat(
                 store.and_then(|s| s.lock().expect("blob store mutex").stat(&blob_id)),
             )
         }
         WireRequest::PublishDiscovery { record, write_sig } => {
             let now = (clock)();
-            let ok = relay.lock().expect("relay mutex").handle_publish_discovery(&record, &write_sig, now);
+            let ok = relay.write().expect("relay lock").handle_publish_discovery(&record, &write_sig, now);
             WireResponse::DiscoveryAck(ok)
         }
         WireRequest::DeleteDiscovery { discovery_pub, delete_sig } => {
-            let ok = relay.lock().expect("relay mutex").handle_delete_discovery(&discovery_pub, &delete_sig);
+            let ok = relay.write().expect("relay lock").handle_delete_discovery(&discovery_pub, &delete_sig);
             WireResponse::DiscoveryAck(ok)
         }
         WireRequest::LookupDiscovery(pseudonym) => {
             let now = (clock)();
-            WireResponse::Discovery(relay.lock().expect("relay mutex").handle_lookup_discovery(&pseudonym, now))
+            WireResponse::Discovery(relay.write().expect("relay lock").handle_lookup_discovery(&pseudonym, now))
         }
     };
 

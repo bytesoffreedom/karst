@@ -556,3 +556,55 @@ fn a_mail_write_in_progress_does_not_block_admission() {
     drop(guard); // the "slow disk" finishes
     assert!(matches!(sender.join().expect("sender thread"), Response::Accepted));
 }
+
+/// #142: the read-only handlers no longer queue behind each other, or behind a send.
+///
+/// The relay sat behind ONE `Mutex`, so a bundle lookup — which happens on every first contact,
+/// and only READS published key material — waited for whatever else held the lock. It is now an
+/// `RwLock`: writers (admission, publish, discovery mutations) still exclude everything, because
+/// they mutate the replay filter, the quota windows and the epoch; readers do not exclude each
+/// other.
+///
+/// Structural, not timed: the test thread holds a READ guard for the whole assertion — which a
+/// second reader may share and a writer may not — and requires a bundle lookup over the socket to
+/// still be answered. Go back to a `Mutex` and the same shape is a deadlock, so the fetch never
+/// returns.
+#[test]
+fn a_reader_does_not_block_another_reader() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut relay = node::node::RelayNode::new(NOW);
+    relay.issue_capability(capability([0x33; 32]));
+    let fetch_pub = relay.relay_public().to_bytes();
+    let server = RelayServer::new(relay, Arc::new(move || NOW));
+    let noise_pub = server.noise_public();
+    let handle = server.relay_handle();
+    thread::spawn(move || {
+        let _ = server.serve_listener(listener);
+    });
+
+    // Publish a bundle first (a WRITE — it must complete before we take the read guard).
+    let account = Account::generate();
+    let mut peer = Peer::new(
+        SocketTransport::new(addr, noise_pub),
+        account.clone(),
+        capability([0x33; 32]),
+        PublicKey::from(fetch_pub),
+    );
+    assert!(matches!(peer.publish(NOW), PublishResponse::Published));
+    let ik = account.identity_public();
+
+    // Hold a reader for the whole of the assertion below.
+    let guard = handle.read().expect("relay read lock");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let t = SocketTransport::new(addr, noise_pub);
+        let _ = tx.send(node::node::Transport::fetch_bundle(&t, &ik, NOW).ok().flatten().is_some());
+    });
+    let found = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a read-only bundle lookup must not wait behind another reader");
+    assert!(found, "the published bundle should come back");
+    drop(guard);
+}

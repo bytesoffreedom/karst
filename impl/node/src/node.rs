@@ -25,7 +25,7 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::PublicKey;
 
 use crate::discovery::{self, DiscoveryRecord};
-use crate::pqxdh::{KeyAgreement, PreKeyBundle};
+use crate::pqxdh::PreKeyBundle;
 use crate::ratchet::RatchetMessage;
 use crate::seal::{Identity, SkeletonSeal};
 
@@ -844,7 +844,7 @@ pub struct RelayNode {
     opk_batches: HashMap<[u8; 32], VecDeque<crate::pqxdh::SignedOpk>>,
     /// Rotating start offset for `node_list`, so advertisement is fair rather than always
     /// favouring whoever was learned first (A3-13). `Cell` because serving a list is a READ.
-    gossip_cursor: std::cell::Cell<usize>,
+    gossip_cursor: std::sync::atomic::AtomicUsize,
     /// Статический ключ узла: основа fetch-auth (и §12 publish-auth). Задаётся
     /// извне (`with_identity`) для персистентности — `karst-relay` хранит его на
     /// диске, relay-id стабилен между перезапусками.
@@ -916,7 +916,7 @@ impl RelayNode {
             mail_durable: false,
             bundles: HashMap::new(),
             opk_batches: HashMap::new(),
-            gossip_cursor: std::cell::Cell::new(0),
+            gossip_cursor: std::sync::atomic::AtomicUsize::new(0),
             relay_identity,
             blobs: None,
             blob_persistence: None,
@@ -1319,8 +1319,11 @@ impl RelayNode {
         // could never leave this node — a permanent centrality bias toward whoever was learned
         // first, and no recovery for a relay that changed address (A3-13). Self is seeded at index
         // 0 and must still be advertised, or a peer cannot verify us, so it is always included.
-        let start = self.gossip_cursor.get() % n;
-        self.gossip_cursor.set(start.wrapping_add(1));
+        // Atomic, not `Cell` (#142): the relay now sits behind an `RwLock`, so a read-only
+        // handler like this one may run on several threads at once — `Cell` is not `Sync` and
+        // would make the whole `RelayNode` unshareable for reads. Fetch-and-add is the same
+        // "rotate the starting point" behaviour with no lock of its own.
+        let start = self.gossip_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
         for k in 0..n {
             let i = if k == 0 { 0 } else { (start + k) % n };
             if k > 0 && i == 0 {

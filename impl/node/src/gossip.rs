@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::node::{RelayDescriptor, RelayNode};
 use crate::socket::SocketTransport;
@@ -151,11 +151,11 @@ pub fn verified_self_descriptor(
 /// Stateless and dependency-injected on the relay handle, so it is integration-tested against
 /// real relays on loopback. Never gossips with self.
 pub fn gossip_round(
-    relay: &Arc<Mutex<RelayNode>>,
+    relay: &Arc<RwLock<RelayNode>>,
     self_noise_pub: &[u8; 32],
     allow_private: bool,
 ) -> usize {
-    let known = relay.lock().expect("relay mutex").known_relays();
+    let known = relay.read().expect("relay lock").known_relays();
     let mut known_ids: HashSet<String> = known.iter().map(|d| d.relay_id_hex()).collect();
     let mut dialed_addrs: HashSet<String> = HashSet::new();
     let mut dials = 0usize;
@@ -205,7 +205,7 @@ pub fn gossip_round(
             // Store what the relay says about ITSELF, not what the peer said about it
             // (CRYPTO-23). The peer's address was only a place to dial.
             if let Some(own) = verified_self_descriptor(&d, &addr, allow_private) {
-                relay.lock().expect("relay mutex").add_relay(own);
+                relay.write().expect("relay lock").add_relay(own);
                 known_ids.insert(id);
                 added += 1;
             }

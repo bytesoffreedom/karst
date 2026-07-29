@@ -6,7 +6,7 @@
 //! reflector aimed at a victim. Neuter `verify` (return true) and the poison test reddens.
 
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use node::node::{RelayDescriptor, RelayNode};
@@ -70,11 +70,11 @@ fn gossip_round_learns_a_verified_relay_from_a_peer() {
     let (_bpriv, bpub) = generate_noise_keypair();
     let mut b = RelayNode::with_identity(NOW, Identity::generate());
     b.add_relay(a.clone());
-    let b = Arc::new(Mutex::new(b));
+    let b = Arc::new(RwLock::new(b));
 
     let added = node::gossip::gossip_round(&b, &bpub, true);
     assert!(added >= 1, "B should learn a new relay (C) from peer A");
-    let ids: Vec<String> = b.lock().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
+    let ids: Vec<String> = b.write().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
     assert!(ids.contains(&c.relay_id_hex()), "B must now know C, verified via a direct dial");
 }
 
@@ -88,10 +88,10 @@ fn gossip_round_rejects_a_poisoned_descriptor() {
     let (_bpriv, bpub) = generate_noise_keypair();
     let mut b = RelayNode::with_identity(NOW, Identity::generate());
     b.add_relay(a);
-    let b = Arc::new(Mutex::new(b));
+    let b = Arc::new(RwLock::new(b));
 
     node::gossip::gossip_round(&b, &bpub, true);
-    let ids: Vec<String> = b.lock().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
+    let ids: Vec<String> = b.write().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
     assert!(
         !ids.contains(&poison.relay_id_hex()),
         "a poisoned (unverifiable) descriptor must NOT be added — the reflection defense"
@@ -209,14 +209,14 @@ fn gossip_stores_the_relays_own_address_not_a_peers_proxy() {
     // A knows B only through the proxy address, and tells C so.
     let (a_addr, a_np, a_fp) = spawn(vec![desc(b_np, b_fp, &proxy_addr)], true);
 
-    let c = Arc::new(Mutex::new(RelayNode::with_identity(NOW, Identity::generate())));
+    let c = Arc::new(RwLock::new(RelayNode::with_identity(NOW, Identity::generate())));
     let (c_np, _c_pub) = generate_noise_keypair();
-    c.lock().unwrap().add_relay(desc(a_np, a_fp, &a_addr));
+    c.write().unwrap().add_relay(desc(a_np, a_fp, &a_addr));
 
     let added = node::gossip::gossip_round(&c, &c_np, true);
     assert_eq!(added, 1, "C should learn B from A");
 
-    let stored = c.lock().unwrap().known_relays();
+    let stored = c.write().unwrap().known_relays();
     let b_entry = stored
         .iter()
         .find(|d| d.noise_pub == b_np && d.fetch_pub == b_fp)

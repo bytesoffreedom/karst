@@ -19,7 +19,7 @@ use node::node::{
 use node::peer::Peer;
 use node::pqxdh::Account;
 use node::socket::{RelayServer, SocketTransport};
-use node::transport::{DirectTcpAdapter, Path};
+use node::transport::{DirectTcpAdapter, Dest, Path, Socks5Adapter};
 use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;
@@ -2611,6 +2611,56 @@ fn failover_skips_dead_primary_and_reaches_live_relay() {
     }
 }
 
+/// A4-10 (#217): the carrier badge names the path that ACTUALLY carried the message.
+///
+/// It used to be computed from the configuration — the primary path's proxy plus env — while
+/// failover could route the message over an alternate with a different carrier. The badge then
+/// claimed a protection that did not carry that message, which for a privacy product is worse
+/// than showing nothing: the user decides what to send based on it.
+///
+/// Here the PRIMARY is a dead SOCKS5 route (so the configured answer would be "SOCKS5") and the
+/// live alternate is direct. After a real send over the real relay, the badge must say `direct`.
+///
+/// Discriminating: it asserts what the badge says AFTER traffic has flowed, and the two paths
+/// deliberately have DIFFERENT carriers — computing it from the configuration reddens this.
+#[test]
+fn the_carrier_badge_names_the_path_that_actually_carried_the_message() {
+    let (real, relay_id) = spawn_relay_with_blobs();
+    let dead_proxy = dead_addr(1); // nothing listens: this SOCKS5 route can never connect
+
+    // Primary: SOCKS5 through the dead proxy. Alternate: direct to the live relay.
+    //
+    // The pair is built directly rather than through the route parser: in production the carrier
+    // ALLOWLIST would narrow a SOCKS5 intent to {SOCKS5, wss-over-SOCKS5}, so this exact pair is
+    // not one the parser would produce. The mismatch it demonstrates is not hypothetical though —
+    // the same gap exists inside every allowed pair (a SOCKS5 intent failing over to
+    // wss-over-SOCKS5, or a Direct intent failing over to SOCKS5), and this shape keeps the test
+    // about the INDICATOR instead of about route parsing or environment variables.
+    let mut relay = client::Relay::new(real, relay_id, Some(dead_proxy));
+    relay.set_paths_for_test(vec![
+        Path::new(Arc::new(Socks5Adapter::isolated(dead_proxy, "test-isolation")), Dest::from(real)),
+        direct_path(real),
+    ]);
+    assert_eq!(
+        relay.carrier().label(),
+        "SOCKS5",
+        "before anything runs the badge can only report intent — the configured primary"
+    );
+
+    // A real request over the real relay: the dead SOCKS5 primary fails, direct carries it.
+    // `blob_stat` is a public read that goes through the very same path list.
+    assert!(
+        client::blob_stat(&relay, [0x5c; 32]).is_ok(),
+        "the live alternate should have reached the relay"
+    );
+
+    assert_eq!(
+        relay.carrier().label(),
+        "direct",
+        "after failover the badge must name the carrier that actually ran, not the configured one"
+    );
+}
+
 /// **Handshake-level failover** — the case connect-level could not see: a path that
 /// ACCEPTS the TCP connection and then never speaks Noise (a silent-drop on-path classifier, a hijacked
 /// endpoint). The session must abandon it and complete over the live relay.
@@ -2650,6 +2700,10 @@ fn failover_skips_a_path_that_accepts_tcp_then_stalls_the_handshake() {
 /// route without needing a real blackholed IP.
 struct CountingDead(Arc<std::sync::atomic::AtomicUsize>);
 impl node::transport::TransportAdapter for CountingDead {
+    fn carrier_label(&self) -> &'static str {
+        "counting-dead"
+    }
+
     fn connect(&self, _dest: &node::transport::Dest) -> std::io::Result<Box<dyn node::transport::Channel>> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "dead"))

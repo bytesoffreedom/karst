@@ -2111,6 +2111,23 @@ credential. Pinned by `a_connection_that_never_gets_admitted_is_dropped_at_the_l
 (client e2e), which carries its own control: a legitimate upload sends MORE requests
 than the leash allows and is untouched, because its second request is admitted.
 
+**The carrier badge names the path that actually ran (#217, A4-10).** It used to be computed from
+the CONFIGURATION — the primary path's proxy plus `KARST_WSS` — while failover could route a
+message over an alternate with a different carrier. The badge then claimed a protection that did
+not carry that message, and for a privacy product a wrong indicator is worse than none: the user
+decides what to send based on it. `Relay::carrier()` now reads the same `PathHealth` the transport
+itself updates, reporting whichever path recorded the most recent success; before anything has
+succeeded it falls through to the configured carrier, which is honest because nothing has been
+carried yet. `TransportAdapter::carrier_label` is a REQUIRED trait method, not a defaulted one —
+a default would silently label every future adapter and every test spy as whatever it said, which
+is the exact failure being fixed — and an unrecognised label maps to `None` and falls back rather
+than inventing a protection. Pinned by
+`the_carrier_badge_names_the_path_that_actually_carried_the_message`: a dead SOCKS5 primary, a
+live direct alternate, and the badge must read `direct` after the request goes through. Note the
+allowlist already narrows which mixed pairs are BUILDABLE (a SOCKS5 intent never falls back to
+bare direct), so the live exposure was within allowed pairs — a SOCKS5 intent failing over to
+wss-over-SOCKS5, or a Direct intent to SOCKS5 — and the ordering fix covers all of them.
+
 **Post-compromise security covers content, not the metadata trail (#208, A6-3) — a NAMED
 BOUNDARY, not a fix.** The ratchet heals message keys: a DH step on a fresh ephemeral leaves an
 adversary who read the session state unable to decrypt what follows. The ADDRESSES do not heal.

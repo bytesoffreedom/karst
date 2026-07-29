@@ -259,6 +259,10 @@ struct SpyAdapter {
 }
 
 impl TransportAdapter for SpyAdapter {
+    fn carrier_label(&self) -> &'static str {
+        "spy"
+    }
+
     fn connect(
         &self,
         dest: &node::transport::Dest,

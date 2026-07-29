@@ -100,6 +100,23 @@ impl Carrier {
             Carrier::Mixnet => "mixnet",
         }
     }
+
+    /// The carrier an ADAPTER reports itself as (`TransportAdapter::carrier_label`) — the bridge
+    /// between what actually ran and what the user is shown (A4-10, #217).
+    ///
+    /// Returns `None` for a label this layer does not know, and the caller falls back to the
+    /// configured carrier rather than inventing one. An unknown adapter (a test spy, a carrier
+    /// added below without a mapping here) must not be able to make the badge claim a protection
+    /// it never provided — the whole point of the finding.
+    pub fn from_label(label: &str) -> Option<Carrier> {
+        match label {
+            "direct" => Some(Carrier::Direct),
+            "socks5" => Some(Carrier::Socks5),
+            "wss" => Some(Carrier::Wss),
+            "wss+socks5" => Some(Carrier::WssOverSocks5),
+            _ => None,
+        }
+    }
 }
 
 /// Pure carrier decision from the two inputs — the exact branch `transport()` takes.
@@ -325,6 +342,17 @@ impl Relay {
         Relay { addr, id, proxy, paths, pseudonym: blob::random32(), isolation, mixnet: false }
     }
 
+    /// Replace the route list — TEST SEAM (A4-10, #217).
+    ///
+    /// Production builds paths through `build_paths`, which also applies the carrier allowlist.
+    /// A test that wants to show the badge following a FAILOVER needs two paths with different
+    /// carriers and a dead primary, which is a state the allowlist would narrow; constructing it
+    /// directly keeps the test about the indicator rather than about route parsing.
+    #[doc(hidden)]
+    pub fn set_paths_for_test(&mut self, paths: Vec<Path>) {
+        self.paths = paths;
+    }
+
     /// The §15 transport over this relay's path list. `SocketTransport` retries a
     /// path's connect AND its Noise handshake, so an adversary that blackholes the IP and
     /// one that kills the handshake are both routed around.
@@ -332,10 +360,52 @@ impl Relay {
         SocketTransport::with_paths(self.paths.clone(), self.id.noise_pub)
     }
 
-    /// The §15 carrier of the PRIMARY path — what the status bar/CLI shows. A `.onion` / `.i2p`
-    /// address reached through the SOCKS bridge is reported as Tor / i2p, not bare SOCKS5, so the
-    /// user sees which anonymity network actually carries them.
+    /// The §15 carrier the status bar/CLI shows — derived from the path that ACTUALLY RAN
+    /// (A4-10, #217).
+    ///
+    /// This used to describe the PRIMARY path only, computed from `proxy` + env. With failover
+    /// that can be a lie: a message routed around a dead primary rides an alternate whose carrier
+    /// may be different, while the badge kept claiming the protected one. For a privacy product a
+    /// wrong indicator is worse than none — the user decides what to send based on it.
+    ///
+    /// The source of truth is now the same `PathHealth` the transport itself updates: whichever
+    /// path recorded the most recent success. Before anything has succeeded there is nothing to
+    /// report but intent, and that case falls through to the primary — honest, because no message
+    /// has been carried yet.
+    ///
+    /// A `.onion` / `.i2p` address reached through the SOCKS bridge is still reported as Tor /
+    /// i2p rather than bare SOCKS5, so the user sees which anonymity network carries them.
     pub fn carrier(&self) -> Carrier {
+        // What actually ran wins over what was configured.
+        if let Some(p) = self
+            .paths
+            .iter()
+            .filter(|p| p.health.last_ok() > 0)
+            .max_by_key(|p| p.health.last_ok())
+        {
+            if let Some(c) = Carrier::from_label(p.adapter.carrier_label()) {
+                // The anonymity-network refinement applies to whatever carried us, not to the
+                // configured primary: a `.onion` destination reached over SOCKS is Tor.
+                if matches!(c, Carrier::Socks5) {
+                    if self.mixnet {
+                        return Carrier::Mixnet;
+                    }
+                    if is_onion_host(&p.dest.host) {
+                        return Carrier::Tor;
+                    }
+                    if is_i2p_host(&p.dest.host) {
+                        return Carrier::I2p;
+                    }
+                }
+                return c;
+            }
+        }
+        self.configured_carrier()
+    }
+
+    /// The carrier the CONFIGURATION implies, before anything has been carried. Split out so the
+    /// "nothing has run yet" case is explicit rather than an accident of the same function.
+    fn configured_carrier(&self) -> Carrier {
         if self.proxy.is_some() {
             // Mixnet is an explicit choice (no address suffix names it), so it wins first.
             if self.mixnet {

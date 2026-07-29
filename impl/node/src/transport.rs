@@ -111,6 +111,14 @@ impl<T: Read + Write + Send> Channel for T {}
 pub trait TransportAdapter: Send + Sync {
     fn connect(&self, dest: &Dest) -> io::Result<Box<dyn Channel>>;
 
+    /// What this carrier is, for the indicator the user reads (A4-10, #217).
+    ///
+    /// Required rather than defaulted on purpose. A default would silently label every future
+    /// adapter — and every test spy — as whatever the default said, which is exactly the failure
+    /// this exists to prevent: a privacy indicator that can be wrong is worse than none, because
+    /// the user makes decisions on it. Adding a carrier now forces its author to name it.
+    fn carrier_label(&self) -> &'static str;
+
     /// Connect with a PER-REQUEST stream-isolation scope on top of whatever the adapter
     /// already carries.
     ///
@@ -144,6 +152,10 @@ impl Default for DirectTcpAdapter {
 }
 
 impl TransportAdapter for DirectTcpAdapter {
+    fn carrier_label(&self) -> &'static str {
+        "direct"
+    }
+
     /// IP literals only. A NAME is refused rather than resolved: a `.onion`/`.i2p` has
     /// no DNS answer, and quietly resolving an ordinary hostname would leak the lookup
     /// to a DNS server the user never chose. Names belong to a resolving carrier.
@@ -242,6 +254,10 @@ impl Socks5Adapter {
 }
 
 impl TransportAdapter for Socks5Adapter {
+    fn carrier_label(&self) -> &'static str {
+        "socks5"
+    }
+
     fn connect(&self, dest: &Dest) -> io::Result<Box<dyn Channel>> {
         self.connect_isolated(dest, None)
     }
@@ -379,7 +395,18 @@ pub struct PathHealth {
     fails: std::sync::atomic::AtomicU32,
     /// Unix seconds until which the path is deprioritized. 0 = healthy.
     until: std::sync::atomic::AtomicU64,
+    /// Sequence number of this path's last success, `0` = never (A4-10, #217).
+    ///
+    /// A COUNTER, not a timestamp: the local clock is an unauthenticated input everywhere else in
+    /// this codebase, and all this needs is an ordering — which path succeeded most recently. It
+    /// is written by the same `record_success` the transport already calls, so the carrier the UI
+    /// reports comes from the path that actually ran rather than from a parallel guess.
+    last_ok: std::sync::atomic::AtomicU64,
 }
+
+/// Monotonic source for `PathHealth::last_ok`. Process-wide because ordering only has to hold
+/// within one running client, which is exactly the lifetime of the indicator it feeds.
+static SUCCESS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl PathHealth {
     /// Is the path currently out of cooldown? (Cooling paths are still tried, just
@@ -392,6 +419,7 @@ impl PathHealth {
     /// The path worked: clear the backoff immediately.
     pub fn record_success(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        self.last_ok.store(SUCCESS_SEQ.fetch_add(1, Relaxed), Relaxed);
         self.fails.store(0, Relaxed);
         self.until.store(0, Relaxed);
     }
@@ -420,6 +448,13 @@ pub struct Path {
     pub adapter: Arc<dyn TransportAdapter>,
     pub dest: Dest,
     pub health: Arc<PathHealth>,
+}
+
+impl PathHealth {
+    /// When this path last worked, as a process-wide sequence number (`0` = never).
+    pub fn last_ok(&self) -> u64 {
+        self.last_ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Path {

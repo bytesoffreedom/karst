@@ -281,6 +281,15 @@ impl WssAdapter {
 }
 
 impl TransportAdapter for WssAdapter {
+    fn carrier_label(&self) -> &'static str {
+        // The inner adapter carries this one, and the distinction matters to the user — wss
+        // THROUGH a proxy is a different property from wss alone — so it is not flattened.
+        match self.inner.carrier_label() {
+            "direct" => "wss",
+            _ => "wss+socks5",
+        }
+    }
+
     fn connect(&self, dest: &crate::transport::Dest) -> io::Result<Box<dyn Channel>> {
         let channel = self.inner.connect(dest)?;
         let server_name: ServerName<'static> = ServerName::try_from(self.host.clone())

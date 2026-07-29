@@ -13,6 +13,35 @@ Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
+## What landed since the last reconcile (2026-07-29, third batch)
+
+One commit, and it is the kind that matters most: a privacy defect the revision pass found in
+work this project had already shipped and already called done.
+
+- **A blob download no longer presents one label for a whole account** (`1bf36cb`, #248).
+  `BlobGetRequest.client_addr` carried `Relay::pseudonym` — random bytes, but minted once per
+  `Relay`, and a `Relay` is built from the account's settings. Every download an account made,
+  across every channel and every restart of that process, therefore carried the same value, and a
+  relay serving downloads could group them with no cryptography at all: "whoever fetched the blob
+  X uploaded also fetched the blob Y uploaded". The field is now minted fresh per download
+  (`blob_get_addr`) and the stored one is deleted outright, so there is nothing left to reuse by
+  accident. Fresh-per-download rather than something narrower because it costs nothing: the relay
+  uses this field on the get path only as the label a stateless cookie HMAC binds to, nothing
+  meters or rate-limits a GET by it, and each download already takes its own cookie round-trip.
+
+  **Scoped honestly.** One `Relay` is also one SOCKS isolation scope, so a relay still groups an
+  account's downloads by CONNECTION whatever the plaintext says. This closes grouping ACROSS
+  connections and restarts; the residual is the shared `Relay` itself, which is the per-proxy work
+  QUIC-5 needs anyway. The side-finding that started this was recorded wider than the truth, and
+  the record has been corrected rather than left flattering.
+
+  **Not pinned by an end-to-end test**, which is a real gap and is stated as one: `Relay::transport()`
+  returns a concrete `SocketTransport`, so nothing can observe what a download puts on the wire,
+  and a unit test on `blob_get_addr` would only re-assert that a CSPRNG returns different bytes.
+  What broke was a *binding*, not a computation, so the guard reads the source and pins the
+  binding — the idiom `at_rest_shape_guard` and `lock_order_guard` already use. Both halves were
+  neutered to confirm they turn red.
+
 ## What landed since the last reconcile (2026-07-29, second batch)
 
 Fourteen commits: the crate split, the format guards, the polling cursor, the lock hierarchy, the

@@ -33,6 +33,20 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "io-
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 karst-transport = { version = "0.1.0", path = "../transport" }
 
+[features]
+# A PRODUCTION build must not be constructible while the things that would make it honest are
+# missing. Turning this on does not "enable production mode" — it asks the compiler whether a
+# production build is possible yet, and today the answer is no (see `src/lib.rs`). Each wall gets
+# its own feature below as it falls; `production` requires all of them, so the day the last one
+# lands the gate opens by itself and nobody has to remember to remove a check.
+production = []
+
+# NOT PROVIDED BY ANYTHING. A crate that ships an independently audited implementation of
+# `admission::token::AdmissionTokenVerifier` would enable this. Declaring it here rather than
+# leaving it implicit is the point: the missing piece has a name, and the error message can
+# say it.
+audited-token-verifier = []
+
 [[bin]]
 name = "karst-relay"
 path = "src/bin/relay.rs"

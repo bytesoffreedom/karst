@@ -13,6 +13,18 @@ Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
+## What landed since the last reconcile (2026-07-29, fifth batch)
+
+- **There is no production build, and the compiler now says so** (#145). `--features production`
+  fails to build, with a message naming the missing piece: an independently audited
+  `AdmissionTokenVerifier`. A runtime warning is something an operator scrolls past and a README
+  paragraph is something nobody reads twice; a build that refuses to exist cannot be shipped by
+  accident or enabled by a config flip. It is a GATE, not a wall — `--features
+  production,audited-token-verifier` compiles today, so the day the audited verifier lands the
+  gate opens by itself and nobody has to remember to delete a check. CI asserts both arms: that
+  the production build is refused, and refused *through the gate* rather than by some unrelated
+  error.
+
 ## What landed since the last reconcile (2026-07-29, fourth batch)
 
 The QUIC carrier's two remaining buildable slices. Both were blocked on each other

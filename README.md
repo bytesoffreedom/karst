@@ -374,7 +374,10 @@ decide whether it is worth your time.
 
 Short version; [`docs/STATUS.md`](docs/STATUS.md) is the authoritative one.
 
-- **No independent audit.** The single biggest caveat, repeated on purpose.
+- **No independent audit.** The single biggest caveat, repeated on purpose — and it is enforced,
+  not just stated: `cargo build -p relay --features production` **refuses to compile** and names
+  what is missing. There is no production build to ship by accident, and the gate opens by itself
+  once an audited token verifier exists.
 - **No group messaging.** One-to-one and a broadcast feed only.
 - **No voice or video calls.** The buttons in the UI are placeholders.
 - **No mobile client.**

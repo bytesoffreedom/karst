@@ -58,6 +58,19 @@ jobs:
       # test, because no test ran them. This does: the demo brings up a relay, earns admission,
       # exchanges messages in both directions and round-trips a file, and fails CI if any step
       # stops working. A documented command nobody executes is a documented command that rots.
+      # The production gate (#145) must REFUSE to build, and must refuse for the stated reason.
+      # An inverted check on purpose: if someone deletes the gate to make a build succeed, this
+      # step goes green-to-red, which is the only way a guard whose job is to fail stays honest.
+      - name: production build is refused
+        run: |
+          if cargo check -p relay --features production 2>err.txt; then
+            echo "FAIL: --features production compiled. The gate is gone or bypassed." >&2
+            exit 1
+          fi
+          grep -q "no production build yet" err.txt || {
+            echo "FAIL: it failed, but not through the gate. Real error:" >&2; cat err.txt >&2; exit 1; }
+          # ...and it must OPEN once the missing piece is declared, or it is a wall, not a gate.
+          cargo check -p relay --features production,audited-token-verifier
       - name: end-to-end demo scripts
         working-directory: .
         run: |

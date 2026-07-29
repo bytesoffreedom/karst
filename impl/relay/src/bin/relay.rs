@@ -983,7 +983,11 @@ fn run_relay(addr: String) -> io::Result<()> {
         None => None,
     };
 
-    eprintln!("karst-relay (SKELETON, NOT for production) listening on {addr}");
+    eprintln!("karst-relay (REFERENCE build, NOT for production) listening on {addr}");
+    // Not a scare line: `--features production` is a real thing you can try, and it will
+    // refuse to compile while an audited token verifier does not exist (#145). Saying so
+    // here means an operator learns it from the program, not from a paragraph they skipped.
+    eprintln!("  there is no production build yet — `cargo build -p relay --features production` says why");
     eprintln!("carrier: {carrier}");
     eprintln!("role: {}", role.name());
     eprintln!(

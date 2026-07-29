@@ -146,11 +146,23 @@ integrity/authenticity is a separate task of migrating to post-quantum signature
 (e.g. ML-DSA/Dilithium), which remains future work and must not be mixed up with
 this section.
 
+**A one-time prekey is ONE unit covering both legs.** A published one-time prekey
+carries an X25519 key and its own ML-KEM-768 encapsulation key, signed together by
+the owner's identity key. The sender encapsulates against that one-time KEM key
+rather than the bundle's long-lived one, and the recipient destroys the unit's seed
+on the same commit that consumes the X25519 half — so a recorded first contact
+cannot be reopened later from the account's long-lived material. The long-lived
+`kem_ek` remains as the last-resort key for a sender who arrives after the batch is
+exhausted, and it is NOT rotated; that case is the reported downgrade below, not a
+silent one. Keeping the two halves in one unit is deliberate: separate batches can
+go out of step, and a per-leg downgrade is precisely what a single unit cannot
+express.
+
 **Prekey exhaustion — a DoS attack on the asynchronous-contact mechanism
 itself.** X3DH/PQXDH rest on a pack of one-time prekeys published in advance — an
 attacker who mass-requests a victim's prekey bundle can exhaust this supply,
-forcing a fallback to a weaker mode (only a signed prekey, no one-time one) or a
-refusal of new contacts.
+forcing a fallback to a weaker mode (the signed prekey and the static KEM key, no
+one-time unit) or a refusal of new contacts.
 
 **By which credential exactly — not just any admission token, or a bootstrap
 paradox for the first contact.** The first formulation ("the same admission

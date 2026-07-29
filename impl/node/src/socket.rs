@@ -841,7 +841,17 @@ impl Transport for SocketTransport {
     }
 
     fn publish_bundle(&self, req: &PublishRequest, _now: u64) -> PublishResponse {
-        match self.round_trip(&WireRequest::PublishBundle(req.clone())) {
+        // The publish class's OWN ceiling on the way OUT, matching the one the server applies on
+        // the way in (`wire::max_frame_for`). `round_trip`'s tight default is sized for the
+        // Send/Fetch class and cannot carry a bundle plus a one-time prekey batch — it fit only
+        // while a unit was ~104 bytes, and a unit now carries its own ML-KEM encapsulation key
+        // (CRYPTO-33). Sending under the wrong ceiling fails as an opaque transport error, which
+        // is exactly how a full batch would have looked: "bundle not published", no reason given.
+        match self.round_trip_sized(
+            &WireRequest::PublishBundle(req.clone()),
+            crate::wire::MAX_PUBLISH_FRAME,
+            MAX_RESPONSE_FRAME,
+        ) {
             Ok(WireResponse::NeedCookie(c)) => PublishResponse::NeedCookie(c),
             Ok(WireResponse::BundlePublished) => PublishResponse::Published,
             Ok(WireResponse::Rejected(s)) => PublishResponse::Rejected(s),

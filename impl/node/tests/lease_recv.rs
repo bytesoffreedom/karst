@@ -59,7 +59,7 @@ fn poll(
     relay_pub: PublicKey,
     account: &Account,
     disk: &mut Vec<u8>,
-    opks: &mut Vec<[u8; 32]>,
+    opks: &mut Vec<node::pqxdh::OneTimeSecret>,
     now: u64,
     crash: Crash,
 ) -> Vec<Vec<u8>> {

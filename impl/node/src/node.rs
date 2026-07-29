@@ -38,7 +38,11 @@ pub const MAX_BUNDLES: usize = 100_000;
 /// 64-byte signature, and the postcard framing around them. Deliberately the STORED size rather
 /// than the wire size — the relay holds it until a fetcher takes it, and that is the resource
 /// the byte budget exists to bound.
-const SIGNED_OPK_COST: usize = 32 + 64 + 8;
+/// Admission cost charged for ONE published one-time prekey unit. Tracks the wire size in
+/// `wire::SIGNED_OPK_WIRE`: the X25519 key, the one-time ML-KEM-768 encapsulation key and the
+/// signature covering both. Undercharging here would make the PQ half free to publish, which is
+/// most of the bytes the relay then stores and serves.
+const SIGNED_OPK_COST: usize = 32 + 1184 + 64 + 24;
 
 /// How long a published bundle survives without being republished. 30 days: a client republishes
 /// on launch and on announce, so an account in ANY use stays live, while an abandoned or
@@ -62,7 +66,20 @@ pub const MAX_ADDR_LEN: usize = 256;
 /// a larger list is not a legitimate ack — it is work being bought cheaply (SEC-28).
 pub const MAX_ACK_IDS: usize = crate::wire::MAX_FETCH_SEALS;
 /// Cap on stored one-time prekeys per IK (bounded relay state; see `PublishRequest::opks`).
-pub const MAX_OPKS_PER_IK: usize = 256;
+///
+/// Was 256, when a one-time prekey was 32 bytes of X25519 plus a signature. A unit now carries its
+/// own ML-KEM-768 encapsulation key (~1184 B) so the post-quantum leg of a first contact is
+/// forward-secret too (CRYPTO-33), which makes the unit ~12× larger and `MAX_OPKS_PER_IK * unit`
+/// the thing that sets `wire::MAX_PUBLISH_FRAME`. That frame must stay under `MAX_BLOB_FRAME` —
+/// a compile-time assert in `wire.rs` enforces it — so this is a batch that fits one publish with
+/// headroom (the ceiling admits ~47). Raising it far is not a matter of taste: it fails the build.
+///
+/// **What the smaller batch costs, plainly:** a batch serves that many FIRST CONTACTS before it
+/// runs out, and a sender who arrives after it does gets a bundle with no one-time unit — 3-DH
+/// instead of 4-DH, and the static last-resort KEM key instead of a one-time one. That is
+/// reported, not silent (`ForwardSecrecy::NoOneTimePrekey`). The mitigation is republishing more
+/// often rather than a deeper batch, which the client already does on every unlock and poll.
+pub const MAX_OPKS_PER_IK: usize = 40;
 
 /// Fixed wire size of an ML-KEM-768 encapsulation key (FIPS 203) — `PreKeyBundle::kem_ek`.
 /// Mirrors the same literal `wire::PREKEY_BUNDLE_WIRE` already hardcodes for its frame-size

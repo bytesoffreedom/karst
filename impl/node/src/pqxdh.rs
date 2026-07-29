@@ -98,6 +98,21 @@ pub struct PreKeyBundle {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SignedOpk {
     pub key: [u8; 32],
+    /// The ONE-TIME ML-KEM-768 encapsulation key minted with `key` (~1184 B), signed with it as
+    /// one unit (CRYPTO-33).
+    ///
+    /// This is the post-quantum half of the same one-time prekey, and it is deliberately not a
+    /// separate object. The classical OPK gives the first message forward secrecy against a later
+    /// compromise of the long-lived X25519 prekey; the KEM leg had no counterpart at all — the
+    /// bundle's `kem_ek` is minted once, never rotated, so anyone who later obtains the account's
+    /// secret material decapsulates every recorded opener and walks the ratchet forward from
+    /// there. A sender that gets a one-time unit encapsulates against THIS key instead, and the
+    /// recipient destroys its seed on the same commit that consumes the X25519 half.
+    ///
+    /// One unit rather than two stores because the pair must be all-or-nothing: two independent
+    /// batches can go out of step (classical half present, PQ half exhausted), and the resulting
+    /// silent per-leg downgrade is exactly what a merged unit cannot express.
+    pub kem_ek: Vec<u8>,
     /// XEdDSA signature (64 B) by the OWNER's identity key over [`opk_sig_message`]. A `Vec`
     /// only because serde has no impl for `[u8; 64]`; a wrong length fails verification, which
     /// is the same door a wrong signature goes through.
@@ -116,16 +131,89 @@ impl SignedOpk {
             return false; // wrong length = unsigned / incompatible
         };
         let pk = xeddsa::xed25519::PublicKey::from(&PublicKey::from(*ik_pub));
-        pk.verify(&opk_sig_message(&self.key), &sig).is_ok()
+        pk.verify(&opk_sig_message(&self.key, &self.kem_ek), &sig).is_ok()
+    }
+}
+
+/// One unconsumed one-time prekey UNIT: the classical X25519 half and the post-quantum ML-KEM
+/// half, minted together and destroyed together (CRYPTO-33).
+///
+/// Held as the KEM's 64-byte FIPS 203 seed rather than the expanded decapsulation key: the
+/// encapsulation key is a pure function of it (`kem_ek`), so the batch costs 96 bytes per unit at
+/// rest instead of the ~2.4 KB the expanded pair would.
+#[derive(Clone)]
+pub struct OneTimePrekey {
+    x: Identity,
+    kem_seed: [u8; 64],
+}
+
+/// One unit's secret material, as it is persisted and handed back to `import_opk_secrets`.
+/// `zeroize` on drop for the same reason every other secret here has it: these ARE the keys whose
+/// destruction is the forward-secrecy claim.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    zeroize::Zeroize,
+    zeroize::ZeroizeOnDrop,
+)]
+pub struct OneTimeSecret {
+    /// X25519 one-time prekey secret.
+    pub x: [u8; 32],
+    /// ML-KEM-768 seed (FIPS 203 `from_seed`/`to_seed`). `serde` has no array impl this wide, so
+    /// it travels as two halves rather than as `[u8; 64]`.
+    pub kem_seed_lo: [u8; 32],
+    pub kem_seed_hi: [u8; 32],
+}
+
+impl OneTimePrekey {
+    fn generate() -> Self {
+        // The KEM seed is the unit's whole post-quantum secret, so it comes from the OS CSPRNG
+        // directly — never from the account's long-lived material, which would make it
+        // re-derivable by exactly the compromise this is supposed to survive.
+        let mut kem_seed = [0u8; 64];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut kem_seed);
+        OneTimePrekey { x: Identity::generate(), kem_seed }
+    }
+
+    fn from_secret(s: &OneTimeSecret) -> Self {
+        let mut kem_seed = [0u8; 64];
+        kem_seed[..32].copy_from_slice(&s.kem_seed_lo);
+        kem_seed[32..].copy_from_slice(&s.kem_seed_hi);
+        OneTimePrekey { x: Identity::from_secret_bytes(s.x), kem_seed }
+    }
+
+    fn to_secret(&self) -> OneTimeSecret {
+        OneTimeSecret {
+            x: self.x.to_secret_bytes(),
+            kem_seed_lo: self.kem_seed[..32].try_into().expect("32"),
+            kem_seed_hi: self.kem_seed[32..].try_into().expect("32"),
+        }
+    }
+
+    fn kem_dk(&self) -> DecapsulationKey<MlKem768> {
+        let seed = Array::try_from(&self.kem_seed[..]).expect("64-byte ML-KEM seed");
+        DecapsulationKey::<MlKem768>::from_seed(seed)
+    }
+
+    /// This unit's ML-KEM encapsulation key, as published.
+    fn kem_ek(&self) -> Vec<u8> {
+        self.kem_dk().encapsulation_key().to_bytes().as_slice().to_vec()
     }
 }
 
 /// The message an OPK signature covers: a domain tag ‖ the one-time prekey. Domain-separated from
 /// [`prekey_sig_message`] so neither signature can ever be replayed as the other.
-pub(crate) fn opk_sig_message(opk_pub: &[u8; 32]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(16 + 32);
-    m.extend_from_slice(b"KARST-opk-sig-v1");
+pub(crate) fn opk_sig_message(opk_pub: &[u8; 32], kem_ek: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16 + 32 + kem_ek.len());
+    m.extend_from_slice(b"KARST-opk-sig-v2"); // v2: the signature now covers the PQ half too
     m.extend_from_slice(opk_pub);
+    m.extend_from_slice(kem_ek);
     m
 }
 
@@ -181,7 +269,7 @@ pub struct Account {
     /// of `account.key`, so the long-lived identity is never at migration risk) and the
     /// relay-side per-fetch distribution that make it end-to-end one-time are the next
     /// increments.
-    opks: std::collections::HashMap<[u8; 32], Identity>,
+    opks: std::collections::HashMap<[u8; 32], OneTimePrekey>,
     /// Per-account mailbox secret `m` (Ristretto scalar bytes) for deposit/fetch key SEPARATION
     /// (`crate::blind`). Derived deterministically from the account's own secret material, so it
     /// re-derives from the seed (no separate persistence) and a sender — who lacks that material
@@ -226,26 +314,36 @@ impl Account {
     /// Mint a fresh one-time prekey, store its secret, and return its public key — to be
     /// placed in a published bundle. Consumed on first use (see `accept_key_agreement`).
     pub fn add_opk(&mut self) -> [u8; 32] {
-        let opk = Identity::generate();
-        let pk = opk.public.to_bytes();
-        self.opks.insert(pk, opk);
+        let unit = OneTimePrekey::generate();
+        let pk = unit.x.public.to_bytes();
+        self.opks.insert(pk, unit);
         pk
     }
 
     /// Sign one of our one-time prekeys with the identity key, so a relay can hand it out but
     /// cannot substitute one of its own (CRYPTO-04). Signing is the publisher's job — the relay
     /// only ever holds the signed pair.
-    pub fn sign_opk(&self, opk_pub: &[u8; 32]) -> Vec<u8> {
+    pub fn sign_opk(&self, opk_pub: &[u8; 32], kem_ek: &[u8]) -> Vec<u8> {
         use xeddsa::Sign;
         let sk = x25519_dalek::StaticSecret::from(self.ik.to_secret_bytes());
         let signer = xeddsa::xed25519::PrivateKey::from(&sk);
-        let sig: [u8; 64] = signer.sign(&opk_sig_message(opk_pub), rand010::rng());
+        let sig: [u8; 64] = signer.sign(&opk_sig_message(opk_pub, kem_ek), rand010::rng());
         sig.to_vec()
+    }
+
+    /// The published form of one of our one-time units — the X25519 key and its ML-KEM
+    /// encapsulation key, signed together. `None` if we do not hold that unit (consumed, or never
+    /// ours).
+    pub fn signed_opk(&self, opk_pub: &[u8; 32]) -> Option<SignedOpk> {
+        let unit = self.opks.get(opk_pub)?;
+        let kem_ek = unit.kem_ek();
+        let sig = self.sign_opk(opk_pub, &kem_ek);
+        Some(SignedOpk { key: *opk_pub, kem_ek, sig })
     }
 
     /// Our unconsumed one-time prekeys, each signed — exactly what `publish` advertises.
     pub fn signed_opks(&self) -> Vec<SignedOpk> {
-        self.opks.keys().map(|k| SignedOpk { key: *k, sig: self.sign_opk(k) }).collect()
+        self.opks.keys().filter_map(|k| self.signed_opk(k)).collect()
     }
 
     /// How many unconsumed one-time prekeys remain (for the batch top-up policy later).
@@ -261,24 +359,23 @@ impl Account {
     /// SECRET bytes of the current unconsumed one-time prekeys, for the caller to persist
     /// in a sidecar (kept OUT of `account.key`, so the long-lived identity never migrates).
     /// **These are private keys in the clear** — write under 0600, same care as the account.
-    pub fn export_opk_secrets(&self) -> Vec<[u8; 32]> {
-        self.opks.values().map(|id| id.to_secret_bytes()).collect()
+    pub fn export_opk_secrets(&self) -> Vec<OneTimeSecret> {
+        self.opks.values().map(|u| u.to_secret()).collect()
     }
 
     /// Load persisted one-time prekey secrets back into the account (see
     /// `export_opk_secrets`). Additive: existing OPKs are kept, so a top-up survives.
-    pub fn import_opk_secrets(&mut self, secrets: &[[u8; 32]]) {
+    pub fn import_opk_secrets(&mut self, secrets: &[OneTimeSecret]) {
         for s in secrets {
-            let id = Identity::from_secret_bytes(*s);
-            self.opks.insert(id.public.to_bytes(), id);
+            let unit = OneTimePrekey::from_secret(s);
+            self.opks.insert(unit.x.public.to_bytes(), unit);
         }
     }
 
     /// This account's bundle carrying a specific one-time prekey (must be one of ours, via
     /// `add_opk`). The sender mixes it into the agreement and the recipient consumes it.
     pub fn prekey_bundle_with_opk(&self, opk_pub: [u8; 32]) -> PreKeyBundle {
-        let opk = SignedOpk { key: opk_pub, sig: self.sign_opk(&opk_pub) };
-        PreKeyBundle { opk: Some(opk), ..self.prekey_bundle() }
+        PreKeyBundle { opk: self.signed_opk(&opk_pub), ..self.prekey_bundle() }
     }
 
     /// Сериализовать секреты для персистентности (§2.1-личность стабильна между
@@ -410,13 +507,23 @@ impl Account {
         // OPK (already consumed, or never ours) fails the agreement rather than silently
         // downgrading — the sender committed to it in the transcript, so proceeding without
         // it would derive a different root key anyway.
-        let dh4 = match ka.opk_pub {
-            Some(opk_pub) => Some(self.opks.get(&opk_pub)?.dh_checked(&ek_a)?),
+        let unit = match ka.opk_pub {
+            Some(opk_pub) => Some(self.opks.get(&opk_pub)?),
+            None => None,
+        };
+        let dh4 = match unit {
+            Some(u) => Some(u.x.dh_checked(&ek_a)?),
             None => None,
         };
 
         let ct: Ciphertext<MlKem768> = Array::try_from(ka.kem_ct.as_slice()).ok()?;
-        let pq_shared = self.kem_dk.decapsulate(&ct);
+        // Mirror of the sender's choice above: a one-time unit means the ciphertext is against
+        // THAT unit's KEM key, whose seed we destroy when the unit is consumed. Only an opener
+        // that used no unit at all is decapsulated with the long-lived key.
+        let pq_shared = match unit {
+            Some(u) => u.kem_dk().decapsulate(&ct),
+            None => self.kem_dk.decapsulate(&ct),
+        };
 
         let transcript = transcript(
             &ka.ik_a_pub,
@@ -470,7 +577,18 @@ pub fn initiate_key_agreement(
     // Parse the WIRE-derived KEM key FIRST — before any DH. `verify_prekey_sig` passing does NOT
     // make this well-formed: a malicious contact signs its own malformed `kem_ek` with its own
     // IK, so the signature verifies. This used to `expect()` and panic the caller (CRYPTO-08).
-    let ek = <EncapsulationKey<MlKem768> as TryKeyInit>::new_from_slice(&bundle.kem_ek)
+    // CRYPTO-33: encapsulate against the ONE-TIME KEM key when the bundle carries a one-time
+    // unit, and only fall back to the bundle's long-lived `kem_ek` when it does not. The
+    // long-lived key is minted once and never rotated, so a ciphertext against it stays
+    // decryptable by anyone who later obtains the account's secret material; a one-time key's
+    // seed is destroyed on the commit that consumes the unit, which is what makes the PQ leg of
+    // this handshake forward-secret at all. Which key was used is not ambiguous to the recipient:
+    // the transcript binds `opk_pub`, and the unit is all-or-nothing.
+    let kem_ek_bytes: &[u8] = match &bundle.opk {
+        Some(o) => &o.kem_ek,
+        None => &bundle.kem_ek,
+    };
+    let ek = <EncapsulationKey<MlKem768> as TryKeyInit>::new_from_slice(kem_ek_bytes)
         .map_err(|_| "bundle KEM key is malformed".to_string())?;
 
     let ik_b = PublicKey::from(bundle.ik_pub);
@@ -774,5 +892,89 @@ mod tests {
         let (bob_rk, sender) = restored.accept_key_agreement(&ka).expect("decap");
         assert_eq!(alice_rk, bob_rk, "восстановленный account согласует ключ");
         assert_eq!(sender, alice.public.to_bytes());
+    }
+
+    /// CRYPTO-33: the post-quantum leg of a first contact is forward-secret.
+    ///
+    /// The bundle's `kem_ek` is minted once and never rotated, so a ciphertext against it stays
+    /// decryptable by anyone who later obtains the account's secret material — the ratchet's
+    /// forward secrecy starts AFTER this handshake and cannot help with the handshake itself. A
+    /// one-time unit carries its own KEM key whose seed is destroyed when the unit is consumed.
+    ///
+    /// Discriminating in the direction that matters: it asserts the ciphertext does NOT open
+    /// under the STATIC key. Point the sender back at `bundle.kem_ek` and the two shared secrets
+    /// coincide, which is the whole bug. (ML-KEM decapsulation under the wrong key does not
+    /// error — FIPS 203 implicit rejection returns a pseudorandom value — so "different secret"
+    /// is exactly the observable, not "it failed".)
+    #[test]
+    fn the_opener_is_encapsulated_against_the_one_time_key_not_the_static_one() {
+        let mut bob = Account::generate();
+        let opk_pub = bob.add_opk();
+        let bundle = bob.prekey_bundle_with_opk(opk_pub);
+        assert_ne!(
+            bundle.opk.as_ref().expect("bundle carries the unit").kem_ek,
+            bundle.kem_ek,
+            "the one-time unit republished the STATIC KEM key — nothing to destroy later"
+        );
+
+        let alice = Identity::generate();
+        let m_a = [7u8; 32];
+        let (alice_root, ka) = initiate_key_agreement(&alice, &m_a, &bundle).expect("agreement");
+        let (bob_root, _) = bob.prepare_key_agreement(&ka).expect("bob agrees");
+        assert_eq!(alice_root, bob_root, "control: the handshake itself still works");
+
+        let ct: Ciphertext<MlKem768> = Array::try_from(ka.kem_ct.as_slice()).expect("ct");
+        let under_static = bob.kem_dk.decapsulate(&ct);
+        let under_unit = bob.opks[&opk_pub].kem_dk().decapsulate(&ct);
+        assert_ne!(
+            under_static.as_slice(),
+            under_unit.as_slice(),
+            "the opener was encapsulated against the long-lived KEM key, so destroying the \
+             one-time unit destroys nothing: the recorded handshake stays openable forever by \
+             whoever later gets the account's secrets"
+        );
+    }
+
+    /// Consuming the unit destroys the PQ secret with it — the account keeps every long-lived
+    /// key and still cannot reopen the recorded opener.
+    #[test]
+    fn consuming_a_one_time_unit_destroys_its_kem_seed() {
+        let mut bob = Account::generate();
+        let opk_pub = bob.add_opk();
+        let bundle = bob.prekey_bundle_with_opk(opk_pub);
+        let alice = Identity::generate();
+        let (_, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("agreement");
+        assert!(bob.prepare_key_agreement(&ka).is_some(), "control: openable while held");
+
+        bob.consume_opk(&ka);
+        assert!(
+            bob.prepare_key_agreement(&ka).is_none(),
+            "the opener is still openable after its one-time unit was consumed"
+        );
+        assert!(!bob.opks.contains_key(&opk_pub), "the unit's secret survived consumption");
+    }
+
+    /// The signature covers the PQ half, so a relay cannot swap a one-time unit's KEM key for one
+    /// it can decapsulate while leaving the X25519 half — and the sender's own long-lived key —
+    /// untouched. Without this the whole slice is decorative: the sender encapsulates against
+    /// whatever the relay put there.
+    #[test]
+    fn a_substituted_one_time_kem_key_fails_the_unit_signature() {
+        let mut bob = Account::generate();
+        let opk_pub = bob.add_opk();
+        let bundle = bob.prekey_bundle_with_opk(opk_pub);
+        let ik = bundle.ik_pub;
+        let genuine = bundle.opk.clone().expect("unit");
+        assert!(genuine.verify(&ik), "control: the genuine unit verifies");
+
+        // The relay keeps the signed X25519 half and swaps in a KEM key of its own.
+        let relay = Account::generate();
+        let mut swapped = genuine.clone();
+        swapped.kem_ek = relay.prekey_bundle().kem_ek;
+        assert!(
+            !swapped.verify(&ik),
+            "a one-time unit whose PQ half was replaced still verified — the sender would \
+             encapsulate to the relay"
+        );
     }
 }

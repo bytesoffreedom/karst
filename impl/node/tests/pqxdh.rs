@@ -84,7 +84,7 @@ fn malformed_kem_ciphertext_length_rejected() {
 /// degenerate key and the agreement.
 #[test]
 fn a_small_order_prekey_in_a_bundle_is_refused() {
-    let bob = Account::generate();
+    let mut bob = Account::generate();
     let alice = Identity::generate();
 
     let good = bob.prekey_bundle();
@@ -101,8 +101,20 @@ fn a_small_order_prekey_in_a_bundle_is_refused() {
     );
 
     // Signed BY ITS OWNER and still small-order: "signed" says nothing about group order, which
-    // is exactly why the contributory check is separate from the signature check.
-    let degenerate_opk = bob.prekey_bundle_with_opk([0u8; 32]);
+    // is exactly why the contributory check is separate from the signature check. Built by hand
+    // from a genuine unit with its X25519 half swapped and RE-SIGNED, because a one-time unit now
+    // carries a KEM key too (CRYPTO-33) and there is no such unit to look up under a key we never
+    // minted.
+    let real = bob.add_opk();
+    let genuine = bob.signed_opk(&real).expect("just minted");
+    let degenerate_opk = node::pqxdh::PreKeyBundle {
+        opk: Some(node::pqxdh::SignedOpk {
+            key: [0u8; 32],
+            sig: bob.sign_opk(&[0u8; 32], &genuine.kem_ek),
+            kem_ek: genuine.kem_ek.clone(),
+        }),
+        ..good.clone()
+    };
     assert!(
         initiate_key_agreement(&alice, &[7u8; 32], &degenerate_opk).is_err(),
         "a small-order one-time prekey must be refused too"

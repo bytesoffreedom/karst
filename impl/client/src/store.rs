@@ -416,7 +416,7 @@ struct SessionFile {
     /// The serialized `PeerState`, untouched.
     state: Vec<u8>,
     /// The one-time prekey secrets, which commit in the SAME write as the state (CRYPTO-26).
-    opks: Vec<[u8; 32]>,
+    opks: Vec<node::pqxdh::OneTimeSecret>,
 }
 
 /// What `capabilities.dat` holds: the admission credentials this account has, split by whether
@@ -2178,7 +2178,7 @@ impl Store {
     /// just been declared missing. Every initiator that received one produced an opener the
     /// recipient could no longer accept: silent, one-sided first-contact failure that looks like
     /// the network dropping messages (R2-4). Absent is still legitimately empty.
-    pub fn load_opks(&self) -> io::Result<Vec<[u8; 32]>> {
+    pub fn load_opks(&self) -> io::Result<Vec<node::pqxdh::OneTimeSecret>> {
         Ok(self.read_session_file()?.map(|f| f.opks).unwrap_or_default())
     }
 
@@ -2189,7 +2189,7 @@ impl Store {
     ///
     /// Read-modify-write of a shared file: the caller must hold `lock_sessions`, or a concurrent
     /// send/receive can interleave and one of the two writes loses the other's half.
-    pub fn save_opks(&self, opks: &[[u8; 32]]) -> io::Result<()> {
+    pub fn save_opks(&self, opks: &[node::pqxdh::OneTimeSecret]) -> io::Result<()> {
         // Carry the session bytes across OPAQUELY (never decode → re-encode): a state this call
         // cannot parse is still a state the ratchet may need, and re-encoding would make every
         // OPK top-up a chance to rewrite it.
@@ -3274,7 +3274,7 @@ impl Store {
     /// A crash mid-write leaves no truncated/torn file (which would wedge the account or lose a
     /// ratchet position); the temp sits in the same directory, so the rename is atomic within the
     /// filesystem. Ratchet keys and prekey secrets are encrypted at rest before the write.
-    fn write_session_file(&self, state: &[u8], opks: &[[u8; 32]]) -> io::Result<()> {
+    fn write_session_file(&self, state: &[u8], opks: &[node::pqxdh::OneTimeSecret]) -> io::Result<()> {
         // One past the highest generation EITHER file knows about, so a rolled-back state file
         // cannot lower the mark by being written over.
         let generation = self.load_sessions_anchor().max(self.sessions_generation()) + 1;
@@ -3338,7 +3338,7 @@ impl Store {
     ///
     /// One file, one rename, so the reachable crash states are only "both old" (the opener
     /// redelivers and re-opens) or "both new" (done) — never "neither".
-    pub fn save_receive_commit(&self, state: &PeerState, opks: &[[u8; 32]]) -> io::Result<()> {
+    pub fn save_receive_commit(&self, state: &PeerState, opks: &[node::pqxdh::OneTimeSecret]) -> io::Result<()> {
         self.write_session_file(&postcard::to_stdvec(state).map_err(io_err)?, opks)
     }
 
@@ -6161,7 +6161,12 @@ mod tests {
         );
 
         // NETWORK isolation: OPKs saved as p0 are invisible to p1 and to the root.
-        p0.save_opks(&[[1u8; 32], [2u8; 32]]).unwrap();
+        let unit = |b: u8| node::pqxdh::OneTimeSecret {
+            x: [b; 32],
+            kem_seed_lo: [b; 32],
+            kem_seed_hi: [b; 32],
+        };
+        p0.save_opks(&[unit(1), unit(2)]).unwrap();
         assert_eq!(p0.load_opks().unwrap().len(), 2, "p0 has its OPKs");
         assert!(p1.load_opks().unwrap().is_empty(), "p1 has its own OPK namespace");
         assert!(s.load_opks().unwrap().is_empty(), "root OPKs untouched");

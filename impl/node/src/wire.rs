@@ -67,9 +67,13 @@ pub const MAX_RESPONSE_FRAME: usize = FETCH_PAGE_LEN + 512;
 /// padded small-message path does not (see docs/STATUS.md).
 pub const MAX_BLOB_FRAME: usize = 65_000;
 
-/// Wire size of one `pqxdh::SignedOpk`: the fixed 32-byte key plus its 64-byte XEdDSA
-/// signature carried as a length-prefixed `Vec<u8>`. Margin, not an exact postcard count.
-const SIGNED_OPK_WIRE: usize = 32 + 64 + 8;
+/// Wire size of one `pqxdh::SignedOpk`: the fixed 32-byte X25519 key, the ONE-TIME ML-KEM-768
+/// encapsulation key (1184 B, fixed by the KEM) and the 64-byte XEdDSA signature covering both,
+/// each `Vec` length-prefixed. Margin, not an exact postcard count.
+///
+/// The PQ half is what makes a one-time unit ~12× the size it used to be, and that is what forced
+/// `MAX_OPKS_PER_IK` down — see its doc for the trade.
+const SIGNED_OPK_WIRE: usize = 32 + 1184 + 64 + 24;
 
 /// Wire size of one `pqxdh::PreKeyBundle`: two X25519 keys (`ik_pub`, `prekey_pub`), the
 /// ML-KEM-768 encapsulation key (1184 B, fixed by the KEM), an optional one-time prekey,

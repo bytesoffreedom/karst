@@ -56,12 +56,16 @@ use crate::pqxdh::{initiate_key_agreement, Account, KeyAgreement, PreKeyBundle};
 /// fallback" rule, applied to cryptographic strength rather than to transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardSecrecy {
-    /// 4-DH: a one-time prekey was used, so the first message stays secret even if the peer's
-    /// long-lived signed prekey secret is compromised later.
+    /// 4-DH AND a one-time ML-KEM key: a one-time unit was used, so the first message stays
+    /// secret even if the peer's long-lived secrets are compromised later — on BOTH legs. The
+    /// unit is one object precisely so this can be one answer (CRYPTO-33).
     Full,
-    /// 3-DH: the bundle carried no one-time prekey. The session is still end-to-end encrypted and
-    /// heals on the first DH ratchet step; what is lost is forward secrecy for the FIRST message
-    /// against a later compromise of the long-lived prekey.
+    /// 3-DH and the STATIC KEM key: the bundle carried no one-time unit. The session is still
+    /// end-to-end encrypted and heals on the first DH ratchet step; what is lost is forward
+    /// secrecy for the FIRST message against a later compromise of the long-lived material —
+    /// the signed prekey on the classical leg, and the never-rotated `kem_ek` on the
+    /// post-quantum one. This is the case a caller must surface rather than swallow: it is the
+    /// only signal that the PQ leg of this particular handshake is recorded-now-decrypt-later.
     NoOneTimePrekey,
 }
 use crate::ratchet::{RatchetMessage, Session, SessionSnapshot};
@@ -762,13 +766,13 @@ impl<T: Transport> Peer<T> {
 
     /// Load persisted one-time prekey secrets into this peer's account (before receiving,
     /// so openers that used an OPK can be accepted; before publishing, to advertise them).
-    pub fn load_opks(&mut self, secrets: &[[u8; 32]]) {
+    pub fn load_opks(&mut self, secrets: &[crate::pqxdh::OneTimeSecret]) {
         self.account.import_opk_secrets(secrets);
     }
 
     /// The account's current unconsumed one-time prekey secrets, to persist after a
     /// `receive` (which consumes some) or a top-up.
-    pub fn export_opks(&self) -> Vec<[u8; 32]> {
+    pub fn export_opks(&self) -> Vec<crate::pqxdh::OneTimeSecret> {
         self.account.export_opk_secrets()
     }
 
@@ -827,7 +831,7 @@ impl<T: Transport> Peer<T> {
         let bundle = self.account.prekey_bundle();
         let signed_opks: Vec<crate::pqxdh::SignedOpk> = opks
             .iter()
-            .map(|k| crate::pqxdh::SignedOpk { key: *k, sig: self.account.sign_opk(k) })
+            .filter_map(|k| self.account.signed_opk(k))
             .collect();
         let shared = self.account.ik().dh(&self.relay_pub);
         // Publishing announces the bundle — and the IK inside it — so it shares the

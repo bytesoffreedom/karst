@@ -207,10 +207,9 @@ fn a_relay_substituted_one_time_prekey_is_refused() {
     // relay can do on its own.
     let mut relay_account = Account::generate();
     let relay_opk = relay_account.add_opk();
-    let forged_opk = node::pqxdh::SignedOpk {
-        key: relay_opk,
-        sig: relay_account.sign_opk(&relay_opk),
-    };
+    // The whole unit — X25519 half AND the one-time ML-KEM key — minted and signed by the relay,
+    // which is exactly what a relay can produce on its own.
+    let forged_opk = relay_account.signed_opk(&relay_opk).expect("the relay just minted it");
     let substituted = node::pqxdh::PreKeyBundle { opk: Some(forged_opk), ..genuine.clone() };
 
     let mut alice = bob_peer();

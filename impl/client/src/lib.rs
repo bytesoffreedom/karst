@@ -3450,7 +3450,7 @@ pub struct MultiReceive {
     /// The ratchet state advanced through the relays that answered — persist this.
     pub state: PeerState,
     /// The remaining one-time prekey secrets — persist these.
-    pub opks: Vec<[u8; 32]>,
+    pub opks: Vec<node::pqxdh::OneTimeSecret>,
     /// Indices into `relays` whose fetch failed this pass (unreachable / blocked / auth
     /// rejected). Empty = every relay answered. A relay in here cost the caller nothing:
     /// the healthy relays' messages and state advance are still returned.
@@ -3489,7 +3489,7 @@ pub struct MultiReceive {
 pub fn receive_threaded<T: Transport + Clone>(
     account: Account,
     base_state: PeerState,
-    opks: Vec<[u8; 32]>,
+    opks: Vec<node::pqxdh::OneTimeSecret>,
     relays: &[(T, x25519_dalek::PublicKey)],
     now: u64,
 ) -> MultiReceive {

@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{InMemoryTransport, PublishResponse, RelayNode, Response};
+use relay::node::{InMemoryTransport, PublishResponse, RelayNode, Response};
 use node::peer::Peer;
 use node::pqxdh::{Account, PreKeyBundle};
 use x25519_dalek::PublicKey;
@@ -100,7 +100,7 @@ fn publish_request_fits_request_frame() {
     // Frame-cap: PublishRequest несёт полный bundle (kem_ek ~1184 Б) — должен
     // влезать в MAX_REQUEST_FRAME (in-process тесты не кадрируют → регресс размера
     // проявился бы только по сокету). Проверяем реальную postcard-длину.
-    use node::node::PublishRequest;
+    use relay::node::PublishRequest;
     use node::wire::{WireRequest, MAX_REQUEST_FRAME};
 
     let bundle = Account::generate().prekey_bundle();
@@ -257,7 +257,7 @@ fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
     // prekeys entirely (R2-3), so this is the only door they come out of now.
     let mut served = Vec::new();
     loop {
-        let mut req = node::node::BundleOpkRequest {
+        let mut req = relay::node::BundleOpkRequest {
             ik: bob_ik,
             client_addr: format!("drain-{}", served.len()).into_bytes(),
             carrier_id: b"test".to_vec(),
@@ -268,12 +268,12 @@ fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
         let mut got = None;
         for _ in 0..2 {
             match relay.borrow_mut().handle_fetch_bundle_opk(&req, NOW) {
-                node::node::BundleOpkResponse::NeedCookie(c) => req.cookie = Some(c),
-                node::node::BundleOpkResponse::Bundle(b) => {
+                relay::node::BundleOpkResponse::NeedCookie(c) => req.cookie = Some(c),
+                relay::node::BundleOpkResponse::Bundle(b) => {
                     got = b;
                     break;
                 }
-                node::node::BundleOpkResponse::Rejected(e) => panic!("gated fetch rejected: {e}"),
+                relay::node::BundleOpkResponse::Rejected(e) => panic!("gated fetch rejected: {e}"),
             }
         }
         match got.and_then(|b| b.opk) {
@@ -300,7 +300,7 @@ fn republishing_with_replace_clears_prekeys_whose_secrets_are_gone() {
 /// keys are still THERE for the sender who is entitled to one.
 #[test]
 fn anonymous_bundle_reads_cannot_drain_a_victims_one_time_prekeys() {
-    use node::node::Transport;
+    use relay::node::Transport;
     use node::peer::ForwardSecrecy;
 
     let (t, relay_pub) = shared();
@@ -333,7 +333,7 @@ fn anonymous_bundle_reads_cannot_drain_a_victims_one_time_prekeys() {
 /// either. Otherwise the "gate" would only be a different message name.
 #[test]
 fn a_bundle_opk_fetch_without_a_valid_capability_is_rejected() {
-    use node::node::{BundleOpkRequest, BundleOpkResponse, Transport};
+    use relay::node::{BundleOpkRequest, BundleOpkResponse, Transport};
 
     let (t, relay_pub) = shared();
     let mut bob = peer(&t, relay_pub);
@@ -434,7 +434,7 @@ fn refreshing_your_own_bundle_does_not_spend_quota() {
 /// resolve sat there until restart.
 #[test]
 fn abandoned_key_distribution_state_is_swept() {
-    use node::node::BUNDLE_TTL_SECS;
+    use relay::node::BUNDLE_TTL_SECS;
 
     let (t, relay_pub) = shared();
     let mut bob = peer(&t, relay_pub);
@@ -473,7 +473,7 @@ fn abandoned_key_distribution_state_is_swept() {
 #[test]
 fn an_expired_discovery_record_is_swept_even_if_nobody_looks_it_up() {
     use node::discovery::{binding_msg, public_of, sign, write_msg, DiscoveryRecord};
-    use node::node::RelayNode;
+    use relay::node::RelayNode;
 
     let mut relay = RelayNode::new(NOW);
 
@@ -481,7 +481,7 @@ fn an_expired_discovery_record_is_swept_even_if_nobody_looks_it_up() {
         let ik_secret = [seed; 32];
         let disc_secret = [seed.wrapping_add(1); 32];
         let (ik, dpub) = (public_of(&ik_secret), public_of(&disc_secret));
-        let loc = node::node::RelayDescriptor {
+        let loc = relay::node::RelayDescriptor {
             noise_pub: [seed; 32],
             fetch_pub: [seed.wrapping_add(2); 32],
             addrs: vec!["127.0.0.1:1".into()],

@@ -10,9 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::store::Store;
 use client::{Relay, RelayId};
-use node::node::{RelayDescriptor, RelayNode};
+use relay::node::{RelayDescriptor, RelayNode};
 use node::seal::Identity;
-use node::socket::{generate_noise_keypair, RelayServer};
+use relay::server::{generate_noise_keypair, RelayServer};
 
 const NOW: u64 = 1_000_000;
 
@@ -43,20 +43,20 @@ fn spawn(others: Vec<RelayDescriptor>) -> (String, [u8; 32], [u8; 32]) {
 }
 
 /// Like `spawn`, but enables the blob store with a chosen persistence so the relay ADVERTISES it.
-fn spawn_with_blobs(persist: node::node::BlobPersistence, tag: &str) -> (String, [u8; 32], [u8; 32]) {
+fn spawn_with_blobs(persist: relay::node::BlobPersistence, tag: &str) -> (String, [u8; 32], [u8; 32]) {
     spawn_cfg(vec![], Some((persist, temp_dir(tag))), None)
 }
 
 /// A relay advertising a MAILBOX durability posture (R2-5, #161) — `Durable` opens a real mail
 /// log, `Volatile` is the default (no log at all), so what it advertises is what it does.
-fn spawn_with_mail(durability: node::node::MailboxDurability, tag: &str) -> (String, [u8; 32], [u8; 32]) {
-    let dir = matches!(durability, node::node::MailboxDurability::Durable).then(|| temp_dir(tag));
+fn spawn_with_mail(durability: relay::node::MailboxDurability, tag: &str) -> (String, [u8; 32], [u8; 32]) {
+    let dir = matches!(durability, relay::node::MailboxDurability::Durable).then(|| temp_dir(tag));
     spawn_cfg(vec![], None, dir)
 }
 
 fn spawn_cfg(
     others: Vec<RelayDescriptor>,
-    blobs: Option<(node::node::BlobPersistence, PathBuf)>,
+    blobs: Option<(relay::node::BlobPersistence, PathBuf)>,
     mail_dir: Option<PathBuf>,
 ) -> (String, [u8; 32], [u8; 32]) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -188,8 +188,8 @@ fn import_refuses_a_descriptor_whose_relay_id_the_endpoint_does_not_serve() {
 #[test]
 fn import_honors_a_persistence_preference() {
     // Two real relays advertising DIFFERENT blob policies.
-    let (d_addr, d_np, d_fp) = spawn_with_blobs(node::node::BlobPersistence::Durable, "pref-dur");
-    let (e_addr, e_np, e_fp) = spawn_with_blobs(node::node::BlobPersistence::Ephemeral, "pref-eph");
+    let (d_addr, d_np, d_fp) = spawn_with_blobs(relay::node::BlobPersistence::Durable, "pref-dur");
+    let (e_addr, e_np, e_fp) = spawn_with_blobs(relay::node::BlobPersistence::Ephemeral, "pref-eph");
     let durable = desc(&d_addr, d_np, d_fp);
     let ephemeral = desc(&e_addr, e_np, e_fp);
     // A knows both.
@@ -199,7 +199,7 @@ fn import_honors_a_persistence_preference() {
     let store = client::store::Store::unlock(temp_dir("pref"), b"pw").unwrap();
     store
         .save_relay_prefs(&client::store::RelayPrefs {
-            prefer_persistence: Some(node::node::BlobPersistence::Durable),
+            prefer_persistence: Some(relay::node::BlobPersistence::Durable),
             prefer_mail_durability: None,
         })
         .unwrap();
@@ -219,15 +219,15 @@ fn import_honors_a_persistence_preference() {
 /// (the durable one has an open mail log), so this is not a mocked policy string.
 #[test]
 fn import_honors_a_mail_durability_preference() {
-    let (d_addr, d_np, d_fp) = spawn_with_mail(node::node::MailboxDurability::Durable, "pref-mail-dur");
-    let (v_addr, v_np, v_fp) = spawn_with_mail(node::node::MailboxDurability::Volatile, "pref-mail-vol");
+    let (d_addr, d_np, d_fp) = spawn_with_mail(relay::node::MailboxDurability::Durable, "pref-mail-dur");
+    let (v_addr, v_np, v_fp) = spawn_with_mail(relay::node::MailboxDurability::Volatile, "pref-mail-vol");
     let (a_addr, a_np, a_fp) = spawn(vec![desc(&d_addr, d_np, d_fp), desc(&v_addr, v_np, v_fp)]);
 
     let store = client::store::Store::unlock(temp_dir("pref-mail"), b"pw").unwrap();
     store
         .save_relay_prefs(&client::store::RelayPrefs {
             prefer_persistence: None,
-            prefer_mail_durability: Some(node::node::MailboxDurability::Durable),
+            prefer_mail_durability: Some(relay::node::MailboxDurability::Durable),
         })
         .unwrap();
 

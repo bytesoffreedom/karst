@@ -24,10 +24,10 @@ use x25519_dalek::PublicKey;
 // Re-exported so `node::` keeps naming the whole vocabulary for now. The extraction is a MOVE,
 // not a rename: call sites across the workspace stay untouched in this slice, and the internal
 // modules are pointed at `protocol` directly (which is what actually breaks the cycle).
-pub use crate::protocol::*;
-use crate::discovery::{self, DiscoveryRecord};
-use crate::pqxdh::PreKeyBundle;
-use crate::seal::{Identity, SkeletonSeal};
+pub use node::protocol::*;
+use node::discovery::{self, DiscoveryRecord};
+use node::pqxdh::PreKeyBundle;
+use node::seal::{Identity, SkeletonSeal};
 
 /// Потолок числа опубликованных bundle (§12): при полноте — отказ на публикацию
 /// нового IK, НЕ тихий сброс (та же дисциплина, что `MAX_FETCH_SEALS`).
@@ -144,7 +144,7 @@ impl AdmittedAck {
 /// the relay lock can be — and is — released before the file I/O begins.
 pub struct AdmittedBlobPut {
     sender: [u8; 32],
-    store: Arc<Mutex<crate::blobstore::BlobStore>>,
+    store: Arc<Mutex<node::blobstore::BlobStore>>,
 }
 
 impl AdmittedBlobPut {
@@ -153,16 +153,16 @@ impl AdmittedBlobPut {
     pub fn put(&self, req: &BlobPutRequest, now: u64) -> BlobResponse {
         let mut store = self.store.lock().expect("blob store mutex");
         match store.put_chunk(self.sender, req.blob_id, req.index, req.count, &req.data, now) {
-            crate::blobstore::BlobPut::Ok => BlobResponse::Stored,
-            crate::blobstore::BlobPut::Complete => BlobResponse::Complete,
-            crate::blobstore::BlobPut::Rejected(r) => BlobResponse::Rejected(r),
+            node::blobstore::BlobPut::Ok => BlobResponse::Stored,
+            node::blobstore::BlobPut::Complete => BlobResponse::Complete,
+            node::blobstore::BlobPut::Rejected(r) => BlobResponse::Rejected(r),
         }
     }
 }
 
 /// Read one chunk out of an already-admitted store. Same split as `AdmittedBlobPut::put`.
 pub fn blob_get_chunk(
-    store: &Arc<Mutex<crate::blobstore::BlobStore>>,
+    store: &Arc<Mutex<node::blobstore::BlobStore>>,
     req: &BlobGetRequest,
 ) -> BlobResponse {
     let store = store.lock().expect("blob store mutex");
@@ -376,7 +376,7 @@ impl MailStore {
                     .filter(|(_, e)| e.leased_until <= now)
                     .map(|(i, e)| (i, e.payload.clone()))
                     .unzip();
-                let take = crate::wire::FetchPage::fit_prefix(&payloads);
+                let take = node::wire::FetchPage::fit_prefix(&payloads);
                 (payloads.into_iter().take(take).collect(), idx.into_iter().take(take).collect())
             }
             None => (Vec::new(), Vec::new()),
@@ -539,7 +539,7 @@ pub struct RelayNode {
     /// `MAX_BUNDLES` (отказ при полноте, не тихий сброс).
     bundles: HashMap<[u8; 32], BundleSlot>,
     /// One-time prekey batches per IK; a fetch pops one (see `PublishRequest::opks`).
-    opk_batches: HashMap<[u8; 32], VecDeque<crate::pqxdh::SignedOpk>>,
+    opk_batches: HashMap<[u8; 32], VecDeque<node::pqxdh::SignedOpk>>,
     /// Rotating start offset for `node_list`, so advertisement is fair rather than always
     /// favouring whoever was learned first (A3-13). `Cell` because serving a list is a READ.
     gossip_cursor: std::sync::atomic::AtomicUsize,
@@ -556,7 +556,7 @@ pub struct RelayNode {
     /// whole relay. The serve loop now takes the relay lock only long enough to ADMIT a blob
     /// request (cookie, nonce shape, capability, quota — all relay state) and does the I/O after
     /// releasing it, under this lock. Lock ORDER is always relay → blobs, never the reverse.
-    blobs: Option<Arc<Mutex<crate::blobstore::BlobStore>>>,
+    blobs: Option<Arc<Mutex<node::blobstore::BlobStore>>>,
     /// The operator's blob-persistence posture, remembered so the relay can ADVERTISE it in its
     /// policy (`policy()`). `None` when blobs are disabled.
     blob_persistence: Option<BlobPersistence>,
@@ -632,8 +632,8 @@ impl RelayNode {
     /// posture, an operator's call). `now` drives the recovery-time TTL sweep. Off by default.
     pub fn enable_blobs(&mut self, dir: std::path::PathBuf, now: u64, persist: BlobPersistence) -> std::io::Result<()> {
         self.blobs = Some(Arc::new(Mutex::new(match persist {
-            BlobPersistence::Durable => crate::blobstore::BlobStore::open(dir, now)?,
-            BlobPersistence::Ephemeral => crate::blobstore::BlobStore::new(dir)?,
+            BlobPersistence::Durable => node::blobstore::BlobStore::open(dir, now)?,
+            BlobPersistence::Ephemeral => node::blobstore::BlobStore::new(dir)?,
         })));
         self.blob_persistence = Some(persist);
         Ok(())
@@ -699,8 +699,8 @@ impl RelayNode {
     pub fn policy(&self) -> RelayPolicy {
         RelayPolicy {
             blob_persistence: self.blob_persistence,
-            blob_ttl_secs: if self.blobs.is_some() { crate::blobstore::BLOB_TTL_SECS } else { 0 },
-            max_blob_size: if self.blobs.is_some() { crate::blobstore::MAX_BLOB_SIZE } else { 0 },
+            blob_ttl_secs: if self.blobs.is_some() { node::blobstore::BLOB_TTL_SECS } else { 0 },
+            max_blob_size: if self.blobs.is_some() { node::blobstore::MAX_BLOB_SIZE } else { 0 },
             pow_bits: self.pow_issue,
             // R2-5 (#161): a real operator choice now — `Durable` only when a mail log is
             // actually open and being fsynced on deposit, never as a bare claim.
@@ -778,7 +778,7 @@ impl RelayNode {
         &mut self,
         req: &BlobGetRequest,
         now: u64,
-    ) -> Result<Arc<Mutex<crate::blobstore::BlobStore>>, BlobResponse> {
+    ) -> Result<Arc<Mutex<node::blobstore::BlobStore>>, BlobResponse> {
         self.advance_epoch(now);
         match req.cookie {
             Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => {}
@@ -793,7 +793,7 @@ impl RelayNode {
     /// The blob store's own handle, for the serve loop's public reads (`BlobStat`) — taken
     /// WITHOUT the relay lock held, so a stat cannot be stuck behind a chunk write while holding
     /// up everyone's mail. `None` = blobs disabled.
-    pub fn blob_store(&self) -> Option<Arc<Mutex<crate::blobstore::BlobStore>>> {
+    pub fn blob_store(&self) -> Option<Arc<Mutex<node::blobstore::BlobStore>>> {
         self.blobs.clone()
     }
 
@@ -1004,7 +1004,7 @@ impl RelayNode {
     /// The relay descriptors to serve for `GetNodeList`, trimmed to fit one response frame so
     /// the list never overflows the wire ceiling.
     pub fn node_list(&self) -> Vec<RelayDescriptor> {
-        let budget = crate::wire::MAX_RESPONSE_FRAME - 512; // headroom for enum tag + framing
+        let budget = node::wire::MAX_RESPONSE_FRAME - 512; // headroom for enum tag + framing
         let mut out = Vec::new();
         let mut used = 0usize;
         let n = self.known_relays.len();
@@ -1617,179 +1617,6 @@ impl Transport for InMemoryTransport {
     }
 }
 
-/// Тонкий клиент: запечатывает сообщение (§2.1-скелет), проходит admission
-/// (§7) с реальным cookie round-trip и шлёт через транспорт.
-pub struct Client<T: Transport> {
-    transport: T,
-    capability: Capability, // выдана relay; клиент хранит для proof'ов
-    client_addr: Vec<u8>,
-    carrier_id: Vec<u8>,
-    cookie: Option<Cookie>,
-    nonce_ctr: u64,
-}
-
-impl<T: Transport> Client<T> {
-    pub fn new(transport: T, capability: Capability, client_addr: &[u8]) -> Self {
-        Client {
-            transport,
-            capability,
-            client_addr: client_addr.to_vec(),
-            carrier_id: b"mem".to_vec(),
-            cookie: None,
-            nonce_ctr: 0,
-        }
-    }
-
-    /// Отправить `plaintext` получателю с публичным ключом `recipient_pub`.
-    ///
-    /// Cookie-refresh: сервер отвечает `NeedCookie` и на первый контакт (cookie
-    /// нет), и на ПРОТУХШИЙ/сменивший эпоху cookie (§7.1, `COOKIE_TTL_SECS`=30 —
-    /// долгоживущий клиент неизбежно упрётся). Поэтому обрабатываем `NeedCookie`
-    /// на КАЖДОЙ отправке и повторяем РОВНО раз с новым cookie; всё остальное
-    /// (`Accepted`, реальный `Rejected` по capability) возвращаем сразу —
-    /// «протух cookie → повтор» строго отделено от «плохой credential → сдаться».
-    ///
-    /// Тот же nonce+proof на повторе безопасен: challenge отдаётся на Ступени 1
-    /// (cookie) ДО Ступени 3 (replay) и Ступени 4 (quota), т.е. первая попытка
-    /// НИЧЕГО не записала — ни в replay-фильтр, ни в учёт квоты.
-    pub fn send(
-        &mut self,
-        recipient_pub: &x25519_dalek::PublicKey,
-        plaintext: &[u8],
-        now: u64,
-    ) -> Response {
-        let sealed = SkeletonSeal::seal(recipient_pub, plaintext);
-        let nonce = format!("req-{}", self.nonce_ctr).into_bytes();
-        self.nonce_ctr += 1;
-        let proof = self.capability.prove(&nonce, 0);
-
-        let mut msg = WireMessage {
-            client_addr: self.client_addr.clone(),
-            carrier_id: self.carrier_id.clone(),
-            cookie: self.cookie,
-            request_nonce: nonce,
-            capability_proof: proof,
-            recipient: recipient_pub.to_bytes(),
-            payload: Payload::Skeleton(sealed),
-        };
-
-        // До двух попыток: один challenge → refresh → один повтор.
-        for _ in 0..2 {
-            match self.transport.send(&msg, now) {
-                Response::NeedCookie(c) => {
-                    self.cookie = Some(c);
-                    msg.cookie = Some(c);
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        // Два challenge подряд — свежий cookie сразу отвергнут (аномалия, не
-        // штатный протух). Не зацикливаемся и не маскируем: честная ошибка.
-        Response::Rejected("persistent cookie challenge".into())
-    }
-}
-
-/// Получатель: своя identity + транспорт + публичный ключ relay (для fetch-auth
-/// DH). Забирает ТОЛЬКО свой mailbox (`mailbox` = собственный pubkey).
-pub struct Recipient<T: Transport> {
-    transport: T,
-    identity: Identity,
-    relay_pub: PublicKey,
-    client_addr: Vec<u8>,
-    carrier_id: Vec<u8>,
-    cookie: Option<Cookie>,
-}
-
-impl<T: Transport> Recipient<T> {
-    pub fn new(transport: T, identity: Identity, relay_pub: PublicKey) -> Self {
-        // client_addr = свой pubkey: стабильная привязка cookie.
-        let client_addr = identity.public.to_bytes().to_vec();
-        Recipient { transport, identity, relay_pub, client_addr, carrier_id: b"mem".to_vec(), cookie: None }
-    }
-
-    pub fn public(&self) -> PublicKey {
-        self.identity.public
-    }
-
-    /// Забрать входящие: cookie-handshake (как send) + доказательство владения
-    /// mailbox, затем расшифровать. `Ok(vec)` — выборка (может быть пустой,
-    /// `None`-элементы = не расшифровались); `Err` — провал (недоступен/протокол/
-    /// отказ auth), отделено от «пусто», чтобы `recv` не путал их.
-    pub fn receive(&mut self, now: u64) -> Result<Vec<Option<Vec<u8>>>, String> {
-        let mailbox = self.identity.public.to_bytes();
-        let shared = self.identity.dh(&self.relay_pub);
-        // До двух попыток: один challenge → refresh → повтор с proof.
-        for _ in 0..2 {
-            let proof = match self.cookie {
-                Some(c) => fetch_proof(&shared, &c.mac, &mailbox),
-                None => [0u8; 16], // cookie ещё нет → сервер сделает challenge
-            };
-            let req = FetchRequest {
-                mailbox,
-                client_addr: self.client_addr.clone(),
-                carrier_id: self.carrier_id.clone(),
-                cookie: self.cookie,
-                proof,
-                own_proof: Vec::new(), // identity mailbox → DH proof above
-            };
-            match self.transport.fetch(&req, now) {
-                FetchResponse::NeedCookie(c) => {
-                    self.cookie = Some(c);
-                    continue;
-                }
-                FetchResponse::Fetched(payloads) => {
-                    // Скелет-получатель открывает только `Skeleton`; сессионные
-                    // §2.1-конверты ему не адресованы (их обрабатывает `Peer`) —
-                    // `None`, а не паника.
-                    let opened: Vec<Option<Vec<u8>>> = payloads
-                        .iter()
-                        .map(|p| match p {
-                            Payload::Skeleton(s) => s.open(&self.identity),
-                            Payload::Session(_) => None,
-                        })
-                        .collect();
-                    // Every fetch is a LEASE now (#179) — the relay no longer offers
-                    // delete-on-read — so a receiver that wants its mail gone has to say so.
-                    // This one ACKs immediately, on receipt, which is the honest behaviour for a
-                    // REFERENCE receiver: it holds nothing durable, so there is no later moment
-                    // at which it would be safer to ACK. `Peer` (the real path) is the one that
-                    // waits until the advanced ratchet is on disk. A failed ACK is not an error
-                    // here: the messages simply stay leased and are redelivered.
-                    //
-                    // ONLY what it actually opened. An ACK says "the relay may forget this", and
-                    // this receiver must not say that about mail it could not read: a
-                    // `Payload::Session` envelope belongs to `Peer`, not here, and a seal that
-                    // failed to open is not ours either. Those stay leased and redeliver to
-                    // whoever they were for. (Before #179 the relay destroyed them regardless,
-                    // which is precisely the behaviour that went away.)
-                    let mine: Vec<[u8; 32]> = payloads
-                        .iter()
-                        .zip(opened.iter())
-                        .filter(|(_, o)| o.is_some())
-                        .map(|(p, _)| payload_id(p))
-                        .collect();
-                    if let (Some(cookie), false) = (self.cookie, mine.is_empty()) {
-                        let ack = AckRequest {
-                            mailbox,
-                            client_addr: self.client_addr.clone(),
-                            carrier_id: self.carrier_id.clone(),
-                            cookie: Some(cookie),
-                            proof: fetch_proof(&shared, &cookie.mac, &mailbox),
-                            ids: mine,
-                            own_proof: Vec::new(),
-                        };
-                        let _ = self.transport.ack(&ack, now);
-                    }
-                    return Ok(opened);
-                }
-                FetchResponse::Rejected(r) => return Err(r),
-            }
-        }
-        Err("persistent cookie challenge".into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     /// A capability the in-crate tests can present when a publish CREATES a slot (CRYPTO-18).
@@ -1805,7 +1632,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::pqxdh::Account;
+    use node::pqxdh::Account;
 
     const NOW: u64 = 1_000_000;
 
@@ -2134,9 +1961,9 @@ mod tests {
     #[test]
     fn a_blinded_box_is_fetchable_only_by_its_fetch_secret_holder() {
         let mut relay = RelayNode::new(NOW);
-        let recipient_m = crate::blind::MailboxSecret::generate();
+        let recipient_m = node::blind::MailboxSecret::generate();
         let (seed, epoch, dir) = ([5u8; 32], 3u64, 0u8);
-        let address = crate::blind::deposit_address(&recipient_m.public(), &seed, epoch, dir).unwrap();
+        let address = node::blind::deposit_address(&recipient_m.public(), &seed, epoch, dir).unwrap();
         let fetch_secret = recipient_m.fetch_secret(&seed, epoch, dir);
         let mk = |cookie: Cookie, own: Vec<u8>, dh: [u8; 16]| FetchRequest {
             mailbox: address,
@@ -2149,15 +1976,15 @@ mod tests {
 
         // The RECIPIENT (fetch-secret holder) is authorized — an empty box returns Fetched, not Rejected.
         let c = relay.keyring.issue(&address, b"c", NOW as u32);
-        let own = crate::blind::FetchOwnershipProof::prove(&fetch_secret, &address, &c.mac).unwrap();
+        let own = node::blind::FetchOwnershipProof::prove(&fetch_secret, &address, &c.mac).unwrap();
         let ok = relay.handle_fetch(&mk(c, own.to_bytes().to_vec(), [0u8; 16]), NOW);
         assert!(!matches!(ok, FetchResponse::Rejected(_)), "the fetch-secret holder is authorized");
 
         // The DEPOSITOR holds only M; a proof from ANY other mailbox secret fails → cannot read.
-        let depositor = crate::blind::MailboxSecret::generate();
+        let depositor = node::blind::MailboxSecret::generate();
         let wrong = depositor.fetch_secret(&seed, epoch, dir);
         let c2 = relay.keyring.issue(&address, b"c", NOW as u32);
-        let forged = crate::blind::FetchOwnershipProof::prove(&wrong, &address, &c2.mac).unwrap();
+        let forged = node::blind::FetchOwnershipProof::prove(&wrong, &address, &c2.mac).unwrap();
         let bad = relay.handle_fetch(&mk(c2, forged.to_bytes().to_vec(), [0u8; 16]), NOW);
         assert!(matches!(bad, FetchResponse::Rejected(_)), "a non-owner (the depositor) cannot fetch the box");
 
@@ -2252,12 +2079,12 @@ mod tests {
         relay.borrow().mail_store().lock().unwrap().append_for_test(bob.public.to_bytes(), vec![MailboxEntry {
             enqueued_at: NOW,
             leased_until: 0,
-            payload: Payload::Session(SessionEnvelope::Ratchet(crate::ratchet::RatchetMessage {
-                header: crate::ratchet::Header {
+            payload: Payload::Session(SessionEnvelope::Ratchet(node::ratchet::RatchetMessage {
+                header: node::ratchet::Header {
                     dh: [9u8; 32],
                     pn: 0,
                     n: 0,
-                    salt: [9u8; crate::ratchet::SALT_LEN],
+                    salt: [9u8; node::ratchet::SALT_LEN],
                 },
                 ciphertext: vec![9u8; 16],
             })),

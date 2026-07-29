@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use node::discovery::{self, DiscoveryRecord, DEFAULT_TTL_SECS, MAX_TTL_SECS};
-use node::node::{InMemoryTransport, PublishResponse, RelayDescriptor, RelayNode};
+use relay::node::{InMemoryTransport, PublishResponse, RelayDescriptor, RelayNode};
 use node::peer::Peer;
 use node::pqxdh::Account;
 

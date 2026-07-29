@@ -9,9 +9,9 @@ use std::net::TcpListener;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use node::node::{RelayDescriptor, RelayNode};
+use relay::node::{RelayDescriptor, RelayNode};
 use node::seal::Identity;
-use node::socket::{generate_noise_keypair, RelayServer};
+use relay::server::{generate_noise_keypair, RelayServer};
 
 const NOW: u64 = 1_000_000;
 
@@ -45,17 +45,17 @@ fn desc(noise: [u8; 32], fetch: [u8; 32], addr: &str) -> RelayDescriptor {
 fn verify_accepts_real_relay_and_rejects_impostors() {
     let (addr, npub, fpub) = spawn(vec![], true);
 
-    assert!(node::gossip::verify(&desc(npub, fpub, &addr), &addr, true), "a real self-advertising relay verifies");
+    assert!(relay::gossip::verify(&desc(npub, fpub, &addr), &addr, true), "a real self-advertising relay verifies");
     // Wrong noise key: the Noise handshake fails → the reflection defense.
-    assert!(!node::gossip::verify(&desc([0xAB; 32], fpub, &addr), &addr, true), "wrong noise key must fail");
+    assert!(!relay::gossip::verify(&desc([0xAB; 32], fpub, &addr), &addr, true), "wrong noise key must fail");
     // Right noise, WRONG fetch: the relay's self-advertisement doesn't match → refused.
-    assert!(!node::gossip::verify(&desc(npub, [0xCD; 32], &addr), &addr, true), "wrong fetch key must fail");
+    assert!(!relay::gossip::verify(&desc(npub, [0xCD; 32], &addr), &addr, true), "wrong fetch key must fail");
     // Dead address: unreachable → refused (connection refused, fast).
-    assert!(!node::gossip::verify(&desc(npub, fpub, "127.0.0.1:1"), "127.0.0.1:1", true), "dead addr must fail");
+    assert!(!relay::gossip::verify(&desc(npub, fpub, "127.0.0.1:1"), "127.0.0.1:1", true), "dead addr must fail");
 
     // A relay that does NOT advertise itself can't be verified (no self-entry to match).
     let (a2, n2, f2) = spawn(vec![], false);
-    assert!(!node::gossip::verify(&desc(n2, f2, &a2), &a2, true), "a non-self-advertising relay can't be confirmed");
+    assert!(!relay::gossip::verify(&desc(n2, f2, &a2), &a2, true), "a non-self-advertising relay can't be confirmed");
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn gossip_round_learns_a_verified_relay_from_a_peer() {
     b.add_relay(a.clone());
     let b = Arc::new(RwLock::new(b));
 
-    let added = node::gossip::gossip_round(&b, &bpub, true);
+    let added = relay::gossip::gossip_round(&b, &bpub, true);
     assert!(added >= 1, "B should learn a new relay (C) from peer A");
     let ids: Vec<String> = b.write().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
     assert!(ids.contains(&c.relay_id_hex()), "B must now know C, verified via a direct dial");
@@ -90,7 +90,7 @@ fn gossip_round_rejects_a_poisoned_descriptor() {
     b.add_relay(a);
     let b = Arc::new(RwLock::new(b));
 
-    node::gossip::gossip_round(&b, &bpub, true);
+    relay::gossip::gossip_round(&b, &bpub, true);
     let ids: Vec<String> = b.write().unwrap().known_relays().iter().map(|d| d.relay_id_hex()).collect();
     assert!(
         !ids.contains(&poison.relay_id_hex()),
@@ -107,7 +107,7 @@ fn gossip_round_rejects_a_poisoned_descriptor() {
 /// itself is egress SSRF and internal port probing.
 #[test]
 fn gossip_refuses_private_and_loopback_destinations() {
-    use node::gossip::addr_is_dialable;
+    use relay::gossip::addr_is_dialable;
 
     for addr in [
         "127.0.0.1:9000",          // loopback
@@ -140,7 +140,7 @@ fn gossip_refuses_private_and_loopback_destinations() {
 /// permanently shut out a relay's new, working address.
 #[test]
 fn advertisement_rotates_and_a_new_address_replaces_the_oldest() {
-    use node::node::{RelayDescriptor, RelayNode};
+    use relay::node::{RelayDescriptor, RelayNode};
 
     let mut relay = RelayNode::new(1_000_000);
     let desc = |n: u8, addr: &str| RelayDescriptor {
@@ -213,7 +213,7 @@ fn gossip_stores_the_relays_own_address_not_a_peers_proxy() {
     let (c_np, _c_pub) = generate_noise_keypair();
     c.write().unwrap().add_relay(desc(a_np, a_fp, &a_addr));
 
-    let added = node::gossip::gossip_round(&c, &c_np, true);
+    let added = relay::gossip::gossip_round(&c, &c_np, true);
     assert_eq!(added, 1, "C should learn B from A");
 
     let stored = c.write().unwrap().known_relays();

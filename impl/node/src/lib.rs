@@ -19,11 +19,9 @@
 /// unaudited, first-contact openers keep the identity mailbox + DH proof). See the module.
 pub mod blind;
 pub mod blobstore;
+pub mod demo;
 pub mod discovery;
 pub mod drop;
-pub mod gossip;
-pub mod mailstore;
-pub mod node;
 pub mod peer;
 pub mod protocol;
 pub mod pqxdh;

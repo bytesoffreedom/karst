@@ -17,14 +17,14 @@ use std::thread;
 use std::time::Duration;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{
-    Client, FetchRequest, FetchResponse, PublishResponse, Recipient, Response, Transport,
-};
+use node::demo::{Client, Recipient};
+use relay::node::{FetchRequest, FetchResponse, PublishResponse, Response, Transport};
 use node::peer::Peer;
 use node::pqxdh::Account;
 use node::seal::Identity;
 use node::session::Session;
-use node::socket::{RelayServer, SocketTransport};
+use relay::server::{RelayServer};
+use node::socket::{SocketTransport};
 use node::wire::{self, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME};
 use x25519_dalek::PublicKey;
 
@@ -46,7 +46,7 @@ fn capability(secret: [u8; 32]) -> Capability {
 fn spawn_relay(with_cap: bool) -> (SocketAddr, [u8; 32], [u8; 32]) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut relay = node::node::RelayNode::new(NOW);
+    let mut relay = relay::node::RelayNode::new(NOW);
     if with_cap {
         relay.issue_capability(capability([0x33; 32]));
     }
@@ -93,10 +93,10 @@ fn relay_with_fixed_noise_key_handshakes() {
     // persist → with_noise_keypair) должна давать РАБОЧИЙ handshake — т.е.
     // хранимый pub согласован с тем, что snow выводит из priv. Регресс на случай
     // рассинхрона деривации pub из priv.
-    let (npriv, npub) = node::socket::generate_noise_keypair();
+    let (npriv, npub) = relay::server::generate_noise_keypair();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let relay = node::node::RelayNode::with_identity(NOW, Identity::generate());
+    let relay = relay::node::RelayNode::with_identity(NOW, Identity::generate());
     let server = RelayServer::with_noise_keypair(relay, Arc::new(move || NOW), npriv, npub);
     assert_eq!(server.noise_public(), npub, "сервер отдаёт заданный pub");
     thread::spawn(move || {
@@ -269,7 +269,7 @@ fn mitm_wrong_noise_key_fails_handshake() {
 fn earn_a_capability_over_the_socket_then_send() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut relay = node::node::RelayNode::with_identity(NOW, Identity::generate());
+    let mut relay = relay::node::RelayNode::with_identity(NOW, Identity::generate());
     relay.enable_pow_issue(8); // cheap PoW for the test
     let fetch_pub = relay.relay_public().to_bytes();
     let server = RelayServer::new(relay, Arc::new(move || NOW));
@@ -313,7 +313,7 @@ fn earn_a_capability_over_the_socket_then_send() {
 fn a_relay_declared_difficulty_above_the_ceiling_is_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut relay = node::node::RelayNode::with_identity(NOW, Identity::generate());
+    let mut relay = relay::node::RelayNode::with_identity(NOW, Identity::generate());
     relay.enable_pow_issue(64); // far past any reasonable ceiling; infeasible to solve
     let fetch_pub = relay.relay_public().to_bytes();
     let server = RelayServer::new(relay, Arc::new(move || NOW));
@@ -439,11 +439,11 @@ fn an_oversized_ordinary_request_is_dropped_instead_of_served() {
 fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut relay = node::node::RelayNode::new(NOW);
+    let mut relay = relay::node::RelayNode::new(NOW);
     relay.issue_capability(capability([0x33; 32]));
     let blob_dir = std::env::temp_dir().join(format!("karst-hol-{}", std::process::id()));
     relay
-        .enable_blobs(blob_dir.clone(), NOW, node::node::BlobPersistence::Ephemeral)
+        .enable_blobs(blob_dir.clone(), NOW, relay::node::BlobPersistence::Ephemeral)
         .unwrap();
     let store = relay.blob_store().expect("blobs are enabled");
     let fetch_pub = relay.relay_public().to_bytes();
@@ -463,8 +463,8 @@ fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
         let mut cookie = None;
         let _ = started_tx.send(());
         loop {
-            let nonce = node::node::blob_put_nonce(&[0xB1; 32], 0);
-            let req = node::node::BlobPutRequest {
+            let nonce = relay::node::blob_put_nonce(&[0xB1; 32], 0);
+            let req = relay::node::BlobPutRequest {
                 request_nonce: nonce.clone(),
                 capability_proof: capability([0x33; 32]).prove(&nonce, 0),
                 client_addr: vec![0x44u8; 32],
@@ -476,7 +476,7 @@ fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
                 data: vec![7u8; 1024],
             };
             match t.blob_put(&req) {
-                node::node::BlobResponse::NeedCookie(c) => cookie = Some(c), // one round trip, then it parks
+                relay::node::BlobResponse::NeedCookie(c) => cookie = Some(c), // one round trip, then it parks
                 _ => break,
             }
         }
@@ -520,7 +520,7 @@ fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
 fn a_mail_write_in_progress_does_not_block_admission() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut relay = node::node::RelayNode::new(NOW);
+    let mut relay = relay::node::RelayNode::new(NOW);
     relay.issue_capability(capability([0x33; 32]));
     let mail = relay.mail_store();
     let server = RelayServer::new(relay, Arc::new(move || NOW));
@@ -573,7 +573,7 @@ fn a_mail_write_in_progress_does_not_block_admission() {
 fn a_reader_does_not_block_another_reader() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut relay = node::node::RelayNode::new(NOW);
+    let mut relay = relay::node::RelayNode::new(NOW);
     relay.issue_capability(capability([0x33; 32]));
     let fetch_pub = relay.relay_public().to_bytes();
     let server = RelayServer::new(relay, Arc::new(move || NOW));
@@ -600,7 +600,7 @@ fn a_reader_does_not_block_another_reader() {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let t = SocketTransport::new(addr, noise_pub);
-        let _ = tx.send(node::node::Transport::fetch_bundle(&t, &ik, NOW).ok().flatten().is_some());
+        let _ = tx.send(relay::node::Transport::fetch_bundle(&t, &ik, NOW).ok().flatten().is_some());
     });
     let found = rx
         .recv_timeout(Duration::from_secs(10))

@@ -16,7 +16,7 @@
 //! route through Tor.
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -715,5 +715,63 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "the error came from the 200ms timeout, not from blocking"
         );
+    }
+}
+
+// ----- Address validation, shared by both sides (#143) -----
+//
+// Moved out of the relay's gossip module with the crate split. It is not gossip logic: it is the
+// question "may we dial this string at all", which the client asks of a peer-supplied hint for
+// exactly the same reason the relay asks it of a gossiped one (A3-12: an unchecked address is an
+// SSRF into loopback and private ranges).
+
+/// Is this `host:port` safe to dial? Resolves the host and requires EVERY resolved address to be
+/// globally routable, so a DNS name pointing at an internal IP is refused too. `allow_private`
+/// exists for loopback tests and local development — production relays run with it off.
+pub fn addr_is_dialable(addr: &str, allow_private: bool) -> bool {
+    if allow_private {
+        return true;
+    }
+    let Ok(dest) = Dest::parse(addr) else {
+        return false;
+    };
+    match (dest.host.as_str(), dest.port).to_socket_addrs() {
+        // Unresolvable ⇒ we cannot prove it is safe, so refuse rather than dial blind.
+        Ok(mut addrs) => {
+            let all: Vec<_> = addrs.by_ref().collect();
+            !all.is_empty() && all.iter().all(|sa| ip_is_globally_routable(&sa.ip()))
+        }
+        Err(_) => false,
+    }
+}
+
+fn ip_is_globally_routable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (64..128).contains(&o[1]))       // 100.64.0.0/10 CGNAT
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)          // 192.0.0.0/24 IETF
+                || (o[0] == 198 && (18..20).contains(&o[1]))        // 198.18.0.0/15 benchmarking
+                || o[0] >= 240)                                     // 240.0.0.0/4 reserved
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return ip_is_globally_routable(&IpAddr::V4(mapped));
+            }
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00                        // fc00::/7 unique local
+                || (s[0] & 0xffc0) == 0xfe80)                       // fe80::/10 link-local
+        }
     }
 }

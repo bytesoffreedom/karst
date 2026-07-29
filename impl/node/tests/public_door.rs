@@ -14,9 +14,8 @@ use std::rc::Rc;
 
 use admission::params::{EPOCH_DURATION_SECS, POW_WINDOW_SECS};
 use admission::pow;
-use node::node::{
-    Client, InMemoryTransport, JoinRequest, Recipient, RelayNode, Response,
-};
+use node::demo::{Client, Recipient};
+use relay::node::{InMemoryTransport, JoinRequest, RelayNode, Response};
 use node::seal::Identity;
 
 const NOW: u64 = 1_000_000;
@@ -311,7 +310,7 @@ fn an_issued_pow_capability_advertises_the_quota_enforcement_will_actually_grant
 #[test]
 fn a_one_time_prekey_batch_is_charged_against_the_publishers_byte_budget() {
     use admission::capability::{Capability, Quota, Scope};
-    use node::node::{InMemoryTransport, RelayNode};
+    use relay::node::{InMemoryTransport, RelayNode};
     use node::peer::Peer;
     use node::pqxdh::Account;
 
@@ -335,7 +334,7 @@ fn a_one_time_prekey_batch_is_charged_against_the_publishers_byte_budget() {
     // Control: a publish with NO one-time prekeys fits the same budget.
     let mut lean = Peer::new(t.clone(), Account::generate(), cap(budget), relay_pub);
     assert!(
-        matches!(lean.publish_advertising(&[], NOW), node::node::PublishResponse::Published),
+        matches!(lean.publish_advertising(&[], NOW), relay::node::PublishResponse::Published),
         "control: a bundle alone must fit a budget this size"
     );
 
@@ -344,7 +343,7 @@ fn a_one_time_prekey_batch_is_charged_against_the_publishers_byte_budget() {
     let opks = heavy.add_opks(128);
     let resp = heavy.publish_advertising(&opks, NOW);
     assert!(
-        !matches!(resp, node::node::PublishResponse::Published),
+        !matches!(resp, relay::node::PublishResponse::Published),
         "128 one-time prekeys rode along without being charged — the byte budget does not bound \
          what a publisher can make the relay store: {resp:?}"
     );

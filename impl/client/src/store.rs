@@ -50,7 +50,7 @@ pub struct InviteRecord {
 /// which is why it is adoptable as a route for THAT contact and a hint is not.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactEndpoint {
-    pub relay: node::node::RelayDescriptor,
+    pub relay: node::protocol::RelayDescriptor,
     pub discovered_at: u64,
 }
 
@@ -4185,20 +4185,20 @@ pub struct Prefs {
 }
 
 /// This account's preferences for WHICH relays to use, matched against each relay's advertised
-/// policy (`node::node::RelayPolicy`). Empty = no preference (any relay).
+/// policy (`node::protocol::RelayPolicy`). Empty = no preference (any relay).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayPrefs {
     /// Prefer relays whose advertised blob persistence matches; `None` = don't care. The
     /// advertisement is operator-declared (durable is provable via `verify_durability`; ephemeral
     /// is a claim), so this is a preference, not a hard guarantee.
-    pub prefer_persistence: Option<node::node::BlobPersistence>,
+    pub prefer_persistence: Option<node::protocol::BlobPersistence>,
     /// Prefer relays whose advertised MAILBOX durability matches (R2-5, #161); `None` = don't
     /// care. This is the knob that makes the durability fix reachable by the code that needed
     /// it: `Response::Accepted` deliberately does not say whether the message was persisted, so
     /// the decision belongs here — at relay CHOICE — rather than per message. `Durable` means
     /// "an accepted message survives that relay restarting"; `Volatile` is the lower-residue
     /// posture, and (like ephemeral blobs) an unverifiable claim.
-    pub prefer_mail_durability: Option<node::node::MailboxDurability>,
+    pub prefer_mail_durability: Option<node::protocol::MailboxDurability>,
 }
 
 // ─── Multi-password keyslots (duress / decoy / dead-man — Tier 1, layout A′) ──────────────

@@ -61,8 +61,9 @@ fn secret_load_err(what: &str, e: std::io::Error) -> String {
 }
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{
-    BlobGetRequest, BlobPutRequest, BlobResponse, Client, PublishResponse, Recipient, Response,
+use node::demo::{Client, Recipient};
+use node::protocol::{
+    BlobGetRequest, BlobPutRequest, BlobResponse, PublishResponse, Response,
     Transport,
 };
 use node::peer::{ForwardSecrecy, Peer, PeerState};
@@ -708,8 +709,8 @@ pub fn earn_missing_capabilities(root: &Store, relays: &[Relay]) -> CapabilityBa
 // usernames (a chooseable name is squattable); the code is unguessable random bytes.
 
 /// The location descriptor for the relay we are talking to (relay-id + the address we dialed).
-fn relay_descriptor(relay: &Relay) -> node::node::RelayDescriptor {
-    node::node::RelayDescriptor {
+fn relay_descriptor(relay: &Relay) -> node::protocol::RelayDescriptor {
+    node::protocol::RelayDescriptor {
         noise_pub: relay.id.noise_pub,
         fetch_pub: relay.id.fetch_pub,
         addrs: vec![relay.addr.to_string()],
@@ -964,7 +965,7 @@ pub fn find_contact(
     relay: &Relay,
     code: &str,
     now: u64,
-) -> Result<([u8; 32], node::node::RelayDescriptor), String> {
+) -> Result<([u8; 32], node::protocol::RelayDescriptor), String> {
     let dpub = node::discovery::decode_code(code).ok_or("that is not a valid KARST contact code")?;
     let rec = lookup_verified(relay, dpub, now)?.ok_or_else(|| CODE_UNKNOWN.to_string())?;
     Ok((rec.ik, rec.location))
@@ -985,7 +986,7 @@ pub fn find_contact_multi(
     relays: &[Relay],
     code: &str,
     now: u64,
-) -> Result<([u8; 32], node::node::RelayDescriptor), String> {
+) -> Result<([u8; 32], node::protocol::RelayDescriptor), String> {
     // Decoded ONCE: a malformed code is not a per-relay failure, and repeating the same complaint
     // as many times as there are relays would only confuse where it came from.
     let dpub = node::discovery::decode_code(code).ok_or("that is not a valid KARST contact code")?;
@@ -1077,14 +1078,14 @@ pub fn relays_for_contact(store: &Store, relays: &[Relay], ik: &[u8; 32]) -> Vec
 
 /// Ask a relay to advertise its policy (blob persistence/TTL/caps, PoW door). Operator-declared —
 /// the caller decides which fields to trust and how far (see `RelayPolicy`).
-pub fn relay_policy(relay: &Relay) -> Result<node::node::RelayPolicy, String> {
+pub fn relay_policy(relay: &Relay) -> Result<node::protocol::RelayPolicy, String> {
     relay.transport().get_policy().map_err(|e| format!("policy fetch failed: {e}"))
 }
 
 /// §12 discovery — ask a relay which relays it knows about (node-list). Lets a client learn of
 /// more relays than it was handed. Each descriptor self-authenticates on dial (its `noise_pub`
 /// is verified in the Noise handshake), so a bad entry only wastes a connection attempt.
-pub fn discover_relays(relay: &Relay) -> Result<Vec<node::node::RelayDescriptor>, String> {
+pub fn discover_relays(relay: &Relay) -> Result<Vec<node::protocol::RelayDescriptor>, String> {
     relay
         .transport()
         .get_node_list()
@@ -1093,7 +1094,7 @@ pub fn discover_relays(relay: &Relay) -> Result<Vec<node::node::RelayDescriptor>
 
 /// Dial a heard descriptor's address hint and return an address the relay declares for ITSELF.
 ///
-/// CRYPTO-23. `node::gossip::verify` proves that whoever answers at `hint` holds `d.noise_pub`
+/// CRYPTO-23. `relay::gossip::verify` proves that whoever answers at `hint` holds `d.noise_pub`
 /// and serves a node-list containing the full relay-id — but it never asks whether `hint` is an
 /// address of that relay. A transparent TCP/WebSocket proxy in front of an honest relay passes
 /// both checks: the Noise handshake terminates at the real relay, so the byte stream really is
@@ -1113,11 +1114,11 @@ pub fn discover_relays(relay: &Relay) -> Result<Vec<node::node::RelayDescriptor>
 /// declares is one we may not dial (`allow_private`, the SSRF gate — the self-declared address
 /// is peer-controlled data too, just controlled by a different peer).
 fn verified_self_address(
-    d: &node::node::RelayDescriptor,
+    d: &node::protocol::RelayDescriptor,
     hint: &str,
     allow_private: bool,
 ) -> Option<String> {
-    if !node::gossip::addr_is_dialable(hint, allow_private) {
+    if !node::transport::addr_is_dialable(hint, allow_private) {
         return None; // never dial into private/loopback space on a peer's say-so (A3-12)
     }
     let dest = Dest::parse(hint).ok()?;
@@ -1126,7 +1127,7 @@ fn verified_self_address(
     // serves, its own entry (full relay-id: noise AND fetch key) is the only one it vouches for
     // with that key, so its addresses are the only ones this exchange can attribute to it.
     let self_entry = list.iter().find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
-    self_entry.addrs.iter().find(|a| node::gossip::addr_is_dialable(a, allow_private)).cloned()
+    self_entry.addrs.iter().find(|a| node::transport::addr_is_dialable(a, allow_private)).cloned()
 }
 
 /// §12 — discover relays from a known one and IMPORT the verified ones into this account's
@@ -1142,7 +1143,7 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
     // The relay we are discovering FROM is this account's primary — dedup against it. Derived
     // from `from` itself, NOT a persisted net.dat (which the CLI never writes), so
     // `karst relays --add` works without a prior set-net.
-    let primary_id = node::node::RelayDescriptor {
+    let primary_id = node::protocol::RelayDescriptor {
         noise_pub: from.id.noise_pub,
         fetch_pub: from.id.fetch_pub,
         addrs: vec![],
@@ -1165,7 +1166,7 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
     // local or LAN deployment the user configured deliberately, so its peers being local is
     // consistent. Relays added explicitly (invite / config) are unaffected — this gates only
     // AUTO-discovery.
-    let allow_private = !node::gossip::addr_is_dialable(&from.addr.to_string(), false);
+    let allow_private = !node::transport::addr_is_dialable(&from.addr.to_string(), false);
     let mut added = 0usize;
     for d in discovered {
         let id_hex = d.relay_id_hex();
@@ -1228,7 +1229,7 @@ impl RelayId {
     /// relay-scoped is stored under. Same string `RelayDescriptor::relay_id_hex` produces, so a
     /// discovered relay and a configured one land on the same key.
     pub fn hex(&self) -> String {
-        node::node::RelayDescriptor { noise_pub: self.noise_pub, fetch_pub: self.fetch_pub, addrs: vec![] }
+        node::protocol::RelayDescriptor { noise_pub: self.noise_pub, fetch_pub: self.fetch_pub, addrs: vec![] }
             .relay_id_hex()
     }
 }
@@ -2531,7 +2532,7 @@ pub fn download_post_attachment(
         DownloadOutcome::GaveUp(why)
     };
     // Past the retry horizon (blob TTL) — a swept blob must not retry forever.
-    if now.saturating_sub(ppa.queued_at) > node::node::MAILBOX_TTL_SECS {
+    if now.saturating_sub(ppa.queued_at) > node::protocol::MAILBOX_TTL_SECS {
         return give_up("post attachment expired (blob past TTL)".into());
     }
     // Bound the pointer before allocating or touching the wire (SEC-31). The admission gate in
@@ -2621,7 +2622,7 @@ pub fn download_gallery(
         let _ = store.remove_pending_gallery(&pg.sender, &pg.blob_id);
         DownloadOutcome::GaveUp(why)
     };
-    if now.saturating_sub(pg.queued_at) > node::node::MAILBOX_TTL_SECS {
+    if now.saturating_sub(pg.queued_at) > node::protocol::MAILBOX_TTL_SECS {
         return give_up("gallery expired (blob past TTL)".into());
     }
     // SEC-31, same reasoning as `download_post_attachment`: `chunks` is the loop bound, so it must
@@ -2859,7 +2860,7 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
                         // Per-chunk nonce of the required shape, so a proof minted for the
                         // message path cannot be replayed here (the scope is not folded into the
                         // MAC, so the nonce shape is what separates the classes).
-                        let nonce = node::node::blob_put_nonce(&blob_id, index);
+                        let nonce = node::protocol::blob_put_nonce(&blob_id, index);
                         let req = BlobPutRequest {
                             request_nonce: nonce.clone(),
                             capability_proof: cap.prove(&nonce, 0),
@@ -3109,7 +3110,7 @@ pub fn download_blob(
         }
     }
     // Past the retry horizon (blob TTL) — a swept blob must not retry forever.
-    if now.saturating_sub(pd.queued_at) > node::node::MAILBOX_TTL_SECS {
+    if now.saturating_sub(pd.queued_at) > node::protocol::MAILBOX_TTL_SECS {
         let _ = store.remove_pending_download(&pd.blob_id);
         return DownloadOutcome::GaveUp("download expired (blob past TTL)".into());
     }
@@ -3791,7 +3792,7 @@ mod tests {
     /// check on the bytes would fail for a reason that has nothing to do with the bug.
     #[test]
     fn a_relay_that_fails_leaves_no_trace_in_the_state() {
-        use node::node::{AckResponse, AckRequest, FetchRequest, FetchResponse, Response, Transport, WireMessage};
+        use node::protocol::{AckResponse, AckRequest, FetchRequest, FetchResponse, Response, Transport, WireMessage};
         use node::peer::PeerState;
 
         #[derive(Clone)]

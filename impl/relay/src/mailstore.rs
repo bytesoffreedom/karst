@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{payload_id, Payload};
+use node::protocol::{payload_id, Payload};
 
 /// Magic + version of the mail log. `KML1` = this record layout.
 const LOG_MAGIC: &[u8; 4] = b"KML1";
@@ -291,7 +291,7 @@ mod tests {
     use super::*;
 
     fn seal(n: u8) -> Payload {
-        Payload::Skeleton(crate::seal::SkeletonSeal {
+        Payload::Skeleton(node::seal::SkeletonSeal {
             ephemeral_pub: [n; 32],
             nonce: [n; 12],
             ciphertext: vec![n; 8],

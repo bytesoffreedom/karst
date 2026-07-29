@@ -80,7 +80,7 @@ pub fn payload_id(payload: &Payload) -> [u8; 32] {
 /// 30 c). Домен KDF `KARST-fetch-auth-v1` отделён от seal — тот же принцип
 /// разделения доменов, что `KARST-skeleton-seal-v1`. Только держатель приватного
 /// ключа `mailbox` может вычислить DH → только он вычислит proof.
-pub(crate) fn fetch_proof(shared_dh: &[u8; 32], cookie_mac: &[u8; 16], mailbox: &[u8; 32]) -> [u8; 16] {
+pub fn fetch_proof(shared_dh: &[u8; 32], cookie_mac: &[u8; 16], mailbox: &[u8; 32]) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(None, shared_dh);
     let mut key = [0u8; 32];
     hk.expand(b"KARST-fetch-auth-v1", &mut key).expect("32 within HKDF output limit");
@@ -96,7 +96,7 @@ pub(crate) fn fetch_proof(shared_dh: &[u8; 32], cookie_mac: &[u8; 16], mailbox: 
 /// (`own_proof` non-empty) proves knowledge of its fetch secret via a Schnorr proof bound to the
 /// cookie MAC; the IDENTITY mailbox (an X25519 key) proves via the DH `dh_proof`. `false` on any
 /// malformed input or a failed check.
-pub(crate) fn mailbox_owner_ok(
+pub fn mailbox_owner_ok(
     relay_identity: &Identity,
     mailbox: [u8; 32],
     cookie_mac: &[u8; 16],
@@ -162,7 +162,7 @@ pub enum Payload {
 }
 impl Payload {
     /// Приблизительный размер груза для stage-0 size-gate конвейера допуска.
-    pub(crate) fn approx_len(&self) -> usize {
+    pub fn approx_len(&self) -> usize {
         match self {
             Payload::Skeleton(s) => s.ciphertext.len(),
             Payload::Session(SessionEnvelope::InitialSealed { sealed_ka, msg }) => {
@@ -178,7 +178,7 @@ impl Payload {
 /// перехваченный proof переиспользовали бы для подмены bundle другим содержимым.
 /// Останавливает ДРУГИХ клиентов от перезаписи чужого bundle; против ЗЛОГО RELAY
 /// не помогает (тот подменит IK — внешняя стена, OOB-проверка IK).
-pub(crate) fn publish_proof(
+pub fn publish_proof(
     shared_dh: &[u8; 32],
     cookie_mac: &[u8; 16],
     bundle: &PreKeyBundle,
@@ -499,7 +499,7 @@ pub struct RelayDescriptor {
 }
 impl RelayDescriptor {
     /// The relay-id bytes (`noise_pub ‖ fetch_pub`) — the dedup key.
-    pub(crate) fn id(&self) -> [u8; 64] {
+    pub fn id(&self) -> [u8; 64] {
         let mut id = [0u8; 64];
         id[..32].copy_from_slice(&self.noise_pub);
         id[32..].copy_from_slice(&self.fetch_pub);

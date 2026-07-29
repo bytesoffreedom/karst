@@ -29,10 +29,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use node::drop::DROP_EPOCH_SECS;
-use node::node::{
-    FetchRequest, FetchResponse, InMemoryTransport, PublishRequest, PublishResponse, RelayNode,
-    Response, Transport, WireMessage,
-};
+use relay::node::{FetchRequest, FetchResponse, InMemoryTransport, PublishRequest, PublishResponse, RelayNode, Response, Transport, WireMessage};
 use node::peer::Peer;
 use node::pqxdh::{Account, PreKeyBundle};
 use x25519_dalek::PublicKey;
@@ -86,9 +83,9 @@ impl Transport for Wiretap {
     }
     fn fetch_bundle_opk(
         &self,
-        req: &node::node::BundleOpkRequest,
+        req: &relay::node::BundleOpkRequest,
         now: u64,
-    ) -> Result<node::node::BundleOpkResponse, String> {
+    ) -> Result<relay::node::BundleOpkResponse, String> {
         self.inner.fetch_bundle_opk(req, now)
     }
 }
@@ -104,7 +101,7 @@ struct Fixture {
 
 impl Fixture {
     /// Everything the relay holds — the view a PIR reader would have.
-    fn relay_slots(&self) -> Vec<node::node::Payload> {
+    fn relay_slots(&self) -> Vec<relay::node::Payload> {
         self.relay.borrow().all_slots_for_test()
     }
     fn alice_transport(&self) -> Wiretap {
@@ -471,9 +468,9 @@ impl Transport for ScopeTap {
     }
     fn fetch_bundle_opk(
         &self,
-        req: &node::node::BundleOpkRequest,
+        req: &relay::node::BundleOpkRequest,
         now: u64,
-    ) -> Result<node::node::BundleOpkResponse, String> {
+    ) -> Result<relay::node::BundleOpkResponse, String> {
         self.inner.fetch_bundle_opk(req, now)
     }
 }
@@ -646,9 +643,9 @@ impl Transport for PublishTap {
     }
     fn fetch_bundle_opk(
         &self,
-        req: &node::node::BundleOpkRequest,
+        req: &relay::node::BundleOpkRequest,
         now: u64,
-    ) -> Result<node::node::BundleOpkResponse, String> {
+    ) -> Result<relay::node::BundleOpkResponse, String> {
         self.inner.fetch_bundle_opk(req, now)
     }
 }

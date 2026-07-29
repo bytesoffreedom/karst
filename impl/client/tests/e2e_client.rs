@@ -12,13 +12,11 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::store::Store;
-use node::node::{
-    BlobPutRequest, BlobResponse, FetchRequest, FetchResponse, Payload, PublishResponse, RelayNode,
-    Response, SessionEnvelope, Transport, WireMessage,
-};
+use relay::node::{BlobPutRequest, BlobResponse, FetchRequest, FetchResponse, Payload, PublishResponse, RelayNode, Response, SessionEnvelope, Transport, WireMessage};
 use node::peer::Peer;
 use node::pqxdh::Account;
-use node::socket::{RelayServer, SocketTransport};
+use relay::server::{RelayServer};
+use node::socket::{SocketTransport};
 use node::transport::{DirectTcpAdapter, Dest, Path, Socks5Adapter};
 use x25519_dalek::PublicKey;
 
@@ -93,10 +91,10 @@ fn opk_request(
     ik: &[u8; 32],
     cookie: Option<admission::cookie::Cookie>,
     n: u64,
-) -> node::node::BundleOpkRequest {
+) -> relay::node::BundleOpkRequest {
     let cap = client::dev_capability();
     let nonce = format!("opk-probe-{n}").into_bytes();
-    node::node::BundleOpkRequest {
+    relay::node::BundleOpkRequest {
         ik: *ik,
         client_addr: format!("probe-{n}").into_bytes(),
         carrier_id: b"test".to_vec(),
@@ -111,7 +109,7 @@ fn drain_one_opk(
     ik: &[u8; 32],
     now: u64,
 ) -> Option<node::pqxdh::PreKeyBundle> {
-    use node::node::BundleOpkResponse;
+    use relay::node::BundleOpkResponse;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut req = opk_request(ik, None, n);
@@ -131,7 +129,7 @@ fn fetch_opk_bundle(
     ik: &[u8; 32],
     now: u64,
 ) -> Option<node::pqxdh::PreKeyBundle> {
-    use node::node::{BundleOpkResponse, Transport};
+    use relay::node::{BundleOpkResponse, Transport};
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let t = SocketTransport::new(addr, id.noise_pub);
@@ -174,7 +172,7 @@ fn spawn_relay_with_blobs() -> (SocketAddr, client::RelayId) {
     let addr = listener.local_addr().unwrap();
     let mut relay = RelayNode::new(NOW);
     relay.issue_capability(client::dev_capability());
-    relay.enable_blobs(temp_dir("blobs"), 0, node::node::BlobPersistence::Durable).unwrap();
+    relay.enable_blobs(temp_dir("blobs"), 0, relay::node::BlobPersistence::Durable).unwrap();
     let fetch_pub = relay.relay_public().to_bytes();
     let server = RelayServer::new(relay, Arc::new(move || NOW));
     let noise_pub = server.noise_public();
@@ -1316,7 +1314,7 @@ fn recv_session_acks_and_drains_the_relay_over_the_wire() {
 
 /// Like `spawn_relay_handle`, but the relay's clock is an atomic a test can ADVANCE — the only
 /// way to observe a lease timing out, since lease visibility is decided by the RELAY's clock.
-/// Advanced in units of `node::node::LEASE_SECS`, never by sleeping: no wall-clock threshold.
+/// Advanced in units of `relay::node::LEASE_SECS`, never by sleeping: no wall-clock threshold.
 fn spawn_relay_handle_clock() -> (SocketAddr, client::RelayId, Arc<RwLock<RelayNode>>, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1418,7 +1416,7 @@ fn a_failed_container_commit_leaves_the_batch_redeliverable() {
     );
 
     // The unacked lease expires and the exact ciphertext redelivers (relay-clock driven, no sleep).
-    clock.store(NOW + node::node::LEASE_SECS + 1, AtomicOrdering::SeqCst);
+    clock.store(NOW + relay::node::LEASE_SECS + 1, AtomicOrdering::SeqCst);
     let poll2 = client::recv_session_multi(&bstore2, std::slice::from_ref(&r), NOW).unwrap();
     assert_eq!(
         poll_texts(&poll2.messages),
@@ -2433,7 +2431,7 @@ fn file_transfer_roundtrips_through_relay_byte_identical() {
 /// Helper: a minimal (no-cookie) BlobPut — the relay answers `NeedCookie` before any
 /// storage, so a `NeedCookie` proves the round-trip REACHED the relay.
 fn probe_blob_put() -> BlobPutRequest {
-    let nonce = node::node::blob_put_nonce(&[7u8; 32], 0);
+    let nonce = relay::node::blob_put_nonce(&[7u8; 32], 0);
     BlobPutRequest {
         request_nonce: nonce.clone(),
         capability_proof: client::dev_capability().prove(&nonce, 0),
@@ -2463,7 +2461,7 @@ fn one_session_streams_a_whole_blob() {
     for index in 0..count {
         loop {
             requests += 1;
-            let nonce = node::node::blob_put_nonce(&blob_id, index);
+            let nonce = relay::node::blob_put_nonce(&blob_id, index);
             let req = BlobPutRequest {
                 request_nonce: nonce.clone(),
                 capability_proof: client::dev_capability().prove(&nonce, 0),
@@ -2512,10 +2510,10 @@ fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
     let t = SocketTransport::new(addr, id.noise_pub);
     let mut sess = t.open_blob_session().expect("open a reusable session");
 
-    let attempts = node::socket::MAX_UNADMITTED_REQUESTS + 12;
+    let attempts = relay::server::MAX_UNADMITTED_REQUESTS + 12;
     let mut served = 0usize;
     for index in 0..attempts {
-        let nonce = node::node::blob_put_nonce(&[0x77; 32], index as u32);
+        let nonce = relay::node::blob_put_nonce(&[0x77; 32], index as u32);
         let req = BlobPutRequest {
             request_nonce: nonce.clone(),
             capability_proof: client::dev_capability().prove(&nonce, 0),
@@ -2537,10 +2535,10 @@ fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
     }
     assert_eq!(
         served,
-        node::socket::MAX_UNADMITTED_REQUESTS,
+        relay::server::MAX_UNADMITTED_REQUESTS,
         "an unadmitted connection must be dropped after exactly {} refused requests, not held \
          open for {attempts}",
-        node::socket::MAX_UNADMITTED_REQUESTS
+        relay::server::MAX_UNADMITTED_REQUESTS
     );
 
     // CONTROL: a legitimate upload sends MORE requests than the leash allows and must be
@@ -2548,14 +2546,14 @@ fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
     // would also pass a fix that simply capped every connection at 8 requests — which would
     // break real uploads.
     let mut sess = t.open_blob_session().expect("open a second reusable session");
-    let count = (node::socket::MAX_UNADMITTED_REQUESTS + 4) as u32;
+    let count = (relay::server::MAX_UNADMITTED_REQUESTS + 4) as u32;
     let blob_id = [0x78; 32];
     let mut cookie = None;
     let mut requests = 0usize;
     for index in 0..count {
         loop {
             requests += 1;
-            let nonce = node::node::blob_put_nonce(&blob_id, index);
+            let nonce = relay::node::blob_put_nonce(&blob_id, index);
             let req = BlobPutRequest {
                 request_nonce: nonce.clone(),
                 capability_proof: client::dev_capability().prove(&nonce, 0),
@@ -2575,7 +2573,7 @@ fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
         }
     }
     assert!(
-        requests > node::socket::MAX_UNADMITTED_REQUESTS,
+        requests > relay::server::MAX_UNADMITTED_REQUESTS,
         "the control must actually cross the leash: {requests} requests"
     );
     assert_eq!(
@@ -3794,7 +3792,7 @@ fn a_crash_before_the_session_commit_leaves_the_prekey_to_reopen_the_contact() {
 
     // And operationally: the lease expires, the relay redelivers the exact opener, and it still
     // opens — the state that redelivery is supposed to recover from.
-    let later = NOW + node::node::LEASE_SECS + 1;
+    let later = NOW + relay::node::LEASE_SECS + 1;
     clock.store(later, AtomicOrdering::SeqCst);
     let again = recv_multi(&bstore, std::slice::from_ref(&r), later).unwrap();
     let texts = poll_texts(&again.messages);

@@ -16,10 +16,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use node::node::{
-    FetchRequest, FetchResponse, InMemoryTransport, PublishResponse, RelayNode, Response, Transport,
-    WireMessage, LEASE_SECS,
-};
+use relay::node::{FetchRequest, FetchResponse, InMemoryTransport, PublishResponse, RelayNode, Response, Transport, WireMessage, LEASE_SECS};
 use node::peer::{Peer, PeerState};
 use node::pqxdh::Account;
 use x25519_dalek::PublicKey;
@@ -157,10 +154,10 @@ impl Transport for TestTransport {
             TestTransport::Dead => FetchResponse::Rejected("relay unreachable".into()),
         }
     }
-    fn ack(&self, req: &node::node::AckRequest, now: u64) -> node::node::AckResponse {
+    fn ack(&self, req: &relay::node::AckRequest, now: u64) -> relay::node::AckResponse {
         match self {
             TestTransport::Live(t) => t.ack(req, now),
-            TestTransport::Dead => node::node::AckResponse::Rejected("relay unreachable".into()),
+            TestTransport::Dead => relay::node::AckResponse::Rejected("relay unreachable".into()),
         }
     }
 }

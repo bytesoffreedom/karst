@@ -21,8 +21,8 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::store::Store;
-use node::node::{PublishResponse, RelayNode, MAILBOX_TTL_SECS};
-use node::socket::RelayServer;
+use relay::node::{PublishResponse, RelayNode, MAILBOX_TTL_SECS};
+use relay::server::RelayServer;
 
 const NOW: u64 = 1_000_000;
 
@@ -204,7 +204,7 @@ fn an_eviction_outside_a_batch_is_recorded_with_the_right_victim() {
 }
 
 /// R2-6, the other half: a message nobody could deliver (relay stays dead) ages out past
-/// `node::peer`'s outbox TTL (`node::node::MAILBOX_TTL_SECS`) during a later `flush_outbox` pass.
+/// `node::peer`'s outbox TTL (`relay::node::MAILBOX_TTL_SECS`) during a later `flush_outbox` pass.
 /// No eviction is ever triggered here (the outbox holds one entry, nowhere near its cap) — this
 /// is purely the TTL path, and it must be attributed as `"expired"`, not conflated with
 /// `"evicted"`. Driven entirely by the `now` argument — no real waiting.

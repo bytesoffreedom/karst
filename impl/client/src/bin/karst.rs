@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::content::{decode, Content, Reassembler};
 use client::store::Store;
-use node::node::PublishResponse;
+use node::protocol::PublishResponse;
 
 fn wall_clock() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -433,11 +433,11 @@ fn cmd_relay_info(args: &[String]) -> Result<(), String> {
         None => println!("large-file blobs: disabled on this relay"),
         Some(mode) => {
             match mode {
-                node::node::BlobPersistence::Durable => {
+                node::protocol::BlobPersistence::Durable => {
                     println!("large-file blobs: DURABLE — parked files survive a relay restart");
                     println!("  ✓ verifiable: you can fetch a chunk back and it self-verifies");
                 }
-                node::node::BlobPersistence::Ephemeral => {
+                node::protocol::BlobPersistence::Ephemeral => {
                     println!("large-file blobs: EPHEMERAL — wiped on restart");
                     println!("  ~ a claim: no one can check 'it forgot' remotely — trust the operator");
                 }
@@ -460,8 +460,8 @@ fn cmd_relay_prefs(args: &[String]) -> Result<(), String> {
     if let Some(v) = flag(args, "--persist") {
         let pref = match v.as_str() {
             "any" => None,
-            "durable" => Some(node::node::BlobPersistence::Durable),
-            "ephemeral" => Some(node::node::BlobPersistence::Ephemeral),
+            "durable" => Some(node::protocol::BlobPersistence::Durable),
+            "ephemeral" => Some(node::protocol::BlobPersistence::Ephemeral),
             other => return Err(format!("--persist must be durable | ephemeral | any (got {other})")),
         };
         let mut prefs = s.load_relay_prefs().map_err(|e| format!("prefs: {e}"))?;
@@ -471,11 +471,11 @@ fn cmd_relay_prefs(args: &[String]) -> Result<(), String> {
     let prefs = s.load_relay_prefs().map_err(|e| format!("prefs: {e}"))?;
     match prefs.prefer_persistence {
         None => println!("relay preference: blob persistence = any (no filter)"),
-        Some(node::node::BlobPersistence::Durable) => {
+        Some(node::protocol::BlobPersistence::Durable) => {
             println!("relay preference: blob persistence = DURABLE");
             println!("(karst relays --add will only multi-home onto relays advertising durable storage)");
         }
-        Some(node::node::BlobPersistence::Ephemeral) => {
+        Some(node::protocol::BlobPersistence::Ephemeral) => {
             println!("relay preference: blob persistence = EPHEMERAL");
             println!("(karst relays --add will only multi-home onto relays advertising ephemeral storage)");
         }

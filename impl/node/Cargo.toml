@@ -38,11 +38,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 rustls-pemfile = "2"
 
-[[bin]]
-name = "karst-relay"
-path = "src/bin/relay.rs"
-
 [dev-dependencies]
+# A dev-dependency cycle, and a legal one: the relay crate depends on this one, and this one's
+# TESTS drive a live relay. Cargo supports exactly this shape. What it does NOT allow — and what
+# the split exists to prevent — is the library itself depending on the relay.
+relay = { path = "../relay" }
 # Self-signed cert/key generation for wss carrier tests (test-only trust root).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # Serialize `PeerState` to bytes in the lease/ACK crash-injection test — the same codec

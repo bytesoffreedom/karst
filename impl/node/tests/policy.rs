@@ -8,8 +8,9 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use node::blobstore::{BLOB_TTL_SECS, MAX_BLOB_SIZE};
-use node::node::{BlobPersistence, RelayNode};
-use node::socket::{RelayServer, SocketTransport};
+use relay::node::{BlobPersistence, RelayNode};
+use relay::server::{RelayServer};
+use node::socket::{SocketTransport};
 
 const NOW: u64 = 1_000_000;
 

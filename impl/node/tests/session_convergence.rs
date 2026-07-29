@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{InMemoryTransport, RelayNode, Response};
+use relay::node::{InMemoryTransport, RelayNode, Response};
 use node::peer::Peer;
 use node::pqxdh::Account;
 use x25519_dalek::PublicKey;

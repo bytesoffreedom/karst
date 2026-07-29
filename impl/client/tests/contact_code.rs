@@ -19,8 +19,8 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::store::Store;
-use node::node::{PublishResponse, RelayNode};
-use node::socket::RelayServer;
+use relay::node::{PublishResponse, RelayNode};
+use relay::server::RelayServer;
 
 const NOW: u64 = 1_000_000;
 

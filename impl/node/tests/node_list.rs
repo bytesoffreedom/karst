@@ -7,8 +7,9 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
 
-use node::node::{RelayDescriptor, RelayNode, MAX_ADDRS_PER_RELAY, MAX_KNOWN_RELAYS};
-use node::socket::{RelayServer, SocketTransport};
+use relay::node::{RelayDescriptor, RelayNode, MAX_ADDRS_PER_RELAY, MAX_KNOWN_RELAYS};
+use relay::server::{RelayServer};
+use node::socket::{SocketTransport};
 
 const NOW: u64 = 1_000_000;
 

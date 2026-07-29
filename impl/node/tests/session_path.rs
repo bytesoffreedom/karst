@@ -11,10 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{
-    FetchRequest, FetchResponse, InMemoryTransport, Payload, RelayNode, Response, SessionEnvelope,
-    Transport, WireMessage,
-};
+use relay::node::{FetchRequest, FetchResponse, InMemoryTransport, Payload, RelayNode, Response, SessionEnvelope, Transport, WireMessage};
 use node::peer::Peer;
 use node::pqxdh::Account;
 use x25519_dalek::PublicKey;

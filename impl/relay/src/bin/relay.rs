@@ -21,9 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use admission::capability::{Capability, Quota, Scope};
 use admission::params::DEFAULT_POW_BITS;
-use node::node::{BlobPersistence, MailboxDurability, RelayDescriptor, RelayNode};
+use relay::node::{BlobPersistence, MailboxDurability, RelayDescriptor, RelayNode};
 use node::seal::Identity;
-use node::socket::{generate_noise_keypair, RelayServer};
+use relay::server::{generate_noise_keypair, RelayServer};
 
 /// Дев-capability: секрет ЗАШИТ и публичен — только для локального теста руками,
 /// НЕ для production. В реальной системе провижининг capability — отдельный слой.
@@ -1033,15 +1033,15 @@ fn run_relay(addr: String) -> io::Result<()> {
         // connect to 127.0.0.1, an RFC1918 host, or the cloud metadata service (A3-12).
         let allow_private = matches!(role, Role::Dev);
         thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(node::gossip::GOSSIP_INTERVAL_SECS));
-            let added = node::gossip::gossip_round(&handle, &self_np, allow_private);
+            thread::sleep(Duration::from_secs(relay::gossip::GOSSIP_INTERVAL_SECS));
+            let added = relay::gossip::gossip_round(&handle, &self_np, allow_private);
             if added > 0 {
                 eprintln!("gossip: verified and learned {added} new relay(s)");
             }
         });
         eprintln!(
             "gossip: on — converging on peers' node-lists every {}s (verify-before-add)",
-            node::gossip::GOSSIP_INTERVAL_SECS
+            relay::gossip::GOSSIP_INTERVAL_SECS
         );
     }
 
@@ -1347,7 +1347,7 @@ mod tests {
         no_relay_message, parse_blob_persistence, parse_mail_persistence, parse_quota_spec,
         shell_quote, Role,
     };
-    use node::node::{BlobPersistence, RelayNode};
+    use relay::node::{BlobPersistence, RelayNode};
     use std::sync::{Arc, RwLock};
 
     #[test]

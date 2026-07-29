@@ -503,6 +503,7 @@ dependencies = [
  "postcard",
  "qrcode",
  "rand 0.8.7",
+ "relay",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2305,6 +2306,7 @@ dependencies = [
  "rand 0.10.2",
  "rand 0.8.7",
  "rcgen",
+ "relay",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -3066,6 +3068,30 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relay"
+version = "0.1.0"
+dependencies = [
+ "admission",
+ "curve25519-dalek",
+ "hex",
+ "hkdf",
+ "hmac",
+ "node",
+ "postcard",
+ "rand 0.8.7",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "snow",
+ "subtle",
+ "tungstenite",
+ "x25519-dalek",
+]
 
 [[package]]
 name = "reqwest"

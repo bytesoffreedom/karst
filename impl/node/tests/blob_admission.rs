@@ -24,8 +24,8 @@
 
 use admission::capability::{Capability, Quota, Scope};
 use node::blobstore::{MAX_BLOB_CHUNKS, MAX_BLOB_SIZE};
-use node::node::{BlobPersistence, BlobPutRequest, BlobResponse, RelayNode, Response};
-use node::node::{blob_put_nonce, BLOB_CAP_QUOTA};
+use relay::node::{BlobPersistence, BlobPutRequest, BlobResponse, RelayNode, Response};
+use relay::node::{blob_put_nonce, BLOB_CAP_QUOTA};
 
 const NOW: u64 = 1_000_000;
 
@@ -219,9 +219,9 @@ fn blob_quota_and_message_quota_are_independent_under_the_same_capability() {
     // Spend the message quota's one allowed request.
     let bob = node::seal::Identity::generate();
     let relay_rc = std::rc::Rc::new(std::cell::RefCell::new(relay));
-    let transport = node::node::InMemoryTransport::new(relay_rc.clone());
-    let mut alice = node::node::Client::new(transport.clone(), cap.clone(), &client_addr);
-    let recipient = node::node::Recipient::new(transport, bob, relay_rc.borrow().relay_public());
+    let transport = relay::node::InMemoryTransport::new(relay_rc.clone());
+    let mut alice = node::demo::Client::new(transport.clone(), cap.clone(), &client_addr);
+    let recipient = node::demo::Recipient::new(transport, bob, relay_rc.borrow().relay_public());
     let bob_pub = recipient.public();
     assert!(
         matches!(alice.send(&bob_pub, b"first", NOW), Response::Accepted),

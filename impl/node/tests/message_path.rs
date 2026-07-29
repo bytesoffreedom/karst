@@ -8,10 +8,8 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use admission::params::EPOCH_DURATION_SECS;
-use node::node::{
-    Client, FetchRequest, FetchResponse, InMemoryTransport, Payload, Recipient, RelayNode,
-    Response, Transport, WireMessage,
-};
+use node::demo::{Client, Recipient};
+use relay::node::{FetchRequest, FetchResponse, InMemoryTransport, Payload, RelayNode, Response, Transport, WireMessage};
 use node::seal::Identity;
 use node::protocol::MAX_FETCH_SEALS;
 use node::wire::FETCH_CAP;

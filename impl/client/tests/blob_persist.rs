@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use node::node::RelayNode;
-use node::socket::RelayServer;
+use relay::node::RelayNode;
+use relay::server::RelayServer;
 
 const NOW: u64 = 1_000_000;
 
@@ -43,7 +43,7 @@ fn spawn(blob_dir: &Path) -> (SocketAddr, client::RelayId) {
     let addr = listener.local_addr().unwrap();
     let mut relay = RelayNode::new(NOW);
     relay.issue_capability(client::dev_capability());
-    relay.enable_blobs(blob_dir.to_path_buf(), NOW, node::node::BlobPersistence::Durable).unwrap();
+    relay.enable_blobs(blob_dir.to_path_buf(), NOW, relay::node::BlobPersistence::Durable).unwrap();
     let fetch_pub = relay.relay_public().to_bytes();
     let server = RelayServer::new(relay, Arc::new(move || NOW));
     let noise_pub = server.noise_public();

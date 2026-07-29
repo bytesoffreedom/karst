@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::thread;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{Client, Recipient, Response};
+use node::demo::{Client, Recipient};
+use relay::node::{Response};
 use node::seal::Identity;
 use node::socket::SocketTransport;
 use node::transport::Socks5Adapter;
@@ -37,10 +38,10 @@ fn spawn_relay() -> (SocketAddr, [u8; 32], [u8; 32]) {
 fn spawn_relay_on(bind: &str) -> (SocketAddr, [u8; 32], [u8; 32]) {
     let listener = TcpListener::bind(bind).unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut relay = node::node::RelayNode::new(NOW);
+    let mut relay = relay::node::RelayNode::new(NOW);
     relay.issue_capability(capability([0x33; 32]));
     let fetch_pub = relay.relay_public().to_bytes();
-    let server = node::socket::RelayServer::new(relay, Arc::new(move || NOW));
+    let server = relay::server::RelayServer::new(relay, Arc::new(move || NOW));
     let noise_pub = server.noise_public();
     thread::spawn(move || {
         let _ = server.serve_listener(listener);

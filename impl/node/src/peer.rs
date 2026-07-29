@@ -1971,7 +1971,7 @@ mod outbox_state_tests {
     #[test]
     fn a_stale_session_without_a_mailbox_point_fails_loud_on_send() {
         use crate::protocol::{Response};
-use crate::node::{InMemoryTransport, RelayNode};
+use relay::node::{InMemoryTransport, RelayNode};
         use crate::pqxdh::Account;
         use crate::ratchet::Session;
         use admission::capability::{Capability, Quota, Scope};
@@ -2012,7 +2012,7 @@ use crate::node::{InMemoryTransport, RelayNode};
 #[cfg(test)]
 mod session_cap_tests {
     use crate::protocol::{Payload, Response, SessionEnvelope};
-use crate::node::{InMemoryTransport, RelayNode};
+use relay::node::{InMemoryTransport, RelayNode};
     use crate::pqxdh::Account;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
@@ -2286,7 +2286,7 @@ use crate::node::{InMemoryTransport, RelayNode};
 mod convergence_route_tests {
     use super::{SessionEnvelope, SessionState};
     use crate::protocol::{Response};
-use crate::node::{InMemoryTransport, RelayNode};
+use relay::node::{InMemoryTransport, RelayNode};
     use crate::pqxdh::Account;
     use crate::ratchet::{Header, RatchetMessage, Session};
     use admission::capability::{Capability, Quota, Scope};
@@ -2549,7 +2549,7 @@ use crate::node::{InMemoryTransport, RelayNode};
 #[cfg(test)]
 mod receive_budget_tests {
     use crate::protocol::{AckRequest, AckResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, PublishRequest, PublishResponse, Response, Transport, WireMessage};
-use crate::node::{InMemoryTransport, RelayNode};
+use relay::node::{InMemoryTransport, RelayNode};
     use crate::pqxdh::PreKeyBundle;
     use crate::pqxdh::Account;
     use crate::ratchet::Session;

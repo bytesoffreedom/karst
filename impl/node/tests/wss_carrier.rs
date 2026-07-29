@@ -185,8 +185,9 @@ fn relay_server_with_tls_serves_a_wss_client_end_to_end() {
     // no cookie must traverse the full TLS + WebSocket + Noise + wire path and come
     // back as `NeedCookie` — i.e. the carrier is not just a mechanism, it's usable
     // end to end from the relay binary's own server type.
-    use node::node::{FetchRequest, FetchResponse, RelayNode, Transport};
-    use node::socket::{generate_noise_keypair, RelayServer, SocketTransport};
+    use relay::node::{FetchRequest, FetchResponse, RelayNode, Transport};
+    use relay::server::{generate_noise_keypair, RelayServer};
+use node::socket::{SocketTransport};
 
     // Matched client/server TLS from the same self-signed test cert.
     let (client_tls, server_cfg) = test_tls();

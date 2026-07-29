@@ -19,72 +19,10 @@ use std::collections::HashSet;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock};
 
-use crate::protocol::{RelayDescriptor};
+use node::protocol::{RelayDescriptor};
 use crate::node::{RelayNode};
-use crate::socket::SocketTransport;
-use crate::transport::Dest;
-
-/// May this IP be dialed on the public internet?
-///
-/// Verify-before-add stops a hostile peer's address from being RE-SERVED, but the dial itself
-/// happens first — so without this an attacker could still make a public relay connect,
-/// repeatedly and on a schedule, to `127.0.0.1:<port>`, `10.0.0.0/8`, or the cloud metadata
-/// service at `169.254.169.254`. The Noise handshake bounds what can be exchanged, but the
-/// connection attempt alone is egress SSRF and internal port probing (A3-12).
-///
-/// Rejects loopback, private, link-local (which covers the metadata address), CGNAT,
-/// unspecified, multicast, broadcast, documentation and benchmarking ranges, plus their IPv6
-/// equivalents and IPv4-mapped IPv6 forms.
-pub fn ip_is_globally_routable(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || o[0] == 0
-                || (o[0] == 100 && (64..128).contains(&o[1]))       // 100.64.0.0/10 CGNAT
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0)          // 192.0.0.0/24 IETF
-                || (o[0] == 198 && (18..20).contains(&o[1]))        // 198.18.0.0/15 benchmarking
-                || o[0] >= 240)                                     // 240.0.0.0/4 reserved
-        }
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return ip_is_globally_routable(&IpAddr::V4(mapped));
-            }
-            let s = v6.segments();
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00                        // fc00::/7 unique local
-                || (s[0] & 0xffc0) == 0xfe80)                       // fe80::/10 link-local
-        }
-    }
-}
-
-/// Is this `host:port` safe to dial? Resolves the host and requires EVERY resolved address to be
-/// globally routable, so a DNS name pointing at an internal IP is refused too. `allow_private`
-/// exists for loopback tests and local development — production relays run with it off.
-pub fn addr_is_dialable(addr: &str, allow_private: bool) -> bool {
-    if allow_private {
-        return true;
-    }
-    let Ok(dest) = Dest::parse(addr) else {
-        return false;
-    };
-    match (dest.host.as_str(), dest.port).to_socket_addrs() {
-        // Unresolvable ⇒ we cannot prove it is safe, so refuse rather than dial blind.
-        Ok(mut addrs) => {
-            let all: Vec<_> = addrs.by_ref().collect();
-            !all.is_empty() && all.iter().all(|sa| ip_is_globally_routable(&sa.ip()))
-        }
-        Err(_) => false,
-    }
-}
+use node::socket::SocketTransport;
+use node::transport::Dest;
 
 /// How often a gossip round runs (seconds).
 pub const GOSSIP_INTERVAL_SECS: u64 = 300;
@@ -130,7 +68,7 @@ pub fn verified_self_descriptor(
     addr: &str,
     allow_private: bool,
 ) -> Option<RelayDescriptor> {
-    if !addr_is_dialable(addr, allow_private) {
+    if !node::transport::addr_is_dialable(addr, allow_private) {
         return None; // never dial into private/loopback space on a peer's say-so (A3-12)
     }
     let dest = Dest::parse(addr).ok()?;
@@ -140,7 +78,7 @@ pub fn verified_self_descriptor(
         .find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
     // Its self-declared addresses still have to pass the SSRF gate: "the relay said so" is not a
     // licence to dial someone's LAN either.
-    own.addrs.retain(|a| addr_is_dialable(a, allow_private));
+    own.addrs.retain(|a| node::transport::addr_is_dialable(a, allow_private));
     if own.addrs.is_empty() {
         return None;
     }
@@ -174,7 +112,7 @@ pub fn gossip_round(
             continue;
         };
         dialed_addrs.insert(peer_addr.clone());
-        if !addr_is_dialable(&peer_addr, allow_private) {
+        if !node::transport::addr_is_dialable(&peer_addr, allow_private) {
             continue; // a known peer's address is still an address we were told about
         }
         dials += 1;

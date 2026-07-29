@@ -39,6 +39,9 @@ name = "karst"
 path = "src/bin/karst.rs"
 
 [dev-dependencies]
+# The client's integration tests drive a LIVE relay. A dev-dependency only: the library itself
+# does not, and must not, depend on the relay crate (#143).
+relay = { path = "../relay" }
 # Build capabilities with relay-specific ids/secrets in the tests (CRYPTO-24), instead of the
 # single globally-known dev credential every dev relay accepts.
 admission = { path = "../admission" }

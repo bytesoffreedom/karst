@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{InMemoryTransport, Payload, RelayNode, SessionEnvelope};
+use relay::node::{InMemoryTransport, Payload, RelayNode, SessionEnvelope};
 use node::peer::Peer;
 use node::pqxdh::{initiate_key_agreement, Account};
 use node::ratchet::{Header, RatchetMessage, Session};

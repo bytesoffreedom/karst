@@ -7,10 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
-use node::node::{
-    AckRequest, AckResponse, FetchRequest, FetchResponse, InMemoryTransport, PublishResponse,
-    RelayNode, Response, Transport, WireMessage,
-};
+use relay::node::{AckRequest, AckResponse, FetchRequest, FetchResponse, InMemoryTransport, PublishResponse, RelayNode, Response, Transport, WireMessage};
 use node::peer::Peer;
 use node::pqxdh::Account;
 
@@ -68,9 +65,9 @@ impl Transport for Flaky {
     /// this wrapper quietly stops exercising first contact at all.
     fn fetch_bundle_opk(
         &self,
-        req: &node::node::BundleOpkRequest,
+        req: &relay::node::BundleOpkRequest,
         now: u64,
-    ) -> Result<node::node::BundleOpkResponse, String> {
+    ) -> Result<relay::node::BundleOpkResponse, String> {
         if self.up.get() {
             self.inner.fetch_bundle_opk(req, now)
         } else {

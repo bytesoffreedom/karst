@@ -11,9 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::store::Store;
 use client::{Relay, RelayId};
-use node::node::RelayNode;
+use relay::node::RelayNode;
 use node::seal::Identity;
-use node::socket::{generate_noise_keypair, RelayServer};
+use relay::server::{generate_noise_keypair, RelayServer};
 
 const NOW: u64 = 1_000_000;
 

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use node::node::Payload;
+use relay::node::Payload;
 use node::seal::SkeletonSeal;
 use node::session::{Session, NOISE_PARAMS};
 use node::wire::{encode, FetchPage, WireResponse, FETCH_CAP, MAX_RESPONSE_FRAME};

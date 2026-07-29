@@ -793,6 +793,14 @@ fn proxy_for_contact(store: &Store, ik: &[u8; 32]) -> u32 {
     }
 }
 
+/// The relay to reach a contact through: the one their contact code named, when we hold it and a
+/// credential for it, else the primary (`client::relays_for_contact`). The counterpart to
+/// `proxy_for_contact` — that one picks WHICH identity of ours they see, this one picks WHERE they
+/// are actually polling (A10-6). `None` only when no relay is configured at all.
+fn relay_for_contact(store: &Store, relays: &[Relay], ik: &[u8; 32]) -> Option<Relay> {
+    client::relays_for_contact(store, relays, ik).into_iter().next()
+}
+
 /// Write the DEV capability for every configured relay — only when `KARST_DEV_CAP=1` says this
 /// is the local demo, and loudly.
 ///
@@ -1664,7 +1672,7 @@ fn set_channel_mode(app: State<App>, password: String, enable: bool) -> Result<C
 fn subscribe(app: State<App>, peer_ik: String) -> Result<(), String> {
     let peer = parse_ik(&peer_ik)?;
     let (store, relays) = app.snapshot()?;
-    let relay = relays.into_iter().next().ok_or("no relay configured")?;
+    let relay = relay_for_contact(&store, &relays, &peer).ok_or("no relay configured")?;
     let ps = store.as_proxy(proxy_for_contact(&store, &peer));
     client::send_join_request(&ps, &relay, &peer, now_secs())
 }
@@ -1700,7 +1708,7 @@ fn approve_subscriber(app: State<App>, peer_ik: String) -> Result<(), String> {
     let (store, relays) = app.snapshot()?;
     store.add_subscriber(peer, now_secs()).map_err(|e| e.to_string())?;
     store.remove_pending_sub(peer).map_err(|e| e.to_string())?;
-    if let Some(relay) = relays.into_iter().next() {
+    if let Some(relay) = relay_for_contact(&store, &relays, &peer) {
         let is_channel = store.load_channel().enabled;
         let ps = store.as_proxy(proxy_for_contact(&store, &peer));
         let _ = client::send_join_accept(&ps, &relay, &peer, is_channel, now_secs());
@@ -1746,7 +1754,7 @@ fn reconnect_peer(app: State<App>, peer_ik: String) -> Result<bool, String> {
     // outbound (the simultaneous-first-contact path). Both sides pressing Reconnect thus heals both
     // directions with no manual message. Best-effort: a dead relay just defers it to the next send.
     if cleared {
-        if let Some(relay) = relays.first() {
+        if let Some(relay) = relay_for_contact(&root, &relays, &peer) {
             let ps = root.as_proxy(proxy_for_contact(&root, &peer));
             // A conversation-only peer must NOT receive your profile — send an EMPTY opener (it still
             // re-runs PQXDH to heal the session). A confirmed contact gets your real profile.
@@ -1756,7 +1764,7 @@ fn reconnect_peer(app: State<App>, peer_ik: String) -> Result<bool, String> {
             } else {
                 (String::new(), String::new())
             };
-            let _ = client::send_profile(&ps, relay, &peer, &n, &b, now_secs());
+            let _ = client::send_profile(&ps, &relay, &peer, &n, &b, now_secs());
         }
     }
     Ok(cleared)
@@ -1944,7 +1952,8 @@ fn discovery_off(app: State<App>) -> Result<(), String> {
     Ok(())
 }
 
-/// Mint a ONE-TIME invite code to hand to one person (self-consumes on first use).
+/// Mint an INVITE code to hand to one person: a short-lived discovery row of its own, revocable
+/// by you (`revoke_invite`) and lapsing on its own after `INVITE_TTL_SECS`.
 #[tauri::command]
 fn create_invite(app: State<App>) -> Result<String, String> {
     let (store, relays) = app.snapshot()?;
@@ -1952,29 +1961,51 @@ fn create_invite(app: State<App>) -> Result<String, String> {
     client::discovery_one_time(&store.as_proxy(default_proxy(&store)?), &relay, now_secs())
 }
 
-/// Add a contact by a CONTACT CODE (persistent or one-time): resolve it to an IK at the relay
-/// (the binding is self-verified — the relay never vouches), then save the contact. Returns the
-/// resolved IK hex so the UI can open the chat. A one-time code is consumed by the relay here.
+/// One outstanding invite for the UI: the code plus when it lapses.
+#[derive(Serialize)]
+struct InviteView {
+    code: String,
+    expiry: u64,
+}
+
+/// The invites of yours that can still resolve. Local only — no relay is contacted.
+#[tauri::command]
+fn list_invites(app: State<App>) -> Result<Vec<InviteView>, String> {
+    let (store, _) = app.snapshot()?;
+    let ps = store.as_proxy(default_proxy(&store)?);
+    Ok(client::invites(&ps, now_secs())?
+        .into_iter()
+        .map(|i| InviteView { code: i.code, expiry: i.expiry })
+        .collect())
+}
+
+/// Retire an invite: delete its row at the relay, then forget it locally. Errors if the relay
+/// could not be reached — the invite is still live in that case and the secret is kept so the
+/// user can retry (silently forgetting it would strand a published row).
+#[tauri::command]
+fn revoke_invite(app: State<App>, code: String) -> Result<bool, String> {
+    let (store, relays) = app.snapshot()?;
+    let relay = relays.into_iter().next().ok_or("configure a relay first")?;
+    let ps = store.as_proxy(default_proxy(&store)?);
+    client::revoke_invite(&ps, &relay, code.trim(), now_secs())
+}
+
+/// Add a contact by a CONTACT CODE (persistent or invite): resolve it across the relay set (the
+/// binding is self-verified — the relay never vouches), then commit the contact in one place
+/// (`client::add_contact_by_code`, which also records the relay their code named). Returns the
+/// resolved IK hex so the UI can open the chat.
 #[tauri::command]
 fn add_by_code(app: State<App>, code: String, name: String, via_proxy: Option<u32>) -> Result<String, String> {
     let (store, relays) = app.snapshot()?;
-    let relay = relays.into_iter().next().ok_or("configure a relay first")?;
-    let (ik, _loc) = client::find_contact(&relay, code.trim(), now_secs())?;
-    let mut cs = store.load_contacts().map_err(|e| e.to_string())?;
-    if !cs.iter().any(|c| c.ik == ik) {
-        // Empty name resolves to the peer's own profile name / a short IK at display time.
-        cs.push(ContactRecord { name: name.trim().to_string(), ik, verified: false });
-        store.save_contacts(&cs).map_err(|e| e.to_string())?;
+    if relays.is_empty() {
+        return Err("configure a relay first".into());
     }
-    // Looking someone up by their code is an EXPLICIT add → a confirmed contact (unlocks their
-    // name/posts as they arrive), not a mere conversation.
-    let _ = store.set_unconfirmed(ik, false);
     // The channel of OURS they'll see us on — chosen, else default (never the root).
     let proxy = match via_proxy {
         Some(p) => p,
         None => default_proxy(&store).map_err(|e| e.to_string())?,
     };
-    let _ = store.set_contact_proxy(ik, proxy);
+    let ik = client::add_contact_by_code(&store, &relays, &code, &name, proxy, now_secs())?;
     Ok(hex::encode(ik))
 }
 
@@ -1996,7 +2027,8 @@ fn save_profile(app: State<App>, name: String, bio: String) -> Result<Me, String
     prof.name = name; // clamped to MAX_PROFILE_NAME/BIO inside save_profile
     prof.bio = bio;
     store.save_profile(&prof).map_err(|e| format!("saving profile: {e}"))?;
-    if let (Some(relay), Ok(contacts)) = (relays.first().cloned(), store.load_contacts()) {
+    if let (false, Ok(contacts)) = (relays.is_empty(), store.load_contacts()) {
+        // (the relay is chosen PER CONTACT below, so the whole set moves into the thread)
         // Only CONFIRMED contacts receive your profile — a conversation-only peer never does.
         let unconfirmed = store.load_unconfirmed().unwrap_or_default();
         let contacts: Vec<_> = contacts.into_iter().filter(|c| !unconfirmed.contains(&c.ik)).collect();
@@ -2006,8 +2038,10 @@ fn save_profile(app: State<App>, name: String, bio: String) -> Result<Me, String
             let store = v.account(&aid);
             let now = now_secs();
             for c in contacts {
-                // Send each contact your profile AS the proxy they know (never the root identity).
+                // Send each contact your profile AS the proxy they know (never the root identity),
+                // THROUGH the relay their contact code named (else the primary).
                 let ps = store.as_proxy(proxy_for_contact(&store, &c.ik));
+                let Some(relay) = relay_for_contact(&store, &relays, &c.ik) else { continue };
                 let _ = client::send_profile(&ps, &relay, &c.ik, &n, &b, now);
             }
         });
@@ -2558,7 +2592,7 @@ fn view_profile(app: State<App>, peer_ik: String) -> Result<bool, String> {
     let peer = parse_ik(&peer_ik)?;
     let (store, relays) = app.snapshot()?;
     let _ = store.add_pulled(peer);
-    if let Some(relay) = relays.into_iter().next() {
+    if let Some(relay) = relay_for_contact(&store, &relays, &peer) {
         let ps = store.as_proxy(proxy_for_contact(&store, &peer));
         std::thread::spawn(move || {
             let _ = client::send_posts_request(&ps, &relay, &peer, now_secs());
@@ -2734,10 +2768,14 @@ fn remove_contact(app: State<App>, peer_ik: String, ask_peer: Option<bool>) -> R
     // Clean slate: drop the CONVERSATION, their cached profile, any pending request, and the
     // session across every proxy — so re-adding the same IK later starts fresh instead of the old
     // thread resurrecting (the bug), and the ratchet doesn't linger.
+    // Their route, resolved BEFORE it is forgotten just below — the optional "please delete your
+    // copy too" still has to reach the relay they actually poll.
+    let route = relay_for_contact(&store, &relays, &ik_b);
     let _ = store.delete_conversation(ik_b);
     let _ = store.remove_peer_profile(ik_b);
     let _ = store.remove_contact_request(ik_b);
     let _ = store.set_unconfirmed(ik_b, false); // clear the chat-only flag so no orphan lingers
+    let _ = store.remove_contact_endpoint(&ik_b); // and where they said they were reachable
     for pidx in active_proxies(&store) {
         let ps = store.as_proxy(pidx);
         if let Ok(mut st) = ps.load_sessions() {
@@ -2748,7 +2786,7 @@ fn remove_contact(app: State<App>, peer_ik: String, ask_peer: Option<bool>) -> R
     }
     // Optionally ask them to delete their copy too (their choice; off-thread, best-effort).
     if ask_peer.unwrap_or(false) {
-        if let Some(relay) = relays.into_iter().next() {
+        if let Some(relay) = route {
             let ps = store.as_proxy(proxy_for_contact(&store, &ik_b));
             std::thread::spawn(move || {
                 let _ = client::send_delete_conversation(&ps, &relay, &ik_b, now_secs());
@@ -2853,13 +2891,16 @@ fn send(app: State<App>, peer_ik: String, text: String) -> Result<Msg, String> {
     // Proxy-identity model: talk to this contact AS the proxy they know (their tag, or the default
     // proxy). Network state rides the proxy; history/prefs it reads/writes are shared root data.
     let store = root.as_proxy(proxy_for_contact(&root, &peer));
-    let relay = relays.first().ok_or("no relay configured — set one in settings")?;
+    // …and THROUGH the relay their contact code named, when we hold it (A10-6): a contact whose
+    // home relay is one of our backups has no bundle and no read mailbox at the primary.
+    let relay = relay_for_contact(&root, &relays, &peer)
+        .ok_or("no relay configured — set one in settings")?;
     let ts = now_secs();
     let ttl = store.load_prefs().map(|p| p.disappearing_secs).unwrap_or(0);
     if ttl > 0 {
         // Disappearing: send as TextExpiring, do NOT append to history. Both sides drop it at
         // `expire_at`; nothing durable is written on either end.
-        client::send_text_expiring(&store, relay, &peer, text.as_bytes(), ttl, ts)?;
+        client::send_text_expiring(&store, &relay, &peer, text.as_bytes(), ttl, ts)?;
         return Ok(Msg {
             from_me: true,
             text,
@@ -2872,7 +2913,7 @@ fn send(app: State<App>, peer_ik: String, text: String) -> Result<Msg, String> {
     }
     // `false` = the relay was down and the message is durably queued (pending); it will
     // retransmit on a later poll. Recorded to history either way — it is committed to send.
-    let delivered = client::send_text(&store, relay, &peer, text.as_bytes(), ts, ts)?;
+    let delivered = client::send_text(&store, &relay, &peer, text.as_bytes(), ts, ts)?;
     let _ = store.append_history(&HistoryRecord {
         from_me: true,
         peer_ik: peer,
@@ -3000,7 +3041,10 @@ fn dispatch_send(app: &App, peer: [u8; 32], name: String, bytes: Vec<u8>) -> Res
     }
     let name = sanitize_name(&name);
     let (vault, id, relays) = app.session_parts()?;
-    let relay = relays.first().cloned().ok_or("no relay configured — set one in settings")?;
+    // The relay the recipient's contact code named, when we hold it (A10-6) — both the session
+    // packets and the blob upload have to land where they actually poll.
+    let relay = relay_for_contact(&vault.account(&id), &relays, &peer)
+        .ok_or("no relay configured — set one in settings")?;
     let ts = now_secs();
     let size = bytes.len() as u64;
 
@@ -4147,6 +4191,8 @@ fn main() {
             discovery_rotate,
             discovery_off,
             create_invite,
+            list_invites,
+            revoke_invite,
             add_by_code,
             proxies,
             create_proxy,

@@ -77,6 +77,9 @@ fn print_usage() {
          karst discovery on --relay H:P --relay-id X   become findable by a random contact code\n\
          karst discovery rotate --relay H:P --relay-id X   mint a fresh code (old one stops working)\n\
          karst discovery off --relay H:P --relay-id X  stop being findable; delete the code\n\
+         karst discovery invite --relay H:P --relay-id X   mint a short-lived invite code for one person\n\
+         karst discovery invites             list your outstanding invites\n\
+         karst discovery revoke <CODE> --relay H:P --relay-id X   retire an invite now\n\
          karst find <CODE> --relay H:P --relay-id X    resolve a contact code to an address\n\
          karst dev-cap --relay H:P --relay-id X  write the dev capability FOR that relay (local test)\n\
          karst join --relay H:P --relay-id X earn a capability from a PUBLIC relay (PoW)\n\
@@ -248,7 +251,47 @@ fn cmd_discovery(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        other => Err(format!("unknown discovery subcommand: {other}\n(status | on | rotate | off)")),
+        // An INVITE is a discovery row of its own: short-lived, revocable, and it never touches
+        // the persistent contact code. It is no longer destroyed by the first lookup (A10-4), so
+        // the invitee can retry a failed add — and retiring it is the inviter's call.
+        "invite" => {
+            let r = relay_arg(args)?;
+            let code = client::discovery_one_time(&s, &r, wall_clock())?;
+            let days = client::INVITE_TTL_SECS / 86_400;
+            println!("invite code (hand it to ONE person):\n\n  {code}\n");
+            println!("It resolves until you revoke it (karst discovery revoke <CODE>) or it lapses");
+            println!("in {days} days. Resolving it does NOT consume it — the person you gave it to can");
+            println!("retry if their first attempt failed — so revoke it once they have added you.");
+            Ok(())
+        }
+        "invites" => {
+            let now = wall_clock();
+            let live = client::invites(&s, now)?;
+            if live.is_empty() {
+                println!("no outstanding invites (mint one: karst discovery invite --relay …)");
+                return Ok(());
+            }
+            println!("{} outstanding invite(s):", live.len());
+            for i in &live {
+                println!("  {}  (lapses in {} h)", i.code, i.expiry.saturating_sub(now) / 3600);
+            }
+            Ok(())
+        }
+        "revoke" => {
+            let code = positional_after_flags(&args[1..])
+                .ok_or("usage: karst discovery revoke <INVITE-CODE> --relay H:P --relay-id X")?;
+            let r = relay_arg(args)?;
+            let removed = client::revoke_invite(&s, &r, &code, wall_clock())?;
+            if removed {
+                println!("revoked — that invite no longer resolves.");
+            } else {
+                println!("that invite had already lapsed at the relay; forgotten locally.");
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown discovery subcommand: {other}\n(status | on | rotate | off | invite | invites | revoke)"
+        )),
     }
 }
 

@@ -346,10 +346,29 @@ const MAX_CONTACTS: usize = 10_000;
 /// Cap on connection proxies in one root's registry. Generous for real use (one per contact/group
 /// over a long time) while bounding `proxies.dat` and the poll fan-out that iterates them.
 const MAX_PROXIES: usize = 10_000;
-/// Cap on channel subscribers (people who follow your posts). Anti-Sybil: a flood of join
-/// requests to a channel can't grow `subscribers.dat` without bound; on overflow new joins are
-/// refused (existing subscribers keep working). Generous for a real channel on this tier.
-const MAX_SUBSCRIBERS: usize = 50_000;
+/// Cap on channel subscribers (people who follow your posts).
+///
+/// **A PRODUCT DECISION, not a data-structure bound** — see `docs/design/audience-scale.md`.
+/// Publication is per-recipient: a post is encrypted separately for every subscriber over that
+/// subscriber's own ratchet, and an attached image is uploaded once per recipient as its own blob
+/// under its own key. That is what stops the relay reading an audience off its own disk — there is
+/// no shared ciphertext for N recipients to fetch, so there is no set to observe — and it costs
+/// LINEARLY in the audience.
+///
+/// This was 50 000, which quietly permitted a scale the crypto model charges linearly for.
+/// "Mass reach" and "the relay cannot see who your audience is" cannot both be had, and nothing
+/// said which one KARST gives up. It gives up reach.
+///
+/// 512 is where the cost becomes visible rather than where the container stops: one post with one
+/// 300 KB image is ~150 MB of upload for the publisher, which is already at the edge of usable on
+/// a mobile link. A cap set where the model stops being honest beats one set where the map runs
+/// out of memory.
+///
+/// Anti-Sybil at the same time: a flood of join requests cannot grow `subscribers.dat` without
+/// bound. On overflow a new subscriber is REFUSED, not silently dropped (existing ones keep
+/// working) — the same discipline `MAX_MAILBOXES` and `MAX_SESSIONS` follow, because a silent
+/// drop would leave a publisher believing they have readers they do not have.
+const MAX_SUBSCRIBERS: usize = 512;
 /// Cap on PENDING join requests awaiting manual approval (private account). Bounds the queue
 /// against a flood; on overflow new requests from unknown IKs are dropped.
 const MAX_PENDING_SUBS: usize = 5_000;

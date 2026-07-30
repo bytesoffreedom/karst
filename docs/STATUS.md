@@ -52,6 +52,39 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### QA-1 slice 1: the untrusted relay is now tested, not argued
+
+Every test in this repository has used an HONEST relay. The design's central sentence — you do not
+have to trust the relay — was therefore inferred from the crypto rather than demonstrated against
+the adversary it names.
+
+`client/tests/evil_relay.rs` wraps the honest in-memory relay in a hostile shell, one misbehaviour at
+a time. Wrapping rather than reimplementing is deliberate: a from-scratch evil relay is a second
+protocol implementation, and a test can pass because THAT is wrong rather than because the client is
+right.
+
+The criterion is stated once at the top so no test drifts from it: a relay may cause DELIVERY TO
+FAIL — it can always just drop a message, so no test may demand a hostile relay deliver anything —
+but it may not read plaintext, substitute authenticated keys, or silently corrupt the client's
+cryptographic state.
+
+Slice 1:
+- **Tampering costs delivery, not integrity.** A flipped byte does not decrypt AND does not move the
+  ratchet, so the next honest message still opens. Without transactional decrypt, one flipped byte
+  would end a conversation permanently — a much better attack than dropping.
+- **A replayed message is delivered at most once**, because the ratchet consumed the key.
+- **A reordered page loses nothing**, since out-of-order arrival is ordinary on store-and-forward.
+
+Two things keep the file honest. A CONTROL ARM — the same harness with an honest relay must deliver,
+otherwise every test below could be passing because the harness is broken. And a served-payload
+COUNTER: "a replay is not delivered twice" passes trivially if the page never held two copies, and "a
+reversed page loses nothing" passes on a page of one, so each test asserts the relay actually
+misbehaved before asserting the client survived it.
+
+Named and not yet covered, in the file itself: claiming `Accepted` without storing, losing data
+across a restart, serving different answers to different clients, forging or withholding ACKs,
+closing after commit, malformed frames, delaying one chosen user, and the multi-relay Byzantine cases.
+
 ### PRIV-8: half of it was closed yesterday, by padding, silently
 
 The task said a relay can see who is looking at whose profile. It cannot, and has not since PRIV-1

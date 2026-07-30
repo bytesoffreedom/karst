@@ -166,6 +166,12 @@ pub struct RelayServer {
     clock: Clock,
     noise_private: [u8; 32],
     noise_public: [u8; 32],
+    /// Connections that were accepted AND given a handler thread — i.e. one per Noise handshake.
+    ///
+    /// Exists to make a claim measurable: the client pools sessions (PERF-8), and "pooling saves
+    /// handshakes" is only worth asserting if something counts them. A number the client cannot
+    /// see, so it proves the property from the relay's side rather than from the client's intent.
+    accepted: Arc<std::sync::atomic::AtomicU64>,
     /// Optional WebSocket-over-TLS carrier (§15): when set, each connection is TLS+WS
     /// terminated (`wss`) BEFORE the Noise handshake, so the relay presents a
     /// standards-compliant HTTPS/WSS endpoint. `None` = raw TCP + Noise (the default skeleton path).
@@ -189,6 +195,7 @@ impl RelayServer {
         noise_public: [u8; 32],
     ) -> Self {
         RelayServer {
+            accepted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             relay: Arc::new(RwLock::new(relay)),
             clock,
             noise_private,
@@ -239,7 +246,14 @@ impl RelayServer {
         noise_private: [u8; 32],
         noise_public: [u8; 32],
     ) -> Self {
-        RelayServer { relay, clock, noise_private, noise_public, tls: None }
+        RelayServer {
+            relay,
+            clock,
+            noise_private,
+            noise_public,
+            tls: None,
+            accepted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
     }
 
     /// The relay state this server serves, so a SECOND listener can serve the same one.
@@ -252,12 +266,22 @@ impl RelayServer {
         self.relay.clone()
     }
 
+    /// A handle on the accepted-connection counter — take it BEFORE `serve_listener`, which
+    /// consumes `self`.
+    #[doc(hidden)]
+    pub fn accepted_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.accepted.clone()
+    }
+
     pub fn serve_listener(self, listener: TcpListener) -> io::Result<()> {
         let limiter = ConnLimiter::new(MAX_CONNECTIONS);
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             // At capacity: drop the connection. The FD closes with `stream`.
             let Some(permit) = limiter.try_acquire() else { continue };
+            // Counted here rather than at accept: a connection refused for capacity never reaches
+            // a handshake, so counting it would overstate what the client actually paid for.
+            self.accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let relay = self.relay.clone();
             let clock = self.clock.clone();
             let noise_priv = self.noise_private;

@@ -5,9 +5,10 @@
 //! connections and the side that makes them, sharing one namespace. The listener now lives in the
 //! `relay` crate; nothing here can name a `RelayNode`.
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use admission::capability::Capability;
 use rand::rngs::OsRng;
@@ -49,6 +50,31 @@ const MAX_ACCEPTED_POW_BITS: u32 = 26;
 /// for it to time out is waiting for the common case.
 const RACE_HEAD_START: Duration = Duration::from_millis(250);
 
+/// How many requests we will serve on one pooled session before retiring it ourselves.
+///
+/// **Every pool limit below is DERIVED from the relay's own, and deliberately stricter.** The relay
+/// (`relay::server`) closes a connection after `MAX_REQUESTS_PER_CONN = 4096` requests,
+/// `CONN_TOTAL_DEADLINE = 120s` of wall clock, or `CONN_READ_TIMEOUT = 30s` of silence. Retiring
+/// first means we never LEARN about those limits from a failed request — we simply open a fresh
+/// connection at a moment when nothing is in flight.
+///
+/// The numbers are duplicated rather than imported because `transport` cannot depend on `relay`
+/// (the dependency runs the other way). That is safe in one direction only, and the direction is
+/// the point: if the relay's limits ever SHRINK below ours, a pooled write fails, and a failed
+/// write is retried on a fresh connection (nothing was delivered — see `pooled_round_trip`). So a
+/// constant drift costs a wasted round trip, never a lost or duplicated message.
+///
+/// 1024 against 4096: a whole poll cycle is ~151 requests at 50 contacts, so this is generous for
+/// the case pooling exists to serve, while leaving the relay's own ceiling far away.
+const POOL_MAX_REQUESTS: u32 = 1024;
+/// Retire well before the relay's 120s wall-clock deadline.
+const POOL_MAX_AGE: Duration = Duration::from_secs(90);
+/// Retire well before the relay's 30s read timeout closes an idle session under us.
+const POOL_MAX_IDLE: Duration = Duration::from_secs(20);
+/// Bound on pooled sessions, mirroring `QuicAdapter`'s. A client with many scopes in flight would
+/// otherwise hold one file descriptor per scope indefinitely.
+const POOL_MAX_SESSIONS: usize = 32;
+
 /// Клиентский транспорт поверх Noise-сессии. Один запрос = одно соединение +
 /// один handshake (скелет). Держит Noise-pubkey relay (аутентификация при
 /// handshake) и адаптер транспорта (§15): direct-TCP или SOCKS5-к-внешнему-PT.
@@ -58,6 +84,32 @@ pub struct SocketTransport {
     /// request fails over across them; see `round_trip_sized` for the retry boundary.
     paths: Vec<Path>,
     relay_noise_pub: [u8; 32],
+    /// Live Noise sessions, keyed by isolation scope and route (PERF-8).
+    ///
+    /// `Arc` so CLONES SHARE IT, deliberately: a cloned `SocketTransport` is the same `Relay` —
+    /// the same compartment, the same routes — so a session opened by one clone is legitimately
+    /// reusable by another. What it must never merge is two isolation scopes, and that is the
+    /// key's job rather than a convention (see `pooled_take`).
+    pool: Arc<Mutex<HashMap<PoolKey, Pooled>>>,
+}
+
+/// `(scope, route)` — the ONLY key a pooled session may be found under.
+///
+/// The scope half is what makes pooling safe at all. Requests under different handles must not
+/// share a circuit, and a pool that ignored the scope would put them on one CONNECTION, which is
+/// strictly worse than one circuit: same source address AND the same Noise session. There is
+/// therefore no `Option` here — an unscoped request never reaches the pool (`pooled_take` refuses
+/// it), which is the same "no scope, no pool" rule `QuicAdapter::connect_isolated` already
+/// follows.
+type PoolKey = (String, String);
+
+/// One idle Noise session plus the bookkeeping that decides when to stop trusting it.
+struct Pooled {
+    session: Session<Box<dyn Channel>>,
+    /// Requests already served on it, against [`POOL_MAX_REQUESTS`].
+    requests: u32,
+    opened: Instant,
+    last_used: Instant,
 }
 
 impl SocketTransport {
@@ -79,7 +131,7 @@ impl SocketTransport {
     /// authenticates it regardless of which path carried the bytes). Each request tries
     /// them in order — see `round_trip_sized` for what may and may not be retried.
     pub fn with_paths(paths: Vec<Path>, relay_noise_pub: [u8; 32]) -> Self {
-        SocketTransport { paths, relay_noise_pub }
+        SocketTransport { paths, relay_noise_pub, pool: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     fn round_trip(&self, req: &WireRequest) -> io::Result<WireResponse> {
@@ -168,6 +220,82 @@ impl SocketTransport {
         None
     }
 
+    /// Route half of a [`PoolKey`] — which physical path a session was opened over.
+    fn path_key(path: &Path) -> String {
+        format!("{}|{}", path.adapter.carrier_label(), path.dest)
+    }
+
+    /// Take a live session for this scope+route, or `None`.
+    ///
+    /// **Refuses an unscoped request outright.** That is the whole safety rule, expressed as an
+    /// early return rather than as a comment: without a scope there is nothing to keep two
+    /// unlinkable handles apart, and pooling them would put them on ONE Noise session — worse than
+    /// the shared source address they already have, because it also merges the sequence.
+    ///
+    /// Retires anything past its limits here rather than on insertion, so a session that went stale
+    /// while idle is dropped at the moment we would otherwise have written to it.
+    fn pooled_take(&self, scope: Option<&str>, path: &Path) -> Option<Pooled> {
+        let scope = scope?;
+        let key = (scope.to_string(), Self::path_key(path));
+        let mut pool = self.pool.lock().ok()?;
+        let p = pool.remove(&key)?;
+        let now = Instant::now();
+        let stale = p.requests >= POOL_MAX_REQUESTS
+            || now.duration_since(p.opened) > POOL_MAX_AGE
+            || now.duration_since(p.last_used) > POOL_MAX_IDLE;
+        // Dropping `p` closes the connection — no goodbye frame, and deliberately no keep-alive
+        // anywhere in this module: periodic traffic on an idle connection is a presence signal.
+        if stale {
+            return None;
+        }
+        Some(p)
+    }
+
+    /// Put a session back for the next request in the same scope.
+    fn pooled_put(&self, scope: Option<&str>, path: &Path, p: Pooled) {
+        let Some(scope) = scope else { return };
+        let Ok(mut pool) = self.pool.lock() else { return };
+        if pool.len() >= POOL_MAX_SESSIONS {
+            // Full: drop this one instead of evicting someone else's. Evicting by age would be
+            // tidier, but it would also let a burst of new scopes close sessions a poll cycle is
+            // actively walking — trading a bounded waste for an unbounded one.
+            return;
+        }
+        pool.insert((scope.to_string(), Self::path_key(path)), p);
+    }
+
+    /// One request/response on an already-open session.
+    ///
+    /// **The retry boundary, which pooling must not move.** `round_trip_scoped_sized` may fail over
+    /// to another path only while nothing has been written, because a deposit is not idempotent.
+    /// A pooled session inherits that rule with one refinement:
+    ///
+    /// - the WRITE fails → the bytes never left this machine (the kernel refused a closed socket),
+    ///   so a fresh connection is safe. Returned as `Err(None)`: "nothing happened, try again".
+    /// - the READ fails → the write had already been accepted into the kernel buffer, which is NOT
+    ///   delivery but is also not proof of non-delivery. The relay may have applied the request.
+    ///   Returned as `Err(Some(e))`: an honest failure, never a silent double-send.
+    ///
+    /// That asymmetry is the entire correctness argument for reusing a connection whose peer may
+    /// have closed it while we were not looking.
+    #[allow(clippy::type_complexity)]
+    fn pooled_round_trip(
+        mut p: Pooled,
+        req_bytes: &[u8],
+        req_max: usize,
+        resp_max: usize,
+    ) -> Result<(WireResponse, Pooled), Option<io::Error>> {
+        if let Err(_e) = p.session.write_msg(req_bytes, req_max) {
+            return Err(None); // nothing delivered — the caller may open a fresh connection
+        }
+        let resp_bytes = p.session.read_msg(resp_max).map_err(Some)?;
+        let resp = decode(&resp_bytes)
+            .map_err(|_| Some(io::Error::new(io::ErrorKind::InvalidData, "decode")))?;
+        p.requests = p.requests.saturating_add(1);
+        p.last_used = Instant::now();
+        Ok((resp, p))
+    }
+
     fn round_trip_scoped_sized(
         &self,
         req: &WireRequest,
@@ -211,6 +339,22 @@ impl SocketTransport {
         }
         let mut last_err: Option<io::Error> = None;
         for path in fresh.into_iter().chain(cooling) {
+            // PERF-8: an already-open session for THIS scope on THIS route, if we have one. Tried
+            // before connecting, so the common case — a poll cycle walking many boxes — pays one
+            // handshake instead of one per request. A read failure here is returned rather than
+            // failed over, exactly as for a fresh session past its write.
+            if let Some(p) = self.pooled_take(scope, path) {
+                match Self::pooled_round_trip(p, &req_bytes, req_max, resp_max) {
+                    Ok((resp, p)) => {
+                        path.health.record_success();
+                        self.pooled_put(scope, path, p);
+                        return Ok(resp);
+                    }
+                    Err(Some(e)) => return Err(e),
+                    // Nothing was delivered (the write itself failed): fall through and connect.
+                    Err(None) => {}
+                }
+            }
             // Pre-request phase: connect through the carrier, then Noise on top. A
             // failure of either means nothing was delivered → the next path is safe.
             let session = path
@@ -229,8 +373,17 @@ impl SocketTransport {
             // Committed to this path: the request goes out now, no failover past here.
             session.write_msg(&req_bytes, req_max)?;
             let resp_bytes = session.read_msg(resp_max)?;
-            return decode(&resp_bytes)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"));
+            let resp = decode(&resp_bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decode"))?;
+            // Keep it for the next request in this scope. Unscoped requests are refused by
+            // `pooled_put`, so a public read never leaves a reusable session behind.
+            let at = Instant::now();
+            self.pooled_put(
+                scope,
+                path,
+                Pooled { session, requests: 1, opened: at, last_used: at },
+            );
+            return Ok(resp);
         }
         Err(last_err.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "transport: no paths configured")
@@ -533,3 +686,105 @@ impl Transport for SocketTransport {
     }
 }
 
+
+/// **What the pool may and may not merge** (PERF-8), enforced rather than described.
+///
+/// Reusing a connection is a performance change that can silently become a privacy change: the
+/// difference between "these two requests came from one address" (already true) and "these two
+/// requests rode one Noise session" (a sequence a relay can join for free) is exactly one missing
+/// component in a pool key. So the key is pinned here, and so is the absence of a keep-alive.
+#[cfg(test)]
+mod the_pool_merges_only_one_scope {
+    use super::*;
+
+    fn tcp(dest: &str) -> Path {
+        Path::new(Arc::new(DirectTcpAdapter::default()), Dest::parse(dest).expect("addr"))
+    }
+
+    fn transport(paths: Vec<Path>) -> SocketTransport {
+        SocketTransport::with_paths(paths, [7u8; 32])
+    }
+
+    /// **An unscoped request never enters the pool.** Same rule as `QuicAdapter`: no scope, no
+    /// pool, because there is nothing to keep two unlinkable handles apart.
+    ///
+    /// DISCRIMINATING: drop the `let scope = scope?;` early return in `pooled_take` and this goes
+    /// red — an unscoped request would then find, and reuse, whatever session was last left behind.
+    #[test]
+    fn an_unscoped_request_is_refused_by_the_pool() {
+        let t = transport(vec![tcp("127.0.0.1:1")]);
+        let p = &t.paths[0];
+        assert!(t.pooled_take(None, p).is_none(), "an unscoped take must not consult the pool");
+    }
+
+    /// Two scopes on ONE route are two entries, never one.
+    ///
+    /// This is the property the whole change rests on: proxy identities are separated by their
+    /// per-handle scope (see `transport::compartment_and_scope_are_two_axes`), so a pool that keyed
+    /// on route alone would hand one identity the session another identity opened.
+    #[test]
+    fn two_scopes_on_one_route_are_two_keys() {
+        let t = transport(vec![tcp("127.0.0.1:1")]);
+        let p = &t.paths[0];
+        let route = SocketTransport::path_key(p);
+        assert_ne!(
+            ("scope-a".to_string(), route.clone()),
+            ("scope-b".to_string(), route),
+            "the key collapsed to the route: one identity would reuse another's Noise session"
+        );
+    }
+
+    /// And one scope over two ROUTES is also two entries — a session belongs to the carrier and
+    /// destination it was opened over, and handing it to a different path would send bytes down a
+    /// connection the caller did not choose.
+    #[test]
+    fn one_scope_on_two_routes_is_two_keys() {
+        let t = transport(vec![tcp("127.0.0.1:1"), tcp("127.0.0.2:1")]);
+        assert_ne!(
+            SocketTransport::path_key(&t.paths[0]),
+            SocketTransport::path_key(&t.paths[1]),
+            "two distinct routes produced the same pool key"
+        );
+    }
+
+    /// **No keep-alive, anywhere.** A pooled session that goes quiet must simply die; pinging to
+    /// hold it open would turn "this client is configured" into "this client is here right now",
+    /// which is a presence signal we do not send. `quic.rs` pins the same absence for QUIC.
+    ///
+    /// A source scan, because the failure it guards is an ADDITION: someone adds a periodic probe
+    /// to make pooling more effective, and the effectiveness is real while the cost is invisible.
+    /// (The forbidden spellings are assembled from fragments below rather than quoted, so this
+    /// documentation is not itself a match.)
+    #[test]
+    fn nothing_in_this_module_keeps_a_pooled_session_warm() {
+        let src = include_str!("socket.rs");
+        for bad in [
+            concat!("keep", "_alive"),
+            concat!("heart", "beat"),
+            concat!("ping", "_interval"),
+        ] {
+            assert!(
+                !src.contains(bad),
+                "`{bad}` appeared in the dialer. A pooled connection must be allowed to go idle \
+                 and die: periodic traffic to hold it open is a presence signal, and it is bought \
+                 for throughput the poll cycle does not need (the relay's own idle timeout is 30s, \
+                 a cycle is seconds)."
+            );
+        }
+    }
+
+    /// The pool's limits must stay STRICTLY under the relay's, so we retire first and never learn
+    /// about its ceilings from a failed request.
+    /// Mirrors of `relay::server`'s constants — see `POOL_MAX_REQUESTS` on why they are duplicated
+    /// and why the direction of safety makes that acceptable.
+    const RELAY_MAX_REQUESTS: u32 = 4096;
+    const RELAY_TOTAL_DEADLINE: Duration = Duration::from_secs(120);
+    const RELAY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // A COMPILE-TIME check, not a runtime one: these are all constants, so a runtime assert would
+    // be dead weight that clippy is right to flag — and a `const` block fails the BUILD, which is
+    // the stronger place for "we must retire before the relay does".
+    const _: () = assert!(POOL_MAX_REQUESTS < RELAY_MAX_REQUESTS);
+    const _: () = assert!(POOL_MAX_AGE.as_secs() < RELAY_TOTAL_DEADLINE.as_secs());
+    const _: () = assert!(POOL_MAX_IDLE.as_secs() < RELAY_READ_TIMEOUT.as_secs());
+}

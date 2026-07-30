@@ -52,6 +52,51 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PERF-8: one handshake per HANDLE — and a corrected arithmetic
+
+The relay has served many requests on one Noise session since §15/FT4 (`MAX_REQUESTS_PER_CONN =
+4096`). The client never used that: `round_trip_scoped_sized` opened a fresh TCP connection and a
+fresh Noise handshake for every request. Sessions are now pooled on `(scope, route)`, measured from
+the RELAY side rather than inferred — the server counts every connection it hands a thread.
+
+**What it buys, and it is smaller than I first claimed.** A poll cycle walks one drop-box per
+session per epoch, and every box is its own `Handle::Box(peer, epoch)`, hence its own isolation
+scope. So the fetches of a cycle are DISTINCT scopes and the pool cannot merge them — nor should it,
+since each box must ride its own circuit. What collapses is repeated requests under ONE handle: a
+box's fetch and its ACK (the receipt carries the scope forward), and a cookie-refresh retry. That is
+roughly half the requests for boxes that have mail, and none of the fan-out. The lever for the
+fan-out is parallelism (#268), not pooling. A test asserts both halves: five distinct scopes cost
+five connections however often they repeat, while a second request on any one of them is free.
+
+**Two arithmetic corrections to this document's own earlier claims, both mine.** The epoch multiplier
+is 3, not ~7 — `poll_epochs` returns `[e-1, e, e+1]` and the full TTL window is swept on a slow
+schedule, which is what a task had been filed to add. And proxy identities do NOT multiply the
+contact count: a contact is bound to ONE proxy (`contact_proxy`) and sessions live in
+`sessions.p<idx>.dat`, so they are PARTITIONED across proxies, not replicated. 50 contacts over 3
+proxies is ~153 requests (one extra identity-mailbox poll per proxy), not ~453. Both errors ran the
+same way — a multiplier assumed rather than read.
+
+**The pool key is the safety argument, not an optimisation detail.** Pooling on route alone would put
+two isolation scopes on one Noise session, which is strictly worse than the shared source address
+they already have: same address AND a joinable sequence. An unscoped request therefore never reaches
+the pool at all, the same "no scope, no pool" rule `QuicAdapter` follows — and four unscoped public
+reads still open four connections, asserted so "optimise those too" cannot land quietly.
+
+**The retry boundary did not move**, which is the whole correctness argument for reusing a connection
+whose peer may have closed it unobserved: a failed WRITE means the bytes never left this machine, so
+a fresh connection is safe; a failed READ means the write was already accepted into the kernel buffer
+— not delivery, but not proof of non-delivery — so it is returned as an error and never retried,
+because a deposit is not idempotent.
+
+Every pool limit is derived from the relay's own and deliberately stricter (1024 vs 4096 requests,
+90s vs a 120s connection deadline, 20s idle vs a 30s read timeout), checked at COMPILE time. The
+numbers are duplicated because `transport` cannot depend on `relay`; that is safe in one direction
+only, and it is the safe one — if the relay's limits shrink below ours, a pooled write fails and a
+failed write is retried on a fresh connection, so drift costs a round trip rather than a message.
+
+No keep-alive, pinned by a source scan: a pooled session that goes quiet dies, because pinging to
+hold it open converts "this client is configured" into "this client is here right now".
+
 ### PRIV-3: the sealed opener goes post-quantum, and the ceiling moves a second time
 
 The inner handshake was hybrid; the OUTER seal that hides the social edge from the relay was not.

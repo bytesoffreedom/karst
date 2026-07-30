@@ -2959,11 +2959,53 @@ if(TA){
     document.querySelectorAll('.railava').forEach(function(r){
       r.style.cssText='width:34px;height:34px;border-radius:50%;'+AVA(me); r.textContent=''; });
   })();
+
+  // A populated feed and profile for the preview. Empty states are worth their own screenshots,
+  // but they are not what the screen looks like in use.
+  (function(){
+    const now=Math.floor(Date.now()/1000);
+    const A=(n)=>demoAvatar(n);
+    const posts=[
+      {id:'p1',author:'ik-maya',author_name:'Maya Chen',mine:false,ts:now-1500,
+       text:'Relay in Reykjavík has been up eleven days without a restart. Multi-homing did what it said: one operator went down overnight and nothing was lost.',
+       has_image:true,has_avatar:true},
+      {id:'p2',author:'me',author_name:'Alex Kerr',mine:true,ts:now-7200,
+       text:'Wrote up how drop-box addresses rotate, in plain language. If you run a node and it still reads as magic, tell me which part.',
+       has_image:false,has_avatar:true},
+      {id:'p3',author:'ik-jordan',author_name:'Jordan Diaz',mine:false,ts:now-15000,
+       text:'Reminder that “encrypted” and “anonymous” are different words. This one is honest about which it is.',
+       has_image:false,has_avatar:true,expire_at:now+61000},
+      {id:'p4',author:'ik-ops',author_name:'Relay Ops',mine:false,ts:now-88000,
+       text:'Ops note: PoW door raised to 20 bits after a spam burst. Legitimate first contacts take about a second longer; the burst stopped.',
+       has_image:true,has_avatar:true},
+      {id:'p5',author:'ik-taylor',author_name:'Taylor Small',mine:false,ts:now-172000,
+       text:'Ran the test suite on a Pi 5 out of curiosity. Everything green except the two that need a live relay.',
+       has_image:false,has_avatar:true}
+    ];
+    ['ik-maya','me','ik-jordan','ik-ops','ik-taylor'].forEach(function(k,i){
+      _avaCache[k]=A(['Maya Chen','Alex Kerr','Jordan Diaz','Relay Ops','Taylor Small'][i]); });
+    _imgCache['p1']=A('Reykjavik ridge'); _imgCache['p4']=A('Ops burst');
+    try{ renderFeed(posts); }catch(e){}
+
+    // The contact's own timeline in the details panel.
+    const g=document.getElementById('dh-gallery');
+    if(g) g.innerHTML=['Maya one','Maya two','Maya three']
+      .map(function(n){return '<img src="'+A(n)+'" alt="">';}).join('');
+    const bio=document.getElementById('dh-bio');
+    if(bio) bio.textContent='Runs a relay in Reykjavík. Ask me about drop-box rotation.';
+
+    // Let a screenshot open the feed directly: ?v=feed
+  })();
   document.getElementById('btn-signin').onclick=()=>go('app');
   document.getElementById('btn-newacct').onclick=()=>go('create1');
   document.getElementById('btn-create').onclick=()=>go('app');
   document.getElementById('btn-restore').onclick=()=>go('app');
   const q=new URLSearchParams(location.search);if(q.get('t'))document.documentElement.setAttribute('data-theme',q.get('t'));go(q.get('s')||'unlock');
+  // ?v=feed opens the Feed inside the app screen. Done here, synchronously with the rest of
+  // the routing: a deferred click is undone by the router, and a timer loses to a screenshot.
+  // The [data-nav] click handler lives in the backend branch, so in the browser preview it is
+  // never attached — clicking the rail did nothing. Switch the section directly instead.
+  if(q.get('v')==='feed'){try{showSection('feed');}catch(e){}}
 }
 enhanceAllSelects();applyI18n();
 </script></body></html>

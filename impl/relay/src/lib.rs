@@ -39,6 +39,7 @@ compile_error!(
 );
 
 pub mod gossip;
+mod log_hygiene;
 pub mod mailstore;
 pub mod node;
 pub mod quic_server;

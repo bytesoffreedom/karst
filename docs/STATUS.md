@@ -52,6 +52,38 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PRIV-9 / PERF-10: two tasks that were already done, and the one thing worth adding
+
+Both came out of the same analysis file and both had premises about this code that were not true.
+
+**PRIV-9 wanted the relay to stop logging IPs, mailbox addresses and blob ids.** It never logged
+them. All 68 print statements in the `relay` crate live in `bin/relay.rs` and address the OPERATOR —
+banner, configuration in effect, the address and relay-id a client needs. The library modules
+(`server.rs`, `node.rs`, `mailstore.rs`, `gossip.rs`, `quic_server.rs`) contain no logging at all. The
+one `client_addr` that gets printed is the relay's OWN connect address, not a client's.
+
+So the deliverable was not removal but **retention**: `relay/src/log_hygiene.rs` scans the library
+modules and fails if any print or log call appears. This property has no test that reddens when it
+breaks, because breaking it breaks nothing — a line like
+`eprintln!("fetch from {} for {}", client_addr, hex::encode(mailbox))` is what someone writes at 2am
+chasing a delivery bug, it works, it ships, and from then on the relay's disk holds exactly the join a
+seizure wants: source address beside drop-box address. Nothing goes red; a reviewer sees a debug line.
+Verified discriminating by adding that exact line. A second test asserts the operator banner still
+EXISTS, so the first cannot be satisfied by deleting all output and calling it hygiene.
+
+What the guard does not claim, stated in the module: nothing about the operator's own infrastructure —
+a reverse proxy's access log, conntrack, a provider's netflow. Those are outside this binary and a
+client cannot verify them; a relay's policy stays a CLAIM.
+
+**PERF-10 wanted public reads moved off the write lock.** They were already on `read()` — bundle
+lookup, `blob_stat`, node list, policy, blob store. The one read-shaped handler holding `write()` is
+`handle_lookup_discovery`, and it earns it: it consumes single-use invites and prunes expired records,
+so a read signature there would be a lie about what the function does. `RelayServer.relay`'s own doc
+comment said this already — the task could have been closed by reading the line above the field.
+
+**Running total for this sweep: six tasks whose premise had expired**, two of them mine. Rule applied
+since: grep the whole chain before taking a task, not after.
+
 ### PRIV-4: the same message reaches two relays as different bytes
 
 Multi-homing exists so a message still lands when the primary relay is down, and the way it lands is

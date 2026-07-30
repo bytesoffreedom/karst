@@ -23,10 +23,10 @@ use crate::pqxdh::PreKeyBundle;
 use crate::ratchet::RatchetMessage;
 use crate::seal::{Identity, SkeletonSeal};
 
-/// Node-list (discovery plane) bounds. `known_relays` holds operator-curated descriptors
-/// (self + configured peers) in this slice — a bounded set keeps the served list inside one
-/// response frame and caps memory. Peer-to-peer gossip merge (with dial-verification) is a
-/// separate slice; this set is never grown from untrusted input.
+/// Node-list (discovery plane) bounds. `known_relays` holds SIGNED descriptors — a bounded set
+/// keeps memory capped and lets the served page stay inside one response frame. Entries only ever
+/// arrive verified (signature, window, and these bounds), so "bounded" is enforced by refusing an
+/// oversized descriptor, never by trimming one: see `descriptor_within_bounds`.
 pub const MAX_KNOWN_RELAYS: usize = 128;
 /// Cap on dial hints per relay descriptor (avoid a junk descriptor bloating the list).
 pub const MAX_ADDRS_PER_RELAY: usize = 4;
@@ -628,6 +628,22 @@ pub struct SignedDescriptor {
 /// postcard is positional and self-description-free, so re-encoding the decoded struct reproduces
 /// the signed bytes exactly — there is no canonicalisation question to get wrong, and
 /// `a_reencoded_descriptor_still_verifies` pins that property against a future field reordering.
+/// Does this descriptor sit inside the node-list bounds?
+///
+/// A predicate rather than a sanitiser, and that is the whole point once descriptors are signed:
+/// trimming an over-long address list produces a document whose signature no longer verifies, so
+/// a relay that stored the trimmed version would be re-serving something nobody signed. An
+/// oversized descriptor is refused instead, and stays refused until its own signer fixes it.
+///
+/// A descriptor with no dial hint at all fails too — it cannot be dialed, so storing it only
+/// consumes a slot and teaches a client nothing.
+pub fn descriptor_within_bounds(d: &RelayDescriptor) -> bool {
+    let ok = |v: &Vec<String>| {
+        v.len() <= MAX_ADDRS_PER_RELAY && v.iter().all(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN)
+    };
+    !d.addrs.is_empty() && ok(&d.addrs) && ok(&d.quic_addrs)
+}
+
 pub fn descriptor_msg(desc: &NodeDescriptor) -> Vec<u8> {
     let mut m = Vec::with_capacity(256);
     m.extend_from_slice(b"KARST-node-descriptor-v1");

@@ -280,8 +280,8 @@ fn a_client_learns_the_quic_endpoint_a_relay_declares_for_itself() {
         addrs: vec![addr.to_string()],
         quic_addrs: vec![advertised.clone()],
     };
-    node.add_relay(desc.clone());
     node.set_self_descriptor(desc);
+    node.refresh_signed_descriptor(NOW, &noise_priv);
 
     let server = relay::server::RelayServer::with_noise_keypair(
         node,

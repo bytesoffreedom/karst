@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::DiscoveryRecord;
-use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, BlobStatRequest, FetchRequest, JoinRequest, Payload, PublishRequest, RelayDescriptor, RelayPolicy, SignedDescriptor, WireMessage};
+use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, BlobStatRequest, FetchRequest, JoinRequest, Payload, PublishRequest, RelayPolicy, SignedDescriptor, WireMessage};
 use crate::pqxdh::PreKeyBundle;
 
 /// Потолок кадра ЗАПРОСА (client→server) — самый враждебный вход. Полезная нагрузка §7 всё равно
@@ -269,7 +269,12 @@ pub enum WireResponse {
     /// secret inside never crosses the wire in the clear.
     Issued(Capability),
     /// §12 discovery plane: the relays this one knows about (bounded, fits one frame).
-    NodeList(Vec<RelayDescriptor>),
+    ///
+    /// Every entry is a statement its OWN relay signed, not this one's summary of it. A relay
+    /// re-serving a list is then a carrier of other relays' claims rather than a witness to them:
+    /// the recipient checks each signature against the relay-id it already has to pin, so a relay
+    /// in the middle can drop entries or serve stale ones but cannot forge or edit one.
+    NodeList(Vec<SignedDescriptor>),
     /// This relay's advertised policy (operator-declared — see `RelayPolicy`).
     Policy(RelayPolicy),
     /// §12 NODE-1: this relay's signed descriptor. `None` when the relay has no routable address
@@ -329,7 +334,7 @@ impl From<io::Error> for WireError {
 /// It exists because postcard is positional and carries no self-description: without a version,
 /// two builds that disagree about a shape decode each other's bytes into plausible nonsense and
 /// fail somewhere far from the cause. With it, the mismatch names itself at the first frame.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// What actually goes on the wire: a version, a feature word, and the encoded request/response.
 ///

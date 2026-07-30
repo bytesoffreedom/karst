@@ -571,10 +571,20 @@ pub struct RelayNode {
     /// test open). Set live via `set_quota_policy` (admin channel) — changes bite immediately,
     /// existing capabilities included, because it is applied on each request, not just at issuance.
     quota_policy: Option<Quota>,
-    /// Discovery plane: operator-curated relay descriptors (self + configured peers) served
-    /// by `GetNodeList` so clients learn which relays exist. NEVER grown from untrusted gossip
-    /// in this slice (see `add_relay`). Empty by default.
-    known_relays: Vec<RelayDescriptor>,
+    /// Discovery plane: what OTHER relays signed about themselves, served by `GetNodeList`.
+    ///
+    /// Every entry is a `SignedDescriptor` and nothing else can get in — see `add_relay`, which
+    /// verifies before storing. That is what lets a client trust a list it received from a relay
+    /// it does not trust: this node is the carrier of those statements, not their author.
+    known_relays: Vec<SignedDescriptor>,
+    /// Where to TRY — operator configuration (`KARST_RELAY_PEERS`), and deliberately a different
+    /// list from `known_relays`.
+    ///
+    /// Nothing signs a config line, so a hint can never be served: re-serving one would put an
+    /// unsigned, operator-typed address into a list whose entire value is that every entry is
+    /// signed. Hints are dial targets; what gets stored and re-served is the signed descriptor
+    /// fetched from the relay itself on first contact.
+    relay_hints: Vec<RelayDescriptor>,
     /// §12 4c — opt-in discovery directory: `discovery_pseudonym(discovery_pub) → DiscoveryRecord`.
     /// The pseudonym is the hash of a RANDOM, per-user discovery key that is decoupled from the IK
     /// — so it is unguessable (no dictionary attack), rotatable (a new keypair mints a new code and
@@ -624,6 +634,7 @@ impl RelayNode {
             pow_issue: None,
             quota_policy: None,
             known_relays: Vec::new(),
+            relay_hints: Vec::new(),
             discovery: HashMap::new(),
             self_descriptor: None,
             signed_self: None,
@@ -920,53 +931,67 @@ impl RelayNode {
     /// gossip: re-serving a peer-heard address without dialing it first would let any relay
     /// aim every client at a victim IP (reflection). That merge, with dial-verification + rate
     /// limits, is a separate slice. Dedups by relay-id (unions addr hints), bounded.
-    pub fn add_relay(&mut self, mut d: RelayDescriptor) {
+    pub fn add_relay(&mut self, s: SignedDescriptor, now: u64) -> bool {
+        // The bounds are a REJECTION test now, where they used to be a fixup. Truncating an
+        // over-long address list would leave a document whose signature no longer verifies, and
+        // re-serving that is worse than serving nothing: it is this relay putting its carriage
+        // behind a statement the signer never made. A descriptor that violates the bounds is the
+        // signer's mistake to fix, and until they do it is simply not stored.
+        if !descriptor_within_bounds(&s.desc.relay) {
+            return false;
+        }
+        // Signature, expiry and window are checked HERE rather than trusted from the caller, so
+        // the invariant "everything in `known_relays` is verifiably signed" holds no matter which
+        // path reached this function — gossip, the bin's self-seed, or a test.
+        if s.verified(now).is_none() {
+            return false;
+        }
+        let id = s.desc.relay.id();
+        if let Some(existing) = self.known_relays.iter_mut().find(|e| e.desc.relay.id() == id) {
+            // Merging died with the signature, and that is an improvement rather than a loss.
+            // Unioning addresses across sightings made sense while each sighting was a fragment
+            // of the truth; a signed descriptor is the relay's whole current answer, so the only
+            // sensible question is which answer is newer. Ties keep what we have — a peer replaying
+            // an equally-old statement cannot displace the one we already verified.
+            if s.desc.issued_at > existing.desc.issued_at {
+                *existing = s;
+            }
+            return true;
+        }
+        if self.known_relays.len() < MAX_KNOWN_RELAYS {
+            self.known_relays.push(s);
+            return true;
+        }
+        false
+    }
+
+    /// Record a dial HINT from operator configuration. Never served — see `relay_hints`.
+    pub fn add_relay_hint(&mut self, mut d: RelayDescriptor) {
+        // A hint is not signed, so trimming it is fine: there is no signature to invalidate, and
+        // the bounds exist to stop an unbounded config line becoming an unbounded dial list.
         d.addrs.truncate(MAX_ADDRS_PER_RELAY);
         d.addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
-        // Same bounds for the QUIC hints, for the same reason: attacker-controlled, unsigned,
-        // free-form (QUIC-1).
         d.quic_addrs.truncate(MAX_ADDRS_PER_RELAY);
         d.quic_addrs.retain(|a| !a.is_empty() && a.len() <= MAX_ADDR_LEN);
-        if d.addrs.is_empty() {
-            return; // a descriptor with no dial hint is useless (and would poison the list)
+        if d.addrs.is_empty() || self.relay_hints.len() >= MAX_KNOWN_RELAYS {
+            return;
         }
         let id = d.id();
-        if let Some(existing) = self.known_relays.iter_mut().find(|e| e.id() == id) {
-            for a in d.addrs {
-                if existing.addrs.contains(&a) {
-                    continue;
-                }
-                // Addresses used to be append-only up to the cap, so once four STALE addresses were
-                // stored, a relay that changed address could never be reached again — its new,
-                // working address was silently dropped (A3-13). Evict the oldest instead: entries
-                // are kept newest-last, and only a freshly VERIFIED descriptor reaches this point.
-                if existing.addrs.len() >= MAX_ADDRS_PER_RELAY {
-                    existing.addrs.remove(0);
-                }
-                existing.addrs.push(a);
-            }
-            // The QUIC hints were bounded above but never MERGED, so a relay already in the list
-            // could never learn that it also speaks QUIC — the field would be sanitised and then
-            // dropped, and a gossiped QUIC endpoint would silently go nowhere (QUIC-1 built the
-            // shape; this is the half that carries it). Same eviction rule as `addrs`: newest-last,
-            // oldest out at the cap.
-            for a in d.quic_addrs {
-                if existing.quic_addrs.contains(&a) {
-                    continue;
-                }
-                if existing.quic_addrs.len() >= MAX_ADDRS_PER_RELAY {
-                    existing.quic_addrs.remove(0);
-                }
-                existing.quic_addrs.push(a);
-            }
-        } else if self.known_relays.len() < MAX_KNOWN_RELAYS {
-            self.known_relays.push(d);
+        match self.relay_hints.iter_mut().find(|e| e.id() == id) {
+            Some(existing) => *existing = d,
+            None => self.relay_hints.push(d),
         }
     }
 
-    /// The full known-relay set (self + curated peers + verified-gossiped). For the gossip
-    /// loop, which pulls each peer's list and merges new entries AFTER dial-verification.
-    pub fn known_relays(&self) -> Vec<RelayDescriptor> {
+    /// The operator's dial hints (where to try). Not part of what this relay serves.
+    pub fn relay_hints(&self) -> Vec<RelayDescriptor> {
+        self.relay_hints.clone()
+    }
+
+    /// Every signed descriptor this relay holds about OTHERS. For the gossip loop, which pulls
+    /// each peer's list and stores the entries that verify. Self is not in here — it lives in
+    /// `signed_self`, because it is the one descriptor this node authors rather than carries.
+    pub fn known_relays(&self) -> Vec<SignedDescriptor> {
         self.known_relays.clone()
     }
 
@@ -1082,10 +1107,18 @@ impl RelayNode {
 
     /// The relay descriptors to serve for `GetNodeList`, trimmed to fit one response frame so
     /// the list never overflows the wire ceiling.
-    pub fn node_list(&self) -> Vec<RelayDescriptor> {
+    pub fn node_list(&self, now: u64) -> Vec<SignedDescriptor> {
         let budget = node::wire::MAX_RESPONSE_FRAME - 512; // headroom for enum tag + framing
         let mut out = Vec::new();
         let mut used = 0usize;
+        // Self first, and from `signed_self` rather than from a seeded slot in `known_relays`:
+        // it is the one entry this node signs instead of carries, and a peer that cannot read it
+        // cannot verify us at all. An expired one is omitted rather than served — a lapsed
+        // statement is exactly what the expiry was added to stop propagating.
+        if let Some(s) = self.signed_descriptor(now) {
+            used += postcard::to_stdvec(&s).map(|v| v.len()).unwrap_or(0);
+            out.push(s);
+        }
         let n = self.known_relays.len();
         if n == 0 {
             return out;
@@ -1094,19 +1127,25 @@ impl RelayNode {
         // stopping at it. Always starting from index 0 and breaking on the first oversized
         // descriptor meant the relays at the front propagated on every single round while the tail
         // could never leave this node — a permanent centrality bias toward whoever was learned
-        // first, and no recovery for a relay that changed address (A3-13). Self is seeded at index
-        // 0 and must still be advertised, or a peer cannot verify us, so it is always included.
+        // first, and no recovery for a relay that changed address (A3-13).
+        //
+        // The rotation matters MORE now than it did: a signed descriptor is roughly twice the size
+        // of the bare one it replaced (policy, two timestamps, a 64-byte signature), so a full
+        // table no longer fits in a single page and the list is genuinely paged rather than
+        // complete. Propagation depends on the cursor moving, which `served_page_rotates_so_no_relay_is_stranded` pins.
         // Atomic, not `Cell` (#142): the relay now sits behind an `RwLock`, so a read-only
         // handler like this one may run on several threads at once — `Cell` is not `Sync` and
         // would make the whole `RelayNode` unshareable for reads. Fetch-and-add is the same
         // "rotate the starting point" behaviour with no lock of its own.
         let start = self.gossip_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
         for k in 0..n {
-            let i = if k == 0 { 0 } else { (start + k) % n };
-            if k > 0 && i == 0 {
-                continue; // self already emitted
+            let d = &self.known_relays[(start + k) % n];
+            // Never pass on a lapsed statement. Holding one is fine (it is evidence we once
+            // verified that relay); repeating it to a client is how a stale address outlives the
+            // relay that moved away from it.
+            if d.verified(now).is_none() {
+                continue;
             }
-            let d = &self.known_relays[i];
             let sz = postcard::to_stdvec(d).map(|v| v.len()).unwrap_or(usize::MAX);
             if used + sz > budget {
                 continue; // too big for what is left — try the next one, do not end the page

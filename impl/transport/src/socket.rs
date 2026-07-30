@@ -15,7 +15,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 
 use node::discovery::DiscoveryRecord;
-use node::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, SignedDescriptor, Transport, WireMessage};
+use node::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayPolicy, Response, SignedDescriptor, Transport, WireMessage};
 use karst_crypto::pqxdh::PreKeyBundle;
 use karst_crypto::session::Session;
 use crate::transport::{Channel, Dest, DirectTcpAdapter, Path, TransportAdapter};
@@ -445,7 +445,11 @@ impl SocketTransport {
     /// operator-curated set (self + configured peers); a client uses it to learn of more
     /// relays than it was handed. Each descriptor self-authenticates on dial (its `noise_pub`
     /// is checked in the Noise handshake), so a wrong-key entry fails closed when used.
-    pub fn get_node_list(&self) -> io::Result<Vec<RelayDescriptor>> {
+    /// Entries arrive SIGNED by the relay each one describes, so the relay answering this call is
+    /// a carrier rather than a witness: it may omit or delay an entry, but it cannot write one.
+    /// The caller still has to check each signature — this returns what was received, not what
+    /// was believed.
+    pub fn get_node_list(&self) -> io::Result<Vec<SignedDescriptor>> {
         match self.round_trip(&WireRequest::GetNodeList)? {
             WireResponse::NodeList(v) => Ok(v),
             WireResponse::Rejected(s) => Err(io::Error::other(s)),

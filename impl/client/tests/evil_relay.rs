@@ -56,6 +56,9 @@ enum Evil {
     /// Accept a deposit and throw it away. Undetectable by definition; the test exists to pin what
     /// the client does with its own state when a relay lies about delivery.
     AcceptedButDiscarded,
+    /// Claim a deletion it did not perform, so every fetched message comes back on the next poll.
+    /// The relay cannot force a duplicate onto the USER, only onto the wire.
+    LyingAck,
 }
 
 /// An honest relay with a hostile shell. Wrapping rather than reimplementing is deliberate: an evil
@@ -130,7 +133,8 @@ impl Transport for EvilRelay {
                     Evil::None
                     | Evil::SubstituteBundle
                     | Evil::HideOpk
-                    | Evil::AcceptedButDiscarded => {}
+                    | Evil::AcceptedButDiscarded
+                    | Evil::LyingAck => {}
                 }
                 *self.served.borrow_mut() += seals.len();
                 FetchResponse::Fetched(seals)
@@ -140,6 +144,10 @@ impl Transport for EvilRelay {
     }
 
     fn ack(&self, req: &AckRequest, now: u64) -> AckResponse {
+        if self.mode == Evil::LyingAck {
+            // "Deleted" — without deleting. The mail stays, and the next poll serves it again.
+            return AckResponse::Acked;
+        }
         self.inner.ack(req, now)
     }
     fn publish_bundle(&self, req: &PublishRequest, now: u64) -> PublishResponse {
@@ -405,4 +413,85 @@ fn a_discarded_deposit_leaves_the_sender_coherent() {
         "the session broke on a discarded deposit; a relay could then end a conversation by \
          accepting one message and dropping it"
     );
+}
+
+/// **A relay that never deletes cannot force a duplicate onto the user.**
+///
+/// An ACK says "these are safely mine now, forget them". A relay may answer `Acked` and keep the
+/// mail anyway — nothing can stop it, and the next poll serves the same ciphertext again. What must
+/// not follow is the message appearing twice in the conversation: the ratchet consumed that message
+/// key, so the second copy fails to open. Redelivery costs bandwidth; it does not let a relay write
+/// into a conversation.
+///
+/// The relay's leverage here is bounded from BELOW as well as above, which is why the first poll
+/// must still deliver: a client that defended itself by refusing redelivered ciphertext outright
+/// would break the legitimate case this mechanism exists for — an ACK lost in transit, where the
+/// relay is honest and redelivery is exactly right.
+#[test]
+fn a_relay_that_lies_about_deleting_cannot_deliver_twice() {
+    let (mut alice, mut bob, bob_ik, spy) = pair(Evil::LyingAck);
+    let env = alice.encrypt_next(&bob_ik, b"once only").expect("encrypts");
+    alice.transmit_envelope(&bob_ik, env, NOW);
+
+    assert_eq!(texts(&mut bob), vec![b"once only".to_vec()], "the first poll must deliver");
+    // ACK it — which is the whole point. Without this the mail is merely LEASED, a second poll
+    // serves nothing whatever the relay intends, and the test passes while exercising nothing. The
+    // counter below caught exactly that on the first attempt.
+    bob.ack_all(NOW);
+    let after_first = spy.served();
+
+    // The relay said "deleted" and kept it. Poll again PAST THE LEASE — a fetched message is
+    // leased for `LEASE_SECS`, so an immediate second poll returns nothing whatever the relay
+    // intends, and a test written that way exercises none of this. (Caught by the counter twice:
+    // first because no ACK was sent at all, then because the lease had not expired.)
+    let later = NOW + relay::node::LEASE_SECS + 1;
+    let second: Vec<Vec<u8>> =
+        bob.receive(later).unwrap_or_default().into_iter().flatten().map(|r| r.plaintext).collect();
+    assert!(
+        spy.served() > after_first,
+        "the relay served nothing on the second poll, so it did not actually keep the mail and \
+         this proves nothing"
+    );
+    assert!(
+        second.is_empty(),
+        "a redelivered message was delivered to the user a second time ({second:?}). A relay that \
+         can duplicate a message can put words in a conversation twice, which is editing it."
+    );
+}
+
+/// **A SPLIT VIEW is not detected here, and that is the design — pinned so it stays a decision.**
+///
+/// A relay can serve one bundle to Alice and a different one to everyone else. Nothing in the
+/// handshake catches it: `connect` verifies that a bundle is signed by the identity it CLAIMS, and
+/// refuses one that claims the wrong identity (see the substitution test) — but if the relay
+/// consistently presents identity X to Alice while the real Bob is identity Y, Alice's view is
+/// internally consistent and she is simply talking to X.
+///
+/// What catches that is OUT OF BAND: the safety number over the two identity keys. This test asserts
+/// the mechanism exists and separates the two views, because "compare your safety numbers" is the
+/// entire answer here and an answer nobody can act on is not one.
+///
+/// The alternative — a witness/transparency layer that makes a split view detectable IN band — is
+/// tracked separately (#282/#283 territory). Recording the limit as a test rather than as prose is
+/// the point: prose about a limit drifts, and this one is load-bearing.
+#[test]
+fn a_split_view_is_caught_only_by_the_safety_number() {
+    let (mut alice, _bob, bob_ik) = pair_unconnected(Evil::SubstituteBundle);
+
+    // Alice is refused outright here, because this relay substitutes an identity that does not
+    // match the one she asked for. A relay running a TRUE split view would instead be consistent:
+    // it would answer for `impostor` whenever Alice asks for `impostor`, and Alice would never know
+    // she was pointed at the wrong person in the first place.
+    assert!(alice.connect(&bob_ik, NOW).is_err(), "control: an inconsistent substitution is caught");
+
+    // The out-of-band check, which is what a consistent split view runs into. Different peer =
+    // different number, and that difference is the whole detection mechanism.
+    let real = node::safety::safety_number(&alice.identity(), &bob_ik);
+    let impostor = node::safety::safety_number(&alice.identity(), &[0x77u8; 32]);
+    assert_ne!(
+        real, impostor,
+        "the safety number does not distinguish two peers, so the ONLY defence against a consistent \
+         split view is inert — and an in-band detection layer does not exist yet"
+    );
+    assert!(!real.is_empty(), "a safety number nobody can read is not a defence either");
 }

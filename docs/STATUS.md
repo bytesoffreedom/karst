@@ -104,9 +104,29 @@ the hostile shell hooked the PUBLIC bundle lookup while `connect` uses the admis
 the client was never offered a substituted bundle at all. The defence had worked the whole time; the
 test simply was not aimed at it.
 
-Named and not yet covered, in the file itself: losing data across a restart, serving different
-answers to different clients, forging or withholding ACKs, closing after commit, malformed frames,
-delaying one chosen user, and the multi-relay Byzantine cases.
+**Slice 3** adds two more, one of which is a LIMIT rather than a defence:
+
+- **A relay that lies about deleting cannot deliver twice.** It answers `Acked` and keeps the mail;
+  the next poll serves the same ciphertext, and the ratchet — having consumed that message key —
+  refuses it. Redelivery costs bandwidth and does not let a relay write into a conversation. The
+  first poll must still succeed, deliberately: a client that defended itself by refusing redelivered
+  ciphertext outright would break the legitimate case the mechanism exists for, an ACK lost in
+  transit.
+- **A consistent SPLIT VIEW is not detected in band, and the test says so.** `connect` refuses a
+  bundle claiming an identity other than the one asked for, but a relay that consistently presents
+  identity X whenever you ask for X gives you an internally coherent view of the wrong person. The
+  answer is out of band — the safety number — so the test asserts that mechanism exists and
+  separates the two views, because "compare your safety numbers" being the whole answer means an
+  unusable one is no answer. Recorded as a test rather than prose because prose about a limit
+  drifts, and an in-band detection layer (witness/transparency) does not exist yet.
+
+The lying-ACK test was vacuous TWICE before it worked, both times caught by the served-payload
+counter rather than by reading it: first because nothing acked at all, so the mail was merely leased;
+then because the second poll happened inside `LEASE_SECS`, where a relay returns nothing whatever it
+intends. Five vacuous tests in one file so far, every one of them green on the first run.
+
+Named and not yet covered, in the file itself: losing data across a restart, closing after commit,
+malformed frames, delaying one chosen user, and the multi-relay Byzantine cases.
 
 ### PRIV-8: half of it was closed yesterday, by padding, silently
 

@@ -2990,7 +2990,12 @@ impl Store {
         ] {
             if let Err(e) = std::fs::remove_file(&path) {
                 if e.kind() != io::ErrorKind::NotFound {
-                    eprintln!("warning: could not remove burned proxy file {}: {e}", path.display());
+                    // The PATH is not printed (PRIV-9, client half). It named the vault's location
+                    // and which proxy this was, in a warning nobody asked for — and this vault may
+                    // be a hidden account, whose whole property is that its existence is not
+                    // evidenced anywhere. A stale file left behind is worth saying; where it lives
+                    // is not.
+                    eprintln!("warning: a burned proxy's file could not be removed: {e}");
                 }
             }
         }

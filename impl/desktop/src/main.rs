@@ -1985,11 +1985,16 @@ fn migrate_channel(app: State<App>, old_index: u32, contacts: Vec<String>, new_l
                 Ok(true) => {
                     let _ = store.set_contact_proxy(peer, new_e.index);
                 }
+                // The contact's identity key is NOT printed (PRIV-9, client half). It named which
+                // contact this was, in plaintext, in whatever collects this process's stderr — a
+                // crash report, a journal, a shared machine. That is a device-to-contact link
+                // written down for free, and it is worth less than nothing here: the operator of
+                // this app already knows which migration they started.
                 Ok(false) => eprintln!(
-                    "warning: channel migration to {hex_ik} is queued, not yet delivered — \
-                     not re-tagging until it reaches the relay"
+                    "warning: a channel migration is queued, not yet delivered — not re-tagging \
+                     until it reaches the relay"
                 ),
-                Err(e) => eprintln!("warning: channel migration to {hex_ik} failed: {e}"),
+                Err(e) => eprintln!("warning: a channel migration failed: {e}"),
             }
         }
     }

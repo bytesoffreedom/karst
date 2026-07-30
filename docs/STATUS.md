@@ -3790,3 +3790,73 @@ Four smaller conclusions the discussion reached that belong in the record:
   nothing to sustain**. Decoys would only additionally muddy A's *inbound* set, which is the
   inherent price of A being findable and which a burner does not remove either. So the
   adopted mechanism is the burner; decoys are not needed and not planned.
+
+### PRIV-9, client half: the rule the relay could not use
+
+The relay's half of PRIV-9 is a blanket ban — no output at all on the request path — and it works
+there because a relay has nobody to talk to. Applying the same rule to the client would be nonsense:
+it prints on purpose, 57 diagnostics across `client`, `client-core`, `transport` and `desktop`,
+because a person is watching and route failures, unreadable state and refused migrations all need
+saying out loud.
+
+So the client's guard (`client/tests/client_log_hygiene.rs`) draws the line at **who asked**:
+
+- **Answers to a typed command are the product.** `karst id` prints an identity key because printing
+  it IS the command; `karst init` prints the recovery phrase because an account you cannot write down
+  is not an account. Suppressing those protects nobody and breaks the tool. `client/src/bin/` is
+  exempt for exactly that reason — the same exemption, on the same grounds, as the relay's operator
+  banner.
+- **Diagnostics nobody asked for are the leak.** Nothing requested them, so their content is whatever
+  was handy while debugging, and they land wherever this process's stderr goes: a journal, a crash
+  report, scrollback, a support bundle pasted to a stranger.
+
+**Two real findings, both in warnings nobody asked for.**
+
+1. *A contact.* A failed channel migration printed the peer's identity key in hex — a
+   device-to-contact link written down for free, which bought nothing even when it worked, because
+   whoever read the warning already knew which contact they had been migrating.
+2. *The vault.* A failed cleanup printed the full path of a burned proxy's file. That names the
+   store's location and which proxy it was; and this store may be a **hidden account**, whose entire
+   property is that nothing evidences its existence. A warning naming its directory evidences it to
+   anyone reading the log — no cryptography involved, deniability simply gone.
+
+Both now say what failed and not who or where it was about. The second is why `display()` is on the
+forbidden list rather than the claim being left to the prose: an earlier draft of this section
+asserted the guard covered "a vault path" while nothing path-shaped was actually checked.
+
+Also banned outright, everywhere including the CLI: `dbg!`, `log::`, `tracing::`. `dbg!` is the
+canonical 2am artifact and is worse than a stray print because it emits the expression's SOURCE TEXT
+beside the value — `dbg!(hex_ik)` labels the leak for the reader. None of the three appears in these
+crates today, which is exactly why stating the ban now is free.
+
+**Two defects in the guard itself, found by running it rather than by reading it.**
+
+1. *Prose read as values.* The first version matched identifier names anywhere in a print, so a help
+   line containing the word "phrase" was a violation. It now separates the format string from the
+   arguments and only flags a forbidden name when it is actually interpolated — `{hex_ik}`, or a
+   `hex::encode(` in the argument list. Without that fix the only way to green was an allow-list of
+   lines, which is how a guard becomes decoration.
+2. *The scan counted every call up to four times*, because `println!(` is a substring of `eprintln!(`
+   and `print!(` of both. Harmless for the ban, but it quadrupled the companion floor test — the one
+   asserting the scan still SEES this code's output would have accepted five diagnostics while
+   claiming to demand twenty. Now anchored on the shared stem: 57 calls, floor 20.
+
+Verified discriminating by putting the identity key back: red, with file, line and identifier; then
+green again on revert. A third test pins that the CLI still answers `id`/`account`/`show-phrase`, so
+the ban cannot be satisfied by gutting the commands, nor by moving a leaky diagnostic into `bin/` to
+slip past the filter.
+
+A fourth test measures the exemption's blast radius instead of assuming it: `/bin/` matches exactly
+one file today, and the test names it, so a second binary cannot silently inherit a licence granted
+to a CLI on the grounds that a person typed a command and is reading the answer.
+
+**NOT done, and unchanged:** declaring the retention/logging policy to a client BEFORE it connects
+(the remainder of PRIV-9, overlapping NODE-1).
+
+**Stated limits.** The guard is a spelling check, like the domain-separation one — a secret laundered
+through an innocently-named variable passes it. And it does not cover **panic messages**, which is
+the gap its own argument points at: a crash report IS a panic message, and
+`.expect(&format!("no session for {hex_ik}"))` sails past. Extending the rule to `panic!`/`assert!`
+would have to exclude `#[cfg(test)]` modules, where these identifiers appear legitimately by the
+dozen; checked by hand instead — today no panic outside a test module interpolates any forbidden
+name.

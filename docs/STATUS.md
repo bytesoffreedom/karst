@@ -52,6 +52,33 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### QA-3, scoped honestly: domain separation, not re-testing RustCrypto
+
+The task asked for reference vectors covering X25519, ML-KEM, HKDF, AEAD and signatures. Those were
+scoped out on purpose: the primitives come from RustCrypto and dalek, which test themselves against
+the published vectors far more thoroughly than a re-check here would, and re-asserting them produces
+a file that looks like assurance and adds none.
+
+The real exposure is one layer up, and it is the item that task listed last and phrased most loosely:
+the same input in different cryptographic contexts must not yield the same key. This codebase runs
+about thirty separate derivations off a handful of secrets — a session's root key alone feeds the
+ratchet, the drop-box seed, the routing chain, the veil keystream and the loop box — and every one of
+them is kept apart by a string.
+
+**The failure mode is a copied label.** Someone adds a derivation by copying the nearest one and does
+not change the tag. Nothing breaks: both derivations work, both produce keys, the suite stays green,
+and two contexts that were meant to be independent now yield the SAME key from the same input. It is
+invisible in review because the copied line looks exactly like the line above it.
+
+`client/tests/domain_separation.rs` walks the workspace sources, harvests every `b"KARST-…"` /
+`b"karst-…"` literal, and requires each to appear in exactly one file (a label twice in ONE file is a
+derive-and-verify pair, which must agree). Discriminating: give two derivations the same tag and it
+reddens naming both files — verified by copying the routing-contribution tag into the drop-box seed.
+
+A second test refuses a suspiciously small harvest. A scan that quietly finds nothing passes the
+first test forever; a floor well under today's count, plus three anchor labels, catches the case
+where the convention moved and the guard is checking nothing while reporting success.
+
 ### QA-1 slice 1: the untrusted relay is now tested, not argued
 
 Every test in this repository has used an HONEST relay. The design's central sentence — you do not

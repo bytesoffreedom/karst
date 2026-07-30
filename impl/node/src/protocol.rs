@@ -583,10 +583,26 @@ pub struct BlobPutRequest {
     pub count: u32,
     pub data: Vec<u8>,
 }
+/// §15 upload-progress query. Same class as [`BlobGetRequest`] — bearer-by-id, answered out of the
+/// blob store — so it carries the same cookie stage.
+///
+/// It used to be `BlobStat([u8; 32])`: no address, no cookie, no admission. That made it the one
+/// blob endpoint a stranger could hit for free, and the serve loop's own comment already noted a
+/// stranger could "buy the full deadline with one `BlobStat`". The progress it returns was never the
+/// interesting part — knowing the id already grants chunk downloads — so this is about the
+/// unauthenticated endpoint, not about hiding a number (PRIV-7).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct BlobStatRequest {
+    pub client_addr: Vec<u8>,
+    pub carrier_id: Vec<u8>,
+    pub cookie: Option<Cookie>,
+    pub blob_id: [u8; 32],
+}
+
 /// §15 large-file download: fetch one ciphertext chunk. Bearer-by-id (knowing the
 /// 256-bit `blob_id` is the download right — the bytes are ciphertext regardless);
 /// cookie-gated for DoS.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlobGetRequest {
     pub client_addr: Vec<u8>,
     pub carrier_id: Vec<u8>,

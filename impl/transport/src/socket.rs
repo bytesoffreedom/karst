@@ -134,6 +134,18 @@ impl SocketTransport {
         SocketTransport { paths, relay_noise_pub, pool: Arc::new(Mutex::new(HashMap::new())) }
     }
 
+    /// The address a progress query presents to the relay.
+    ///
+    /// A per-call RANDOM value, never the blob id. Using the id would tie every stat of that blob
+    /// together across connections and hand the relay a stable handle for the transfer — the exact
+    /// linkage the download path already avoids by minting a fresh address per chunk fetch. The
+    /// cookie this earns therefore lives exactly as long as the one retry below.
+    fn stat_addr() -> Vec<u8> {
+        let mut a = [0u8; 32];
+        OsRng.fill_bytes(&mut a);
+        a.to_vec()
+    }
+
     fn round_trip(&self, req: &WireRequest) -> io::Result<WireResponse> {
         self.round_trip_sized(req, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME)
     }
@@ -489,13 +501,41 @@ impl SocketTransport {
     }
 
     /// §15: a blob's upload progress `(next, count, complete)` — the watermark a resumable upload
-    /// continues from. `None` = the relay has no such blob yet (start at 0). Public read, no cookie.
+    /// continues from. `None` = the relay has no such blob yet (start at 0).
+    ///
+    /// Cookie-gated since PRIV-7, like every other blob request: the first attempt from an unproven
+    /// address is answered with a challenge and retried ONCE. Two attempts, not a loop — a relay
+    /// that keeps challenging is not going to be talked round, and a loop there is a free way to
+    /// make a client spin.
     pub fn blob_stat(&self, blob_id: [u8; 32]) -> io::Result<Option<(u32, u32, bool)>> {
-        match self.round_trip(&WireRequest::BlobStat(blob_id))? {
-            WireResponse::BlobStat(s) => Ok(s),
-            WireResponse::Rejected(s) => Err(io::Error::other(s)),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on BlobStat")),
+        let mut cookie = None;
+        // ONE address for both attempts. A cookie is bound to `(client_addr, carrier_id)`, so a
+        // fresh address on the retry would present the challenge back under a name it was never
+        // issued for and loop forever — which is exactly what happened the first time this was
+        // written, against a comment that already said the cookie lives as long as the retry.
+        let addr = Self::stat_addr();
+        for _ in 0..2 {
+            let req = node::protocol::BlobStatRequest {
+                client_addr: addr.clone(),
+                carrier_id: b"blob".to_vec(),
+                cookie,
+                blob_id,
+            };
+            match self.round_trip(&WireRequest::BlobStat(req))? {
+                WireResponse::BlobStat(node::wire::BlobStatOutcome::Stat(s)) => return Ok(s),
+                WireResponse::BlobStat(node::wire::BlobStatOutcome::NeedCookie(c)) => {
+                    cookie = Some(c)
+                }
+                WireResponse::Rejected(s) => return Err(io::Error::other(s)),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "protocol: unexpected on BlobStat",
+                    ))
+                }
+            }
         }
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "blob stat: persistent cookie challenge"))
     }
 
     /// §15: download one ciphertext chunk (small request, large response frame).

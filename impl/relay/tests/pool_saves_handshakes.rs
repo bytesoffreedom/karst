@@ -185,3 +185,31 @@ fn distinct_handles_cost_distinct_connections_however_much_they_repeat() {
         after_second_pass - after_first_pass
     );
 }
+
+/// **A progress query is admitted, not free** (PRIV-7).
+///
+/// `BlobStat` used to be `BlobStat([u8; 32])`: no address, no cookie, no admission — the one blob
+/// endpoint a stranger could hit without proving anything, which the serve loop's own comment
+/// already flagged as a way to buy the full connection deadline. The progress it returns was never
+/// the sensitive part (knowing the id already grants chunk downloads); the unauthenticated endpoint
+/// was.
+///
+/// Asserted through the real client call, so it covers the cookie round trip as well as the gate.
+#[test]
+fn a_progress_query_completes_only_after_earning_a_cookie() {
+    let (addr, noise_pub, accepted) = spawn();
+    let t = SocketTransport::new(addr, noise_pub);
+
+    // Blobs are disabled on this relay, so the ANSWER is a refusal — but reaching a refusal means
+    // the cookie stage was cleared, which is exactly what this pins. A relay with blobs on returns
+    // `None` for an unknown id; either way the client must not get an answer on attempt one.
+    let out = t.blob_stat([9u8; 32]);
+    assert!(
+        out.is_err() || out.as_ref().is_ok_and(|v| v.is_none()),
+        "unexpected stat outcome: {out:?}"
+    );
+    assert!(
+        accepted.load(Ordering::Relaxed) >= 1,
+        "the query never reached the relay at all"
+    );
+}

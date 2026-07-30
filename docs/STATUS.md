@@ -52,6 +52,32 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PRIV-7 (partial): the one blob endpoint with no admission now has some
+
+`BlobStat` was `BlobStat([u8; 32])` on the wire: no client address, no cookie, no admission stage.
+Every other blob request — put, get — clears a cookie challenge first. The serve loop's own comment
+already observed that a stranger could "buy the full connection deadline with one `BlobStat`". It now
+carries a `BlobStatRequest` and goes through `admit_blob_stat`, the same cookie stage as a chunk
+download, answered with `BlobStatOutcome::{NeedCookie, Stat}` and retried ONCE by the client.
+
+**The task's framing overstated the leak, and the correction matters more than the fix.** It called
+this a public progress ORACLE. It is not, in two ways: the `blob_id` is 32 random bytes delivered
+inside an E2E message, so it is not enumerable; and knowing that id already grants chunk DOWNLOADS
+(`blob_get` is bearer-by-id too), so progress is strictly less than what the bearer already holds.
+Gating stat while get stays open would have been inconsistent security theatre. What was real is the
+unauthenticated endpoint, and that is what this closes.
+
+The address a stat presents is per-call random, never the blob id — using the id would tie every
+stat of one transfer together across connections, the linkage the download path already avoids by
+minting a fresh address per chunk. It is generated ONCE per call and reused for the retry: a cookie
+is bound to `(client_addr, carrier_id)`, so a fresh address on the retry presents the challenge back
+under a name it was never issued for and loops forever. That is exactly what the first version did —
+against a comment in the same function that already said the cookie lives as long as the retry.
+
+Still open in #262, and the honest remainder: replacing bearer-by-id with a one-time read token for
+the whole blob path. That is the design the source proposed, it must cover `get` and `stat` together,
+and it is a bigger change than this.
+
 ### PRIV-9 / PERF-10: two tasks that were already done, and the one thing worth adding
 
 Both came out of the same analysis file and both had premises about this code that were not true.

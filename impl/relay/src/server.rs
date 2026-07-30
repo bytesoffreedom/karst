@@ -506,13 +506,24 @@ pub(crate) fn serve_channel(
         WireRequest::GetPolicy => {
             WireResponse::Policy(relay.read().expect("relay lock").policy())
         }
-        WireRequest::BlobStat(blob_id) => {
-            // Public read, and it takes the BLOB lock — so it is taken outside the relay lock
-            // too (#142): a stat stuck behind a chunk write must not also be holding up mail.
-            let store = relay.read().expect("relay lock").blob_store();
-            WireResponse::BlobStat(
-                store.and_then(|s| s.lock().expect("blob store mutex").stat(&blob_id)),
-            )
+        WireRequest::BlobStat(req) => {
+            // Admitted like every other blob request now (PRIV-7): a stat used to be the one blob
+            // endpoint with no address, no cookie and no admission — the serve loop's own note
+            // below observed a stranger could buy the full connection deadline with it.
+            //
+            // The BLOB lock is still taken outside the relay lock (#142): a stat stuck behind a
+            // chunk write must not also be holding up everyone's mail.
+            let now = (clock)();
+            match relay.write().expect("relay lock").admit_blob_stat(&req, now) {
+                Ok(store) => WireResponse::BlobStat(node::wire::BlobStatOutcome::Stat(
+                    store.lock().expect("blob store mutex").stat(&req.blob_id),
+                )),
+                Err(BlobResponse::NeedCookie(c)) => {
+                    WireResponse::BlobStat(node::wire::BlobStatOutcome::NeedCookie(c))
+                }
+                Err(BlobResponse::Rejected(s)) => WireResponse::Rejected(s),
+                Err(_) => WireResponse::Rejected("blob stat refused".into()),
+            }
         }
         WireRequest::PublishDiscovery { record, write_sig } => {
             let now = (clock)();

@@ -790,6 +790,24 @@ impl RelayNode {
         self.blobs.clone().ok_or_else(|| BlobResponse::Rejected("blobs disabled".into()))
     }
 
+    /// Admit a progress query. Same cookie stage as `admit_blob_get` — see `BlobStatRequest` on
+    /// why this stopped being the one blob endpoint with no admission at all.
+    pub fn admit_blob_stat(
+        &mut self,
+        req: &node::protocol::BlobStatRequest,
+        now: u64,
+    ) -> Result<Arc<Mutex<node::blobstore::BlobStore>>, BlobResponse> {
+        self.advance_epoch(now);
+        match req.cookie {
+            Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => {}
+            _ => {
+                let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
+                return Err(BlobResponse::NeedCookie(cookie));
+            }
+        }
+        self.blobs.clone().ok_or_else(|| BlobResponse::Rejected("blobs disabled".into()))
+    }
+
     /// The blob store's own handle, for the serve loop's public reads (`BlobStat`) — taken
     /// WITHOUT the relay lock held, so a stat cannot be stuck behind a chunk write while holding
     /// up everyone's mail. `None` = blobs disabled.

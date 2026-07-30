@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::DiscoveryRecord;
-use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, FetchRequest, JoinRequest, Payload, PublishRequest, RelayDescriptor, RelayPolicy, WireMessage};
+use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, BlobStatRequest, FetchRequest, JoinRequest, Payload, PublishRequest, RelayDescriptor, RelayPolicy, WireMessage};
 use crate::pqxdh::PreKeyBundle;
 
 /// Потолок кадра ЗАПРОСА (client→server) — самый враждебный вход. Полезная нагрузка §7 всё равно
@@ -196,7 +196,7 @@ pub enum WireRequest {
     BlobGet(BlobGetRequest),
     /// §15: upload progress of a blob (`next`/`count`/`complete`) — the watermark a resumable
     /// upload continues from. Public read by blob-id, no cookie (like `FetchBundle`).
-    BlobStat([u8; 32]),
+    BlobStat(BlobStatRequest),
     /// §7 slice 4a: ask a PUBLIC relay for its current PoW challenge (bucket + difficulty).
     JoinChallenge,
     /// §7 slice 4a: redeem a solved PoW for a capability (the Public door).
@@ -221,6 +221,16 @@ pub enum WireRequest {
 }
 
 /// Ответ на проводе.
+/// What a progress query yields. `NeedCookie` exists because the query is admitted now (PRIV-7):
+/// the first attempt from an unproven address is answered with a challenge, exactly as a chunk
+/// download is, and the client retries once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlobStatOutcome {
+    NeedCookie(Cookie),
+    /// `(next, count, complete)`; `None` = never seen, or blobs are disabled.
+    Stat(Option<(u32, u32, bool)>),
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum WireResponse {
     NeedCookie(Cookie),
@@ -238,7 +248,7 @@ pub enum WireResponse {
     Blob(BlobResponse),
     /// §15: a blob's upload progress `(next, count, complete)`, or `None` if the relay has no such
     /// blob (a fresh upload starts at `next = 0`).
-    BlobStat(Option<(u32, u32, bool)>),
+    BlobStat(BlobStatOutcome),
     /// §7 slice 4a: the PoW challenge to solve — the relay-declared time `bucket`,
     /// required `difficulty_bits`, and the `relay_id` the work binds to (the relay's
     /// fetch-auth key; the relay verifies against its own, so a solution mined for one

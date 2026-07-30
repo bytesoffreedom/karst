@@ -52,8 +52,10 @@ fn spawn_relay_with_quic() -> (std::net::SocketAddr, client::RelayId) {
             quic_addrs: vec![quic_addr.to_string()],
         };
         let mut n = shared.write().expect("relay lock");
-        n.add_relay(desc.clone());
+        // Self advertises by signing a statement about itself; `known_relays` is what OTHERS
+        // signed, so a copy of our own descriptor has no business in it.
         n.set_self_descriptor(desc);
+        n.refresh_signed_descriptor(NOW, &noise_priv);
     }
 
     thread::spawn(move || {

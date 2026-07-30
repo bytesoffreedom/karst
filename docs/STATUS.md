@@ -3803,6 +3803,40 @@ Four smaller conclusions the discussion reached that belong in the record:
   paragraph was quoted as a live gap for two days. Any FUTURE auto-dial path must reuse the same
   gate.
 
+  **Signed node-list (2026-07-30, NODE-1 slice 2).** The list now carries `SignedDescriptor`s:
+  each entry is a statement its OWN relay signed, so a relay serving a list is a CARRIER of other
+  relays' claims rather than a witness to them. Three consequences, none of them optional:
+
+  - **Merging died, and that is an improvement.** Unioning addresses across sightings produced a
+    document nobody signed. A signed descriptor is the relay's whole current answer, so the rule
+    is newest-`issued_at`-wins, ties keeping what was already verified (an equally-old replay
+    cannot roll a client back to an address the relay has moved off).
+  - **Bounds refuse instead of trimming**, for the same reason: truncating an over-long address
+    list invalidates the signature. `descriptor_within_bounds` is now a predicate, and an
+    oversized descriptor stays refused until its signer fixes it.
+  - **Operator hints and signed entries are different lists.** Nothing signs `KARST_RELAY_PEERS`,
+    so a configured peer is a place to DIAL and is never re-served — one unsigned operator-typed
+    address in the served list would destroy the property for the whole list.
+
+  **The dial stays, and the reason is worth stating**: a signature proves AUTHORSHIP, not
+  reachability or presence. Without the dial, a peer could replay a genuine, correctly-signed
+  descriptor for a relay that has since vanished and we would re-serve it forever. Signing is also
+  unprivileged — anyone can sign "I am at 198.51.100.9" — so the reflection defence is still the
+  dial, exactly as before. What the signature removes is the *editing*: a relay in the middle can
+  omit or delay an entry, never forge or alter one.
+
+  **Client cost, and the remainder of #264.** The policy now rides inside the signed statement, so
+  a client filters on retention/durability BEFORE contacting a relay: what used to be two dials per
+  candidate (verify, then ask its policy) is now dials only for the candidates that survive the
+  free checks — `2k` connections become `m`. That closes #264 **for discovered relays**; it does
+  not close it for the FIRST relay, where a client has only a configured hint and must dial to
+  learn anything at all. Said plainly rather than rounded up.
+
+  The page is now genuinely a rotating WINDOW rather than a whole table: a signed descriptor is
+  roughly twice the size of the bare one it replaced, so a full 128-relay table no longer fits one
+  frame. Nothing becomes unpropagatable (no single entry can exceed the budget), but propagation
+  depends on the cursor moving, which is why the rotation has its own test.
+
 - **The relay does NOT automatically reconstruct your whole graph — a precision that
   corrects an earlier overstatement in this doc.** Post-3b, what a Public node sees cleanly
   is the individual conversation **edge**: one drop-box, deposited by one end, fetched by

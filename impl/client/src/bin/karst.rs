@@ -405,7 +405,7 @@ fn cmd_relays(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--add") {
         let s = store()?;
         println!("discovering + verifying relays (dialing each to confirm)…");
-        let added = client::import_discovered_relays(&s, &r)?;
+        let added = client::import_discovered_relays(&s, &r, wall_clock())?;
         println!(
             "imported {added} new verified relay(s) into this account's multi-homing set{}",
             if added == 0 { " (nothing new to add)" } else { "" }
@@ -418,8 +418,15 @@ fn cmd_relays(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     println!("{} relay(s) known to this one:", list.len());
-    for d in &list {
-        println!("  {}  @ {}", d.relay_id_hex(), d.addrs.join(", "));
+    for s in &list {
+        // The posture is in the signed statement, so it can be shown here without contacting the
+        // relay — which is the same reason the import path can now filter before it dials.
+        let d = &s.desc.relay;
+        let mail = match s.desc.policy.mailbox_durability {
+            node::protocol::MailboxDurability::Durable => "durable mail",
+            node::protocol::MailboxDurability::Volatile => "volatile mail",
+        };
+        println!("  {}  @ {}  [{mail}]", d.relay_id_hex(), d.addrs.join(", "));
     }
     println!("(add --add to verify and multi-home onto these)");
     Ok(())

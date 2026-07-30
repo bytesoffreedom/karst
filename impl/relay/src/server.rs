@@ -500,8 +500,11 @@ pub(crate) fn serve_channel(
             }
         }
         WireRequest::GetNodeList => {
-            // Public read of the discovery plane; no time needed.
-            WireResponse::NodeList(relay.read().expect("relay lock").node_list())
+            // A clock is needed now: every entry carries a validity window, and serving a lapsed
+            // statement is how a relay's stale address outlives the relay itself. Still a READ —
+            // expired entries are skipped in the page, not pruned from storage, so a public read
+            // never takes the write lock.
+            WireResponse::NodeList(relay.read().expect("relay lock").node_list((clock)()))
         }
         WireRequest::GetPolicy => {
             WireResponse::Policy(relay.read().expect("relay lock").policy())

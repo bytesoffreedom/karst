@@ -1182,9 +1182,12 @@ pub fn relay_policy(relay: &Relay) -> Result<node::protocol::RelayPolicy, String
 }
 
 /// §12 discovery — ask a relay which relays it knows about (node-list). Lets a client learn of
-/// more relays than it was handed. Each descriptor self-authenticates on dial (its `noise_pub`
-/// is verified in the Noise handshake), so a bad entry only wastes a connection attempt.
-pub fn discover_relays(relay: &Relay) -> Result<Vec<node::protocol::RelayDescriptor>, String> {
+/// more relays than it was handed.
+///
+/// Entries come back SIGNED by the relay each one describes, so the relay answering can omit or
+/// delay an entry but cannot write one. Verification is the caller's job (`SignedDescriptor::
+/// verified`) — this returns what arrived, not what is believed.
+pub fn discover_relays(relay: &Relay) -> Result<Vec<node::protocol::SignedDescriptor>, String> {
     relay
         .transport()
         .get_node_list()
@@ -1205,14 +1208,18 @@ pub fn discover_relays(relay: &Relay) -> Result<Vec<node::protocol::RelayDescrip
 ///
 /// `Ok(vec![])` is the ordinary answer for a relay that does not offer QUIC, and is not an error.
 pub fn quic_endpoints(relay: &Relay) -> Result<Vec<String>, String> {
-    let list = relay
+    // Its OWN signed descriptor, not its entry in the page it serves: the page is a rotating
+    // window now, so a relay with a full table can legitimately leave itself out of the slice we
+    // happened to receive, and reading "no QUIC" out of that absence would be wrong.
+    let signed = relay
         .transport()
-        .get_node_list()
-        .map_err(|e| format!("node-list fetch failed: {e}"))?;
-    let self_entry = list
-        .iter()
-        .find(|e| e.noise_pub == relay.id.noise_pub && e.fetch_pub == relay.id.fetch_pub);
-    Ok(self_entry.map(|e| e.quic_addrs.clone()).unwrap_or_default())
+        .get_descriptor()
+        .map_err(|e| format!("descriptor fetch failed: {e}"))?;
+    let Some(s) = signed else { return Ok(vec![]) }; // no routable address to advertise
+    if s.desc.relay.noise_pub != relay.id.noise_pub || s.desc.relay.fetch_pub != relay.id.fetch_pub {
+        return Ok(vec![]); // not about the relay we are talking to
+    }
+    Ok(s.desc.relay.quic_addrs.clone())
 }
 
 /// Refresh the cached QUIC endpoints for every relay in `relays`, and report what changed.
@@ -1273,12 +1280,14 @@ fn verified_self_address(
         return None; // never dial into private/loopback space on a peer's say-so (A3-12)
     }
     let dest = Dest::parse(hint).ok()?;
-    let list = SocketTransport::new(dest, d.noise_pub).get_node_list().ok()?;
-    // Noise authenticated the far end as the holder of `d.noise_pub`; among the descriptors IT
-    // serves, its own entry (full relay-id: noise AND fetch key) is the only one it vouches for
-    // with that key, so its addresses are the only ones this exchange can attribute to it.
-    let self_entry = list.iter().find(|e| e.noise_pub == d.noise_pub && e.fetch_pub == d.fetch_pub)?;
-    self_entry.addrs.iter().find(|a| karst_transport::transport::addr_is_dialable(a, allow_private)).cloned()
+    // Noise authenticated the far end as the holder of `d.noise_pub`; ask it for the one
+    // statement it signs about itself. Reading its self-entry out of the page it serves would
+    // work too, but the page rotates, so absence there means nothing.
+    let s = SocketTransport::new(dest, d.noise_pub).get_descriptor().ok()??;
+    if s.desc.relay.noise_pub != d.noise_pub || s.desc.relay.fetch_pub != d.fetch_pub {
+        return None;
+    }
+    s.desc.relay.addrs.iter().find(|a| karst_transport::transport::addr_is_dialable(a, allow_private)).cloned()
 }
 
 /// §12 — discover relays from a known one and IMPORT the verified ones into this account's
@@ -1288,7 +1297,7 @@ fn verified_self_address(
 /// spoof) — and the route that gets stored is the one the relay itself advertises, not the
 /// address the gossiping peer supplied (`verified_self_address`, CRYPTO-23). Dedups against the
 /// primary and existing secondaries. Returns how many new relays were added.
-pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, String> {
+pub fn import_discovered_relays(store: &Store, from: &Relay, now: u64) -> Result<usize, String> {
     let discovered = discover_relays(from)?;
     let mut extras = store.load_extra_relays().map_err(|e| format!("relay list: {e}"))?;
     // The relay we are discovering FROM is this account's primary — dedup against it. Derived
@@ -1320,30 +1329,38 @@ pub fn import_discovered_relays(store: &Store, from: &Relay) -> Result<usize, St
     // AUTO-discovery.
     let allow_private = !karst_transport::transport::addr_is_dialable(&from.addr.to_string(), false);
     let mut added = 0usize;
-    for d in discovered {
+    for s in discovered {
+        // FREE CHECKS FIRST, and that ordering is the point of this slice. A signed descriptor
+        // answers "who said this, when, and what is their posture" from bytes we already hold, so
+        // every candidate that was going to be rejected anyway is rejected before it costs a
+        // connection. What used to be 2 dials per candidate (verify, then ask its policy) is now
+        // dials only for the candidates that survive.
+        let Some(d) = s.verified(now).map(|v| v.relay.clone()) else {
+            continue; // unsigned, forged, expired, or signed for a window we will not accept
+        };
         let id_hex = d.relay_id_hex();
         if known.contains(&id_hex) || d.addrs.is_empty() {
             continue;
         }
-        // VERIFY-BEFORE-ADD: dial and confirm the relay serves its own full relay-id before
-        // trusting it enough to route our mail through it — and take the ROUTE from what it
-        // says about itself, not from the peer that told us about it (CRYPTO-23).
+        // POLICY PREFERENCE, now readable BEFORE connecting: the posture is inside the signed
+        // statement, so a relay whose retention or durability does not match is skipped without
+        // ever being contacted. It is still an operator CLAIM — a signature proves the relay said
+        // it, not that it does it (`verify_durability` is the one knob a client can actually
+        // prove) — but the claim is now accountable and cannot be edited by whoever relayed it.
+        let p = &s.desc.policy;
+        if want_persistence.is_some_and(|want| p.blob_persistence != Some(want)) {
+            continue; // mismatch, disabled, or unknown → skip
+        }
+        if want_mail.is_some_and(|want| p.mailbox_durability != want) {
+            continue; // R2-5: this account wants its queued mail to survive a restart
+        }
+        // VERIFY-BEFORE-ADD: the dial STAYS, and it is not redundant with the signature. A
+        // signature proves authorship; only a dial proves the relay is still there and that the
+        // address we would store actually serves it. Nothing about signing makes a replayed
+        // descriptor for a departed relay less attractive to a hostile peer.
         let Some(addr) = verified_self_address(&d, &d.addrs[0], allow_private) else {
             continue;
         };
-        // POLICY PREFERENCE: skip a verified relay whose advertised policy does not match.
-        // ONE fetch covers both knobs — asking twice would double the dial cost and could even
-        // straddle a policy change.
-        if want_persistence.is_some() || want_mail.is_some() {
-            let Ok(dest) = Dest::parse(&addr) else { continue };
-            let Ok(p) = SocketTransport::new(dest, d.noise_pub).get_policy() else { continue };
-            if want_persistence.is_some_and(|want| p.blob_persistence != Some(want)) {
-                continue; // mismatch, disabled, or unknown → skip
-            }
-            if want_mail.is_some_and(|want| p.mailbox_durability != want) {
-                continue; // R2-5: this account wants its queued mail to survive a restart
-            }
-        }
         extras.push((addr, id_hex.clone()));
         known.insert(id_hex);
         added += 1;

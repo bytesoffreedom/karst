@@ -960,7 +960,9 @@ fn run_relay(addr: String) -> io::Result<()> {
     if is_routable_advertise(&advertise) {
         let self_desc =
             RelayDescriptor { noise_pub, fetch_pub, addrs: vec![advertise.clone()], quic_addrs: Vec::new() };
-        relay.add_relay(self_desc.clone());
+        // Self does NOT go into `known_relays`: that list holds what OTHER relays signed, and
+        // our own entry is served from the signed self-descriptor instead — one authored
+        // statement, re-signed on a cadence, rather than a copy that could drift from it.
         // §12 4c — the directory records "user X is reachable HERE" using this descriptor as
         // the node_hint; only meaningful when we have a routable address to hand out.
         relay.set_self_descriptor(self_desc);
@@ -972,10 +974,13 @@ fn run_relay(addr: String) -> io::Result<()> {
     }
     if let Ok(spec) = std::env::var("KARST_RELAY_PEERS") {
         for d in parse_peers(&spec) {
-            relay.add_relay(d);
+            // A HINT, not an entry: nothing signs a config line, so a configured peer is a place
+            // to dial and never something this relay re-serves. What gets served about that peer
+            // is the descriptor IT signs, fetched on first contact.
+            relay.add_relay_hint(d);
         }
     }
-    let known_relays = relay.node_list().len();
+    let known_relays = relay.node_list(wall_clock()).len();
 
     // relay-id = Noise-pub ‖ fetch-auth-pub (оба узнаются вне канала). СТАБИЛЕН
     // между перезапусками, т.к. ключ персистентен. Клиент подаёт как `--relay-id`.
@@ -1052,7 +1057,6 @@ fn run_relay(addr: String) -> io::Result<()> {
                     let mut n = node.write().expect("relay lock");
                     if let Some(mut d) = n.self_descriptor() {
                         d.quic_addrs = vec![quic_advertise.clone()];
-                        n.add_relay(d.clone());
                         n.set_self_descriptor(d);
                         true
                     } else {
@@ -1131,7 +1135,7 @@ fn run_relay(addr: String) -> io::Result<()> {
         let allow_private = matches!(role, Role::Dev);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(relay::gossip::GOSSIP_INTERVAL_SECS));
-            let added = relay::gossip::gossip_round(&handle, &self_np, allow_private);
+            let added = relay::gossip::gossip_round(&handle, &self_np, allow_private, wall_clock());
             if added > 0 {
                 eprintln!("gossip: verified and learned {added} new relay(s)");
             }

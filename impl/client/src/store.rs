@@ -7102,7 +7102,7 @@ mod at_rest_shape_guard {
 
     /// The pinned digest. Regenerate ONLY together with a `STATE_VERSION` bump: run the test, take
     /// the "actual" value from the failure, and move both in the same commit.
-    const SHAPE_DIGEST: &str = "9c59878ee4c27aab";
+    const SHAPE_DIGEST: &str = "70acb02ab8c8cf67";
 
     fn source(module: &str) -> &'static str {
         match module {

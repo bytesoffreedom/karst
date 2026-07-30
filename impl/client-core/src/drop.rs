@@ -58,35 +58,94 @@ pub const DROP_EPOCH_SECS: u64 = 24 * 3600;
 /// must move with it or mail goes quietly unreachable.
 const TTL_EPOCHS: u64 = node::protocol::MAILBOX_TTL_SECS.div_ceil(DROP_EPOCH_SECS);
 
-/// Take a session's stable drop-box seed from its root key.
+/// Take a session's INITIAL drop-box seed from its root key — generation 0 of the routing chain.
 ///
-/// **NAMED BOUNDARY (A6-3, #208): routing material does NOT heal with the ratchet.** Message keys
-/// get post-compromise security — a DH step on a fresh ephemeral makes an adversary who read the
-/// session state unable to decrypt what follows. The addresses do not: this seed comes from
-/// `root_key`, which is fixed at key agreement and never advances, so anyone who once held the
-/// session state can compute every future epoch's box for this pair and keep watching WHO talks
-/// to whom, and when, forever. Content heals; the metadata trail does not.
+/// **This used to be the whole story, and the narrative here used to explain why it had to be.**
+/// The routing seed did not heal: it came from `root_key`, which is fixed at key agreement, so
+/// anyone who once held the session state could compute every future epoch's box for the pair and
+/// keep watching who talks to whom, forever. Content healed; the metadata trail did not.
 ///
-/// Rotating the seed along the ratchet was designed and deliberately NOT built yet, because the
-/// obvious shape defeats itself. Chaining `seed_{n+1} = KDF(seed_n, dh_out_n)` would give real
-/// metadata PCS — but a hash chain has no self-recovery: one side advancing while the other
-/// misses that step (a dropped final message, a state rollback) puts them on different chains
-/// permanently, where epochs merely need the clock to correct itself. Adding a `root_key`-derived
-/// FALLBACK box that both sides always poll restores recovery and simultaneously hands the
-/// adversary exactly the address the rotation was meant to take away. Choosing between "delivery
-/// can break forever" and "the fix is cosmetic" is a protocol decision, not a refactor, so it is
-/// stated here rather than half-done. See #208.
+/// The block that stood here named two shapes and rejected both, correctly:
 ///
-/// The root key is fixed at key agreement and never advances, which is exactly why the
-/// ratchet's `rk` cannot serve here: `rk` moves on every DH step, and the two sides step
-/// at different times, so they would derive different addresses. Separated by `info`
-/// from every other use of the root key.
+/// 1. A plain hash chain `seed_{n+1} = KDF(seed_n, dh_out_n)` gives real metadata PCS but has no
+///    self-recovery — one side advancing while the other misses that step leaves them on different
+///    chains permanently, where epochs merely need the clock to correct itself.
+/// 2. Adding a `root_key`-derived FALLBACK box that both sides always poll restores recovery and
+///    simultaneously hands the adversary exactly the address the rotation was meant to take away.
+///
+/// **Why a third shape works where those two do not.** The obstacle both run into is derivability:
+/// the recipient must compute the next box BEFORE receiving anything in it. A chain fed by the
+/// sender's fresh DH cannot be derived in advance — the recipient does not hold that key yet — so
+/// the fallback box is the only way back, and the fallback is the leak.
+///
+/// The chain here is fed by [`karst_crypto::ratchet::Session::take_routing_contributions`]. The DH
+/// outputs form ONE sequence that both sides walk in the same order: each step computes two of them
+/// with a one-element overlap, and the initiator's key agreement supplies the first. Nothing in that
+/// sequence is fresh to only one side, so the recipient holds the next element BEFORE the sender
+/// uses it, and needs no fallback box to find the address.
+///
+/// Taking ONE output per step instead of two was the first attempt and it is wrong in a way that
+/// reads as correct: each side then walks only the even or only the odd elements, the sequences are
+/// DISJOINT, and the recipient can never derive the sender's address. It was caught by a test, not
+/// by review — which is why the agreement is pinned in `ratchet` rather than described here.
+///
+/// That leaves a bounded disagreement rather than an unbounded one. A DH step happens only inside
+/// `advance_for_decrypt`, so neither side advances without a successful delivery from the other:
+/// the two can differ by exactly one leg, never more. The recipient therefore polls TWO
+/// generations — the current one and the previous — and destroys the older secret when the window
+/// slides. Not three "for safety": every extra generation kept is another address an adversary who
+/// captured state can still compute, so the window is the bound itself, not a margin around it.
+///
+/// **What still does not heal, stated plainly.** A state rollback (a restore from backup) puts the
+/// two sides further apart than one leg, and routing does not recover from that on its own. This
+/// is not a new failure: a rollback already desynchronises the ratchet's message keys and already
+/// requires the explicit forget/reconnect path. Routing now fails in exactly the case that was
+/// already broken, with the same remedy — which is what the earlier analysis of shape 1
+/// underweighted when it called the desync fatal.
+///
+/// PCS, concretely: state captured at generation `k` yields `k` and `k-1` and stops. Generation
+/// `k+1` needs a contribution derived from a private key generated after the capture.
+///
+/// **WHAT IS WIRED TODAY, precisely — this paragraph is the difference between a design and a
+/// claim.** The derivability argument above is verified against `ratchet::dh_ratchet`, and the
+/// mechanism exists: the ratchet produces a contribution per step
+/// ([`karst_crypto::ratchet::Session::take_routing_contribution`]) and [`advance_routing`] folds it.
+/// `peer::SessionState` does NOT yet carry the two generations, so the address a message actually
+/// goes to is still generation 0 — this function's output — and the routing trail still does not
+/// heal in the shipped product. The guard test below therefore still passes, and is expected to go
+/// red in the slice that wires the session layer.
+///
+/// Said here rather than left implicit because the failure mode of a half-landed privacy change is
+/// a file that reads as though the property holds. It does not hold yet.
+///
+/// Separated by `info` from every other use of the root key.
 pub fn drop_seed(root_key: &[u8; 32]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, root_key);
     let mut out = [0u8; 32];
     hk.expand(b"karst-dropbox-seed-v1", &mut out).expect("32 is a valid HKDF length");
     out
 }
+
+/// Advance the routing chain by one generation (PRIV-2).
+///
+/// `contrib` comes from [`karst_crypto::ratchet::Session::take_routing_contribution`] and must be
+/// folded exactly once per DH step. Chained rather than replaced so a generation cannot be
+/// reconstructed from the contribution alone: an adversary who learns one step's contribution
+/// without the previous secret still cannot name the box.
+pub fn advance_routing(seed: &[u8; 32], contrib: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(seed), contrib);
+    let mut out = [0u8; 32];
+    hk.expand(b"karst-dropbox-seed-gen-v1", &mut out).expect("32 is a valid HKDF length");
+    out
+}
+
+/// How many routing generations a recipient must poll: the current one and the previous one.
+///
+/// **This is a bound, not a margin.** A DH step happens only on a successful decrypt, so neither
+/// side can advance without a delivery from the other, and the two can differ by exactly one leg.
+/// Widening it would not buy robustness — it would keep additional generations derivable by anyone
+/// who captured the session state, which is precisely what PRIV-2 removes.
+pub const ROUTING_WINDOW: usize = 2;
 
 /// Which epoch a timestamp falls in.
 pub fn epoch_of(now: u64) -> u64 {
@@ -231,6 +290,12 @@ mod tests {
 
     /// A6-3 (#208): the routing seed does NOT change when the ratchet heals — pinned, not merely
     /// written down.
+    ///
+    /// STILL TRUE, and expected to become false: the chain primitives landed (see `drop_seed`'s
+    /// note on what is wired), but `peer::SessionState` does not yet carry the two generations, so
+    /// generation 0 is still the address in use. When the session layer is wired this test must be
+    /// REWRITTEN to assert healing — not deleted, because its job is to make whoever does that
+    /// update the claim in the same commit.
     ///
     /// This asserts a LIMIT rather than a fix, which is unusual and deliberate. `docs/STATUS.md`
     /// tells a reader that message keys get post-compromise security while the addresses do not;

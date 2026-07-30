@@ -52,6 +52,44 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PRIV-2, slice 1: the routing chain becomes possible (and the first design was wrong)
+
+`drop_seed` comes from `root_key`, which is fixed at key agreement, so anyone who once held a
+session's state could compute every future epoch's drop-box for that pair forever. Message keys heal;
+the metadata trail did not. `client-core/src/drop.rs` already carried a ~15-line analysis naming two
+shapes and rejecting both — a plain hash chain (no self-recovery) and a chain plus a `root_key`
+fallback box both sides always poll (hands back the very address rotation removes). That analysis was
+right about both.
+
+The obstacle underneath both is DERIVABILITY: the recipient must compute the next box before
+receiving anything in it. A chain fed by the sender's fresh DH cannot be derived in advance, which is
+why the fallback was the only way back, and why the fallback is the leak.
+
+**Slice 1 removes that obstacle.** The DH outputs of a ratchet form ONE sequence both sides walk in
+the same order — each step computes two of them with a one-element overlap, and the initiator's key
+agreement supplies the first. Nothing in it is fresh to only one side, so the recipient holds the next
+element before the sender uses it. `Session::take_routing_contributions` surfaces domain-separated
+contributions (never raw DH), `drop::advance_routing` folds them, and `ROUTING_WINDOW = 2` is sized
+from a proved bound rather than a guess: a DH step happens only inside `advance_for_decrypt`, so
+neither side advances without a delivery from the other.
+
+**My first formulation of this was wrong, and reasoning did not catch it.** Taking ONE output per step
+(the step's first DH) looks correct on paper — it is the value the peer already holds. In fact each
+side then walks only the even or only the odd elements of the sequence: the two are DISJOINT, and the
+recipient can never derive the sender's address. A test comparing the sequences caught it in one run;
+three rounds of careful argument had not. The agreement is now pinned in `ratchet` next to the
+arithmetic, along with the ≤1 divergence that `ROUTING_WINDOW` depends on.
+
+**Not yet true in the shipped product, said in the file itself.** `peer::SessionState` does not carry
+the two generations, so the address still comes from generation 0 and the trail still does not heal.
+The A6-3 guard test therefore still passes and is expected to go red in slice 2 — its job is to force
+whoever wires the session layer to update the claim in the same commit. Slice 2 is the session-layer
+wiring plus a metadata PCS test (capture state at generation k, continue, require generation k+1 to be
+uncomputable).
+
+Also: `SessionSnapshot` gained a field, so `at_rest_shape_guard` demanded the state-version bump and
+named the digest to set — v9 → v10, the mechanical path working as intended rather than remembered.
+
 ## What landed since the last reconcile (2026-07-29, sixth batch)
 
 **QUIC went from written to working.** It had been built and unreachable at the same time: the

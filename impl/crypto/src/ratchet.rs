@@ -141,6 +141,16 @@ pub struct Session {
     /// Counts DH-ratchet steps, so a skipped key can be aged out by protocol progress rather than
     /// by an unauthenticated wall clock (A6-9).
     dh_gen: u64,
+    /// **Routing contribution produced by the last DH step**, waiting to be taken by the session
+    /// layer (PRIV-2). NOT key material for messages — a domain-separated derivative of the step's
+    /// FIRST DH output, which is the one value the peer provably already holds (it computed the
+    /// same number as its own second output, one leg earlier). That asymmetry is the whole reason
+    /// routing can heal at all: a contribution taken from the step's SECOND output would need a
+    /// key the peer has not received yet, so the recipient could never derive the address it is
+    /// supposed to poll.
+    ///
+    /// Deliberately not the raw DH: nothing outside this module should ever hold that.
+    routing_contribs: Vec<[u8; 32]>,
 }
 
 /// Персистентная форма сессии (для возобновления ratchet между процесс-вызовами
@@ -167,6 +177,10 @@ pub struct SessionSnapshot {
     /// без них out-of-order-фикс не переживает `load→process→save` клиента.
     skipped: Vec<SkippedKey>,
     dh_gen: u64,
+    /// Persisted because it is produced on decrypt and consumed by the session layer AFTER the
+    /// durable save: dropping it on restart would silently skip one routing generation, and the
+    /// two sides would then disagree about the address with no error anywhere.
+    routing_contribs: Vec<[u8; 32]>,
 }
 
 impl Session {
@@ -183,6 +197,7 @@ impl Session {
             pn: self.pn,
             skipped: self.skipped.clone(),
             dh_gen: self.dh_gen,
+            routing_contribs: self.routing_contribs.clone(),
         }
     }
 
@@ -201,6 +216,7 @@ impl Session {
             // by field — take the vector out and leave an empty one behind for the drop to scrub.
             skipped: std::mem::take(&mut s.skipped),
             dh_gen: s.dh_gen,
+            routing_contribs: s.routing_contribs.clone(),
         }
     }
 
@@ -209,6 +225,10 @@ impl Session {
         let dhs = Identity::generate();
         let dh_out = dhs.dh(&PublicKey::from(their_ratchet_pub));
         let (rk, cks) = kdf_rk(&root_key, &dh_out);
+        // The FIRST element of the shared sequence. The responder computes the same number as the
+        // first DH of its own first step, so both sides start the routing chain from it — without
+        // this the two sequences would be offset by one element forever and never agree.
+        let first_contrib = vec![routing_contrib(&dh_out)];
         Session {
             dhs,
             dhr: Some(their_ratchet_pub),
@@ -220,6 +240,7 @@ impl Session {
             pn: 0,
             skipped: Vec::new(),
             dh_gen: 0,
+            routing_contribs: first_contrib,
         }
     }
 
@@ -237,6 +258,7 @@ impl Session {
             pn: 0,
             skipped: Vec::new(),
             dh_gen: 0,
+            routing_contribs: Vec::new(),
         }
     }
 
@@ -265,6 +287,25 @@ impl Session {
         self.ns += 1;
         let ciphertext = aead_encrypt(&mk, plaintext, &aad(&header), &header.salt);
         RatchetMessage { header, ciphertext }
+    }
+
+    /// Take the routing contributions produced since the last call, in the order computed (PRIV-2).
+    ///
+    /// A step produces TWO, and the sender's init produces one. That is not an implementation
+    /// detail — it is the reason the two sides agree at all. The DH outputs form ONE sequence
+    /// `v0, v1, v2, …` that both sides walk in the same order, each computing two of them per step
+    /// with a one-element overlap. Folding only ONE output per step was tried first and is wrong in
+    /// a way no amount of reasoning caught: each side then takes only the even or only the odd
+    /// elements, the sequences are DISJOINT, and the recipient can never derive the sender's
+    /// address. A test in this module pins the agreement precisely because that mistake looks
+    /// correct on paper.
+    ///
+    /// Take, not read: exactly one caller may fold it into the routing chain, and folding the same
+    /// contribution twice would advance one side's generation past the other's with nothing to say
+    /// so — the two would then derive different addresses and mail would stop arriving with no
+    /// error anywhere. Consuming it makes the double-fold impossible instead of discouraged.
+    pub fn take_routing_contributions(&mut self) -> Vec<[u8; 32]> {
+        std::mem::take(&mut self.routing_contribs)
     }
 
     /// Расшифровать. ТРАНЗАКЦИОННО: мутируем копию, проверяем AEAD, коммитим
@@ -368,10 +409,28 @@ impl Session {
         self.dhs = dhs_new;
         self.ckr = Some(ckr);
         self.cks = Some(cks);
+        // PRIV-2: hand the session layer a routing contribution derived from `dh1` — the output
+        // the PEER already computed as its own `dh2` one leg earlier. Domain-separated so it can
+        // never collide with a chain or root key, and set here rather than returned so the value
+        // rides the same transactional commit as the step itself: `decrypt` stages a clone, so a
+        // forged message cannot advance routing any more than it can advance the ratchet.
+        self.routing_contribs.push(routing_contrib(&dh1));
+        self.routing_contribs.push(routing_contrib(&dh2));
         self.dh_gen = self.dh_gen.saturating_add(1);
         self.expire_skipped();
         Ok(())
     }
+}
+
+/// Domain-separated routing contribution from ONE DH output (PRIV-2).
+///
+/// Separate from `kdf_rk` so routing material can never be confused with a chain or root key, and
+/// so the raw DH never leaves this module.
+fn routing_contrib(dh_out: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, dh_out);
+    let mut out = [0u8; 32];
+    hk.expand(b"karst-routing-contrib-v1", &mut out).expect("32 is a valid HKDF length");
+    out
 }
 
 /// `KDF_RK`: HKDF-SHA256(salt=rk, ikm=dh) → 64 Б → (new_rk, chain_key).
@@ -718,5 +777,119 @@ mod tests {
         assert_eq!(bob.cks, None, "the sending chain key is gone, not merely blanked");
         assert_eq!(bob.ckr, None, "the receiving chain key is gone, not merely blanked");
         assert!(bob.skipped.is_empty(), "stored skipped message keys must not survive");
+    }
+}
+
+/// **The claim PRIV-2's whole design rests on**, checked rather than argued.
+///
+/// The routing chain can only heal if the recipient can derive the next generation BEFORE receiving
+/// anything in it. That is possible for exactly one reason: a step's FIRST DH output is numerically
+/// the same value the peer computed as its own SECOND output one leg earlier. If that ever stops
+/// being true — someone reorders the two `kdf_rk` calls, or takes the contribution from `dh2` —
+/// the recipient starts polling an address it cannot compute yet, mail stops arriving, and nothing
+/// in the code says why. So it is pinned here, next to the arithmetic that makes it true.
+#[cfg(test)]
+mod routing_contribution_is_derivable_by_both_sides {
+    use super::*;
+
+    /// Both sides produce the SAME contribution sequence, and the recipient produces each element
+    /// no later than the sender needs it.
+    #[test]
+    fn each_step_yields_the_contribution_the_peer_already_produced_one_leg_earlier() {
+        // A real two-sided conversation: only `decrypt` advances a DH step, so the legs alternate.
+        let root = [5u8; 32];
+        let bob_dh = Identity::generate();
+        let mut alice = Session::init_sender(root, bob_dh.public.to_bytes());
+        let mut bob = Session::init_receiver(root, bob_dh);
+
+        let mut alice_contribs = Vec::new();
+        let mut bob_contribs = Vec::new();
+
+        // Six legs, alternating. Each side folds whatever its own step produced.
+        for leg in 0..6 {
+            if leg % 2 == 0 {
+                let m = alice.encrypt(b"from alice");
+                bob.decrypt(&m).expect("delivers");
+                bob_contribs.extend(bob.take_routing_contributions());
+            } else {
+                let m = bob.encrypt(b"from bob");
+                alice.decrypt(&m).expect("delivers");
+                alice_contribs.extend(alice.take_routing_contributions());
+            }
+        }
+
+        assert!(
+            !alice_contribs.is_empty() && !bob_contribs.is_empty(),
+            "no contributions were produced at all — the hook is not firing, so the routing chain \
+             would silently never advance"
+        );
+
+        // THE property, in two halves.
+        //
+        // (1) SAME SEQUENCE, SAME ORDER. The DH outputs form one sequence both sides walk; each
+        //     computes two per step with a one-element overlap, and the sender's init supplies the
+        //     first. Compared as PREFIXES, not with an offset: an offset was the first guess and it
+        //     was wrong — folding one output per step gives each side only the even or only the odd
+        //     elements, so the sequences are disjoint and the recipient can never derive the
+        //     sender's address. That mistake reads as correct on paper, which is why this is a test.
+        let shared = alice_contribs.len().min(bob_contribs.len());
+        assert!(shared >= 4, "not enough legs to compare sequences: {shared}");
+        assert_eq!(
+            alice_contribs[..shared],
+            bob_contribs[..shared],
+            "the two sides are walking DIFFERENT contribution sequences. If they do not agree \
+             element for element, the recipient cannot derive the box the sender writes to and \
+             delivery stops with no error anywhere."
+        );
+
+        // (2) DIVERGENCE OF AT MOST ONE. This is what makes a two-wide polling window a BOUND
+        //     rather than a guess: a DH step happens only inside `advance_for_decrypt`, so neither
+        //     side advances without a successful delivery from the other. If this ever exceeds one,
+        //     `drop::ROUTING_WINDOW` is too narrow and mail goes missing intermittently — the
+        //     worst possible way for this to break.
+        let gap = alice_contribs.len().abs_diff(bob_contribs.len());
+        assert!(
+            gap <= 1,
+            "the two sides drifted {gap} generations apart, not the one leg the design bounds. \
+             drop::ROUTING_WINDOW is sized from this bound."
+        );
+    }
+
+    /// A contribution can be folded once and only once.
+    #[test]
+    fn a_contribution_is_consumed_not_merely_read() {
+        let root = [6u8; 32];
+        let bob_dh = Identity::generate();
+        let mut alice = Session::init_sender(root, bob_dh.public.to_bytes());
+        let mut bob = Session::init_receiver(root, bob_dh);
+        let m = alice.encrypt(b"one");
+        bob.decrypt(&m).expect("delivers");
+        // The first step of a receiver session may or may not ratchet; take twice either way and
+        // require the second take to be empty, because a double fold desynchronises the sides.
+        let first = bob.take_routing_contributions();
+        assert!(
+            bob.take_routing_contributions().is_empty(),
+            "taking twice returned values twice ({} then more) — folding one step's contributions \
+             into two generations puts this side permanently ahead of its peer",
+            first.len()
+        );
+    }
+
+    /// A forged message must not advance routing, for the same reason it must not advance the
+    /// ratchet: `decrypt` stages a clone and commits only on a verified AEAD.
+    #[test]
+    fn a_message_that_fails_to_decrypt_produces_no_contribution() {
+        let root = [7u8; 32];
+        let bob_dh = Identity::generate();
+        let mut alice = Session::init_sender(root, bob_dh.public.to_bytes());
+        let mut bob = Session::init_receiver(root, bob_dh);
+        let mut m = alice.encrypt(b"one");
+        *m.ciphertext.last_mut().expect("non-empty") ^= 0xFF;
+        assert!(bob.decrypt(&m).is_err(), "a tampered message must not decrypt");
+        assert!(
+            bob.take_routing_contributions().is_empty(),
+            "a forged message advanced the routing chain — an attacker could push a recipient's \
+             routing generation past its peer's and cut delivery without holding any key"
+        );
     }
 }

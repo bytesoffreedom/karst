@@ -60,7 +60,7 @@ pub(crate) const MAGIC: &[u8; 4] = b"KRS2";
 /// the version the file surfaces as "secrets unreadable" — which this store deliberately treats as
 /// a loud, wedging error telling the user to delete and re-provision. With it, the failure names
 /// itself: written by an older KARST.
-pub const STATE_VERSION: u16 = 9;
+pub const STATE_VERSION: u16 = 10;
 
 /// The pinned Argon2id cost parameters (see [`MasterKey::derive`]). Owned by KARST, not by the
 /// `argon2` crate's defaults, so a dependency bump cannot silently change key derivation.

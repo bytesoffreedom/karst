@@ -699,7 +699,9 @@ fn cmd_export_chat(args: &[String]) -> Result<(), String> {
     let peer = parse_pubkey(&to_hex)?;
 
     let s = store()?;
-    let records = s.load_history().map_err(|e| format!("reading history: {e}"))?;
+    // Only this peer's records: `format_conversation` filters by peer anyway, so reading the
+    // whole log to throw most of it away was cost with no product.
+    let records = s.load_history_for_peer(&peer).map_err(|e| format!("reading history: {e}"))?;
     let text = client::format_conversation(&records, &peer);
     if text.is_empty() {
         eprintln!("(no stored messages with that peer)");

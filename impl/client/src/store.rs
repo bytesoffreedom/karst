@@ -325,6 +325,54 @@ struct ReceivedFileV0 {
 /// prefix'а из мусорного хвоста → не аллоцируем гигабайты по битой длине).
 const MAX_HISTORY_RECORD: usize = 1 << 20; // 1 MiB — с запасом на любой текст
 
+/// The sealed history index is rounded up to a multiple of this before sealing, so its length
+/// stops tracking how many people you talk to and how much.
+const HISTORY_INDEX_PAGE: usize = 4096;
+
+/// Where each peer's records sit in `history.dat`, so opening one chat costs that chat.
+///
+/// # A cache, not a second source of truth
+///
+/// The log is authoritative and this is derived from it, entirely. `covered_upto` is the byte
+/// offset already consumed, and the index is brought up to date lazily on READ by scanning only
+/// what has been appended since. Nothing in the append path touches it, which is the point: a
+/// message write stays one `fsync` of one file, and there is no window where a crash freezes a
+/// disagreement between index and log. The worst a crash does is leave the index behind, and
+/// being behind is its ordinary state.
+///
+/// Truncation is handled by the same field. `load_history` cuts a torn tail, so the log can get
+/// SHORTER; `covered_upto` past the end of the file means the bytes it described are gone, and
+/// the index is rebuilt from zero rather than patched.
+///
+/// # Why there is no HMAC here, though the plan asked for one
+///
+/// The plan said `HMAC(index_key, peer_ik) → offsets`, to keep identity keys off the disk in the
+/// clear. They are not in the clear either way: this file is sealed with the store key exactly
+/// like the history records, and those records already carry `peer_ik` inside their own sealed
+/// plaintext. An HMAC would add a key-derivation path and protect nothing the AEAD already does
+/// — ceremony that reads as security. It becomes necessary the moment this index is written
+/// unsealed or handed to anything but this store, which is the condition to re-check before
+/// deleting this paragraph.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct HistoryIndex {
+    covered_upto: u64,
+    peers: Vec<([u8; 32], Vec<u64>)>,
+}
+
+/// Decode one history record's plaintext, tolerating the pre-`msg_id` layout.
+///
+/// Shared by the full scan and the index refresh so the two can never disagree about what counts
+/// as a decodable record — a split between them would show up as a chat that is complete in one
+/// view and missing its oldest messages in the other.
+fn decode_stored_history(plain: &[u8]) -> Option<StoredHistory> {
+    match postcard::from_bytes::<StoredHistory>(plain) {
+        Ok(s) => Some(s),
+        Err(_) => postcard::from_bytes::<HistoryRecord>(plain)
+            .ok()
+            .map(|rec| StoredHistory { rec, msg_id: [0u8; 32] }),
+    }
+}
+
 /// How many recent incoming `msg_id`s the dedup ring keeps. Must be >= the window any caller
 /// asks `recent_incoming_ids` for (`client::HISTORY_DEDUP_WINDOW`), or the answer would silently
 /// be short and a duplicate would slip through. 2048 leaves a factor of two of headroom.
@@ -3730,6 +3778,10 @@ impl Store {
         self.dir.join("history.dat")
     }
 
+    fn history_index_path(&self) -> PathBuf {
+        self.dir.join("history_index.dat")
+    }
+
     fn history_lock_path(&self) -> PathBuf {
         self.dir.join("history.lock")
     }
@@ -3809,13 +3861,7 @@ impl Store {
             // `HistoryRecord` (postcard errors on the missing trailing field, and try-new-first
             // because it would otherwise ignore trailing bytes). Old records get a zero id,
             // which never matches a real `payload_id`, so they simply don't dedup.
-            let stored = match postcard::from_bytes::<StoredHistory>(&plain) {
-                Ok(s) => s,
-                Err(_) => match postcard::from_bytes::<HistoryRecord>(&plain) {
-                    Ok(rec) => StoredHistory { rec, msg_id: [0u8; 32] },
-                    Err(_) => break,
-                },
-            };
+            let Some(stored) = decode_stored_history(&plain) else { break };
             records.push(stored);
             off = end;
             last_good = end;
@@ -3842,6 +3888,168 @@ impl Store {
             OpenOptions::new().write(true).open(&path)?.set_len(last_good as u64)?;
         }
         Ok(records.into_iter().map(|s| s.rec).collect())
+    }
+
+    /// Load only `peer`'s side of the conversation log.
+    ///
+    /// Opening a chat used to read and AEAD-open the WHOLE account history to display one
+    /// conversation, so the cost grew with the AGE of the account rather than with anything the
+    /// user was doing — it got slower by being used. This reads the index, seeks to that peer's
+    /// records, and opens those.
+    ///
+    /// The index is a cache and is repaired here rather than maintained on write; see
+    /// [`HistoryIndex`] for why that is the safer half of the trade.
+    pub fn load_history_for_peer(&self, peer: &[u8; 32]) -> io::Result<Vec<HistoryRecord>> {
+        let _lock = self.lock_history()?;
+        let path = self.history_path();
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let file_len = f.metadata()?.len();
+        let index = self.refresh_history_index(&mut f, file_len)?;
+
+        let mut out = Vec::new();
+        let Some((_, offsets)) = index.peers.iter().find(|(p, _)| p == peer) else {
+            return Ok(out);
+        };
+        for &off in offsets {
+            // A bad offset is a corrupt cache, not corrupt history: skip the entry rather than
+            // failing the read, and the next rebuild will drop it.
+            let Some(rec) = self.read_history_record_at(&mut f, off, file_len)? else { continue };
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Read one record whose 4-byte length prefix starts at `off`. `None` = this offset does not
+    /// point at a well-formed, openable record.
+    fn read_history_record_at(
+        &self,
+        f: &mut std::fs::File,
+        off: u64,
+        file_len: u64,
+    ) -> io::Result<Option<HistoryRecord>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if off.saturating_add(4) > file_len {
+            return Ok(None);
+        }
+        f.seek(SeekFrom::Start(off))?;
+        let mut lenb = [0u8; 4];
+        f.read_exact(&mut lenb)?;
+        let len = u32::from_le_bytes(lenb) as usize;
+        if len == 0 || len > MAX_HISTORY_RECORD || off + 4 + len as u64 > file_len {
+            return Ok(None);
+        }
+        let mut blob = vec![0u8; len];
+        f.read_exact(&mut blob)?;
+        let Ok(plain) = self.key.open(&self.label(&self.history_path()), &blob) else {
+            return Ok(None);
+        };
+        Ok(decode_stored_history(&plain).map(|s| s.rec))
+    }
+
+    /// Bring the index up to date with the log and return it. Cheap in the common case: it scans
+    /// only the bytes appended since the last time, and writes nothing when there are none.
+    fn refresh_history_index(
+        &self,
+        f: &mut std::fs::File,
+        file_len: u64,
+    ) -> io::Result<HistoryIndex> {
+        let mut index = self.load_history_index();
+        if index.covered_upto > file_len {
+            // The log got SHORTER — `load_history` truncated a torn tail — so the bytes this
+            // index describes past the new end are gone.
+            index = HistoryIndex::default();
+        }
+        if index.covered_upto == file_len {
+            return Ok(index);
+        }
+        let progressed = self.extend_history_index(&mut index, f, file_len)?;
+        if !progressed && index.covered_upto > 0 {
+            // Nothing parsed at the mark, yet the file is longer than the mark. That is not an
+            // ordinary torn tail: it means the log was REWRITTEN under us — truncated mid-record
+            // and then appended to, so the mark now sits inside a record that did not exist when
+            // it was taken. Length alone cannot see this, because the regrown file is longer than
+            // the mark again. Everything after the mark would silently never be indexed, so the
+            // index is discarded and rebuilt from zero.
+            //
+            // A genuine torn tail reaches this only if it starts exactly at the mark, in which
+            // case the rebuild costs one full rescan and lands on the same answer — and
+            // `load_history` cuts that tail the next time it runs.
+            index = HistoryIndex::default();
+            self.extend_history_index(&mut index, f, file_len)?;
+        }
+        // Best-effort: a cache that fails to persist costs one rescan, never a message.
+        let _ = self.save_history_index(&index);
+        Ok(index)
+    }
+
+    /// Scan from `index.covered_upto` to the end, recording each record's offset. Returns whether
+    /// it consumed at least one record — the caller uses that to tell "nothing new" from "the
+    /// mark is not on a record boundary any more".
+    fn extend_history_index(
+        &self,
+        index: &mut HistoryIndex,
+        f: &mut std::fs::File,
+        file_len: u64,
+    ) -> io::Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        if index.covered_upto >= file_len {
+            return Ok(false);
+        }
+        f.seek(SeekFrom::Start(index.covered_upto))?;
+        let mut tail = Vec::new();
+        f.read_to_end(&mut tail)?;
+
+        let base = index.covered_upto;
+        let mut off = 0usize;
+        let mut progressed = false;
+        while off + 4 <= tail.len() {
+            let len = u32::from_le_bytes(tail[off..off + 4].try_into().unwrap()) as usize;
+            if len == 0 || len > MAX_HISTORY_RECORD {
+                break;
+            }
+            let start = off + 4;
+            let Some(end) = start.checked_add(len).filter(|e| *e <= tail.len()) else { break };
+            let Ok(plain) = self.key.open(&self.label(&self.history_path()), &tail[start..end])
+            else {
+                break; // a record that will not open is the same boundary `scan_history` stops at
+            };
+            let Some(stored) = decode_stored_history(&plain) else { break };
+            let peer = stored.rec.peer_ik;
+            let at = base + off as u64;
+            match index.peers.iter_mut().find(|(p, _)| *p == peer) {
+                Some((_, offsets)) => offsets.push(at),
+                None => index.peers.push((peer, vec![at])),
+            }
+            off = end;
+            index.covered_upto = base + end as u64;
+            progressed = true;
+        }
+        Ok(progressed)
+    }
+
+    fn load_history_index(&self) -> HistoryIndex {
+        let path = self.history_index_path();
+        let Ok(blob) = std::fs::read(&path) else { return HistoryIndex::default() };
+        let Ok(plain) = self.key.open(&self.label(&path), &blob) else {
+            return HistoryIndex::default(); // corrupt or from another key: rebuild, do not fail
+        };
+        // postcard ignores trailing bytes, which is what makes the padding below free.
+        postcard::from_bytes(&plain).unwrap_or_default()
+    }
+
+    fn save_history_index(&self, index: &HistoryIndex) -> io::Result<()> {
+        let mut plain = postcard::to_stdvec(index).map_err(io_err)?;
+        // Pad to a page multiple before sealing. Without it the FILE SIZE tracks the number of
+        // records per contact closely enough to be a side channel of its own — how many people
+        // you talk to and how much — visible to anyone who can see the directory but not open it.
+        // The contents are sealed; the length is not, so the length is what gets rounded off.
+        let padded = plain.len().next_multiple_of(HISTORY_INDEX_PAGE);
+        plain.resize(padded, 0);
+        self.write_sealed(&self.history_index_path(), &plain)
     }
 
     /// The `payload_id`s of the last `limit` INCOMING history records — the dedup set for the
@@ -7248,6 +7456,237 @@ mod orphan_sweep_tests {
         assert!(
             s.as_proxy(keeper.index).has_own_capability_for(&relay).unwrap(),
             "the sweep took a LIVE channel's credential with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The per-peer history index (#266): a cache that must never disagree with the log.
+#[cfg(test)]
+mod history_index_tests {
+    use super::*;
+
+    /// A per-peer read must return EXACTLY what a full scan would have returned for that peer.
+    ///
+    /// This is the test that matters: the index is a second path to the same bytes, and a second
+    /// path is only safe while it cannot disagree with the first. DISCRIMINATING — drop a record
+    /// from the refresh loop, or key it on the wrong field, and this reds.
+    #[test]
+    fn a_peer_read_returns_exactly_what_a_full_scan_would() {
+        let dir = std::env::temp_dir().join(format!("karst-hidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let (a, b, c) = ([0xA1; 32], [0xB2; 32], [0xC3; 32]);
+        // Interleaved on purpose: the offsets a peer's records sit at are not contiguous, which
+        // is the whole reason an index is needed rather than a range.
+        for i in 0..30u64 {
+            let peer = match i % 3 {
+                0 => a,
+                1 => b,
+                _ => c,
+            };
+            s.append_history(&HistoryRecord {
+                peer_ik: peer,
+                from_me: i % 2 == 0,
+                text: format!("message {i}").into_bytes(),
+                ts: 1_000 + i,
+            })
+            .unwrap();
+        }
+
+        for peer in [a, b, c] {
+            let full: Vec<_> =
+                s.load_history().unwrap().into_iter().filter(|r| r.peer_ik == peer).collect();
+            let indexed = s.load_history_for_peer(&peer).unwrap();
+            assert_eq!(indexed.len(), 10, "each peer has ten records");
+            assert_eq!(indexed, full, "the indexed read disagrees with a full scan");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The index catches up with messages appended after it was last written, and appends never
+    /// touch it. Being behind is its ordinary state, not an error state.
+    #[test]
+    fn the_index_catches_up_with_records_appended_since_it_was_built() {
+        let dir = std::env::temp_dir().join(format!("karst-hidx-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        let peer = [0x5A; 32];
+
+        s.append_history(&HistoryRecord { peer_ik: peer, from_me: true, text: b"one".to_vec(), ts: 1 })
+            .unwrap();
+        assert_eq!(s.load_history_for_peer(&peer).unwrap().len(), 1); // builds the index
+        assert!(s.history_index_path().exists(), "the index was not persisted");
+
+        // Two more, written by the ordinary append path, which knows nothing about the index.
+        for (n, t) in [(b"two".to_vec(), 2u64), (b"three".to_vec(), 3)] {
+            s.append_history(&HistoryRecord { peer_ik: peer, from_me: false, text: n, ts: t })
+                .unwrap();
+        }
+        let got = s.load_history_for_peer(&peer).unwrap();
+        assert_eq!(got.len(), 3, "the index did not pick up records appended after it was built");
+        assert_eq!(got[2].text, b"three".to_vec(), "order must follow the log");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log that got SHORTER, then GREW again, must not be read through stale offsets.
+    ///
+    /// `load_history` truncates a torn tail, so this is a real sequence: crash mid-append, reopen
+    /// (tail cut), keep chatting. The index now claims to have consumed bytes the log no longer
+    /// has, and the records written after that point sit at offsets it never learned — so they
+    /// are invisible to a peer read while present in a full scan.
+    ///
+    /// DISCRIMINATING, and it took two attempts to make it so. The first version only truncated
+    /// and re-read, which passed even with the rebuild removed: `read_history_record_at` bounds-
+    /// checks every offset, so stale ones were simply skipped and the answer came out right by
+    /// accident. Growing the log after the truncation is what separates the two implementations.
+    #[test]
+    fn a_truncated_log_that_grows_again_is_not_read_through_stale_offsets() {
+        let dir = std::env::temp_dir().join(format!("karst-hidx-trunc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        let peer = [0x77; 32];
+
+        for i in 0..6u64 {
+            s.append_history(&HistoryRecord {
+                peer_ik: peer,
+                from_me: false,
+                text: format!("before {i}").into_bytes(),
+                ts: i,
+            })
+            .unwrap();
+        }
+        assert_eq!(s.load_history_for_peer(&peer).unwrap().len(), 6); // index now covers all six
+
+        // The torn tail `load_history` would cut.
+        let path = dir.join("history.dat");
+        let len = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new().write(true).open(&path).unwrap().set_len(len / 2).unwrap();
+
+        // …and the conversation continues, writing into the byte range the stale index still
+        // believes it has already consumed.
+        for i in 0..4u64 {
+            s.append_history(&HistoryRecord {
+                peer_ik: peer,
+                from_me: true,
+                text: format!("after {i}").into_bytes(),
+                ts: 100 + i,
+            })
+            .unwrap();
+        }
+
+        let indexed = s.load_history_for_peer(&peer).unwrap();
+        let full: Vec<_> =
+            s.load_history().unwrap().into_iter().filter(|r| r.peer_ik == peer).collect();
+        assert_eq!(indexed, full, "a peer read must never disagree with the log it derives from");
+        assert!(
+            indexed.iter().any(|r| r.text.starts_with(b"after")),
+            "the records written after the truncation went missing from the peer read"
+        );
+    }
+
+    /// A corrupt or foreign index is rebuilt silently. It is a cache: it may be deleted, damaged
+    /// or written by a key we no longer hold, and none of that may cost a message.
+    #[test]
+    fn a_damaged_index_is_rebuilt_instead_of_failing_the_read() {
+        let dir = std::env::temp_dir().join(format!("karst-hidx-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        let peer = [0x33; 32];
+        for i in 0..4u64 {
+            s.append_history(&HistoryRecord { peer_ik: peer, from_me: true, text: vec![b'x'], ts: i })
+                .unwrap();
+        }
+        assert_eq!(s.load_history_for_peer(&peer).unwrap().len(), 4);
+
+        std::fs::write(s.history_index_path(), b"not a sealed index at all").unwrap();
+        assert_eq!(
+            s.load_history_for_peer(&peer).unwrap().len(),
+            4,
+            "a damaged cache must rebuild, never lose a message"
+        );
+
+        std::fs::remove_file(s.history_index_path()).unwrap();
+        assert_eq!(s.load_history_for_peer(&peer).unwrap().len(), 4, "a missing cache must rebuild");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The index file's LENGTH must not track how many contacts you have or how much you talk to
+    /// them. The contents are sealed; the size is not, so the size is rounded off.
+    ///
+    /// DISCRIMINATING: drop the padding and the file grows with every few records, which is a
+    /// per-contact activity signal readable by anyone who can see the directory listing.
+    #[test]
+    fn the_index_file_size_is_quantised() {
+        let dir = std::env::temp_dir().join(format!("karst-hidx-pad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+
+        let mut sizes = Vec::new();
+        for i in 0..40u64 {
+            s.append_history(&HistoryRecord {
+                peer_ik: [(i % 7) as u8; 32],
+                from_me: false,
+                text: vec![b'y'; 64],
+                ts: i,
+            })
+            .unwrap();
+            let _ = s.load_history_for_peer(&[0u8; 32]).unwrap(); // refresh + persist
+            sizes.push(std::fs::metadata(s.history_index_path()).unwrap().len());
+        }
+        sizes.dedup();
+        assert!(
+            sizes.len() <= 2,
+            "the index size moved {} times over 40 records — it is tracking activity: {sizes:?}",
+            sizes.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cost of opening a chat must stop scaling with the rest of the account.
+    ///
+    /// Counted, not timed: a wall-clock assertion in CI is a flake waiting to happen, and the
+    /// claim being made is about WORK, not milliseconds. One peer holds a handful of messages
+    /// while another holds many; opening the small chat must not pay for the large one, which is
+    /// measured by how many records the read has to AEAD-open.
+    #[test]
+    fn opening_a_small_chat_does_not_pay_for_a_large_one() {
+        let dir = std::env::temp_dir().join(format!("karst-hidx-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::unlock(&dir, b"pw").unwrap();
+        let (chatty, quiet) = ([0x0C; 32], [0x0D; 32]);
+
+        for i in 0..200u64 {
+            s.append_history(&HistoryRecord {
+                peer_ik: chatty,
+                from_me: false,
+                text: vec![b'z'; 32],
+                ts: i,
+            })
+            .unwrap();
+        }
+        for i in 0..3u64 {
+            s.append_history(&HistoryRecord {
+                peer_ik: quiet,
+                from_me: true,
+                text: b"hi".to_vec(),
+                ts: 1_000 + i,
+            })
+            .unwrap();
+        }
+
+        let _ = s.load_history_for_peer(&quiet).unwrap(); // build the index once
+        let index = s.load_history_index();
+        let quiet_offsets = index.peers.iter().find(|(p, _)| *p == quiet).unwrap().1.len();
+        let total: usize = index.peers.iter().map(|(_, o)| o.len()).sum();
+
+        assert_eq!(quiet_offsets, 3, "the quiet chat is three records");
+        assert_eq!(total, 203, "the log really does hold 203 records");
+        assert_eq!(
+            s.load_history_for_peer(&quiet).unwrap().len(),
+            3,
+            "opening the quiet chat must read three records, not 203"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

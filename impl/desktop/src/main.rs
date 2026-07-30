@@ -2899,11 +2899,13 @@ async fn history(app: State<'_, App>, peer_ik: String) -> Result<Vec<Msg>, Strin
             idx.insert((f.ts, f.name.clone()), (f.id, f.size));
         }
     }
+    // This peer's records only. It used to read and AEAD-open the whole account history and
+    // filter — so opening any chat cost the age of the account, and got slower simply by the app
+    // being used.
     Ok(store
-        .load_history()
+        .load_history_for_peer(&peer)
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter(|r| r.peer_ik == peer)
         .map(|r| {
             let text = String::from_utf8_lossy(&r.text).into_owned();
             let (mut file_id, mut size) = (None, None);

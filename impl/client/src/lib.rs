@@ -550,17 +550,10 @@ fn routes_from_env() -> String {
 ///
 /// One syntax, one list: the `@` decides. Empty `routes` = a single path — exactly the
 /// pre-failover behaviour.
-/// An i2p eepsite / relay destination — `<b32>.b32.i2p` or any `*.i2p` name. Resolved only by
-/// an i2p router (via its SOCKS bridge), never by clearnet DNS.
-pub fn is_i2p_host(host: &str) -> bool {
-    host.trim_end_matches('.').to_ascii_lowercase().ends_with(".i2p")
-}
-
-/// A Tor onion service address — `*.onion`. Reachable only through Tor's SOCKS port; it has no
-/// clearnet IP and clearnet DNS never resolves it.
-pub fn is_onion_host(host: &str) -> bool {
-    host.trim_end_matches('.').to_ascii_lowercase().ends_with(".onion")
-}
+/// Hidden-service name tests (`*.i2p`, `*.onion`). One definition, in the transport crate, because
+/// the dialability gate there has to ask the same question and two spellings of "is this an onion"
+/// would drift; re-exported so callers of this crate (the desktop app) keep one import path.
+pub use karst_transport::transport::{is_i2p_host, is_onion_host};
 
 fn build_paths(
     addr: Dest,
@@ -4323,12 +4316,95 @@ mod tests {
 
     #[test]
     fn carrier_labels_are_distinct_and_nonempty() {
-        let all = [Carrier::Direct, Carrier::Socks5, Carrier::Wss, Carrier::WssOverSocks5];
+        // Every carrier, not the four that existed when this was written: the label IS the
+        // privacy indicator (A4-10), so two carriers sharing one would tell a user riding the
+        // mixnet that they are on something else.
+        let all = ALL_CARRIERS;
         let mut labels: Vec<&str> = all.iter().map(|c| c.label()).collect();
         assert!(labels.iter().all(|l| !l.is_empty()));
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), all.len(), "labels must be distinct");
+    }
+
+    /// What a user is buying when they pick a carrier. A fallback is legal only if it has every
+    /// property of the intent — that is the entire no-downgrade rule, stated once.
+    ///
+    /// The `match` has NO wildcard on purpose: adding a `Carrier` variant stops this file
+    /// compiling until someone says what the new carrier protects, which is the point. A rule
+    /// spelled out carrier-by-carrier is only ever as complete as the day it was written.
+    const ALL_CARRIERS: [Carrier; 8] = [
+        Carrier::Direct,
+        Carrier::Socks5,
+        Carrier::Wss,
+        Carrier::WssOverSocks5,
+        Carrier::I2p,
+        Carrier::Tor,
+        Carrier::Mixnet,
+        Carrier::Quic,
+    ];
+
+    const OFF_HOST: u8 = 1; // leaves through an external proxy, not from this host's IP
+    const HTTPS_SHAPE: u8 = 2; // on the wire it is ordinary HTTPS
+    const INSIDE_I2P: u8 = 4; // stays in i2p's own address space
+    const MIX_TIMING: u8 = 8; // mixnet cover: resistance to timing/traffic analysis
+
+    fn properties(c: Carrier) -> u8 {
+        match c {
+            Carrier::Direct => 0,
+            Carrier::Quic => 0,
+            Carrier::Socks5 => OFF_HOST,
+            Carrier::Wss => HTTPS_SHAPE,
+            Carrier::WssOverSocks5 => OFF_HOST | HTTPS_SHAPE,
+            Carrier::I2p => OFF_HOST | INSIDE_I2P,
+            // Tor's property IS "rides the configured external proxy" — which is why wss THROUGH
+            // Tor qualifies while bare wss (same host, its own IP) does not.
+            Carrier::Tor => OFF_HOST,
+            Carrier::Mixnet => OFF_HOST | MIX_TIMING,
+        }
+    }
+
+    #[test]
+    fn no_carrier_may_fall_back_to_one_that_lacks_its_protection() {
+        // The three tests below pin i2p, Tor and the mixnet ONE AT A TIME, which leaves the class
+        // open: a carrier added later gets a fresh arm in `allowed_carriers` and nothing reddens.
+        // So check the rule over every variant instead of over the ones we happened to remember.
+        //
+        // The check is one-directional by design: a fallback must not LOSE a property, but a
+        // carrier that keeps them all still need not be offered (i2p admits only i2p even though
+        // wss-over-SOCKS5 through the i2p bridge would technically qualify — narrower is fine,
+        // wider is the bug).
+        for intent in ALL_CARRIERS {
+            let want = properties(intent);
+            // QUIC is the one carrier that is not in its own switchable set, and deliberately:
+            // a QUIC path is ADDED from an endpoint the relay declared, never picked as a
+            // substitute for a carrier the user asked for. Assert the exception explicitly, both
+            // halves, so it can neither disappear nor quietly spread to a second carrier.
+            if intent == Carrier::Quic {
+                assert!(!allowed_carriers(intent).contains(&Carrier::Quic));
+            } else {
+                assert!(
+                    allowed_carriers(intent).contains(&intent),
+                    "{} must always be allowed to stay itself",
+                    intent.label()
+                );
+            }
+            assert!(
+                !allowed_carriers(intent).contains(&Carrier::Quic),
+                "QUIC is never a substitute for the carrier a {} user chose",
+                intent.label()
+            );
+            for &fb in allowed_carriers(intent) {
+                let got = properties(fb);
+                assert_eq!(
+                    got & want,
+                    want,
+                    "switching a {} user onto {} drops a protection they chose",
+                    intent.label(),
+                    fb.label()
+                );
+            }
+        }
     }
 
     fn spec(carrier: Carrier, port: u16) -> PathSpec {

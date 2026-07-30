@@ -1656,6 +1656,41 @@ overlay**, and our existing allowlist + failover then lets one client carry
 first-class carrier alongside Tor, not "later" — precisely because its failure modes are
 different ones.
 
+**Landed (2026-07-30), and the "one small gap" above is closed.** Routes are `Dest`
+(host-or-IP), `Socks5Adapter` sends ATYP `0x03`, and `Carrier` carries `I2p`, `Tor` and
+`Mixnet` as first-class entries — an `*.i2p` relay through i2pd's SOCKS bridge reports as
+i2p rather than bare SOCKS5, and a Nym mixnet is chosen by an explicit flag because it has
+no address suffix to infer from. The load-bearing part is the allowlist: `allowed_carriers`
+lets `I2p` and `Mixnet` fall back to nothing but themselves, and `Tor` only to `wss over
+SOCKS5` (wss *through* Tor). That rule is now checked over EVERY carrier at once, against
+the properties each one is chosen for, rather than variant by variant — so a carrier added
+later cannot get a permissive fallback set unnoticed
+(`no_carrier_may_fall_back_to_one_that_lacks_its_protection`; the property table is a
+wildcard-free `match`, so a new variant stops the file compiling until someone states what
+it protects).
+
+One real defect fell out of that pass, in the SSRF gate rather than in the carriers:
+`addr_is_dialable` resolved every address through the clearnet resolver before judging it.
+For a hidden-service name that is wrong twice.
+
+- **It could not succeed.** No resolver serves `.onion` or `.i2p`, so the answer was always
+  "undialable" — and `verified_self_descriptor` keeps only dialable addresses and discards a
+  descriptor left with none. A relay reachable only as a hidden service was therefore dropped
+  from gossip entirely: not de-prioritized, deleted, and by the one gate that was supposed to
+  be about private-address safety.
+- **It asked, out loud, where this host was about to go.** Measured here rather than assumed:
+  `getaddrinfo("<b32>.b32.i2p")` takes as long as a real lookup (~274 ms, versus ~0.2 ms for a
+  local answer), i.e. the name went to the configured nameserver. `.onion` did *not* leak on
+  this host — glibc implements RFC 7686 and refuses it without a query (~5 ms) — but that is
+  the C library's courtesy, extended to one suffix on one platform, and not a property KARST
+  was providing.
+
+Hidden-service names are now exempted before the resolver is touched. The SSRF property is
+unaffected, and the reason is what the dial does, not what the name looks like:
+`DirectTcpAdapter::connect` refuses a name outright rather than resolving it, so an exempted
+name can only ever be dialed through a SOCKS bridge the user configured, inside that
+network's address space — there is no path from it to loopback or a LAN address.
+
 ### The deeper consequence: distrusting the network layer RAISES the priority of our own
 
 If the carrier might be hostile, then the work no carrier can do for us matters more, not

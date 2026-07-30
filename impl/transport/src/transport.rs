@@ -471,9 +471,42 @@ impl Path {
 // exactly the same reason the relay asks it of a gossiped one (A3-12: an unchecked address is an
 // SSRF into loopback and private ranges).
 
+/// An i2p eepsite / relay destination — `<b32>.b32.i2p` or any `*.i2p` name. Resolved only by
+/// an i2p router (via its SOCKS bridge), never by clearnet DNS.
+pub fn is_i2p_host(host: &str) -> bool {
+    host.trim_end_matches('.').to_ascii_lowercase().ends_with(".i2p")
+}
+
+/// A Tor onion service address — `*.onion`. Reachable only through Tor's SOCKS port; it has no
+/// clearnet IP and clearnet DNS never resolves it.
+pub fn is_onion_host(host: &str) -> bool {
+    host.trim_end_matches('.').to_ascii_lowercase().ends_with(".onion")
+}
+
+/// A name that belongs to an anonymity network's own namespace, not to the DNS.
+pub fn is_hidden_service_host(host: &str) -> bool {
+    is_i2p_host(host) || is_onion_host(host)
+}
+
 /// Is this `host:port` safe to dial? Resolves the host and requires EVERY resolved address to be
 /// globally routable, so a DNS name pointing at an internal IP is refused too. `allow_private`
 /// exists for loopback tests and local development — production relays run with it off.
+///
+/// A hidden-service name (`*.onion`, `*.i2p`) is exempted BEFORE the resolver is touched, for two
+/// separate reasons:
+///
+///   1. **It must not be resolved here.** These names live in Tor's / i2p's namespace; asking the
+///      clearnet resolver about one tells the local DNS server that this host is about to visit a
+///      specific onion. The rest of the code takes care never to resolve them (`build_paths`
+///      hands the name to the SOCKS bridge unresolved); this gate was the one place that did.
+///   2. **Resolution would fail, and the failure meant "undialable".** So a relay operating behind
+///      a hidden service could not be gossiped at all: `verified_self_descriptor` retains only
+///      dialable addresses and drops a descriptor left with none — silently deleting exactly the
+///      relays whose reachability does not depend on a public IP.
+///
+/// The SSRF property survives: what this gate protects against is a peer naming loopback or a LAN
+/// address, and an onion/i2p name cannot denote one — it is dialed through the bridge, inside the
+/// anonymity network's address space, never through the local network stack.
 pub fn addr_is_dialable(addr: &str, allow_private: bool) -> bool {
     if allow_private {
         return true;
@@ -481,6 +514,9 @@ pub fn addr_is_dialable(addr: &str, allow_private: bool) -> bool {
     let Ok(dest) = Dest::parse(addr) else {
         return false;
     };
+    if is_hidden_service_host(&dest.host) {
+        return true;
+    }
     match (dest.host.as_str(), dest.port).to_socket_addrs() {
         // Unresolvable ⇒ we cannot prove it is safe, so refuse rather than dial blind.
         Ok(mut addrs) => {
@@ -838,5 +874,26 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "the error came from the 200ms timeout, not from blocking"
         );
+    }
+
+    #[test]
+    fn a_hidden_service_address_is_dialable_and_is_never_handed_to_the_resolver() {
+        // DISCRIMINATING: delete the hidden-service exemption and this reds twice over. An onion
+        // can only be judged by asking the clearnet resolver about a name the DNS does not serve
+        // — which both leaks the lookup and comes back "no", so `verified_self_descriptor` drops
+        // every relay whose only address is a hidden service.
+        assert!(addr_is_dialable("expyuzz4wqqyqhjn.onion:9000", false));
+        assert!(addr_is_dialable("hq7f2c.b32.i2p:9000", false));
+        assert!(addr_is_dialable("RELAY.ONION:9000", false), "case-insensitive");
+        assert!(addr_is_dialable("relay.i2p.:9000", false), "a fully-qualified trailing dot");
+        // Suffix, not substring: a clearnet host that merely CONTAINS .onion is not exempt (it is
+        // an ordinary name and must still pass the resolver check).
+        assert!(!is_hidden_service_host("relay.onion.example.com"));
+        assert!(!is_hidden_service_host("i2p.example.com"));
+        // The SSRF gate is otherwise untouched — IP literals only here, so no lookup happens.
+        assert!(!addr_is_dialable("127.0.0.1:9000", false), "loopback still refused");
+        assert!(!addr_is_dialable("10.0.0.1:9000", false), "private space still refused");
+        assert!(!addr_is_dialable("169.254.169.254:80", false), "link-local still refused");
+        assert!(addr_is_dialable("8.8.8.8:9000", false), "a routable address still passes");
     }
 }

@@ -16,6 +16,7 @@ independently unaudited** reference implementation.
 | Independent relay operation         | Implemented            | Relay availability is not guaranteed             |
 | Multi-relay delivery                | Implemented/partial    | Depends on client configuration                  |
 | Encryption at rest                  | Implemented            | Depends on password strength and device state    |
+| Routing through an external anonymity network (Tor / I2P / Nym mixnet) | Implemented/partial | The seam is ours, the anonymity is theirs: KARST dials a SOCKS bridge the user configures and never switches to a carrier that loses a property the user chose. Requires that network to be installed, reachable and trusted; the relay still sees a connection |
 | Sender anonymity                    | Not claimed            | Network and relay metadata may remain visible    |
 | Traffic indistinguishability        | Not claimed            | Statistical classification may be possible       |
 | Universal connectivity              | Not claimed            | Paths and endpoints may become unavailable       |

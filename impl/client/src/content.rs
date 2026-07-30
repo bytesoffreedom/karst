@@ -1598,3 +1598,65 @@ mod every_content_fits_one_envelope {
         );
     }
 }
+
+/// **A control message is not distinguishable from a chat message by size** (PRIV-1 → PRIV-8).
+///
+/// `PostsRequest` is what a client sends when someone opens a profile they do not subscribe to. It
+/// carries no payload at all — a bare enum variant, a couple of bytes — while an ordinary message
+/// carries text. Before every ratchet plaintext was padded to one block, that difference was on the
+/// wire, and a relay watching a conversation could plausibly have picked profile views out of it by
+/// size alone.
+///
+/// Padding removed that as a side effect rather than as a goal, which is exactly the kind of
+/// property that quietly comes back: raise a limit, add a variant that skips the pad path, and the
+/// small control messages are legible again with nothing failing. So it is asserted here, next to
+/// the variants, rather than left to be inferred from `pad`'s own tests.
+///
+/// **What this does NOT close.** The AUTHOR still learns who viewed their profile — they receive the
+/// request and answer it. That is inherent to a live pull and is peer-visible, not relay-visible;
+/// removing it needs published posts to become fetchable batches instead of a per-view question
+/// (#263). And viewing a STRANGER's profile still requires establishing a session first, which is a
+/// first contact and is visible as one.
+#[cfg(test)]
+mod control_messages_are_the_same_size_as_chat {
+    use super::*;
+    use karst_client_core::pad;
+
+    /// DISCRIMINATING: make `pad::pad` return its input unchanged and this reports two very
+    /// different lengths — the state in which a relay can pick control traffic out by size.
+    #[test]
+    fn a_profile_view_and_a_full_length_message_pad_to_one_size() {
+        let view = pad::pad(&encode(&Content::PostsRequest)).expect("fits");
+        let chat =
+            pad::pad(&encode(&Content::Text(vec![b'x'; MAX_TEXT_BYTES]))).expect("fits");
+        assert_eq!(
+            view.len(),
+            chat.len(),
+            "a profile-view request is {} bytes on the wire and a full message is {} — a relay \
+             watching one conversation can then separate 'they opened a profile' from 'they said \
+             something', which is a behavioural read it should not get for free",
+            view.len(),
+            chat.len()
+        );
+    }
+
+    /// The same for every OTHER control variant, so the property covers the class rather than the
+    /// one example that prompted it.
+    #[test]
+    fn every_small_control_message_pads_to_the_same_size() {
+        let sizes: Vec<usize> = [
+            Content::PostsRequest,
+            Content::JoinRequest,
+            Content::Reaction { msg_id: [1u8; 16], emoji: "x".into(), add: true },
+            Content::DeleteForEveryone { ts: 1, text: b"a".to_vec() },
+        ]
+        .into_iter()
+        .map(|c| pad::pad(&encode(&c)).expect("fits").len())
+        .collect();
+        assert!(
+            sizes.windows(2).all(|w| w[0] == w[1]),
+            "control messages have varying wire sizes {sizes:?}; each distinct size is a category \
+             a relay can count"
+        );
+    }
+}

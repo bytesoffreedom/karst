@@ -52,6 +52,33 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PRIV-8: half of it was closed yesterday, by padding, silently
+
+The task said a relay can see who is looking at whose profile. It cannot, and has not since PRIV-1
+landed the day before.
+
+`view_profile` sends `Content::PostsRequest` over the EXISTING E2E session, so it lands in the same
+drop-box as ordinary chat with that person. Before every ratchet plaintext was padded to one block,
+that request — a bare enum variant, a couple of bytes — was conspicuously shorter than a message
+carrying text, and a relay watching one conversation could plausibly have picked profile views out
+by size. Padding removed that, as a side effect rather than as a goal.
+
+Side effects come back. Add a variant that skips the pad path, raise a limit, and small control
+messages are legible again with nothing failing — so the property is now asserted next to the
+variants themselves, for `PostsRequest` and for the class (`JoinRequest`, `Reaction`,
+`DeleteForEveryone`). Discriminating: make `pad` return its input and the test reports two very
+different lengths.
+
+**What genuinely remains is peer-visible, not relay-visible.** The AUTHOR still learns who viewed —
+they receive the request and answer it, which is inherent to a live pull. And viewing a STRANGER's
+profile still needs a session first, which is a first contact and visible as one. Both are closed by
+the same design the source proposed and this task now carries: published posts as encrypted
+immutable batches fetched from a relay cache, so there is no per-view question to anyone.
+
+**Seventh expired premise in this sweep, and the first that expired because of our OWN change from
+the previous day.** The rule that follows: re-check a task's premise after each large change, not
+only when the task is filed. PRIV-1 closed half of this one and said nothing about it.
+
 ### PRIV-7 (partial): the one blob endpoint with no admission now has some
 
 `BlobStat` was `BlobStat([u8; 32])` on the wire: no client address, no cookie, no admission stage.

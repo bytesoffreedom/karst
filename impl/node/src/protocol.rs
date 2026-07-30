@@ -150,6 +150,20 @@ pub enum SessionEnvelope {
     ///
     /// APPENDED LAST: postcard numbers variants positionally.
     InitialSealed { sealed_ka: crate::seal::SkeletonSeal, msg: RatchetMessage },
+    /// **A `Ratchet` envelope re-randomised for ONE relay** (PRIV-4, `crate::veil`).
+    ///
+    /// Adds no security: the bytes inside are already a ratchet ciphertext. It exists so that the
+    /// same queued message, when multi-homing retransmits it to a second relay, does not arrive
+    /// there BYTE-IDENTICAL — two operators comparing logs would otherwise match on equality and
+    /// learn it is one message, with no analysis at all. PRIV-12 removed that join on the box
+    /// address; this removes it on the payload.
+    ///
+    /// `nonce` is DERIVED from `(relay, inner)` rather than random, so a retransmit to the SAME
+    /// relay reproduces the same bytes and this relay's own `payload_id` deduplication keeps
+    /// working. See `crate::veil` for why that is correct here and would not be in an AEAD.
+    ///
+    /// APPENDED LAST: postcard numbers variants positionally.
+    Veiled { nonce: [u8; crate::veil::NONCE_LEN], inner: Vec<u8> },
 }
 /// Полезный груз в mailbox. **Стадийная миграция** (не мёртвый код): сессионный
 /// §2.1-путь (`Session`) — новый in-process E2E; скелет (`Skeleton`) ещё несёт
@@ -173,6 +187,9 @@ impl Payload {
                 // number that has nothing to do with what is on the wire.
                 sealed_ka.ciphertext.len() + sealed_ka.kem_ct.len() + msg.ciphertext.len() + 64
             }
+            // The veil is a byte-for-byte re-encoding of a `Ratchet` envelope plus a nonce, so its
+            // size gate cost is the veiled length itself.
+            Payload::Session(SessionEnvelope::Veiled { nonce, inner }) => nonce.len() + inner.len(),
             Payload::Session(SessionEnvelope::Ratchet(msg)) => msg.ciphertext.len(),
         }
     }

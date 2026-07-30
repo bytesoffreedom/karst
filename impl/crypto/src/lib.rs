@@ -14,4 +14,5 @@ pub mod pqxdh;
 pub mod ratchet;
 pub mod safety;
 pub mod seal;
+pub mod veil;
 pub mod session;

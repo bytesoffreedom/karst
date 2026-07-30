@@ -1093,6 +1093,45 @@ impl<T: Transport> Peer<T> {
     /// by `converge_split_session` would be routed by the NEW (winning) session's box address
     /// instead of the one it was actually encrypted for — silently stranding it (A6-1). `None`
     /// falls back to whatever `sessions[peer_ik]` holds right now, for the immediate-send path.
+    /// Wrap a `Ratchet` envelope in this relay's veil (PRIV-4). Openers and already-veiled
+    /// envelopes pass through unchanged.
+    ///
+    /// **Openers are NOT veiled, and this is a named limit rather than an oversight.** The veil key
+    /// is the session's `drop_seed`; a recipient meeting a stranger has no session yet, so it could
+    /// not derive one. An opener that reaches two relays is therefore still byte-identical there.
+    /// Closing it would mean re-sealing the key agreement per relay — the `SkeletonSeal` has fresh
+    /// randomness, so that would work — but `pending_initial` is cleared as soon as the envelope is
+    /// queued (PRIV-3, so a batch carries ONE opener rather than N), so the material is gone by
+    /// flush time. Retaining it to un-do that would trade a certain waste for a narrow gain.
+    fn veiled_for_this_relay(
+        &self,
+        peer_ik: &[u8; 32],
+        envelope: SessionEnvelope,
+        routing: Option<([u8; 32], [u8; 32])>,
+    ) -> Result<SessionEnvelope, String> {
+        let msg = match envelope {
+            SessionEnvelope::Ratchet(m) => m,
+            // An opener carries no session the recipient could derive a key from; a `Veiled` here
+            // would mean this ran twice.
+            other => return Ok(other),
+        };
+        let drop_seed = match routing {
+            Some((seed, _)) => seed,
+            None => self
+                .sessions
+                .get(peer_ik)
+                .map(|st| st.drop_seed)
+                .ok_or("no session (call connect first)")?,
+        };
+        let inner = postcard::to_stdvec(&SessionEnvelope::Ratchet(msg))
+            .map_err(|e| format!("encode envelope: {e}"))?;
+        let (nonce, veiled) =
+            karst_crypto::veil::veil(&drop_seed, &self.relay_id(), &inner).ok_or_else(|| {
+                "envelope too long to veil — this is a bug, not a wire condition".to_string()
+            })?;
+        Ok(SessionEnvelope::Veiled { nonce, inner: veiled })
+    }
+
     fn transmit_envelope_routed(
         &mut self,
         peer_ik: &[u8; 32],
@@ -1102,6 +1141,15 @@ impl<T: Transport> Peer<T> {
     ) -> Response {
         let (recipient, handle) = match self.route_for(peer_ik, &envelope, routing, now) {
             Ok(r) => r,
+            Err(e) => return Response::Rejected(e),
+        };
+        // PRIV-4: re-randomise for THIS relay, here rather than at encrypt time — the whole point is
+        // that a queued envelope retransmitted to a second relay does not arrive byte-identical, and
+        // "this relay" is only known at transmit. The routing snapshot's `drop_seed` is the key, so
+        // the veil follows the same session the address does (A6-1), including after a convergence
+        // swap.
+        let envelope = match self.veiled_for_this_relay(peer_ik, envelope, routing) {
+            Ok(e) => e,
             Err(e) => return Response::Rejected(e),
         };
         let resp = self.transmit(recipient, handle, envelope, now);
@@ -1319,6 +1367,12 @@ impl<T: Transport> Peer<T> {
         match envelope {
             SessionEnvelope::InitialSealed { .. } => {
                 Ok((*peer_ik, Handle::Opener(*peer_ik)))
+            }
+            // Cannot happen by construction: the veil is applied AFTER routing, because it needs to
+            // know which relay this transmit is for. Loud rather than routed on a guess — a veiled
+            // envelope here means the ordering was changed, and guessing a route would strand mail.
+            SessionEnvelope::Veiled { .. } => {
+                Err("internal: a veiled envelope reached routing; the veil is applied after it".into())
             }
             SessionEnvelope::Ratchet(_) => {
                 let (drop_seed, peer_mailbox_pub) = match routing {
@@ -1733,6 +1787,29 @@ impl<T: Transport> Peer<T> {
     /// actually needs; `process`/`process_ratchet` remain the fallback for payloads whose
     /// owning session genuinely isn't known ahead of time (the identity mailbox).
     fn process_for_peer(&mut self, peer_ik: &[u8; 32], payload: &Payload) -> Option<Received> {
+        // PRIV-4: unveil first, then handle the envelope exactly as before. The key is this peer's
+        // `drop_seed` — the same value that produced the box this arrived in, so a message that
+        // reached the right box always has the right key. Both maps are tried because a peer's
+        // stream can ride `inbound_sessions` after a simultaneous first contact.
+        if let Payload::Session(SessionEnvelope::Veiled { nonce, inner }) = payload {
+            let seeds: Vec<[u8; 32]> = self
+                .sessions
+                .get(peer_ik)
+                .map(|st| st.drop_seed)
+                .into_iter()
+                .chain(self.inbound_sessions.get(peer_ik).map(|st| st.drop_seed))
+                .collect();
+            for seed in seeds {
+                let Some(bytes) = karst_crypto::veil::unveil(&seed, nonce, inner) else { continue };
+                let Ok(env) = postcard::from_bytes::<SessionEnvelope>(&bytes) else { continue };
+                // Only a `Ratchet` is ever veiled; anything else means a peer sent a shape our own
+                // encoder cannot produce, which is a miss rather than something to reinterpret.
+                if matches!(env, SessionEnvelope::Ratchet(_)) {
+                    return self.process_for_peer(peer_ik, &Payload::Session(env));
+                }
+            }
+            return None;
+        }
         match payload {
             Payload::Session(SessionEnvelope::Ratchet(msg)) => {
                 if let Some(st) = self.sessions.get_mut(peer_ik) {
@@ -1786,7 +1863,33 @@ impl<T: Transport> Peer<T> {
     }
 
     fn process(&mut self, payload: &Payload) -> Option<Received> {
+        // PRIV-4, the generic path: no box told us whose this is, so every held session's
+        // `drop_seed` is a candidate key. Bounded by `MAX_SESSIONS` and cheap (one HKDF each), and
+        // it only runs for payloads that arrived WITHOUT a known box — `process_for_peer` handles
+        // the ordinary case with one or two candidates.
+        if let Payload::Session(SessionEnvelope::Veiled { nonce, inner }) = payload {
+            let seeds: Vec<[u8; 32]> = self
+                .sessions
+                .values()
+                .chain(self.inbound_sessions.values())
+                .map(|st| st.drop_seed)
+                .collect();
+            for seed in seeds {
+                let Some(bytes) = karst_crypto::veil::unveil(&seed, nonce, inner) else { continue };
+                let Ok(env) = postcard::from_bytes::<SessionEnvelope>(&bytes) else { continue };
+                if matches!(env, SessionEnvelope::Ratchet(_)) {
+                    if let Some(r) = self.process(&Payload::Session(env)) {
+                        return Some(r);
+                    }
+                }
+            }
+            return None;
+        }
         match payload {
+            // Handled by the block above; an arm is still required for exhaustiveness. `None`
+            // rather than a panic: nothing about our own dispatch should be able to abort the
+            // process, and a miss here is the same "not for us" the rest of this function returns.
+            Payload::Session(SessionEnvelope::Veiled { .. }) => None,
             // Скелет-конверт этому session-peer не адресован.
             Payload::Skeleton(_) => None,
             // A sealed opener: unwrap it with our OWN identity key — which works without
@@ -3403,6 +3506,120 @@ mod a_batch_repeats_no_key_agreement {
              after PRIV-3 that is ~3.4 KB apiece — so the redundant copies overflow the fixed fetch \
              page and split a transfer across polls, which reaches the user as a file or avatar \
              that never finishes assembling."
+        );
+    }
+}
+
+/// **The same queued message does not reach two relays byte-identical** (PRIV-4).
+///
+/// `crate::veil`'s own tests prove the primitive. This proves the PEER applies it per relay — the
+/// link that actually matters, and the one that would silently vanish if the veil moved to encrypt
+/// time (where "which relay" is not yet known) instead of transmit time.
+#[cfg(test)]
+mod a_message_looks_different_at_each_relay {
+    use super::LoopbackMail;
+    use admission::capability::{Capability, Quota, Scope};
+    use karst_crypto::pqxdh::Account;
+    use node::protocol::SessionEnvelope;
+    use x25519_dalek::PublicKey;
+
+    fn dev_cap() -> Capability {
+        Capability {
+            capability_id: [0xCC; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 100_000, max_bytes: 1 << 30, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x35; 32],
+        }
+    }
+
+    fn veiled_bytes(env: SessionEnvelope) -> (Vec<u8>, Vec<u8>) {
+        match env {
+            SessionEnvelope::Veiled { nonce, inner } => (nonce.to_vec(), inner),
+            _ => panic!("an ordinary message must ride the wire veiled"),
+        }
+    }
+
+    /// DISCRIMINATING: have `veiled_for_this_relay` return the envelope untouched and this reports
+    /// the panic above; veil with a relay-independent nonce and the two byte strings match.
+    #[test]
+    fn two_relays_receive_the_same_message_as_different_bytes() {
+        let transport = LoopbackMail::default();
+        let mut bob = super::Peer::new(
+            transport.clone(),
+            Account::generate(),
+            dev_cap(),
+            PublicKey::from([7u8; 32]),
+        );
+        bob.publish(0);
+        let bob_ik = bob.identity();
+
+        // One session, one message — then the SAME message offered to two different relays, which
+        // is exactly what failover does with a queued envelope.
+        let mut alice = super::Peer::new(
+            transport.clone(),
+            Account::generate(),
+            dev_cap(),
+            PublicKey::from([7u8; 32]),
+        );
+        alice.connect(&bob_ik, 0).expect("PQXDH against a published bundle");
+        let opener = alice.encrypt_next(&bob_ik, b"hi").expect("opener");
+        alice.transmit_envelope(&bob_ik, opener, 0);
+        let env = alice.encrypt_next(&bob_ik, b"the same queued message").expect("ratchet");
+
+        let routing = alice.sessions.get(&bob_ik).map(|st| (st.drop_seed, st.peer_mailbox_pub));
+        let at_a = alice
+            .veiled_for_this_relay(&bob_ik, env.clone(), routing)
+            .expect("veils for relay A");
+        // A second `Peer` differing ONLY in which relay it talks to.
+        let mut alice_b = super::Peer::new(
+            transport,
+            Account::generate(),
+            dev_cap(),
+            PublicKey::from([0xB2u8; 32]),
+        );
+        alice_b.import_state(alice.export_state());
+        let at_b = alice_b
+            .veiled_for_this_relay(&bob_ik, env, routing)
+            .expect("veils for relay B");
+
+        let (na, va) = veiled_bytes(at_a);
+        let (nb, vb) = veiled_bytes(at_b);
+        assert_ne!(na, nb, "the nonce did not vary by relay");
+        assert_ne!(
+            va, vb,
+            "one queued message reached two relays as IDENTICAL bytes. Two operators comparing logs \
+             then match on equality and learn it is one message — the join PRIV-4 exists to remove, \
+             and the one multi-homing hands them for free."
+        );
+    }
+
+    /// An OPENER is deliberately not veiled — named here so the limit is a decision on the record
+    /// rather than a gap someone discovers. A recipient meeting a stranger holds no session, so it
+    /// could not derive the key.
+    #[test]
+    fn an_opener_is_left_alone_because_the_recipient_has_no_key_yet() {
+        let transport = LoopbackMail::default();
+        let mut bob = super::Peer::new(
+            transport.clone(),
+            Account::generate(),
+            dev_cap(),
+            PublicKey::from([7u8; 32]),
+        );
+        bob.publish(0);
+        let bob_ik = bob.identity();
+        let mut alice =
+            super::Peer::new(transport, Account::generate(), dev_cap(), PublicKey::from([7u8; 32]));
+        alice.connect(&bob_ik, 0).expect("agree");
+        let opener = alice.encrypt_next(&bob_ik, b"first contact").expect("opener");
+        let routing = alice.sessions.get(&bob_ik).map(|st| (st.drop_seed, st.peer_mailbox_pub));
+        assert!(
+            matches!(
+                alice.veiled_for_this_relay(&bob_ik, opener, routing).expect("passes through"),
+                SessionEnvelope::InitialSealed { .. }
+            ),
+            "an opener was veiled; the recipient has no session yet and could never unveil it"
         );
     }
 }

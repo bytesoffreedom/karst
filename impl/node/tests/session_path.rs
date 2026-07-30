@@ -180,9 +180,29 @@ fn failed_send_never_reuses_ratchet_position() {
         std::collections::HashMap::new();
     for m in tap.sent.borrow().iter() {
         if let Payload::Session(env) = &m.payload {
+            // PRIV-4: ordinary envelopes ride the wire VEILED for one relay, so the header this
+            // invariant is about is inside. Unveil with the sender's own session seed — skipping
+            // veiled envelopes instead would leave this test inspecting only openers while still
+            // passing, which is the failure mode of a test that stopped testing.
+            let unveiled: Option<SessionEnvelope> = match env {
+                SessionEnvelope::Veiled { nonce, inner } => {
+                    let st = alice.export_state();
+                    let (out, inb) = st.debug_peers();
+                    out.iter()
+                    .chain(inb.iter())
+                    .filter_map(|(_, seed)| node::veil::unveil(seed, nonce, inner))
+                    .filter_map(|b| postcard::from_bytes::<SessionEnvelope>(&b).ok())
+                    .find(|e| matches!(e, SessionEnvelope::Ratchet(_)))
+                }
+                _ => None,
+            };
+            let env = unveiled.as_ref().unwrap_or(env);
             let (h, ct) = match env {
                 SessionEnvelope::InitialSealed { msg, .. } => (msg.header, msg.ciphertext.clone()),
                 SessionEnvelope::Ratchet(msg) => (msg.header, msg.ciphertext.clone()),
+                SessionEnvelope::Veiled { .. } => {
+                    panic!("a veiled envelope could not be unveiled with any held session seed")
+                }
             };
             match seen.get(&(h.dh, h.n)) {
                 Some(prev) => assert_eq!(

@@ -52,6 +52,47 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PRIV-4: the same message reaches two relays as different bytes
+
+Multi-homing exists so a message still lands when the primary relay is down, and the way it lands is
+a retransmit of the SAME queued envelope. So the same ciphertext could reach two relays, and two
+operators comparing logs matched on equality — no timing, no volume, no analysis. PRIV-12 removed
+that join on the box address; this removes it on the payload.
+
+An ordinary `Ratchet` envelope is now wrapped, at TRANSMIT time, in a per-relay veil
+(`karst_crypto::veil`, wire variant `SessionEnvelope::Veiled`). Transmit time is not an
+implementation detail: at encrypt time "which relay" is not yet known, and veiling there would
+produce one blob for every relay — exactly the thing being removed.
+
+**It provides NO security property, and the module says so first.** The inner bytes are already a
+ratchet ciphertext: confidential, authenticated, indistinguishable from random. The veil defeats one
+adversary — the one who compares bytes. Nothing here may be cited as protecting content.
+
+**The nonce is DERIVED, not random, and that is load-bearing.** A fresh random nonce per transmit
+looks obviously correct and breaks something real: the relay deduplicates a redeposited payload by
+hashing it (`payload_id`), so a retransmit to the SAME relay would arrive as different bytes, fail to
+dedup, and occupy the mailbox twice — paid for in delivery before the recipient ever dropped it. The
+nonce is therefore `H(relay_id ‖ inner)`: two relays get different bytes (the goal), one relay's
+retransmit reproduces them exactly (dedup keeps working). Deriving a nonce from the data would be a
+mistake in an AEAD; here there is nothing to protect and the keystream's only job is to differ per
+relay.
+
+**Openers are NOT veiled — a limit, on the record.** The veil key is the session's `drop_seed`, and a
+recipient meeting a stranger has no session to derive it from. An opener that reaches two relays is
+still byte-identical there. Closing it would mean re-sealing the key agreement per relay (the
+`SkeletonSeal` has fresh randomness, so it would work), but `pending_initial` is cleared the moment
+the envelope is queued — that is the PRIV-3 fix which stopped a batch carrying one opener per payload
+— so the material is gone by flush time. Trading a certain, measured waste for a narrow gain was
+refused.
+
+Tests: the primitive's own (two relays differ; one relay's retransmit is identical — discriminating
+both ways), and a peer-level one proving the PEER applies it per relay, which is the link that would
+vanish silently if the veil ever moved to encrypt time. `node/tests/session_path.rs` had to unveil to
+keep checking its keystream-reuse invariant — skipping veiled envelopes would have left it inspecting
+only openers while still passing, which is how a test stops testing.
+
+With this and PRIV-12, both axes of the multi-homing join are closed: the address and the bytes.
+
 ### PRIV-12: a box has a different address at every relay
 
 `deposit_address(m_pub, root_key, epoch, dir)` took no relay, so a drop-box address was a function of

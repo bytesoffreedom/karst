@@ -24,5 +24,5 @@ pub mod protocol;
 // The crypto primitives live in their own crate now (#247). Re-exported so every `node::seal::…`
 // path in this workspace keeps working: the CUT is the dependency direction, not a rename, and
 // making thirty call sites churn would bury the one change that matters.
-pub use karst_crypto::{blind, pqxdh, ratchet, safety, seal, session};
+pub use karst_crypto::{blind, pqxdh, ratchet, safety, seal, session, veil};
 pub mod wire;

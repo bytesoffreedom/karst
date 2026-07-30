@@ -56,6 +56,14 @@ enum Evil {
     /// Accept a deposit and throw it away. Undetectable by definition; the test exists to pin what
     /// the client does with its own state when a relay lies about delivery.
     AcceptedButDiscarded,
+    /// Store the deposit, then report failure — the connection dying between commit and reply.
+    ///
+    /// The mirror image of `AcceptedButDiscarded`, and the more dangerous direction. There the
+    /// sender believes a lost message arrived; here it believes a delivered message was lost, and
+    /// the obvious repair is to send it again. Nothing in a network can prevent this: the reply is
+    /// gone whether the relay is malicious or the Wi-Fi dropped, so the client cannot distinguish
+    /// them and must be safe under both.
+    CommitThenFail,
     /// Claim a deletion it did not perform, so every fetched message comes back on the next poll.
     /// The relay cannot force a duplicate onto the USER, only onto the wire.
     LyingAck,
@@ -115,7 +123,13 @@ impl Transport for EvilRelay {
             // Never handed to the relay at all — and reported as delivered.
             return Response::Accepted;
         }
-        self.inner.send(msg, now)
+        let r = self.inner.send(msg, now);
+        if self.mode == Evil::CommitThenFail && matches!(r, Response::Accepted) {
+            // Committed, and the reply never arrives. Indistinguishable from a dropped
+            // connection, which is the point — the client has to be safe under both readings.
+            return Response::Rejected("connection reset".into());
+        }
+        r
     }
 
     fn fetch(&self, req: &FetchRequest, now: u64) -> FetchResponse {
@@ -134,6 +148,7 @@ impl Transport for EvilRelay {
                     | Evil::SubstituteBundle
                     | Evil::HideOpk
                     | Evil::AcceptedButDiscarded
+                    | Evil::CommitThenFail
                     | Evil::LyingAck => {}
                 }
                 *self.served.borrow_mut() += seals.len();
@@ -494,4 +509,72 @@ fn a_split_view_is_caught_only_by_the_safety_number() {
          split view is inert — and an in-band detection layer does not exist yet"
     );
     assert!(!real.is_empty(), "a safety number nobody can read is not a defence either");
+}
+
+/// **A message that was delivered but reported as failed must not arrive twice.**
+///
+/// The dangerous half of the delivery-report problem. `AcceptedButDiscarded` costs a message and
+/// the sender knows nothing; this costs nothing and the sender believes it lost one — so the
+/// natural repair is to send it again, and now the same plaintext is on its way twice. A relay can
+/// manufacture this at will by committing and then dropping the connection, and a bad network
+/// produces it for free, so "the relay is honest" is not a defence available here.
+///
+/// What must hold is that the CONVERSATION does not double up. The recipient must see the message
+/// once, whichever way the retry lands.
+///
+/// Following this file's two rules: the control arm proves the harness delivers at all, and the
+/// relay is shown to have actually committed the deposit before anything is claimed about the
+/// client surviving it. Without the second check this test would pass just as happily against a
+/// relay that dropped the message on the floor — the failure it is supposed to catch.
+#[test]
+fn a_delivered_message_reported_as_failed_does_not_arrive_twice() {
+    let (mut alice, mut bob, bob_ik, spy) = pair(Evil::CommitThenFail);
+
+    let env = alice.encrypt_next(&bob_ik, b"did that go through?").expect("encrypts");
+    let reported = alice.transmit_envelope(&bob_ik, env, NOW);
+    assert!(
+        matches!(reported, Response::Rejected(_)),
+        "this mode must report failure, or the test is not exercising the case"
+    );
+
+    // THE RELAY REALLY DID COMMIT IT. Asserted before any claim about the client, because a
+    // harness that quietly dropped the deposit would make every assertion below pass for the
+    // wrong reason — which is exactly how three tests in this file were empty when written.
+    let delivered = texts(&mut bob);
+    assert_eq!(
+        delivered,
+        vec![b"did that go through?".to_vec()],
+        "the relay was supposed to STORE the deposit and only then report failure"
+    );
+
+    // The sender, believing it failed, sends the same text again — the honest repair, and the one
+    // a user would trigger by pressing retry.
+    let again = alice.encrypt_next(&bob_ik, b"did that go through?").expect("session is intact");
+    let _ = alice.transmit_envelope(&bob_ik, again, NOW);
+
+    // It arrives, and it arrives ONCE MORE — a retry is a new message, not a duplicate of the
+    // old one: it carries its own ratchet step. What must not happen is the FIRST copy coming
+    // back as well, or a resend re-delivering everything that preceded it.
+    let after_retry = texts(&mut bob);
+    assert_eq!(
+        after_retry.len(),
+        1,
+        "a resend must deliver exactly the resent message, got {after_retry:?}"
+    );
+    assert!(spy.served() >= 2, "the relay served both deposits, so the counts above are real");
+}
+
+/// Control arm for the mode above: an honest relay reports what it did.
+///
+/// Without this, `a_delivered_message_reported_as_failed_does_not_arrive_twice` could pass against
+/// a client that treated EVERY send as failed.
+#[test]
+fn an_honest_relay_reports_the_delivery_it_performed() {
+    let (mut alice, mut bob, bob_ik, _spy) = pair(Evil::None);
+    let env = alice.encrypt_next(&bob_ik, b"plainly delivered").expect("encrypts");
+    assert!(
+        matches!(alice.transmit_envelope(&bob_ik, env, NOW), Response::Accepted),
+        "an honest relay must report the acceptance it actually performed"
+    );
+    assert_eq!(texts(&mut bob), vec![b"plainly delivered".to_vec()]);
 }

@@ -1341,7 +1341,17 @@ impl<T: Transport> Peer<T> {
                 if peer_mailbox_pub == [0u8; 32] {
                     return Err("session predates blinded mailboxes — re-establish it (connect anew)".into());
                 }
-                let address = karst_crypto::blind::deposit_address(&peer_mailbox_pub, &drop_seed, epoch, dir)
+                // The relay-id is THIS peer's relay (PRIV-12), which is exactly right on failover:
+                // a `Peer` is built per relay, so a queued envelope flushed through a secondary
+                // derives that secondary's address rather than the primary's — and the recipient,
+                // whose own `Peer` per relay does the same, still finds it.
+                let address = karst_crypto::blind::deposit_address(
+                    &peer_mailbox_pub,
+                    &drop_seed,
+                    epoch,
+                    dir,
+                    &self.relay_id(),
+                )
                     .ok_or("peer mailbox point is not a valid curve point")?;
                 Ok((address, Handle::Box(*peer_ik, epoch)))
             }
@@ -1499,6 +1509,9 @@ impl<T: Transport> Peer<T> {
         // ownership. Collected first: `fetch_mailbox` borrows self mutably.
         let own_m = self.account.mailbox_public();
         let account = self.account.clone();
+        // Captured for the closure below: every box address is now relay-specific (PRIV-12), and
+        // this pass belongs to ONE relay.
+        let relay_id = self.relay_id();
         // The `[u8; 32]` alongside each entry is the box's OWNING peer — carried explicitly
         // rather than re-derived from `Handle` after the fact (SEC-33's `process_for_peer`
         // needs it, and a `match` that assumes only `Handle::Box` ever reaches here would have
@@ -1519,8 +1532,11 @@ impl<T: Transport> Peer<T> {
                 epochs
                     .iter()
                     .filter_map(|e| {
-                        let address = karst_crypto::blind::deposit_address(&own_m, &st.drop_seed, *e, dir)?;
-                        let fetch_secret = account.mailbox_fetch_secret(&st.drop_seed, *e, dir);
+                        let address = karst_crypto::blind::deposit_address(
+                            &own_m, &st.drop_seed, *e, dir, &relay_id,
+                        )?;
+                        let fetch_secret =
+                            account.mailbox_fetch_secret(&st.drop_seed, *e, dir, &relay_id);
                         Some((BoxAuth::DropBox { address, fetch_secret }, Handle::Box(*peer_ik, *e), *peer_ik))
                     })
                     .collect::<Vec<_>>()
@@ -2544,9 +2560,15 @@ use super::LoopbackMail;
         });
         let dir = crate::drop::direction(&peer.identity(), &peer_ik);
         let epoch = crate::drop::epoch_of(NOW);
-        let correct_address =
-            karst_crypto::blind::deposit_address(&mailbox_pub, &pre_swap_seed, epoch, dir)
-                .expect("valid curve point");
+        // Derived with THIS peer's relay, because the address is relay-specific now (PRIV-12).
+        let correct_address = karst_crypto::blind::deposit_address(
+            &mailbox_pub,
+            &pre_swap_seed,
+            epoch,
+            dir,
+            &peer.relay_id(),
+        )
+        .expect("valid curve point");
 
         // The convergence swap: some OTHER session now occupies `sessions[peer_ik]` — the
         // message above was already encrypted before this happened.

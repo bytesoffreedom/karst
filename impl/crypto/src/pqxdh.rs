@@ -305,10 +305,16 @@ impl Account {
     /// The fetch secret `h·m` for one of MY inbound drop-boxes (epoch/direction under the shared
     /// per-session `seed`). Its public key is the box address a sender deposited into; I prove
     /// ownership of the box to the relay with a `blind::FetchOwnershipProof` over this secret.
-    pub fn mailbox_fetch_secret(&self, seed: &[u8; 32], epoch: u64, dir: u8) -> [u8; 32] {
+    pub fn mailbox_fetch_secret(
+        &self,
+        seed: &[u8; 32],
+        epoch: u64,
+        dir: u8,
+        relay_id: &[u8; 32],
+    ) -> [u8; 32] {
         crate::blind::MailboxSecret::from_bytes(&self.mailbox_secret)
             .expect("stored mailbox secret is canonical")
-            .fetch_secret(seed, epoch, dir)
+            .fetch_secret(seed, epoch, dir, relay_id)
     }
 
     /// Mint a fresh one-time prekey, store its secret, and return its public key — to be
@@ -866,7 +872,7 @@ mod tests {
         let restored = Account::from_secret_bytes(&acct.to_secret_bytes());
         assert_eq!(restored.mailbox_public(), acct.mailbox_public(), "M re-derives from the seed");
         // And the sender can already turn M into a blinded deposit address it cannot open.
-        let addr = crate::blind::deposit_address(&bundle.mailbox_pub, &[3u8; 32], 5, 0);
+        let addr = crate::blind::deposit_address(&bundle.mailbox_pub, &[3u8; 32], 5, 0, &[0xA7; 32]);
         assert!(addr.is_some(), "the published M is a valid Ristretto point");
     }
 

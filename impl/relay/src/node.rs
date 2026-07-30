@@ -2000,9 +2000,11 @@ mod tests {
     fn a_blinded_box_is_fetchable_only_by_its_fetch_secret_holder() {
         let mut relay = RelayNode::new(NOW);
         let recipient_m = node::blind::MailboxSecret::generate();
-        let (seed, epoch, dir) = ([5u8; 32], 3u64, 0u8);
-        let address = node::blind::deposit_address(&recipient_m.public(), &seed, epoch, dir).unwrap();
-        let fetch_secret = recipient_m.fetch_secret(&seed, epoch, dir);
+        // A box address is relay-specific now (PRIV-12); this relay's identity names it.
+        let (seed, epoch, dir, rid) = ([5u8; 32], 3u64, 0u8, [0xA7u8; 32]);
+        let address =
+            node::blind::deposit_address(&recipient_m.public(), &seed, epoch, dir, &rid).unwrap();
+        let fetch_secret = recipient_m.fetch_secret(&seed, epoch, dir, &rid);
         let mk = |cookie: Cookie, own: Vec<u8>, dh: [u8; 16]| FetchRequest {
             mailbox: address,
             client_addr: address.to_vec(),
@@ -2020,7 +2022,7 @@ mod tests {
 
         // The DEPOSITOR holds only M; a proof from ANY other mailbox secret fails → cannot read.
         let depositor = node::blind::MailboxSecret::generate();
-        let wrong = depositor.fetch_secret(&seed, epoch, dir);
+        let wrong = depositor.fetch_secret(&seed, epoch, dir, &rid);
         let c2 = relay.keyring.issue(&address, b"c", NOW as u32);
         let forged = node::blind::FetchOwnershipProof::prove(&wrong, &address, &c2.mac).unwrap();
         let bad = relay.handle_fetch(&mk(c2, forged.to_bytes().to_vec(), [0u8; 16]), NOW);

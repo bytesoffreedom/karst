@@ -52,6 +52,42 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PRIV-12: a box has a different address at every relay
+
+`deposit_address(m_pub, root_key, epoch, dir)` took no relay, so a drop-box address was a function of
+the SESSION alone. Receive polls the full box set at EVERY relay (`receive_threaded` loops them) while
+send is failover, so a client that multi-homes polled the identical 32 bytes at relay A and relay B.
+Two relays comparing logs could join on an EXACT MATCH — cheaper than any timing or volume
+correlation, and needing no analysis. Multi-homing, added for availability, was quietly buying
+cross-relay linkability, and nothing said so.
+
+`relay_id` — the relay's Noise static public key, the value a client pins and the handshake
+authenticates — now enters `blind_factor`, which is the single site both the address and the
+ownership secret derive from, so they cannot drift apart. Domain moved v1 → v2.
+
+**It costs nothing.** The sender knows which relay it deposits to and the recipient knows which it
+polls; a `Peer` is built per relay, so `self.relay_id()` is always the right one — including on
+failover, where an envelope flushed through a secondary derives the secondary's address and the
+recipient's own per-relay pass finds it there. Round-trip count is unchanged, because a recipient
+already walks its boxes once per relay.
+
+Tests assert the property and its two failure modes: two relays never share an address
+(discriminating — remove the input and it goes red), a fetch secret opens its OWN relay's box and not
+another's (without which delivery would break at the proof check rather than leak), and epoch and
+direction still separate within one relay, so the new input did not swallow the old axes.
+
+**Only one of two axes.** #259 remains: on failover the secondary receives the same sealed ciphertext
+byte for byte, so colluding relays can still join on the bytes. That task's description said they
+"compare bytes or hashes", which named the more visible join rather than the cheaper one — corrected
+there.
+
+**And a false to-do I nearly left behind.** I had noted that `Socks5Adapter::credential` also lacks a
+relay component. It does, and it does not matter: `isolation_token()` is called inside the `Relay`
+constructor and a fresh `Relay` is built per configured entry, so each relay already has its own
+compartment token, credential and circuit. That is the THIRD time in two days I read one of the two
+isolation axes and drew a conclusion about both. The axes are compartment and scope; both get checked
+before the word "probably" is used.
+
 ### PERF-8: one handshake per HANDLE — and a corrected arithmetic
 
 The relay has served many requests on one Noise session since §15/FT4 (`MAX_REQUESTS_PER_CONN =

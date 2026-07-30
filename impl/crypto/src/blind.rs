@@ -94,31 +94,61 @@ impl MailboxSecret {
         (&self.0 * RISTRETTO_BASEPOINT_TABLE).compress().to_bytes()
     }
 
-    /// The fetch secret `h·m` for one epoch/direction — only the holder of `m` can compute it.
-    /// Its public key is exactly the sender's deposit address for that box.
-    pub fn fetch_secret(&self, root_key: &[u8; 32], epoch: u64, dir: u8) -> [u8; 32] {
-        (blind_factor(root_key, epoch, dir) * self.0).to_bytes()
+    /// The fetch secret `h·m` for one epoch/direction/relay — only the holder of `m` can compute
+    /// it. Its public key is exactly the sender's deposit address for that box AT THAT RELAY.
+    pub fn fetch_secret(
+        &self,
+        root_key: &[u8; 32],
+        epoch: u64,
+        dir: u8,
+        relay_id: &[u8; 32],
+    ) -> [u8; 32] {
+        (blind_factor(root_key, epoch, dir, relay_id) * self.0).to_bytes()
     }
 }
 
-/// The per-epoch/direction blinding scalar `h = H(domain ‖ root_key ‖ epoch ‖ dir)`, wide-
-/// reduced to a UNIFORM scalar (never `from_bytes_mod_order` on 32 bytes, which biases).
+/// The blinding scalar `h = H(domain ‖ root_key ‖ epoch ‖ dir ‖ relay_id)`, wide-reduced to a
+/// UNIFORM scalar (never `from_bytes_mod_order` on 32 bytes, which biases).
+///
 /// `dir` is bound so the A→B and B→A boxes of a session differ.
-pub fn blind_factor(root_key: &[u8; 32], epoch: u64, dir: u8) -> Scalar {
-    let mut input = Vec::with_capacity(22 + 32 + 8 + 1);
-    input.extend_from_slice(b"KARST-mailbox-blind-v1");
+///
+/// **`relay_id` is bound so the SAME box has a DIFFERENT address at every relay** (PRIV-12). Without
+/// it, the address was a function of the session alone, so a client that multi-homes polled the
+/// identical 32 bytes at relay A and relay B — and two colluding relays could join their logs on an
+/// EXACT MATCH rather than on timing or volume. That is the cheapest possible join, and it made
+/// multi-homing (added for availability) quietly buy cross-relay linkability. It is a different axis
+/// from the one PRIV-4 closes: re-wrapping the ciphertext per relay leaves the address identical.
+///
+/// This costs nothing to derive on either side. The sender knows which relay it is depositing to and
+/// the recipient knows which relay it is polling, so both compute the same scalar for that relay
+/// without exchanging anything — and the number of polls is unchanged, because a recipient already
+/// walks its boxes once per relay.
+///
+/// Which 32 bytes: the relay's Noise static public key. It is the value the client PINS and the
+/// handshake authenticates, so a relay cannot induce a client to derive some other relay's address
+/// by lying about its identity — it would fail the handshake first.
+pub fn blind_factor(root_key: &[u8; 32], epoch: u64, dir: u8, relay_id: &[u8; 32]) -> Scalar {
+    let mut input = Vec::with_capacity(22 + 32 + 8 + 1 + 32);
+    input.extend_from_slice(b"KARST-mailbox-blind-v2");
     input.extend_from_slice(root_key);
     input.extend_from_slice(&epoch.to_le_bytes());
     input.push(dir);
+    input.extend_from_slice(relay_id);
     Scalar::hash_from_bytes::<Sha512>(&input)
 }
 
 /// The deposit ADDRESS `h·M` for one epoch/direction — computed by the SENDER from the public
 /// mailbox point `M` and the shared `root_key`, with NO access to `m`. `None` if `M` is not a
 /// valid Ristretto point. Equal to the public key of the recipient's `fetch_secret`.
-pub fn deposit_address(m_pub: &[u8; 32], root_key: &[u8; 32], epoch: u64, dir: u8) -> Option<[u8; 32]> {
+pub fn deposit_address(
+    m_pub: &[u8; 32],
+    root_key: &[u8; 32],
+    epoch: u64,
+    dir: u8,
+    relay_id: &[u8; 32],
+) -> Option<[u8; 32]> {
     let m_point = CompressedRistretto(*m_pub).decompress()?;
-    Some((blind_factor(root_key, epoch, dir) * m_point).compress().to_bytes())
+    Some((blind_factor(root_key, epoch, dir, relay_id) * m_point).compress().to_bytes())
 }
 
 /// The public key of a fetch secret, `s·G` — so a test (and, later, the relay's ownership
@@ -215,6 +245,9 @@ impl FetchOwnershipProof {
 mod tests {
     use super::*;
 
+    /// A stand-in relay identity: the address is relay-specific now (PRIV-12), so every derivation
+    /// in these tests names one.
+    const RELAY: [u8; 32] = [0xA7; 32];
     const RK: [u8; 32] = [7u8; 32];
 
     /// The defining property: the SENDER (holding only the public `M` + the shared root key)
@@ -226,9 +259,9 @@ mod tests {
         let m_pub = m.public();
 
         // Sender side: only the public M + root key.
-        let addr = deposit_address(&m_pub, &RK, 5, 0).expect("valid M");
+        let addr = deposit_address(&m_pub, &RK, 5, 0, &RELAY).expect("valid M");
         // Recipient side: the fetch secret and its public key.
-        let secret = m.fetch_secret(&RK, 5, 0);
+        let secret = m.fetch_secret(&RK, 5, 0, &RELAY);
         assert_eq!(public_of_secret(&secret).unwrap(), addr, "fetch secret unlocks the deposit box");
     }
 
@@ -240,10 +273,10 @@ mod tests {
     fn the_fetch_secret_requires_the_private_m() {
         let a = MailboxSecret::generate();
         let b = MailboxSecret::generate();
-        assert_ne!(a.fetch_secret(&RK, 5, 0), b.fetch_secret(&RK, 5, 0), "secret is bound to m");
+        assert_ne!(a.fetch_secret(&RK, 5, 0, &RELAY), b.fetch_secret(&RK, 5, 0, &RELAY), "secret is bound to m");
         // Both are valid box secrets for THEIR OWN M — but a sender who saw only a.public()
         // has no route to a.fetch_secret without a's m.
-        assert_eq!(public_of_secret(&a.fetch_secret(&RK, 5, 0)).unwrap(), deposit_address(&a.public(), &RK, 5, 0).unwrap());
+        assert_eq!(public_of_secret(&a.fetch_secret(&RK, 5, 0, &RELAY)).unwrap(), deposit_address(&a.public(), &RK, 5, 0, &RELAY).unwrap());
     }
 
     /// The address rotates per epoch (so a relay can't chain one address across time) and per
@@ -252,9 +285,9 @@ mod tests {
     fn addresses_rotate_by_epoch_and_direction() {
         let m = MailboxSecret::generate();
         let mp = m.public();
-        let e5 = deposit_address(&mp, &RK, 5, 0).unwrap();
-        let e6 = deposit_address(&mp, &RK, 6, 0).unwrap();
-        let e5_rev = deposit_address(&mp, &RK, 5, 1).unwrap();
+        let e5 = deposit_address(&mp, &RK, 5, 0, &RELAY).unwrap();
+        let e6 = deposit_address(&mp, &RK, 6, 0, &RELAY).unwrap();
+        let e5_rev = deposit_address(&mp, &RK, 5, 1, &RELAY).unwrap();
         assert_ne!(e5, e6, "different epoch → different box");
         assert_ne!(e5, e5_rev, "different direction → different box");
     }
@@ -265,7 +298,7 @@ mod tests {
         let m = MailboxSecret::generate();
         let restored = MailboxSecret::from_bytes(&m.to_bytes()).unwrap();
         assert_eq!(m.public(), restored.public());
-        assert_eq!(m.fetch_secret(&RK, 1, 0), restored.fetch_secret(&RK, 1, 0));
+        assert_eq!(m.fetch_secret(&RK, 1, 0, &RELAY), restored.fetch_secret(&RK, 1, 0, &RELAY));
     }
 
     // --- the relay-side ownership proof (Schnorr PoK of the fetch secret) ---
@@ -274,7 +307,7 @@ mod tests {
     /// sees) and the fetch secret (what only the recipient holds).
     fn a_box(epoch: u64, dir: u8) -> ([u8; 32], [u8; 32]) {
         let m = MailboxSecret::generate();
-        (deposit_address(&m.public(), &RK, epoch, dir).unwrap(), m.fetch_secret(&RK, epoch, dir))
+        (deposit_address(&m.public(), &RK, epoch, dir, &RELAY).unwrap(), m.fetch_secret(&RK, epoch, dir, &RELAY))
     }
 
     /// The defining property: the holder of the fetch secret proves ownership of the box, and the
@@ -360,5 +393,69 @@ mod tests {
         let ctx = b"ctx";
         let proof = FetchOwnershipProof::prove(&secret, &addr, ctx).unwrap();
         assert!(FetchOwnershipProof::from_bytes(&proof.to_bytes()).verify(&addr, ctx));
+    }
+}
+
+/// **The same box has a different address at every relay** (PRIV-12).
+///
+/// The property exists for one adversary: two relays that compare notes. Everything else about a
+/// drop-box already frustrates them — the address is blinded, it rotates per epoch, and it reveals
+/// no identity — but until `relay_id` entered the derivation the address was a function of the
+/// SESSION alone, so a client that multi-homes polled the identical 32 bytes at both. Colluding
+/// relays could then join their logs on an exact match, which is cheaper than any timing or volume
+/// correlation and needs no analysis at all.
+///
+/// Kept as its own module because the fix is invisible in behaviour: delivery works identically
+/// either way, so nothing else in the suite notices if this is undone.
+#[cfg(test)]
+mod an_address_is_specific_to_its_relay {
+    use super::*;
+
+    const RK: [u8; 32] = [9u8; 32];
+
+    /// DISCRIMINATING: drop `relay_id` from `blind_factor`'s input and this goes red.
+    #[test]
+    fn two_relays_never_see_the_same_box_address() {
+        let m = MailboxSecret::generate();
+        let a = deposit_address(&m.public(), &RK, 5, 0, &[0xA1; 32]).expect("valid M");
+        let b = deposit_address(&m.public(), &RK, 5, 0, &[0xB2; 32]).expect("valid M");
+        assert_ne!(
+            a, b,
+            "one session's box has the SAME address at two relays. Two relays that compare logs \
+             then join on an exact 32-byte match — the cheapest possible correlation — and \
+             multi-homing, which exists for availability, silently buys cross-relay linkability."
+        );
+    }
+
+    /// The fetch secret must move with the address, or the recipient cannot prove ownership of the
+    /// box the sender actually deposited into — delivery would break at the relay's proof check.
+    #[test]
+    fn the_fetch_secret_matches_its_own_relays_address_and_no_other() {
+        let m = MailboxSecret::generate();
+        let (r1, r2) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let addr1 = deposit_address(&m.public(), &RK, 7, 1, &r1).expect("valid M");
+        let addr2 = deposit_address(&m.public(), &RK, 7, 1, &r2).expect("valid M");
+        assert_eq!(
+            public_of_secret(&m.fetch_secret(&RK, 7, 1, &r1)).expect("canonical"),
+            addr1,
+            "the fetch secret no longer opens its own relay's box — deposits would be unreachable"
+        );
+        assert_ne!(
+            public_of_secret(&m.fetch_secret(&RK, 7, 1, &r1)).expect("canonical"),
+            addr2,
+            "one relay's fetch secret matches ANOTHER relay's address, so the separation is cosmetic"
+        );
+    }
+
+    /// The other axes still separate — the new input must not have swallowed them.
+    #[test]
+    fn epoch_and_direction_still_separate_within_one_relay() {
+        let m = MailboxSecret::generate();
+        let r = [0xA1u8; 32];
+        let e5 = deposit_address(&m.public(), &RK, 5, 0, &r).expect("valid M");
+        let e6 = deposit_address(&m.public(), &RK, 6, 0, &r).expect("valid M");
+        let rev = deposit_address(&m.public(), &RK, 5, 1, &r).expect("valid M");
+        assert_ne!(e5, e6, "epoch rotation stopped rotating");
+        assert_ne!(e5, rev, "the two directions of one session collapsed into one box");
     }
 }

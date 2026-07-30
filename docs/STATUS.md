@@ -81,9 +81,32 @@ COUNTER: "a replay is not delivered twice" passes trivially if the page never he
 reversed page loses nothing" passes on a page of one, so each test asserts the relay actually
 misbehaved before asserting the client survived it.
 
-Named and not yet covered, in the file itself: claiming `Accepted` without storing, losing data
-across a restart, serving different answers to different clients, forging or withholding ACKs,
-closing after commit, malformed frames, delaying one chosen user, and the multi-relay Byzantine cases.
+**Slice 2** adds the half slice 1 did not touch — "may not substitute authenticated keys":
+
+- **A bundle of the relay's own making is refused.** The bundle served is not malformed: it is real,
+  self-consistent and correctly signed — by the wrong identity, which is the shape a substitution
+  actually takes. `connect` compares the bundle's `ik_pub` against the IK that was ASKED for.
+  Discriminating: delete that comparison and it reddens.
+- **A withheld one-time prekey downgrades LOUDLY.** Running out is legitimate, so proceeding is
+  correct; proceeding silently is not, because the missing unit is the only signal that this first
+  message's post-quantum leg is recorded-now-decrypt-later, and withholding it costs the relay
+  nothing.
+- **A relay that lies about delivery costs a message and nothing else.** Undetectable by
+  construction, so the assertion is about the sender's own state staying coherent rather than about
+  noticing.
+
+**Three of these tests were vacuous when first written, and each was caught by a rule rather than by
+review.** The replay test would have passed on a page that never held two copies — caught by the
+served-payload counter. The substitution test passed because `pair()` had already connected, so its
+own `connect` returned "session already established", an `Err` the assertion accepted as a refusal —
+caught by writing a separate unconnected fixture. And it then failed for the opposite wrong reason:
+the hostile shell hooked the PUBLIC bundle lookup while `connect` uses the admission-gated one, so
+the client was never offered a substituted bundle at all. The defence had worked the whole time; the
+test simply was not aimed at it.
+
+Named and not yet covered, in the file itself: losing data across a restart, serving different
+answers to different clients, forging or withholding ACKs, closing after commit, malformed frames,
+delaying one chosen user, and the multi-relay Byzantine cases.
 
 ### PRIV-8: half of it was closed yesterday, by padding, silently
 

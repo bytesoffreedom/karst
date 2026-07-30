@@ -45,6 +45,17 @@ enum Evil {
     Replay,
     /// Serve a page back to front.
     Reorder,
+    /// Answer a bundle lookup with a bundle of the relay's OWN making — the key-substitution
+    /// attack, and the one thing on this list that would break the guarantee rather than the
+    /// delivery. Everything else costs a message; this would cost the conversation.
+    SubstituteBundle,
+    /// Serve the real bundle with its one-time prekey stripped. Not forgery — a relay may
+    /// legitimately run out — so the question is not whether the handshake proceeds but whether the
+    /// client SAYS the first message lost forward secrecy.
+    HideOpk,
+    /// Accept a deposit and throw it away. Undetectable by definition; the test exists to pin what
+    /// the client does with its own state when a relay lies about delivery.
+    AcceptedButDiscarded,
 }
 
 /// An honest relay with a hostile shell. Wrapping rather than reimplementing is deliberate: an evil
@@ -97,6 +108,10 @@ fn tamper(p: &mut Payload) {
 
 impl Transport for EvilRelay {
     fn send(&self, msg: &WireMessage, now: u64) -> Response {
+        if self.mode == Evil::AcceptedButDiscarded {
+            // Never handed to the relay at all — and reported as delivered.
+            return Response::Accepted;
+        }
         self.inner.send(msg, now)
     }
 
@@ -104,13 +119,18 @@ impl Transport for EvilRelay {
         match self.inner.fetch(req, now) {
             FetchResponse::Fetched(mut seals) => {
                 match self.mode {
-                    Evil::None => {}
                     Evil::TamperCiphertext => seals.iter_mut().for_each(tamper),
                     Evil::Replay => {
                         let dup = seals.clone();
                         seals.extend(dup);
                     }
                     Evil::Reorder => seals.reverse(),
+                    // These misbehave elsewhere — on the bundle lookup or the deposit — and serve
+                    // pages honestly, so a failure names the one behaviour under test.
+                    Evil::None
+                    | Evil::SubstituteBundle
+                    | Evil::HideOpk
+                    | Evil::AcceptedButDiscarded => {}
                 }
                 *self.served.borrow_mut() += seals.len();
                 FetchResponse::Fetched(seals)
@@ -126,14 +146,41 @@ impl Transport for EvilRelay {
         self.inner.publish_bundle(req, now)
     }
     fn fetch_bundle(&self, ik: &[u8; 32], now: u64) -> Result<Option<PreKeyBundle>, String> {
-        self.inner.fetch_bundle(ik, now)
+        let real = self.inner.fetch_bundle(ik, now)?;
+        Ok(match (self.mode, real) {
+            // A bundle the RELAY generated: correctly formed, self-consistent, signed — by the
+            // wrong identity. Everything about it looks right except whose it is.
+            (Evil::SubstituteBundle, Some(_)) => Some(Account::generate().prekey_bundle()),
+            (Evil::HideOpk, Some(mut b)) => {
+                b.opk = None;
+                Some(b)
+            }
+            (_, other) => other,
+        })
     }
+    /// The path `Peer::connect` ACTUALLY uses.
+    ///
+    /// Intercepting only the public `fetch_bundle` was the first attempt and tested nothing: the
+    /// admission-gated lookup is a different method, `connect` calls that one, and the substitution
+    /// never reached the code under test — so the test failed with "a substituted bundle was
+    /// accepted" while the client had in fact never been offered one. Third vacuous-test trap in
+    /// this file, and the reason each test here also asserts that the relay misbehaved.
     fn fetch_bundle_opk(
         &self,
         req: &BundleOpkRequest,
         now: u64,
     ) -> Result<BundleOpkResponse, String> {
-        self.inner.fetch_bundle_opk(req, now)
+        let real = self.inner.fetch_bundle_opk(req, now)?;
+        Ok(match (self.mode, real) {
+            (Evil::SubstituteBundle, BundleOpkResponse::Bundle(Some(_))) => {
+                BundleOpkResponse::Bundle(Some(Account::generate().prekey_bundle()))
+            }
+            (Evil::HideOpk, BundleOpkResponse::Bundle(Some(mut b))) => {
+                b.opk = None;
+                BundleOpkResponse::Bundle(Some(b))
+            }
+            (_, other) => other,
+        })
     }
 }
 
@@ -150,6 +197,28 @@ fn dev_cap() -> admission::capability::Capability {
         not_after: u32::MAX,
         secret: [0x35; 32],
     }
+}
+
+/// Alice and Bob over one relay running `mode`, with Bob published and Alice NOT yet connected.
+///
+/// Separate from [`pair`] because a test about the HANDSHAKE has to run the handshake itself. The
+/// first version of the substitution test did not, and passed for the wrong reason: `pair` had
+/// already connected, so the test's own `connect` returned "session already established" — an
+/// `Err`, which the assertion happily accepted as a refusal. It asserted nothing at all.
+fn pair_unconnected(mode: Evil) -> (Peer<EvilRelay>, Peer<EvilRelay>, [u8; 32]) {
+    let mut node = RelayNode::new(NOW);
+    node.issue_capability(dev_cap());
+    let relay_pub = node.relay_public();
+    let shared = Rc::new(RefCell::new(node));
+    let t = EvilRelay::new(shared, mode);
+    let mut bob = Peer::new(t.clone(), Account::generate(), dev_cap(), relay_pub);
+    // WITH one-time prekeys: without them an honest bundle also yields `NoOneTimePrekey`, and the
+    // "a withheld unit downgrades loudly" test could not tell withholding from having none.
+    let opks = bob.add_opks(4);
+    bob.publish_advertising(&opks, NOW);
+    let bob_ik = bob.identity();
+    let alice = Peer::new(t, Account::generate(), dev_cap(), relay_pub);
+    (alice, bob, bob_ik)
 }
 
 /// Alice and Bob over one relay running `mode`, with Bob published and Alice connected.
@@ -257,5 +326,83 @@ fn a_reordered_page_still_delivers_everything() {
         got,
         vec![b"one".to_vec(), b"three".to_vec(), b"two".to_vec()],
         "a reversed page lost messages; out-of-order delivery is normal, so this must be free"
+    );
+}
+
+/// **A substituted bundle must not become a session.**
+///
+/// This is the one behaviour on the list that would break the GUARANTEE rather than the delivery.
+/// Everything else a hostile relay does costs a message; handing you keys of its own making would
+/// cost the conversation — it would sit in the middle of it.
+///
+/// The bundle the relay serves here is not malformed: it is a real, self-consistent, correctly
+/// signed bundle. It is simply signed by the wrong identity, which is exactly the shape a
+/// substitution takes in practice. `verify_prekey_sig` checks it against the IK the caller ASKED
+/// for, so the mismatch is caught by whose signature it is rather than by anything about its
+/// contents.
+#[test]
+fn a_bundle_of_the_relays_own_making_is_refused() {
+    let (mut alice, _bob, bob_ik) = pair_unconnected(Evil::SubstituteBundle);
+    let out = alice.connect(&bob_ik, NOW);
+    assert!(
+        out.is_err(),
+        "a bundle signed by a DIFFERENT identity was accepted for {}. A relay that can substitute \
+         keys is a relay in the middle of the conversation, which is the one outcome the whole \
+         design refuses.",
+        hex::encode(bob_ik)
+    );
+}
+
+/// **A stripped one-time prekey is REPORTED, not swallowed.**
+///
+/// Running out of one-time prekeys is legitimate, so the handshake proceeding is correct. What must
+/// not happen is proceeding SILENTLY: the missing unit is the only signal that this first message's
+/// post-quantum leg is recorded-now-decrypt-later, and a relay can withhold the unit deliberately to
+/// obtain exactly that.
+///
+/// DISCRIMINATING: have `connect` return `Full` unconditionally and this goes red — which is the
+/// state in which a relay downgrades every first contact and nobody is told.
+#[test]
+fn a_withheld_one_time_prekey_downgrades_loudly() {
+    let (mut alice, _bob, bob_ik) = pair_unconnected(Evil::HideOpk);
+    let fs = alice.connect(&bob_ik, NOW).expect("a bundle with no one-time unit is still usable");
+    assert!(
+        matches!(fs, karst_client_core::peer::ForwardSecrecy::NoOneTimePrekey),
+        "a relay withheld the one-time prekey and the handshake reported full forward secrecy. \
+         Withholding it is free for the relay, so an unreported downgrade is a downgrade it can \
+         apply to everyone."
+    );
+
+    // CONTROL: the same code path with an honest relay reports the opposite, so the assertion above
+    // is about the withholding rather than about this harness never producing `Full`.
+    let (mut a2, _b2, ik2) = pair_unconnected(Evil::None);
+    assert!(
+        matches!(a2.connect(&ik2, NOW), Ok(karst_client_core::peer::ForwardSecrecy::Full)),
+        "the control arm does not reach full forward secrecy, so the test above proves nothing"
+    );
+}
+
+/// **A relay that lies about delivery costs a message and nothing else.**
+///
+/// Undetectable by construction — a relay can always accept and discard, and no protocol can tell
+/// that from a delivery the recipient has not fetched yet. So the assertion is not that the client
+/// notices; it is that the client's own state stays coherent: the ratchet advanced exactly once, so
+/// the NEXT message over an honest path still opens rather than arriving on a chain the recipient
+/// never saw move.
+#[test]
+fn a_discarded_deposit_leaves_the_sender_coherent() {
+    let (mut alice, mut bob, bob_ik, _spy) = pair(Evil::AcceptedButDiscarded);
+    let env = alice.encrypt_next(&bob_ik, b"into the void").expect("encrypts");
+    assert!(
+        matches!(alice.transmit_envelope(&bob_ik, env, NOW), Response::Accepted),
+        "the relay claimed acceptance, which is the point of this mode"
+    );
+    assert!(texts(&mut bob).is_empty(), "nothing was stored, so nothing can arrive");
+
+    // The sender is not wedged: it can still produce envelopes, and its session is intact.
+    assert!(
+        alice.encrypt_next(&bob_ik, b"and again").is_ok(),
+        "the session broke on a discarded deposit; a relay could then end a conversation by \
+         accepting one message and dropping it"
     );
 }

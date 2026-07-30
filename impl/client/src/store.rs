@@ -3840,13 +3840,19 @@ impl Store {
     }
 
     /// The `payload_id`s of the last `limit` INCOMING history records — the dedup set for the
-    /// plaintext-first receive path. Only the recent tail is logically needed (a redelivered
+    /// plaintext-first receive path. Only the recent tail is logically needed: a redelivered
     /// duplicate arises only in the crash-before-ratchet-save window and reappears on the very
-    /// next poll, so its twin is among the newest records), but the framed append-log has no
-    /// reverse index, so this currently reads and AEAD-opens the WHOLE file and then slices the
-    /// tail. That is a full-history decrypt per poll for a large log — acceptable for now,
-    /// flagged as a follow-up (a record index / reverse scan would bound it). Zeroed ids
-    /// (outgoing / pre-`msg_id` legacy) are excluded — they never match a real id.
+    /// next poll, so its twin is among the newest records.
+    ///
+    /// **Bounded, and this comment used to say otherwise.** It described reading and AEAD-opening
+    /// the WHOLE history file per poll and called that "acceptable for now" — true when written,
+    /// false since the dedup ring landed. This reads `dedup.dat` alone: one sealed file capped at
+    /// `DEDUP_RING_CAP`, so the cost is a fixed tail rather than O(history). The stale version was
+    /// worse than no comment, because it sent a reader looking for a performance problem that had
+    /// already been fixed — and it survived long enough to be filed as a backlog item on that
+    /// premise.
+    ///
+    /// Zeroed ids (outgoing / pre-`msg_id` legacy) are excluded — they never match a real id.
     pub fn recent_incoming_ids(&self, limit: usize) -> io::Result<std::collections::HashSet<[u8; 32]>> {
         let ring = self.load_dedup_ring()?;
         let start = ring.len().saturating_sub(limit);

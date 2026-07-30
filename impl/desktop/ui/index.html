@@ -3,12 +3,16 @@
 <link rel="icon" href="favicon.png"><title>KARST</title>
 <style>
 :root{
-  --bg:#0E1116; --panel:#151A21; --panel2:#1B222B; --rail:#0A0D11;
-  --line:#242D38; --line-soft:#1B222B;
-  --text:#E9EDF2; --muted:#8B95A4; --faint:#5B6572;
+  /* Brandbook §07, applied as the product's own tokens. Karst Black is the primary
+     background, Graphite the raised surface, Ice White the primary text, Slate the
+     secondary — and green/amber stay SEMANTIC, never decorative (§07, §15). */
+  --bg:#030609; --panel:#07151B; --panel2:#0B1E26; --rail:#020507;
+  --line:#17272E; --line-soft:#0E1B21;
+  --text:#F4FAFB; --muted:#71818A; --faint:#4C5C65;
   --accent:#00F8FF; --accent-deep:#008A8E; --accent-soft:rgba(0,248,255,.13);
-  --on-accent:#04252A; --bubble-them:#1C242E; --bubble-me:#00767B;
-  --good:#45C08A; --warn:#E4A64C; --danger:#E06B5C;
+  --on-accent:#04252A; --bubble-them:#0E2028; --bubble-me:#00595E;
+  --cta:#00F8FF; --cta-ink:#04252A;
+  --good:#79F05D; --warn:#FFB24D; --danger:#E06B5C;
   --shadow:0 12px 34px rgba(0,0,0,.5); --r:12px; --r-lg:16px;
   --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
@@ -17,7 +21,12 @@
   --bg:#EDF1F5; --panel:#FFFFFF; --panel2:#F2F5F8; --rail:#E6EBF0;
   --line:#E0E6EC; --line-soft:#EBEFF3; --text:#0F151C; --muted:#586472; --faint:#93a0ad;
   --accent:#0CA6AA; --accent-deep:#088386; --accent-soft:rgba(12,166,170,.12);
-  --on-accent:#FFFFFF; --bubble-them:#EEF2F6; --bubble-me:#0C8A8E; --shadow:0 12px 34px rgba(20,40,60,.12);
+  /* The brandbook defines one palette, for dark. On white, Proof Green and Warning Amber
+     are unreadable as text, so the light theme keeps their HUE and drops the lightness —
+     the semantics stay, the legibility rule (§16) is kept. */
+  --good:#2E8C1B; --warn:#9A6200;
+  --on-accent:#FFFFFF; --bubble-them:#FFFFFF; --bubble-me:#0C8A8E;
+  --cta:#088386; --cta-ink:#FFFFFF; --shadow:0 12px 34px rgba(20,40,60,.12);
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -35,6 +44,9 @@ input,textarea{font:inherit}
 .center{height:100vh;display:grid;place-items:center;padding:24px;overflow:auto}
 .card{width:100%;max-width:400px;text-align:center}
 .brandmark{width:60px;height:60px;margin:0 auto 14px;display:block}
+/* KARST is artwork, never type (brandbook §08, §13). */
+.wordmark-art{height:26px;width:auto;display:block;margin:0 auto 6px}
+:root[data-theme="light"] .wordmark-art{filter:invert(1) brightness(.12)}
 .wordmark{font-size:34px;font-weight:600;letter-spacing:.14em;margin:0}
 .subtitle{color:var(--muted);font-size:13px;margin:6px 0 0;letter-spacing:.04em}
 .panelbox{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);padding:24px;margin-top:22px;text-align:left;box-shadow:var(--shadow)}
@@ -43,7 +55,7 @@ input,textarea{font:inherit}
 .field:focus{border-color:var(--accent)}
 .field::placeholder{color:var(--faint)}
 .btn{width:100%;border-radius:11px;padding:12px;font-weight:600;font-size:15px;transition:.15s}
-.btn.primary{background:var(--accent-deep);color:#fff}
+.btn.primary{background:var(--cta);color:var(--cta-ink)}
 .btn.primary:hover{filter:brightness(1.08)}
 .btn.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--muted);font-weight:500;font-size:13.5px;padding:9px}
 .btn.ghost:hover{color:var(--text);border-color:var(--accent)}
@@ -412,8 +424,8 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- UNLOCK -->
 <section class="screen" id="s-unlock"><div class="center"><div class="card">
-  <img class="brandmark" src="logo-small.svg" alt="KARST">
-  <h1 class="wordmark">KARST</h1>
+  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="wordmark-art" src="wordmark.svg" alt="KARST">
   <p class="subtitle" data-i18n="END-TO-END ENCRYPTED">END-TO-END ENCRYPTED</p>
   <div class="panelbox">
     <p class="flabel" data-i18n="Password — unlocks the secrets on this device">Password &mdash; unlocks the secrets on this device</p>
@@ -441,8 +453,8 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- WELCOME -->
 <section class="screen" id="s-welcome"><div class="center"><div class="card">
-  <img class="brandmark" src="logo-small.svg" alt="KARST">
-  <h1 class="wordmark">KARST</h1>
+  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="wordmark-art" src="wordmark.svg" alt="KARST">
   <p class="subtitle" data-i18n="A DECENTRALIZED, ENCRYPTED MESSENGER">A DECENTRALIZED, ENCRYPTED MESSENGER</p>
   <div class="panelbox">
     <p style="margin:0 0 16px;color:var(--muted);font-size:13.5px;line-height:1.6" data-i18n="No phone number. No central server. Your identity is a key only you hold — recoverable from a 24-word phrase.">No phone number. No central server. Your identity is a key only you hold &mdash; recoverable from a 24-word phrase.</p>
@@ -463,7 +475,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- CREATE 1 -->
 <section class="screen" id="s-create1"><div class="center"><div class="card">
-  <img class="brandmark" src="logo-small.svg" alt="KARST">
+  <img class="brandmark" src="logo.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Your recovery phrase">Your recovery phrase</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Write these 24 words down, in order. They are the only way to recover this account.">Write these 24 words down, in order. They are the only way to recover this account.</p>
   <div class="panelbox">
@@ -476,7 +488,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- CREATE 2 -->
 <section class="screen" id="s-create2"><div class="center"><div class="card">
-  <img class="brandmark" src="logo-small.svg" alt="KARST">
+  <img class="brandmark" src="logo.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Confirm &amp; protect">Confirm &amp; protect</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Prove you saved the phrase, then set a device password.">Prove you saved the phrase, then set a device password.</p>
   <div class="panelbox">
@@ -504,7 +516,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- RELAY CONFIG (its own short step, so onboarding screens never scroll) -->
 <section class="screen" id="s-relaycfg"><div class="center"><div class="card">
-  <img class="brandmark" src="logo-small.svg" alt="KARST">
+  <img class="brandmark" src="logo.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Connect to a relay">Connect to a relay</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Where your messages travel. Your relay prints all of these when it starts.">Where your messages travel. Your relay prints all of these when it starts.</p>
   <div class="panelbox">
@@ -522,7 +534,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- RESTORE -->
 <section class="screen" id="s-restore"><div class="center"><div class="card">
-  <img class="brandmark" src="logo-small.svg" alt="KARST">
+  <img class="brandmark" src="logo.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Restore account">Restore account</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Enter your 24-word recovery phrase into an empty profile.">Enter your 24-word recovery phrase into an empty profile.</p>
   <div class="panelbox">

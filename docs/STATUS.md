@@ -3760,11 +3760,13 @@ Four smaller conclusions the discussion reached that belong in the record:
   self-descriptor (re-checked against the SSRF gate). Deliberately NOT the audit's suggested
   "compare the hint against the self-descriptor": address comparison needs canonicalization rules
   (host vs IP, carrier, port, path) and every such rule also refuses honest relays reached by a
-  different spelling. **Residual, node side (`gossip::gossip_round`, out of this change's scope):
-  a relay merging a heard descriptor still verifies with, and re-serves, the peer-supplied
-  addresses — so a hostile peer can still inject a proxy address into other relays' node-lists.
-  The client no longer adopts it as a route, but the class is only half dead until `gossip_round`
-  keeps the self-declared addresses too.** Any FUTURE auto-dial path must reuse the same gate.
+  different spelling. ~~**Residual, node side (`gossip::gossip_round`): a relay merging a heard
+  descriptor still verifies with, and re-serves, the peer-supplied addresses.**~~ **CORRECTED
+  2026-07-30 — this was true when written (9e77bd5) and was closed later the same day by 8efce45:
+  `gossip::verified_self_descriptor` dials the candidate and stores what the relay says about
+  ITSELF, so the class is dead on the node side too.** Left visible rather than deleted because the
+  paragraph was quoted as a live gap for two days. Any FUTURE auto-dial path must reuse the same
+  gate.
 
 - **The relay does NOT automatically reconstruct your whole graph — a precision that
   corrects an earlier overstatement in this doc.** Post-3b, what a Public node sees cleanly
@@ -3860,3 +3862,62 @@ the gap its own argument points at: a crash report IS a panic message, and
 would have to exclude `#[cfg(test)]` modules, where these identifiers appear legitimately by the
 dozen; checked by hand instead — today no panic outside a test module interpolates any forbidden
 name.
+
+### NODE-1, slice 1: one signed statement a relay makes about itself
+
+The same facts were already advertised, from two places with different standing. `GetNodeList`
+served addresses that nothing bound to the relay they described; `GetPolicy` served the policy over
+a session with that relay and nowhere else. So a client could not learn a relay's posture without
+first connecting to it, and an intermediary passing a descriptor along could rewrite anything in it.
+
+A `NodeDescriptor` (`node/src/protocol.rs`) carries the keys, the dial hints, the policy, an
+`issued_at` and an `expires_at`, under one signature — **XEdDSA over the relay's existing Noise
+static secret**, the same construction the prekey bundle uses. No second key, no configuration
+surface, no install-script change; the descriptor is verified with the `noise_pub` already in the
+relay-id, so it is self-authenticating wherever it travels.
+
+**What the signature does NOT establish, decided rather than discovered.** The obvious next step —
+let gossip merge a signed descriptor without dialing, and take the scaling win — was considered and
+**rejected**. `verified_self_descriptor`'s dial buys two things and only one of them is authenticity;
+the other is LIVENESS at merge time. Signature-only merge would trade a structural property for a
+claim: a hostile peer floods genuinely-signed descriptors for relays that retired an hour ago,
+`MAX_KNOWN_RELAYS = 128` becomes a poisoning target, and `expires_at` bounds how STALE an entry can
+be, never how MANY arrive. So the signature rides alongside the dial, and the dial stays the gate for
+list entry. Nor does signing make the policy true: it is still operator-declared, exactly as
+`RelayPolicy` says. What it buys is attributability — a relay that signs "ephemeral" and keeps your
+blobs has put its name on the statement.
+
+**The expiry needed a renewal path before it needed anything else.** An `expires_at` with nothing
+re-signing means a running, reachable, perfectly healthy relay stops being served by everyone at the
+TTL boundary — "the network forgot a relay that never went anywhere". The relay caches its signed
+descriptor and re-signs when the copy is older than `DESCRIPTOR_REFRESH_SECS` (1 h, against a 6 h
+TTL), which also bounds how long an operator's configuration change takes to reach whoever asks: an
+hour, not a TTL. The cache is load-bearing for a second reason — `GetDescriptor` is a public,
+unauthenticated read, and signing per request would sell a scalar multiplication for the price of one
+cheap request.
+
+**`GetPolicy` stayed, as a thin reader of the same state.** Both answers are built from
+`RelayNode::policy()`, so they can disagree only if that one function is asked twice across a
+configuration change. `RelayDescriptor`'s own doc rejects a `supported_transports` field for exactly
+this reason ("a second place that can disagree with the first"), and it would have been easy to
+create that problem here while claiming to remove one.
+
+13 tests, each checked by neutering the thing it tests: the four validity branches (lapsed / issued
+in the future / signature / a validity window longer than the protocol allows) each redden their own
+test, and the two behavioural ones — the cache and the renewal — redden theirs. The upper-bound check
+is worth naming: a descriptor with a ten-year window and a *genuine* signature is refused, because
+`expires_at` bounds staleness only if the VERIFIER enforces the maximum. The discovery plane had the
+same hole before its own bound existed.
+
+**NOT done — slice 2:** the node list still serves bare `RelayDescriptor`s, so gossip cannot yet
+store what each relay signed (which also means replacing address MERGING with "take the newest signed
+statement wholesale"), and the client still learns policy only after dialing. That last one is where
+the countable win is: today `client/src/lib.rs` filters by policy AFTER `verified_self_address`, so
+every rejected candidate has already cost a full dial, plus a SECOND connection for `GetPolicy`
+(public reads carry no scope, so PERF-8's pool cannot merge them). With policy in the descriptor the
+filter moves before the dial: `2k` connections for `k` candidates becomes `m`, the number that match.
+
+**Premise check, as usual, before taking the task — and it had half-expired.** The task inherited a
+STATUS paragraph naming a live gossip residual; the code closed it a day later, and the correction is
+recorded in place above rather than quietly deleted. That is the **eighth** task in this sweep whose
+premise had moved, and the third where the mover was our own change.

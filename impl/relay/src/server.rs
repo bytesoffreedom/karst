@@ -506,6 +506,21 @@ pub(crate) fn serve_channel(
         WireRequest::GetPolicy => {
             WireResponse::Policy(relay.read().expect("relay lock").policy())
         }
+        WireRequest::GetDescriptor => {
+            // Fast path under the READ lock: the cached signature is what almost every request
+            // gets, and taking the write lock for a public read would let strangers serialise the
+            // whole relay behind them.
+            let now = (clock)();
+            let cached = relay.read().expect("relay lock").signed_descriptor(now);
+            let d = match cached {
+                Some(d) => Some(d),
+                // Stale or never signed: re-sign once, under the write lock. Whoever loses the
+                // race re-signs too — one extra scalar multiplication, not a correctness problem,
+                // and cheaper than holding a lock across the common case to prevent it.
+                None => relay.write().expect("relay lock").refresh_signed_descriptor(now, &noise_priv),
+            };
+            WireResponse::Descriptor(d)
+        }
         WireRequest::BlobStat(req) => {
             // Admitted like every other blob request now (PRIV-7): a stat used to be the one blob
             // endpoint with no address, no cookie and no admission — the serve loop's own note

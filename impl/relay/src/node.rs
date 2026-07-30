@@ -589,6 +589,9 @@ pub struct RelayNode {
     /// advertises a routable address (else it has no reachable hint to offer — same rule as
     /// node-list self-advertisement).
     self_descriptor: Option<RelayDescriptor>,
+    /// The signed form of `self_descriptor` + `policy()`, cached and re-signed on a cadence
+    /// (NODE-1). See `refresh_signed_descriptor` for why it is not minted per request.
+    signed_self: Option<SignedDescriptor>,
 }
 
 impl RelayNode {
@@ -623,6 +626,7 @@ impl RelayNode {
             known_relays: Vec::new(),
             discovery: HashMap::new(),
             self_descriptor: None,
+            signed_self: None,
         }
     }
 
@@ -979,6 +983,36 @@ impl RelayNode {
     /// claim is added then and not before (QUIC-11).
     pub fn self_descriptor(&self) -> Option<RelayDescriptor> {
         self.self_descriptor.clone()
+    }
+
+    /// The cached signed descriptor, if one exists and is still fresh enough to serve (NODE-1).
+    ///
+    /// "Fresh enough" is `DESCRIPTOR_REFRESH_SECS`, not the TTL: serving a copy that is about to
+    /// lapse would hand the holder something it must immediately re-fetch, and would make a
+    /// configuration change take a full TTL to reach anyone.
+    pub fn signed_descriptor(&self, now: u64) -> Option<SignedDescriptor> {
+        let d = self.signed_self.as_ref()?;
+        (now < d.desc.issued_at.saturating_add(DESCRIPTOR_REFRESH_SECS)
+            && now.saturating_add(DESCRIPTOR_SKEW_SECS) >= d.desc.issued_at)
+            .then(|| d.clone())
+    }
+
+    /// Re-sign this relay's statement about itself from CURRENT state, cache it and return it.
+    /// `None` when this relay advertises no routable address — it is undiscoverable by its own
+    /// choice, and there is nothing truthful to sign.
+    ///
+    /// Built fresh from `self_descriptor()` and `policy()` on every refresh, which is what makes an
+    /// operator's configuration change propagate at all: nothing here remembers what was signed an
+    /// hour ago.
+    pub fn refresh_signed_descriptor(
+        &mut self,
+        now: u64,
+        noise_secret: &[u8; 32],
+    ) -> Option<SignedDescriptor> {
+        let relay = self.self_descriptor.clone()?;
+        let signed = NodeDescriptor::signed(relay, self.policy(), now, noise_secret);
+        self.signed_self = Some(signed.clone());
+        Some(signed)
     }
 
     /// §12 4c — publish (or rotate) an opt-in discovery record. Accepts iff (a) the slot matches

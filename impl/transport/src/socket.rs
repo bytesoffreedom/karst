@@ -15,7 +15,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 
 use node::discovery::DiscoveryRecord;
-use node::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, Transport, WireMessage};
+use node::protocol::{AckRequest, AckResponse, BlobGetRequest, BlobPutRequest, BlobResponse, BundleOpkRequest, BundleOpkResponse, FetchRequest, FetchResponse, JoinRequest, PublishRequest, PublishResponse, RelayDescriptor, RelayPolicy, Response, SignedDescriptor, Transport, WireMessage};
 use karst_crypto::pqxdh::PreKeyBundle;
 use karst_crypto::session::Session;
 use crate::transport::{Channel, Dest, DirectTcpAdapter, Path, TransportAdapter};
@@ -459,6 +459,22 @@ impl SocketTransport {
             WireResponse::Policy(p) => Ok(p),
             WireResponse::Rejected(s) => Err(io::Error::other(s)),
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on GetPolicy")),
+        }
+    }
+
+    /// Fetch this relay's SIGNED descriptor — keys, dial hints and policy under one signature with
+    /// an expiry (NODE-1). `None` means the relay advertises no routable address, so it has nothing
+    /// truthful to sign about where to reach it.
+    ///
+    /// The signature is NOT checked here: this returns what the wire said, and the caller decides
+    /// what `now` is. Verification lives at the point of use (`SignedDescriptor::verified`) because
+    /// a transport has no business holding an opinion about the clock, and because a caller that
+    /// forgot to verify should have to write that omission down rather than inherit it.
+    pub fn get_descriptor(&self) -> io::Result<Option<SignedDescriptor>> {
+        match self.round_trip(&WireRequest::GetDescriptor)? {
+            WireResponse::Descriptor(d) => Ok(d),
+            WireResponse::Rejected(s) => Err(io::Error::other(s)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "protocol: unexpected on GetDescriptor")),
         }
     }
 

@@ -31,12 +31,18 @@ fn a_round_trip_through_the_envelope_is_lossless() {
 #[test]
 fn a_peer_on_another_protocol_version_is_refused_by_name() {
     let mut bytes = encode(&sample()).unwrap();
-    // postcard varint-encodes a u16; v1 is a single 0x01 byte at offset 0.
+    // postcard varint-encodes a u16; every version this codebase has used is one byte at offset 0.
     assert_eq!(bytes[0], PROTOCOL_VERSION as u8, "the version leads the frame");
-    bytes[0] = 2;
+    // Derived from the current version, never a literal: this test used to hardcode `2` as "some
+    // other version", which quietly stopped testing anything the day the wire moved to v2 — it
+    // asserted that OUR OWN version is refused, and failed for that reason rather than for the one
+    // it was written to catch.
+    let other = PROTOCOL_VERSION + 1;
+    assert!(other < 128, "a one-byte varint no longer holds the version — this patch needs rewriting");
+    bytes[0] = other as u8;
     match decode::<JoinRequest>(&bytes) {
         Err(WireError::ProtocolVersion { got, want }) => {
-            assert_eq!((got, want), (2, PROTOCOL_VERSION));
+            assert_eq!((got, want), (other, PROTOCOL_VERSION));
         }
         other => panic!("a version mismatch must name itself, got {}", describe(&other)),
     }

@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::DiscoveryRecord;
-use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, BlobStatRequest, FetchRequest, JoinRequest, Payload, PublishRequest, RelayDescriptor, RelayPolicy, WireMessage};
+use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, BlobStatRequest, FetchRequest, JoinRequest, Payload, PublishRequest, RelayDescriptor, RelayPolicy, SignedDescriptor, WireMessage};
 use crate::pqxdh::PreKeyBundle;
 
 /// Потолок кадра ЗАПРОСА (client→server) — самый враждебный вход. Полезная нагрузка §7 всё равно
@@ -207,7 +207,18 @@ pub enum WireRequest {
     GetNodeList,
     /// Ask this relay to advertise its policy (blob persistence/TTL/caps, PoW door). Public read —
     /// rides the completed Noise session, bounded response, no cookie. Carries no user info.
+    ///
+    /// Kept as a thin reader of the SAME state `GetDescriptor` signs, never a second source: the
+    /// handler builds both from `RelayNode::policy()`, so the two can disagree only if that one
+    /// function is asked twice across a configuration change.
     GetPolicy,
+    /// §12 NODE-1: ask this relay for its signed statement about itself — keys, dial hints and
+    /// policy under one signature with an expiry. Public read, same standing as the two above.
+    ///
+    /// Unlike `GetPolicy`, the answer is useful AWAY from this session: it is self-authenticating,
+    /// so whoever receives it can hand it on and the next holder can still check it came from the
+    /// relay it describes.
+    GetDescriptor,
     /// §12 4c: publish (or rotate) an opt-in discovery record + the discovery-key write signature.
     /// Self-authenticated (see `handle_publish_discovery`), so it rides the Noise session without
     /// a cookie.
@@ -261,6 +272,10 @@ pub enum WireResponse {
     NodeList(Vec<RelayDescriptor>),
     /// This relay's advertised policy (operator-declared — see `RelayPolicy`).
     Policy(RelayPolicy),
+    /// §12 NODE-1: this relay's signed descriptor. `None` when the relay has no routable address
+    /// to advertise — it is not discoverable by its own choice, and signing a statement with no
+    /// way to reach it would be advertising nothing, loudly.
+    Descriptor(Option<SignedDescriptor>),
     /// §12 4c: outcome of a discovery publish/delete (`true` = applied).
     DiscoveryAck(bool),
     /// §12 4c: the record a discovery pseudonym resolves to (`None` = not published / expired).
@@ -314,7 +329,7 @@ impl From<io::Error> for WireError {
 /// It exists because postcard is positional and carries no self-description: without a version,
 /// two builds that disagree about a shape decode each other's bytes into plausible nonsense and
 /// fail somewhere far from the cause. With it, the mismatch names itself at the first frame.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// What actually goes on the wire: a version, a feature word, and the encoded request/response.
 ///

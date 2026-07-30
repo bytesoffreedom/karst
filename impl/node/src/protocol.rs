@@ -561,6 +561,130 @@ impl RelayDescriptor {
         s
     }
 }
+
+/// How long a signed descriptor stays valid. Short enough that a retired relay, or a policy a
+/// relay has since changed, ages out of everyone's copy on its own; long enough that an offline
+/// relay is not evicted for a restart.
+pub const DESCRIPTOR_TTL_SECS: u64 = 6 * 3600;
+
+/// How often a relay re-signs. Well under [`DESCRIPTOR_TTL_SECS`] so a descriptor fetched at the
+/// worst moment still has hours of validity left, and so a configuration change reaches whoever
+/// asks within an hour rather than at the next TTL boundary.
+pub const DESCRIPTOR_REFRESH_SECS: u64 = 3600;
+
+/// Clock-skew allowance, matching the discovery plane's (`DISCOVERY_CLOCK_SKEW_SECS`). Two honest
+/// machines disagree by minutes; refusing a descriptor over that would make discovery depend on NTP.
+pub const DESCRIPTOR_SKEW_SECS: u64 = 5 * 60;
+
+/// **Everything a relay says about itself, in one statement it signs** (NODE-1).
+///
+/// # What this changes
+///
+/// The same facts were already advertised, in two places with different standing: `GetNodeList`
+/// served addresses that nothing bound to the relay they described, and `GetPolicy` served the
+/// policy over a session with that relay and nowhere else. So a client could not learn a relay's
+/// policy without first connecting to it, and an intermediary passing a descriptor along could
+/// rewrite anything in it.
+///
+/// A `NodeDescriptor` is signed by the relay's OWN Noise key, so it carries its own proof of
+/// authorship wherever it travels: whoever relays it can drop it or delay it, but cannot edit it.
+///
+/// # What the signature does NOT establish
+///
+/// **Liveness.** A signature says "this relay said this", never "this relay is up, and is still
+/// reachable at these addresses". A hostile peer can hand out genuinely-signed descriptors for
+/// relays that retired an hour ago, and `expires_at` bounds only how stale that can get, never how
+/// MANY it can send. So this does not replace the dial in `gossip::verified_self_descriptor` — that
+/// dial is what keeps a dead-but-authentic entry out of the node list, and any future auto-dial path
+/// must keep reusing the same gate.
+///
+/// **Truth.** The policy inside is still operator-DECLARED, exactly as `RelayPolicy` documents:
+/// signing an unverifiable claim makes it attributable, not true. What it buys is accountability —
+/// a relay that signs "ephemeral blobs" and keeps them has put its name on the statement.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodeDescriptor {
+    /// The keys and dial hints — unchanged in meaning from a bare [`RelayDescriptor`].
+    pub relay: RelayDescriptor,
+    /// The operator-declared posture, now readable BEFORE connecting to this relay.
+    pub policy: RelayPolicy,
+    /// When this statement was made (relay's wall clock).
+    pub issued_at: u64,
+    /// When it stops being usable. See [`DESCRIPTOR_TTL_SECS`].
+    pub expires_at: u64,
+}
+
+/// A [`NodeDescriptor`] with the relay's signature over it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SignedDescriptor {
+    pub desc: NodeDescriptor,
+    /// XEdDSA over [`descriptor_msg`], by the X25519 secret behind `desc.relay.noise_pub` — the
+    /// same construction the prekey bundle uses, so this needs no second key, no new configuration
+    /// and no change to the install scripts.
+    pub sig: Vec<u8>,
+}
+
+/// The exact bytes a descriptor's signature covers: a domain tag and the postcard encoding.
+///
+/// postcard is positional and self-description-free, so re-encoding the decoded struct reproduces
+/// the signed bytes exactly — there is no canonicalisation question to get wrong, and
+/// `a_reencoded_descriptor_still_verifies` pins that property against a future field reordering.
+pub fn descriptor_msg(desc: &NodeDescriptor) -> Vec<u8> {
+    let mut m = Vec::with_capacity(256);
+    m.extend_from_slice(b"KARST-node-descriptor-v1");
+    m.extend_from_slice(&postcard::to_stdvec(desc).expect("NodeDescriptor serializes"));
+    m
+}
+
+impl NodeDescriptor {
+    /// Build and sign this relay's current statement about itself. `noise_secret` is the X25519
+    /// secret behind `relay.noise_pub`; signing with any other key yields a descriptor that
+    /// verifies nowhere, which [`SignedDescriptor::verified`] treats exactly like a forgery.
+    pub fn signed(
+        relay: RelayDescriptor,
+        policy: RelayPolicy,
+        now: u64,
+        noise_secret: &[u8; 32],
+    ) -> SignedDescriptor {
+        let desc = NodeDescriptor {
+            relay,
+            policy,
+            issued_at: now,
+            expires_at: now.saturating_add(DESCRIPTOR_TTL_SECS),
+        };
+        let sig = crate::discovery::sign(noise_secret, &descriptor_msg(&desc));
+        SignedDescriptor { desc, sig }
+    }
+}
+
+impl SignedDescriptor {
+    /// The descriptor, if the signature is the relay's own AND the validity window contains `now`.
+    /// `None` on any fault — nothing partially-trusted comes out of here.
+    ///
+    /// Both ends of the window are checked, for different reasons. The lower bound stops a
+    /// still-perfectly-signed record from being replayed forever, which is the failure the discovery
+    /// plane already had to close. The upper bound stops a relay from minting a descriptor that
+    /// never lapses: without it, `expires_at` is a promise the signer makes to itself, and one line
+    /// of a hostile fork removes it.
+    pub fn verified(&self, now: u64) -> Option<&NodeDescriptor> {
+        if self.desc.expires_at.saturating_add(DESCRIPTOR_SKEW_SECS) <= now {
+            return None; // lapsed
+        }
+        if self.desc.expires_at
+            > self.desc.issued_at.saturating_add(DESCRIPTOR_TTL_SECS + DESCRIPTOR_SKEW_SECS)
+        {
+            return None; // a validity window longer than the protocol allows
+        }
+        if self.desc.issued_at > now.saturating_add(DESCRIPTOR_SKEW_SECS) {
+            return None; // signed in the future
+        }
+        let ok = crate::discovery::verify(
+            &self.desc.relay.noise_pub,
+            &descriptor_msg(&self.desc),
+            &self.sig,
+        );
+        ok.then_some(&self.desc)
+    }
+}
 /// §15 large-file upload: one ciphertext chunk of an E2E-encrypted blob. Cookie-gated
 /// (DoS/freshness, like fetch) AND capability-gated (CRYPTO-15/#169) — `capability_proof` must
 /// verify (§7.2) and `request_nonce` must equal `blob_put_nonce(blob_id, index)`, so this chunk

@@ -52,7 +52,7 @@ fn a_pow_earned_capability_opens_the_door() {
     let bob_pub = bob.public();
 
     assert!(
-        matches!(alice.send(&bob_pub, b"hi via pow", NOW), Response::Accepted),
+        matches!(alice.send(&bob_pub, bob.kem_ek(), b"hi via pow", NOW), Response::Accepted),
         "an earned capability must be admitted"
     );
     let msgs = bob.receive(NOW).expect("fetch");
@@ -111,12 +111,14 @@ fn a_replayed_redemption_shares_one_exhausted_quota_bucket() {
     let transport = InMemoryTransport::new(relay.clone());
     let bob = Identity::generate();
     let bob_pub = bob.public;
+    // Nobody opens these — the loop exists to exhaust the quota — so any well-formed KEM key does.
+    let kem = node::seal::SealKemKeys::generate();
     let mut alice = Client::new(transport.clone(), cap.clone(), b"alice");
 
     // Spend the whole per-capability quota (POW_CAP_QUOTA.max_requests).
     let mut admitted = 0u32;
     loop {
-        match alice.send(&bob_pub, b"x", NOW) {
+        match alice.send(&bob_pub, kem.ek(), b"x", NOW) {
             Response::Accepted => {
                 admitted += 1;
                 assert!(admitted <= 1000, "quota never exhausted — is it enforced?");
@@ -141,7 +143,7 @@ fn a_replayed_redemption_shares_one_exhausted_quota_bucket() {
     // rejected it"). The discriminator is Accepted-vs-not: a FRESH-quota bug would mint a new
     // id → an empty window → `Accepted`. That is the failure this guards.
     let mut mallory = Client::new(transport, cap2, b"mallory");
-    match mallory.send(&bob_pub, b"y", NOW) {
+    match mallory.send(&bob_pub, kem.ek(), b"y", NOW) {
         Response::Rejected(r) => assert!(
             r.contains("CapabilityQuota") || r.contains("Replay"),
             "expected the shared bucket to refuse the replayed cap, got: {r}"
@@ -162,11 +164,13 @@ fn idle_quota_windows_are_reaped_so_the_door_cannot_be_memory_flooded() {
     let transport = InMemoryTransport::new(relay.clone());
     let bob = Identity::generate();
     let bob_pub = bob.public;
+    // Not opened — this counts quota windows, not deliveries.
+    let kem = node::seal::SealKemKeys::generate();
 
     for i in 0..5u8 {
         let (cap, _) = earn(&relay, [i; 32], NOW);
         let mut c = Client::new(transport.clone(), cap, b"c");
-        assert!(matches!(c.send(&bob_pub, b"x", NOW), Response::Accepted));
+        assert!(matches!(c.send(&bob_pub, kem.ek(), b"x", NOW), Response::Accepted));
     }
     assert_eq!(relay.borrow().cap_quota_windows_for_test(), 5, "each cap has its own window");
 
@@ -208,7 +212,7 @@ fn the_owner_can_toggle_the_door_off_open_and_on_at_runtime() {
     let mut bob = Recipient::new(transport.clone(), Identity::generate(), relay_pub);
     let bob_pub = bob.public();
     assert!(
-        matches!(alice.send(&bob_pub, b"still works", NOW), Response::Accepted),
+        matches!(alice.send(&bob_pub, bob.kem_ek(), b"still works", NOW), Response::Accepted),
         "a cap earned before issuance was turned off must keep working"
     );
     assert_eq!(
@@ -226,7 +230,7 @@ fn the_owner_can_toggle_the_door_off_open_and_on_at_runtime() {
         .expect("an open door issues without real work");
     let mut carol = Client::new(transport, open_cap, b"carol");
     assert!(
-        matches!(carol.send(&bob_pub, b"open door", NOW), Response::Accepted),
+        matches!(carol.send(&bob_pub, bob.kem_ek(), b"open door", NOW), Response::Accepted),
         "a freely-earned (open-door) cap must open the door"
     );
 }
@@ -250,7 +254,7 @@ fn a_pow_capability_survives_a_relay_restart() {
     let bob_pub = bob.public();
 
     assert!(
-        matches!(alice.send(&bob_pub, b"after restart", NOW), Response::Accepted),
+        matches!(alice.send(&bob_pub, bob.kem_ek(), b"after restart", NOW), Response::Accepted),
         "a PoW capability must survive a restart (stateless — no stored record)"
     );
 }

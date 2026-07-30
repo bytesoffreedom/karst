@@ -14,10 +14,29 @@ pub const GRACE_EPOCHS: u64 = 1;
 /// itself, so a post-quantum opener carrying a first message longer than ~120 B was
 /// silently dropped as oversize (`DropNoReply`). A spec mandating PQ key agreement and a
 /// ceiling too small to carry one is inconsistent — the ceiling was the arbitrary part.
-/// 2560 is sized from the real protocol: sealed ML-KEM opener (~1.2 KB) + a
-/// maximum-length first message (1 KB) + framing. Ordinary messages (~1 KB) are
-/// unaffected; the headroom exists only for the envelope that needs it.
-pub const MAX_PACKET_SIZE: usize = 2560;
+/// Raised a SECOND time, 2560 -> 3840, by the same argument (PRIV-3). The outer sealed opener now
+/// carries its own ML-KEM-768 ciphertext so a quantum adversary cannot recover the social graph
+/// from a recorded first contact. That is +1088 bytes on the one envelope in the protocol that was
+/// already the largest, and the previous ceiling had no room for it: the budget comes to
+///
+///   1235 (sealed key agreement) + 1088 (outer KEM ciphertext)
+/// + 1325 (padded plaintext + AEAD tag) + 64 (opener framing) + 128 (admission framing) = 3840
+///
+/// Shrinking the envelope instead was not an option: `pad::PADDED_LEN` is derived from THIS
+/// constant, and taking 1088 out of it would leave ~29 bytes for a message whose largest legal
+/// `Content` is 1053. The ceiling is again the arbitrary part — a design that mandates
+/// post-quantum protection for the social graph and a ceiling too small to carry it are
+/// inconsistent, exactly as with the first raise.
+///
+/// 3840 rather than the tight 3648: the extra 192 bytes go into `pad::MAX_PAYLOAD`, whose margin
+/// over the largest legal `Content` was down to 60 bytes. A privacy parameter with 5% headroom is
+/// one new message variant away from a silent send failure.
+///
+/// **What this costs, said plainly.** Every ordinary message is padded to the same block, so the
+/// per-message cost rises with the ceiling: ~1.3 KB of plaintext per message instead of ~1.1 KB.
+/// That is the price of a uniform size class (PRIV-1), and it is paid to hide message length rather
+/// than to carry the opener's PQ ciphertext — ordinary messages do not contain one.
+pub const MAX_PACKET_SIZE: usize = 3840;
 /// Фиксированный размер challenge-ответа непроверенному адресу (§7.1).
 pub const COOKIE_CHALLENGE_SIZE: usize = 64;
 

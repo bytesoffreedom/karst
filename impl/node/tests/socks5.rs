@@ -141,8 +141,9 @@ fn routes_through_socks5_proxy() {
         PublicKey::from(fpub),
     );
     let bob_pub = bob.public();
+    let bob_kem = bob.kem_ek().to_vec();
 
-    assert!(matches!(alice.send(&bob_pub, b"via socks5", NOW), Response::Accepted));
+    assert!(matches!(alice.send(&bob_pub, &bob_kem, b"via socks5", NOW), Response::Accepted));
     assert!(validated.load(Ordering::SeqCst), "прокси должен был провести SOCKS5-handshake");
 
     let msgs = bob.receive(NOW).expect("fetch через socks5");
@@ -170,8 +171,9 @@ fn routes_through_socks5_proxy_ipv6() {
         PublicKey::from(fpub),
     );
     let bob_pub = bob.public();
+    let bob_kem = bob.kem_ek().to_vec();
 
-    assert!(matches!(alice.send(&bob_pub, b"via socks5 v6", NOW), Response::Accepted));
+    assert!(matches!(alice.send(&bob_pub, &bob_kem, b"via socks5 v6", NOW), Response::Accepted));
     assert!(validated.load(Ordering::SeqCst), "IPv6 SOCKS5-handshake должен пройти");
     let msgs = bob.receive(NOW).expect("fetch через socks5 v6");
     assert_eq!(msgs[0].as_deref(), Some(b"via socks5 v6".as_ref()));
@@ -195,7 +197,7 @@ fn socks5_dead_proxy_hard_fails_no_direct() {
     );
     let bob = Identity::generate();
 
-    let resp = alice.send(&bob.public, b"should not send", NOW);
+    let resp = alice.send(&bob.public, node::seal::SealKemKeys::generate().ek(), b"should not send", NOW);
     // Прямой fallback вернул бы Accepted (relay доступен). Rejected доказывает,
     // что тихого прямого соединения НЕ произошло.
     assert!(

@@ -19,11 +19,13 @@ use crate::discovery::DiscoveryRecord;
 use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, FetchRequest, JoinRequest, Payload, PublishRequest, RelayDescriptor, RelayPolicy, WireMessage};
 use crate::pqxdh::PreKeyBundle;
 
-/// Потолок кадра ЗАПРОСА (client→server) — самый враждебный вход. Полезная
-/// нагрузка §7 всё равно режется Ступенью 0 (`MAX_PACKET_SIZE` = 1400); здесь —
-/// потолок аллокации ДО запуска конвейера, с запасом на обёртку
-/// (proof/cookie/адреса/postcard-теги). Тот же ~1.2КБ класс, что задокументирован
-/// для скелет-пути в docs/STATUS.md.
+/// Потолок кадра ЗАПРОСА (client→server) — самый враждебный вход. Полезная нагрузка §7 всё равно
+/// режется Ступенью 0 по `MAX_PACKET_SIZE`; здесь — потолок аллокации ДО запуска конвейера, с
+/// запасом на обёртку (proof/cookie/адреса/postcard-теги).
+///
+/// Числа тут не повторяются намеренно: этот комментарий говорил «= 1400» ещё две ревизии потолка
+/// спустя (1400 → 2560 → 3840). Константа ВЫВЕДЕНА, поэтому она ехала правильно всё это время —
+/// врал только текст рядом с ней.
 pub const MAX_REQUEST_FRAME: usize = MAX_PACKET_SIZE + 512;
 
 

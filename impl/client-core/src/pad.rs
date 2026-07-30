@@ -15,11 +15,12 @@
 //!
 //! # Two classes, and why not one
 //!
-//! Padding the plaintext to one fixed block gives the wire exactly two shapes, because
-//! `SkeletonSeal`'s ciphertext is a deterministic size:
+//! Padding the plaintext to one fixed block gives the wire exactly two shapes, because both of the
+//! opener's own ciphertexts are a deterministic size:
 //!
 //! - `Ratchet` — a fixed length. Text, reaction, ACK, file chunk and cover loop are identical.
-//! - `InitialSealed` — a larger fixed length (it carries the sealed key agreement).
+//! - `InitialSealed` — a larger fixed length (it carries the sealed key agreement AND the outer
+//!   ML-KEM ciphertext that keeps a recorded first contact from naming the pair later).
 //!
 //! Collapsing those two into ONE class was considered and refused. It would cost every ordinary
 //! message the ~1.2 KB of an opener it does not carry, and it would buy nothing: `SessionEnvelope`
@@ -33,8 +34,10 @@
 //! oversize packet is not an error, it is `Outcome::DropNoReply(Oversize)` — the message vanishes
 //! with no reply and no log. Rounding UP to a pretty 1024 or 2048 and hoping is exactly how you
 //! ship a client whose first message to a new contact silently never arrives, and
-//! `admission::params::MAX_PACKET_SIZE` carries the scar from the last time this bit
-//! (1400 → 2560, because an ML-KEM opener did not fit its own mandated ceiling).
+//! `admission::params::MAX_PACKET_SIZE` carries the scars from both times this bit: 1400 → 2560
+//! because an ML-KEM key agreement did not fit its own mandated ceiling, and 2560 → 3840 because the
+//! outer seal's ML-KEM ciphertext (PRIV-3) did not either. Both times the ceiling was the arbitrary
+//! part, and both times the numbers came from adding up real fields rather than rounding.
 //!
 //! The opener is the binding case, so the budget is taken from it and ordinary messages inherit the
 //! same block.
@@ -56,9 +59,20 @@ const AEAD_TAG: usize = 16;
 /// stage-0 ceiling where they disappear without a word.
 pub const SEALED_KA_CIPHERTEXT: usize = 1235;
 
+/// Size of the ML-KEM-768 ciphertext the outer seal carries (PRIV-3).
+///
+/// Counted separately from [`SEALED_KA_CIPHERTEXT`] because it is a separate field: the sealed key
+/// agreement's AEAD ciphertext does not contain it. `Payload::approx_len` charges both, so the
+/// budget must too — and until PRIV-3 it charged neither, which is why this constant did not exist.
+pub const SEAL_KEM_CIPHERTEXT: usize = 1088;
+
 /// **Every ratchet plaintext is padded to exactly this.** Derived from the ceiling, not picked.
-pub const PADDED_LEN: usize =
-    MAX_PACKET_SIZE - ADMIT_FRAMING - OPENER_FRAMING - AEAD_TAG - SEALED_KA_CIPHERTEXT;
+pub const PADDED_LEN: usize = MAX_PACKET_SIZE
+    - ADMIT_FRAMING
+    - OPENER_FRAMING
+    - AEAD_TAG
+    - SEALED_KA_CIPHERTEXT
+    - SEAL_KEM_CIPHERTEXT;
 
 /// Bytes a caller may actually hand to [`pad`]: the length prefix lives inside the fixed block.
 pub const MAX_PAYLOAD: usize = PADDED_LEN - 4;
@@ -125,9 +139,20 @@ mod tests {
             mailbox_a_pub: [5u8; 32],
         };
         let plain = postcard::to_stdvec(&ka).expect("KeyAgreement serializes");
+        // A real recipient KEM key, because `seal` now parses one and the budget depends on the
+        // ciphertext it produces.
+        let keys = karst_crypto::seal::SealKemKeys::generate();
         let sealed = karst_crypto::seal::SkeletonSeal::seal(
             &x25519_dalek::PublicKey::from([9u8; 32]),
+            keys.ek(),
             &plain,
+        )
+        .expect("a freshly generated KEM key parses");
+        assert_eq!(
+            sealed.kem_ct.len(),
+            SEAL_KEM_CIPHERTEXT,
+            "the outer ML-KEM ciphertext changed size; recompute SEAL_KEM_CIPHERTEXT from THIS \
+             number — an opener over the stage-0 ceiling is dropped with no reply"
         );
         assert_eq!(
             sealed.ciphertext.len(),
@@ -146,7 +171,8 @@ mod tests {
     #[test]
     fn a_padded_opener_fits_under_the_admission_ceiling_with_nothing_to_spare() {
         let ratchet_ciphertext = PADDED_LEN + AEAD_TAG;
-        let approx_len = SEALED_KA_CIPHERTEXT + ratchet_ciphertext + OPENER_FRAMING;
+        let approx_len =
+            SEALED_KA_CIPHERTEXT + SEAL_KEM_CIPHERTEXT + ratchet_ciphertext + OPENER_FRAMING;
         let raw_len = approx_len + ADMIT_FRAMING;
         assert_eq!(
             raw_len, MAX_PACKET_SIZE,

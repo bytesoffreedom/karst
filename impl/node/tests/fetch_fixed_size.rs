@@ -43,7 +43,7 @@ impl Write for Counting {
 }
 
 fn a_seal() -> Payload {
-    Payload::Skeleton(SkeletonSeal { ephemeral_pub: [7u8; 32], nonce: [9u8; 12], ciphertext: vec![0xAB; 100] })
+    Payload::Skeleton(SkeletonSeal { kem_ct: Vec::new(), ephemeral_pub: [7u8; 32], nonce: [9u8; 12], ciphertext: vec![0xAB; 100] })
 }
 
 /// Serialize a `Fetched` response carrying `count` seals exactly as the relay does

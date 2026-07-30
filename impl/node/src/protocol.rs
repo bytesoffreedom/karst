@@ -166,7 +166,12 @@ impl Payload {
         match self {
             Payload::Skeleton(s) => s.ciphertext.len(),
             Payload::Session(SessionEnvelope::InitialSealed { sealed_ka, msg }) => {
-                sealed_ka.ciphertext.len() + msg.ciphertext.len() + 64
+                // `kem_ct` counts (PRIV-3). It is ~1088 bytes — by far the largest single field in
+                // the envelope — so omitting it would make the stage-0 size gate under-count by
+                // more than a third of the packet: an oversize opener would pass the gate that
+                // exists to reject it, and the ceiling in `admission::params` would be enforcing a
+                // number that has nothing to do with what is on the wire.
+                sealed_ka.ciphertext.len() + sealed_ka.kem_ct.len() + msg.ciphertext.len() + 64
             }
             Payload::Session(SessionEnvelope::Ratchet(msg)) => msg.ciphertext.len(),
         }

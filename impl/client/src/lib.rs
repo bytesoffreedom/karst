@@ -1454,10 +1454,15 @@ fn blob_get_addr() -> Vec<u8> {
 
 /// Отправить одно сообщение получателю `to_pub` через `relay` (внутри
 /// Noise-сессии). `now` — часы вызывающего, на провод не уходят.
+///
+/// `to_kem_ek` — долгоживущий ML-KEM-ключ получателя: конверт теперь гибридный (PRIV-3), и без
+/// этого ключа его нечем запечатать постквантово. Это СКЕЛЕТНЫЙ путь; настоящий сессионный путь
+/// берёт тот же ключ из подписанного bundle сам.
 pub fn send_message(
     relay: &Relay,
     cap: Capability,
     to_pub: &[u8; 32],
+    to_kem_ek: &[u8],
     plaintext: &[u8],
     now: u64,
 ) -> Response {
@@ -1467,7 +1472,7 @@ pub fn send_message(
     let addr = cap.capability_id;
     let mut client = Client::new(transport, cap, &addr);
     let recipient_pub = x25519_dalek::PublicKey::from(*to_pub);
-    client.send(&recipient_pub, plaintext, now)
+    client.send(&recipient_pub, to_kem_ek, plaintext, now)
 }
 
 /// Забрать и расшифровать входящие для нашей `identity` (внутри Noise-сессии;
@@ -1476,11 +1481,16 @@ pub fn send_message(
 pub fn fetch_messages(
     relay: &Relay,
     identity: Identity,
+    account: &node::pqxdh::Account,
     now: u64,
 ) -> Result<Vec<Option<Vec<u8>>>, String> {
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
-    let mut recipient = Recipient::new(transport, identity, fetch_pub);
+    // The account's KEM half, NOT a fresh one (PRIV-3): it is derived from the recovery phrase, so
+    // it survives a reload — which is the whole point of this path. A generated key would make
+    // every envelope sealed to this account unopenable after a restart, and the failure would look
+    // like "no mail" rather than like a bug.
+    let mut recipient = Recipient::with_kem(transport, identity, account.seal_kem(), fetch_pub);
     recipient.receive(now)
 }
 

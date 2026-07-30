@@ -144,8 +144,10 @@ fn loopback_happy_path() {
     let mut alice = Client::new(SocketTransport::new(addr, npub), capability([0x33; 32]), b"alice");
     let mut bob = Recipient::new(SocketTransport::new(addr, npub), Identity::generate(), PublicKey::from(fpub));
     let bob_pub = bob.public();
+    // The recipient's ML-KEM key, from the receiver that will open the seal (PRIV-3).
+    let bob_kem = bob.kem_ek().to_vec();
 
-    let resp = alice.send(&bob_pub, b"hello over noise", NOW);
+    let resp = alice.send(&bob_pub, &bob_kem, b"hello over noise", NOW);
     assert!(matches!(resp, Response::Accepted), "получено: {:?}", resp);
 
     let msgs = bob.receive(NOW).expect("fetch должен пройти");
@@ -232,7 +234,7 @@ fn wire_bytes_are_ciphertext_recipient_metadata_hidden() {
     let mut alice = Client::new(SocketTransport::new(proxy_addr, npub), capability([0x33; 32]), b"alice");
 
     // send синхронен: вернулся Accepted → полный round-trip прошёл через прокси.
-    assert!(matches!(alice.send(&bob.public, b"secret payload", NOW), Response::Accepted));
+    assert!(matches!(alice.send(&bob.public, node::seal::SealKemKeys::generate().ek(), b"secret payload", NOW), Response::Accepted));
 
     let rec = recorded.lock().unwrap();
     assert!(!rec.is_empty(), "прокси должен был записать шифртекст");
@@ -251,7 +253,7 @@ fn mitm_wrong_noise_key_fails_handshake() {
     let wrong = [0x77u8; 32];
     let mut alice = Client::new(SocketTransport::new(addr, wrong), capability([0x33; 32]), b"alice");
     let bob = Identity::generate();
-    let resp = alice.send(&bob.public, b"hi", NOW);
+    let resp = alice.send(&bob.public, node::seal::SealKemKeys::generate().ek(), b"hi", NOW);
     assert!(
         matches!(resp, Response::Rejected(_)),
         "handshake к чужому ключу должен провалиться, получено: {:?}",
@@ -294,7 +296,7 @@ fn earn_a_capability_over_the_socket_then_send() {
     );
     let bob_pub = bob.public();
     assert!(
-        matches!(alice.send(&bob_pub, b"hello via earned cap", NOW), Response::Accepted),
+        matches!(alice.send(&bob_pub, bob.kem_ek(), b"hello via earned cap", NOW), Response::Accepted),
         "a PoW-earned capability must open the door over the socket"
     );
     let msgs: Vec<_> = bob.receive(NOW).unwrap().into_iter().flatten().collect();
@@ -492,7 +494,7 @@ fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
     thread::spawn(move || {
         let mut alice = Client::new(SocketTransport::new(addr, noise_pub), capability([0x33; 32]), b"alice");
         let bob = Recipient::new(SocketTransport::new(addr, noise_pub), Identity::generate(), PublicKey::from(fetch_pub));
-        let _ = tx.send(matches!(alice.send(&bob.public(), b"mail during a blob write", NOW), Response::Accepted));
+        let _ = tx.send(matches!(alice.send(&bob.public(), bob.kem_ek(), b"mail during a blob write", NOW), Response::Accepted));
     });
     let accepted = rx
         .recv_timeout(Duration::from_secs(10))
@@ -537,7 +539,7 @@ fn a_mail_write_in_progress_does_not_block_admission() {
         let mut alice = Client::new(SocketTransport::new(addr, noise_pub), capability([0x33; 32]), b"alice");
         let _ = started_tx.send(());
         // Parks inside the relay, past admission, waiting for the mail lock.
-        alice.send(&PublicKey::from([0x77u8; 32]), b"stuck behind a slow disk", NOW)
+        alice.send(&PublicKey::from([0x77u8; 32]), node::seal::SealKemKeys::generate().ek(), b"stuck behind a slow disk", NOW)
     });
     started_rx.recv().expect("sender started");
     // Synchronisation, not a measurement (see the blob test): if the send has not arrived yet the

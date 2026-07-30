@@ -224,10 +224,10 @@ fn blob_quota_and_message_quota_are_independent_under_the_same_capability() {
     let recipient = karst_client_core::demo::Recipient::new(transport, bob, relay_rc.borrow().relay_public());
     let bob_pub = recipient.public();
     assert!(
-        matches!(alice.send(&bob_pub, b"first", NOW), Response::Accepted),
+        matches!(alice.send(&bob_pub, node::seal::SealKemKeys::generate().ek(), b"first", NOW), Response::Accepted),
         "the capability's one allowed message must be admitted"
     );
-    let resp2 = alice.send(&bob_pub, b"second", NOW);
+    let resp2 = alice.send(&bob_pub, node::seal::SealKemKeys::generate().ek(), b"second", NOW);
     assert!(
         matches!(resp2, Response::Rejected(_)),
         "a second message must be refused by the exhausted MESSAGE quota, got {resp2:?}"

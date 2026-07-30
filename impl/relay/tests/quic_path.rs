@@ -279,8 +279,7 @@ fn a_deposit_over_quic_lands_in_the_state_the_tcp_listener_serves() {
         request_nonce: nonce.to_vec(),
         capability_proof: dev_cap().prove(&nonce, 0),
         recipient: [0x77u8; 32],
-        payload: node::protocol::Payload::Skeleton(node::seal::SkeletonSeal {
-            ephemeral_pub: [0x55; 32],
+        payload: node::protocol::Payload::Skeleton(node::seal::SkeletonSeal { kem_ct: Vec::new(), ephemeral_pub: [0x55; 32],
             nonce: [0x66; 12],
             ciphertext: b"carried by udp, read out of the shared state".to_vec(),
         }),

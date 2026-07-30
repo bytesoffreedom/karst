@@ -57,10 +57,18 @@ impl<T: Transport> Client<T> {
     pub fn send(
         &mut self,
         recipient_pub: &x25519_dalek::PublicKey,
+        recipient_kem_ek: &[u8],
         plaintext: &[u8],
         now: u64,
     ) -> Response {
-        let sealed = SkeletonSeal::seal(recipient_pub, plaintext);
+        // The seal is hybrid now (PRIV-3), so this path needs the recipient's ML-KEM key as well as
+        // its X25519 one. A malformed key is a caller error here rather than a wire hazard — this
+        // demo path gets the key straight from the `Recipient` — but it is still surfaced as a
+        // refusal instead of a panic, because the real path takes the same key off the wire.
+        let sealed = match SkeletonSeal::seal(recipient_pub, recipient_kem_ek, plaintext) {
+            Ok(s) => s,
+            Err(e) => return Response::Rejected(format!("cannot seal to recipient: {e}")),
+        };
         let nonce = format!("req-{}", self.nonce_ctr).into_bytes();
         self.nonce_ctr += 1;
         let proof = self.capability.prove(&nonce, 0);
@@ -97,6 +105,9 @@ impl<T: Transport> Client<T> {
 pub struct Recipient<T: Transport> {
     transport: T,
     identity: Identity,
+    /// Long-lived ML-KEM half of the hybrid seal (PRIV-3). Generated per `Recipient` like the
+    /// identity itself: this is the skeleton path, so there is no bundle to publish it in.
+    kem: karst_crypto::seal::SealKemKeys,
     relay_pub: PublicKey,
     client_addr: Vec<u8>,
     carrier_id: Vec<u8>,
@@ -105,9 +116,35 @@ pub struct Recipient<T: Transport> {
 
 impl<T: Transport> Recipient<T> {
     pub fn new(transport: T, identity: Identity, relay_pub: PublicKey) -> Self {
-        // client_addr = свой pubkey: стабильная привязка cookie.
+        Self::with_kem(transport, identity, karst_crypto::seal::SealKemKeys::generate(), relay_pub)
+    }
+
+    /// As [`Recipient::new`], but with a KEM half the caller derived (PRIV-3).
+    ///
+    /// The library path needs this: a recipient reloaded from a recovery phrase must re-derive the
+    /// same KEM key it had before, or every envelope sealed to it becomes unopenable after a
+    /// restart — silently, because the AEAD failure is indistinguishable from "not for us".
+    pub fn with_kem(
+        transport: T,
+        identity: Identity,
+        kem: karst_crypto::seal::SealKemKeys,
+        relay_pub: PublicKey,
+    ) -> Self {
         let client_addr = identity.public.to_bytes().to_vec();
-        Recipient { transport, identity, relay_pub, client_addr, carrier_id: b"mem".to_vec(), cookie: None }
+        Recipient {
+            transport,
+            identity,
+            kem,
+            relay_pub,
+            client_addr,
+            carrier_id: b"mem".to_vec(),
+            cookie: None,
+        }
+    }
+
+    /// This recipient's ML-KEM encapsulation key — what a sender needs for the hybrid seal.
+    pub fn kem_ek(&self) -> &[u8] {
+        self.kem.ek()
     }
 
     pub fn public(&self) -> PublicKey {
@@ -147,7 +184,7 @@ impl<T: Transport> Recipient<T> {
                     let opened: Vec<Option<Vec<u8>>> = payloads
                         .iter()
                         .map(|p| match p {
-                            Payload::Skeleton(s) => s.open(&self.identity),
+                            Payload::Skeleton(s) => self.kem.open(s, &self.identity),
                             Payload::Session(_) => None,
                         })
                         .collect();

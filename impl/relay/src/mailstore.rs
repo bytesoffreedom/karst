@@ -291,8 +291,7 @@ mod tests {
     use super::*;
 
     fn seal(n: u8) -> Payload {
-        Payload::Skeleton(node::seal::SkeletonSeal {
-            ephemeral_pub: [n; 32],
+        Payload::Skeleton(node::seal::SkeletonSeal { kem_ct: Vec::new(), ephemeral_pub: [n; 32],
             nonce: [n; 12],
             ciphertext: vec![n; 8],
         })

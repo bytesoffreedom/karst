@@ -49,9 +49,18 @@ fn dev_cap() -> Capability {
 /// A `Peer` for Bob over an in-memory relay — this test never sends over the wire, it feeds
 /// payloads straight into `process` (via `open_for_test`), which is exactly the code path a
 /// fetched envelope takes.
-fn sealed_to(recipient_ik: [u8; 32], ka: &node::pqxdh::KeyAgreement, msg: RatchetMessage) -> Payload {
+fn sealed_to(
+    recipient_ik: [u8; 32],
+    recipient_kem_ek: &[u8],
+    ka: &node::pqxdh::KeyAgreement,
+    msg: RatchetMessage,
+) -> Payload {
     let plain = postcard::to_stdvec(ka).unwrap();
-    let sealed_ka = node::seal::SkeletonSeal::seal(&PublicKey::from(recipient_ik), &plain);
+    // Sealed to the recipient's X25519 IK AND its long-lived ML-KEM key (PRIV-3). `bob.bundle()`
+    // publishes the latter, which is exactly where a real sender gets it.
+    let sealed_ka =
+        node::seal::SkeletonSeal::seal(&PublicKey::from(recipient_ik), recipient_kem_ek, &plain)
+            .expect("a published KEM key parses");
     Payload::Session(SessionEnvelope::InitialSealed { sealed_ka, msg })
 }
 
@@ -84,7 +93,7 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
     };
     // SEALED, so the refusal below is about authentication — not about the envelope form.
     let bob_ik = bob.bundle().ik_pub;
-    let forged = sealed_to(bob_ik, &ka, garbage);
+    let forged = sealed_to(bob_ik, &bob.bundle().kem_ek, &ka, garbage);
 
     assert!(bob.open_for_test(&forged).is_none(), "a bogus opener delivers nothing");
     assert!(
@@ -105,7 +114,7 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
         initiate_key_agreement(&real_sender, &[3u8; 32], &bundle).expect("well-formed bundle");
     let mut sender = Session::init_sender(root, bundle.prekey_pub);
     let msg = sender.encrypt(&padded(b"genuine first contact"));
-    let honest = sealed_to(bob_ik, &ka2, msg);
+    let honest = sealed_to(bob_ik, &bob.bundle().kem_ek, &ka2, msg);
 
     let got = bob.open_for_test(&honest).expect("the genuine opener must still be acceptable");
     assert_eq!(got.plaintext, b"genuine first contact");
@@ -159,7 +168,7 @@ fn the_legacy_unsealed_opener_shape_cannot_become_a_session() {
     assert_eq!(bob.opk_count(), 1, "nothing about the legacy shape may consume the one-time prekey");
 
     // Sealed form of the SAME agreement: accepted.
-    let sealed = sealed_to(bob.bundle().ik_pub, &ka, msg);
+    let sealed = sealed_to(bob.bundle().ik_pub, &bob.bundle().kem_ek, &ka, msg);
     let got = bob.open_for_test(&sealed).expect("the sealed form of the same opener must work");
     assert_eq!(got.plaintext, b"first contact");
     assert_eq!(got.sender, alice.public.to_bytes());
@@ -183,7 +192,7 @@ fn a_degenerate_mailbox_point_is_refused_on_both_sides() {
     assert_eq!(ka.mailbox_a_pub, [0u8; 32], "the sender advertised the degenerate point");
     let mut sender = Session::init_sender(root, bundle.prekey_pub);
     let msg = sender.encrypt(&padded(b"hello"));
-    let sealed = sealed_to(bundle.ik_pub, &ka, msg);
+    let sealed = sealed_to(bundle.ik_pub, &bob.bundle().kem_ek, &ka, msg);
     assert!(bob.open_for_test(&sealed).is_none(), "a degenerate sender mailbox must be refused");
     assert!(!bob.has_session(&alice.public.to_bytes()), "and must leave no session");
 
@@ -196,7 +205,7 @@ fn a_degenerate_mailbox_point_is_refused_on_both_sides() {
     let _ = &ka2;
     let mut sender2 = Session::init_sender(root2, bundle.prekey_pub);
     let msg2 = sender2.encrypt(&padded(b"hello again"));
-    let sealed2 = sealed_to(bundle.ik_pub, &ka2, msg2);
+    let sealed2 = sealed_to(bundle.ik_pub, &bob.bundle().kem_ek, &ka2, msg2);
     assert!(bob.open_for_test(&sealed2).is_some(), "a real mailbox point still works");
 }
 

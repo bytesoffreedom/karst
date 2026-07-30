@@ -2006,20 +2006,32 @@ fn alice_sends_bob_reloads_from_disk_and_decrypts() {
     // Bob: создать корень, сохранить, затем ЗАБЫТЬ и перезагрузить с диска.
     let bob_dir = temp_dir("bob");
     let bob_store = Store::unlock(&bob_dir, b"test-pw").unwrap();
-    let bob_pub = {
+    // Bob's KEM key comes from the SAME phrase as his identity, so it survives the reload below
+    // and a sender can be told it out of band (PRIV-3).
+    let (bob_pub, bob_kem_ek) = {
         let e = seed_provision(&bob_store);
-        client::seed::derive(&e).seal.public.to_bytes()
+        let d = client::seed::derive(&e);
+        (d.seal.public.to_bytes(), d.account.seal_kem().ek().to_vec())
     };
     // ← identity выше вышла из области видимости; ниже работаем только с диском.
     let bob_reloaded = bob_store.load_identity().unwrap();
     assert_eq!(bob_reloaded.public.to_bytes(), bob_pub);
 
     // Alice: дев-capability, шлёт на pubkey Bob (внутри Noise-сессии).
-    let resp = client::send_message(&ctx(relay, &relay_id), client::dev_capability(), &bob_pub, b"hi bob", NOW);
+    let resp = client::send_message(
+        &ctx(relay, &relay_id),
+        client::dev_capability(),
+        &bob_pub,
+        &bob_kem_ek,
+        b"hi bob",
+        NOW,
+    );
     assert!(matches!(resp, Response::Accepted), "получено: {:?}", resp);
 
     // Bob: забрать перезагруженной identity (Noise + fetch-auth) → расшифровать.
-    let msgs = client::fetch_messages(&ctx(relay, &relay_id), bob_reloaded, NOW).expect("fetch");
+    let bob_account = bob_store.load_account().expect("account re-derives from the stored phrase");
+    let msgs = client::fetch_messages(&ctx(relay, &relay_id), bob_reloaded, &bob_account, NOW)
+        .expect("fetch");
     let got: Vec<_> = msgs.into_iter().flatten().collect(); // skeleton-путь: Vec<u8>
     assert_eq!(got, vec![b"hi bob".to_vec()], "Bob должен расшифровать своим сохранённым ключом");
 

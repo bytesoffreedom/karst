@@ -1649,6 +1649,16 @@ mod tests {
     use karst_client_core::demo::{Client, Recipient};
     use node::seal::SkeletonSeal;
     /// A capability the in-crate tests can present when a publish CREATES a slot (CRYPTO-18).
+    /// A KEM key for a recipient that NOBODY opens (PRIV-3).
+    ///
+    /// These tests fabricate recipients to exercise admission, quota and mailbox behaviour; the seal
+    /// is never opened, so any well-formed encapsulation key does. Named so the distinction is
+    /// visible: where a test DOES open the seal, it must use that recipient's own key
+    /// (`Recipient::kem_ek`), and passing this instead would make the envelope unopenable.
+    fn throwaway_kem_ek() -> Vec<u8> {
+        node::seal::SealKemKeys::generate().ek().to_vec()
+    }
+
     fn publish_cap() -> Capability {
         Capability {
             capability_id: [0xBC; 16],
@@ -1748,8 +1758,7 @@ mod tests {
         // forgotten. Neuter `MailStore::sweep` to a no-op and the "swept" case reddens.
         let relay = RelayNode::new(NOW);
         let ik = [9u8; 32];
-        let seal = Payload::Skeleton(SkeletonSeal {
-            ephemeral_pub: [1u8; 32],
+        let seal = Payload::Skeleton(SkeletonSeal { kem_ct: Vec::new(), ephemeral_pub: [1u8; 32],
             nonce: [2u8; 12],
             ciphertext: vec![0u8; 8],
         });
@@ -1797,7 +1806,7 @@ mod tests {
         // A FRESH fabricated recipient, once the table is already full, must be rejected loudly
         // — never a silent drop of the send.
         let fresh = PublicKey::from([0xFEu8; 32]);
-        let resp = attacker.send(&fresh, b"hello", NOW);
+        let resp = attacker.send(&fresh, &throwaway_kem_ek(), b"hello", NOW);
         assert!(
             matches!(resp, Response::Rejected(_)),
             "a brand-new recipient must be rejected once the mailbox table is at MAX_MAILBOXES, got {resp:?}"
@@ -1812,7 +1821,7 @@ mod tests {
         // — the cap throttles brand-new keys, never delivery to an existing correspondent.
         let mut known = [0u8; 32];
         known[..8].copy_from_slice(&0u64.to_le_bytes());
-        let resp2 = attacker.send(&PublicKey::from(known), b"hi", NOW);
+        let resp2 = attacker.send(&PublicKey::from(known), &throwaway_kem_ek(), b"hi", NOW);
         assert!(
             matches!(resp2, Response::Accepted),
             "legitimate delivery to an EXISTING mailbox must still work while the table is full, got {resp2:?}"
@@ -1962,7 +1971,7 @@ mod tests {
     // ---- lease / ACK (at-most-once → effectively-once receive) ----
 
     fn test_seal(n: u8) -> Payload {
-        Payload::Skeleton(SkeletonSeal { ephemeral_pub: [n; 32], nonce: [n; 12], ciphertext: vec![n; 8] })
+        Payload::Skeleton(SkeletonSeal { kem_ct: Vec::new(), ephemeral_pub: [n; 32], nonce: [n; 12], ciphertext: vec![n; 8] })
     }
 
     /// Build a valid authenticated `FetchRequest` for `recip`'s own mailbox: a fresh cookie
@@ -2101,9 +2110,17 @@ mod tests {
         relay.borrow_mut().issue_capability(cap.clone());
         let bob = Identity::generate();
 
+        // The receiver is built FIRST now: a hybrid seal needs the recipient's ML-KEM key
+        // (PRIV-3), and `Recipient` mints its own, so there is nothing to seal to until it
+        // exists. That mirrors the real path, where a sender must fetch the bundle first.
+        let mut recip = Recipient::new(InMemoryTransport::new(relay.clone()), bob.clone(), identity.public);
+
         // One seal Bob can open...
         let mut alice = Client::new(InMemoryTransport::new(relay.clone()), cap, b"alice");
-        assert!(matches!(alice.send(&bob.public, b"for bob", NOW), Response::Accepted));
+        assert!(matches!(
+            alice.send(&bob.public, recip.kem_ek(), b"for bob", NOW),
+            Response::Accepted
+        ));
         // ...and one session envelope that is not his to read (it is `Peer`'s business).
         relay.borrow().mail_store().lock().unwrap().append_for_test(bob.public.to_bytes(), vec![MailboxEntry {
             enqueued_at: NOW,
@@ -2120,7 +2137,6 @@ mod tests {
         }]);
         assert_eq!(relay.borrow().mailbox_len_for_test(&bob.public.to_bytes()), 2);
 
-        let mut recip = Recipient::new(InMemoryTransport::new(relay.clone()), bob.clone(), identity.public);
         let got = recip.receive(NOW).expect("fetch succeeds");
         assert_eq!(got.len(), 2, "both entries were served");
         assert_eq!(got.iter().filter(|o| o.is_some()).count(), 1, "only one was openable");
@@ -2170,8 +2186,7 @@ mod tests {
             // A payload that cannot collide with anything in the fill above — otherwise the
             // idempotent-deposit path would answer `Accepted` for a DUPLICATE and the test would
             // be measuring dedup, not the cap.
-            payload: Payload::Skeleton(SkeletonSeal {
-                ephemeral_pub: [n; 32],
+            payload: Payload::Skeleton(SkeletonSeal { kem_ct: Vec::new(), ephemeral_pub: [n; 32],
                 nonce: [n; 12],
                 ciphertext: vec![n; 9],
             }),
@@ -2387,7 +2402,7 @@ mod tests {
             relay.issue_capability(cap.clone());
             let relay = Rc::new(RefCell::new(relay));
             let mut sender = Client::new(InMemoryTransport::new(relay.clone()), cap, b"sender");
-            assert!(matches!(sender.send(&recipient, b"hello", NOW), Response::Accepted));
+            assert!(matches!(sender.send(&recipient, &throwaway_kem_ek(), b"hello", NOW), Response::Accepted));
             assert_eq!(relay.borrow().mailbox_len_for_test(&recipient.to_bytes()), 1);
         } // the relay process "exits" here
 
@@ -2424,7 +2439,7 @@ mod tests {
                 let shared = Rc::new(RefCell::new(relay));
                 let mut sender = Client::new(InMemoryTransport::new(shared.clone()), cap, b"sender");
                 for body in [b"one".as_ref(), b"two".as_ref()] {
-                    assert!(matches!(sender.send(&bob.public, body, NOW), Response::Accepted));
+                    assert!(matches!(sender.send(&bob.public, &throwaway_kem_ek(), body, NOW), Response::Accepted));
                 }
                 drop(sender);
                 Rc::try_unwrap(shared).ok().expect("sole owner").into_inner()
@@ -2486,7 +2501,7 @@ mod tests {
         let relay = Rc::new(RefCell::new(relay));
         let mut sender = Client::new(InMemoryTransport::new(relay.clone()), cap, b"sender");
         let recipient = PublicKey::from([0x43u8; 32]);
-        match sender.send(&recipient, b"hello", NOW) {
+        match sender.send(&recipient, &throwaway_kem_ek(), b"hello", NOW) {
             Response::Rejected(r) => assert_eq!(r, "MailNotDurable"),
             other => panic!("a durable relay that cannot write must reject, got {other:?}"),
         }
@@ -2529,7 +2544,7 @@ mod tests {
             relay.issue_capability(cap.clone());
             let relay = Rc::new(RefCell::new(relay));
             let mut sender = Client::new(InMemoryTransport::new(relay.clone()), cap, b"sender");
-            assert!(matches!(sender.send(&recipient, b"on disk?", NOW), Response::Accepted));
+            assert!(matches!(sender.send(&recipient, &throwaway_kem_ek(), b"on disk?", NOW), Response::Accepted));
         }
         let mut restarted = RelayNode::with_identity(NOW, identity);
         restarted.enable_durable_mail(dir.clone(), NOW).expect("reopen");
@@ -2558,7 +2573,7 @@ mod tests {
         let mut sender = Client::new(transport, cap, b"sender");
 
         let recipient = PublicKey::from([0x42u8; 32]);
-        let resp = sender.send(&recipient, b"hello", NOW);
+        let resp = sender.send(&recipient, &throwaway_kem_ek(), b"hello", NOW);
         assert!(matches!(resp, Response::Accepted), "precondition: the relay actually admitted it");
         assert_eq!(
             relay.borrow().mailbox_len_for_test(&recipient.to_bytes()),

@@ -105,6 +105,12 @@ struct SessionState {
     /// deposit box. The initiator takes it from the peer's signed bundle; the responder from the
     /// key-agreement. My own inbound box uses my own account mailbox secret, not this.
     peer_mailbox_pub: [u8; 32],
+    /// The peer's LONG-LIVED ML-KEM encapsulation key, kept so the opener can be sealed
+    /// post-quantum (PRIV-3). Only the initiator has one — it comes from the bundle this session
+    /// was opened against — and it is only used while `pending_initial` is `Some`, which is why an
+    /// empty vector is a legitimate state rather than a missing value: the responding side never
+    /// seals an opener.
+    peer_kem_ek: Vec<u8>,
 }
 
 /// Max messages held awaiting delivery to the relay. A permanently-unreachable relay must
@@ -290,6 +296,12 @@ struct PersistedSession {
     peer_ik: [u8; 32],
     snapshot: SessionSnapshot,
     pending_initial: Option<KeyAgreement>,
+    /// The peer's long-lived ML-KEM encapsulation key (PRIV-3), persisted for the same reason as
+    /// `pending_initial`: an opener queued before a restart still has to be sealed post-quantum
+    /// when it is finally sent, and this key is not recoverable from anything else on disk — the
+    /// bundle it came from is not kept.
+    #[serde(default)]
+    peer_kem_ek: Vec<u8>,
     /// Persisted because it cannot be recovered: the root key it came from is consumed
     /// at key agreement and the ratchet has already moved past it. Lose this and the
     /// session's mail becomes unreachable — it is secret material, same care as the
@@ -733,6 +745,7 @@ impl<T: Transport> Peer<T> {
                     pending_initial: st.pending_initial.clone(),
                     drop_seed: st.drop_seed,
                     peer_mailbox_pub: st.peer_mailbox_pub,
+                    peer_kem_ek: st.peer_kem_ek.clone(),
                 })
                 .collect()
         };
@@ -775,6 +788,7 @@ impl<T: Transport> Peer<T> {
                             pending_initial: p.pending_initial,
                             drop_seed: p.drop_seed,
                             peer_mailbox_pub: p.peer_mailbox_pub,
+                            peer_kem_ek: p.peer_kem_ek,
                         },
                     )
                 })
@@ -993,7 +1007,13 @@ impl<T: Transport> Peer<T> {
         };
         self.sessions.insert(
             bundle.ik_pub,
-            SessionState { session, pending_initial: Some(ka), drop_seed, peer_mailbox_pub },
+            SessionState {
+                session,
+                pending_initial: Some(ka),
+                drop_seed,
+                peer_mailbox_pub,
+                peer_kem_ek: bundle.kem_ek.clone(),
+            },
         );
         Ok(fs)
     }
@@ -1040,8 +1060,14 @@ impl<T: Transport> Peer<T> {
             // and cannot tell who opened the conversation.
             Some(ka) => {
                 let plain = postcard::to_stdvec(ka).map_err(|e| format!("encode ka: {e}"))?;
-                let sealed_ka =
-                    karst_crypto::seal::SkeletonSeal::seal(&PublicKey::from(*peer_ik), &plain);
+                // Sealed to BOTH of the recipient's long-lived public keys (PRIV-3): X25519 for the
+                // classical half, ML-KEM for the half a quantum adversary cannot break. Without the
+                // second one, an opener recorded today still names who first wrote to whom later.
+                let sealed_ka = karst_crypto::seal::SkeletonSeal::seal(
+                    &PublicKey::from(*peer_ik),
+                    &st.peer_kem_ek,
+                    &plain,
+                )?;
                 SessionEnvelope::InitialSealed { sealed_ka, msg: rmsg }
             }
             None => SessionEnvelope::Ratchet(rmsg),
@@ -1106,6 +1132,23 @@ impl<T: Transport> Peer<T> {
             .map(|st| (st.drop_seed, st.peer_mailbox_pub))
             .ok_or("no session (call connect first)")?;
         let envelope = self.encrypt_next(peer_ik, plaintext)?;
+        // **ONE opener per batch, not one per payload.** `pending_initial` normally clears when a
+        // transmit is ACCEPTED — right for the immediate-send path, where encrypt and transmit are
+        // back to back. A batch (`send_session_batch`) encrypts EVERY payload first and flushes
+        // afterwards, so nothing was accepted yet and every envelope in the batch came out as an
+        // opener, each carrying its own full copy of the key agreement. For a six-part avatar that
+        // is five redundant copies — and after PRIV-3 added the outer ML-KEM ciphertext it is
+        // ~3.4 KB of waste apiece, enough to overflow the fixed fetch page and split a transfer
+        // that used to arrive in one poll. It fit before by about 96 bytes, which is not a margin,
+        // it is a coincidence.
+        //
+        // Clearing it HERE is safe precisely because the envelope above is already built: this only
+        // affects what LATER payloads encrypt to, never what is already queued. The opener sits at
+        // the front of a FIFO outbox that retransmits exactly, so the recipient still sees it
+        // first, and a flush that fails leaves the remainder queued behind it.
+        if let Some(st) = self.sessions.get_mut(peer_ik) {
+            st.pending_initial = None;
+        }
         let id = self.outbox_next_id;
         self.outbox_next_id = self.outbox_next_id.wrapping_add(1);
         self.outbox.push(OutboxEntry {
@@ -1166,6 +1209,16 @@ impl<T: Transport> Peer<T> {
     /// How many messages are queued awaiting delivery (for tests / a UI "pending" count).
     pub fn outbox_len(&self) -> usize {
         self.outbox.len()
+    }
+
+    /// The queued envelopes, for asserting their SHAPE (test-only).
+    ///
+    /// Exists for one property: a batch must not repeat the key agreement. Counting openers is the
+    /// only way to see that from outside, and the alternative — inferring it from delivered byte
+    /// counts — is what let the waste go unnoticed until it crossed a page boundary.
+    #[doc(hidden)]
+    pub fn outbox_envelopes_for_test(&self) -> Vec<SessionEnvelope> {
+        self.outbox.iter().map(|e| e.envelope.clone()).collect()
     }
 
     /// Собрать WireMessage и провести через admission с cookie-refresh. Тот же
@@ -1725,7 +1778,7 @@ impl<T: Transport> Peer<T> {
             // handle the KeyAgreement as usual. Sender authentication is unchanged: it
             // comes from the inner PQXDH, never from the outer box.
             Payload::Session(SessionEnvelope::InitialSealed { sealed_ka, msg }) => {
-                let plain = sealed_ka.open(self.account.ik())?;
+                let plain = sealed_ka.open(self.account.ik(), self.account.kem_dk_ref())?;
                 let ka: KeyAgreement = postcard::from_bytes(&plain).ok()?;
                 self.process_opener(&ka, msg)
             }
@@ -1795,7 +1848,16 @@ impl<T: Transport> Peer<T> {
                 // The sender's mailbox point rode the (authenticated) key-agreement — store it as
                 // where I deposit my B→A replies.
                 let peer_mailbox_pub = ka.mailbox_a_pub;
-                let new_state = SessionState { session, pending_initial: None, drop_seed, peer_mailbox_pub };
+                // `peer_kem_ek` stays EMPTY on the responding side, deliberately: `pending_initial`
+                // is `None` here, so this session never seals an opener and has no use for the
+                // peer's KEM key. Storing one would mean keeping a public key we would never read.
+                let new_state = SessionState {
+                    session,
+                    pending_initial: None,
+                    drop_seed,
+                    peer_mailbox_pub,
+                    peer_kem_ek: Vec::new(),
+                };
                 // INVARIANT `inbound implies outbound`: a responder session goes in the SECONDARY
                 // map ONLY when we already hold our own OUTBOUND session to this peer — i.e. we
                 // both PQXDH-initiated before either received (simultaneous first contact). Keeping
@@ -2020,6 +2082,7 @@ mod outbox_state_tests {
             pending_initial: None,
             drop_seed: [ik; 32],
             peer_mailbox_pub: [0u8; 32],
+            peer_kem_ek: Vec::new(),
         };
         let mut st = PeerState::empty();
         st.sessions = vec![mk(1), mk(2)];
@@ -2121,7 +2184,8 @@ use super::LoopbackMail;
                 session: Session::init_sender([1u8; 32], [2u8; 32]),
                 pending_initial: None, // a follow-up Ratchet send → hits the blinded deposit path
                 drop_seed: [3u8; 32],
-                peer_mailbox_pub: [0u8; 32], // the serde default of a pre-change session
+                peer_mailbox_pub: [0u8; 32],
+                peer_kem_ek: Vec::new(), // the serde default of a pre-change session
             },
         );
 
@@ -2190,6 +2254,7 @@ use super::LoopbackMail;
                 pending_initial: None,
                 drop_seed: [3u8; 32],
                 peer_mailbox_pub: [4u8; 32],
+                peer_kem_ek: Vec::new(),
             },
         );
     }
@@ -2468,7 +2533,8 @@ use super::LoopbackMail;
             pending_initial: None,
             drop_seed,
             peer_mailbox_pub: mailbox_pub,
-        };
+                        peer_kem_ek: Vec::new(),
+            };
 
         // The session this message is ACTUALLY encrypted under.
         peer.sessions.insert(peer_ik, mk_state(pre_swap_seed));
@@ -2532,6 +2598,7 @@ use super::LoopbackMail;
                 pending_initial: None,
                 drop_seed: seed,
                 peer_mailbox_pub: mailbox_pub,
+                            peer_kem_ek: Vec::new(),
             },
         );
         let envelope = SessionEnvelope::Ratchet(RatchetMessage {
@@ -2638,7 +2705,8 @@ use super::LoopbackMail;
             pending_initial: None,
             drop_seed,
             peer_mailbox_pub: mailbox_pub,
-        };
+                        peer_kem_ek: Vec::new(),
+            };
         // `sessions[peer]` (the outbound map — what `send`/`queue` use) starts with the LARGER
         // seed on purpose: convergence must actually SWAP for the assertion below to hold. If
         // it started with the smaller seed already, a completely inert (no-op) sweep would
@@ -2782,6 +2850,7 @@ use super::LoopbackMail;
                     pending_initial: None,
                     drop_seed: [i as u8; 32],
                     peer_mailbox_pub: [0u8; 32],
+                peer_kem_ek: Vec::new(),
                 },
             );
         }
@@ -2836,6 +2905,7 @@ use super::LoopbackMail;
                 pending_initial: None,
                 drop_seed: [5u8; 32],
                 peer_mailbox_pub: [0u8; 32],
+                peer_kem_ek: Vec::new(),
             },
         );
 
@@ -2891,6 +2961,7 @@ use super::LoopbackMail;
                 pending_initial: None,
                 drop_seed: [5u8; 32],
                 peer_mailbox_pub: [0u8; 32],
+                peer_kem_ek: Vec::new(),
             },
         );
         // A ratchet message this session cannot open — what a diverged chain produces.
@@ -2942,6 +3013,7 @@ use super::LoopbackMail;
                     pending_initial: None,
                     drop_seed: [i as u8; 32],
                     peer_mailbox_pub: [0u8; 32],
+                peer_kem_ek: Vec::new(),
                 },
             );
         }
@@ -3000,6 +3072,7 @@ use super::LoopbackMail;
                     pending_initial: None,
                     drop_seed: [i as u8; 32],
                     peer_mailbox_pub: [0u8; 32],
+                peer_kem_ek: Vec::new(),
                 },
             );
         }
@@ -3242,6 +3315,72 @@ mod the_relay_learns_nothing_from_size {
         assert_eq!(
             long, short,
             "a first contact still leaks how much was written: {long} vs {short} bytes"
+        );
+    }
+}
+
+/// **A batch carries ONE opener, not one per payload.**
+///
+/// `pending_initial` clears on an ACCEPTED transmit, which is right for the immediate-send path but
+/// wrong for a batch: `send_session_batch` encrypts every payload before flushing any of them, so
+/// nothing has been accepted yet and every envelope came out as an opener with its own full copy of
+/// the key agreement. Nobody noticed because it still WORKED — a six-part avatar's six openers came
+/// to about 15.9 KB against a 16 KB fetch page, so it fit by ~96 bytes. That is not a margin, it is
+/// a coincidence, and PRIV-3's outer ML-KEM ciphertext spent it: the transfer started arriving in
+/// two polls instead of one, which surfaces as an avatar that silently never assembles.
+///
+/// Pinned here rather than left to the integration test that caught it, because the integration test
+/// only fails once the waste is large enough to cross a page boundary. This fails as soon as the
+/// waste exists.
+#[cfg(test)]
+mod a_batch_repeats_no_key_agreement {
+    use super::LoopbackMail;
+    use admission::capability::{Capability, Quota, Scope};
+    use karst_crypto::pqxdh::Account;
+    use node::protocol::SessionEnvelope;
+    use x25519_dalek::PublicKey;
+
+    fn dev_cap() -> Capability {
+        Capability {
+            capability_id: [0xCC; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 100_000, max_bytes: 1 << 30, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x35; 32],
+        }
+    }
+
+    /// Queue six payloads the way a multi-part transfer does, and require exactly one opener.
+    ///
+    /// DISCRIMINATING: remove the `pending_initial = None` in `Peer::queue` and this reports six.
+    #[test]
+    fn only_the_first_queued_envelope_is_an_opener() {
+        let transport = LoopbackMail::default();
+        let mk = |t: &LoopbackMail| {
+            super::Peer::new(t.clone(), Account::generate(), dev_cap(), PublicKey::from([7u8; 32]))
+        };
+        let mut bob = mk(&transport);
+        bob.publish(0);
+        let bob_ik = bob.identity();
+
+        let mut alice = mk(&transport);
+        alice.connect(&bob_ik, 0).expect("PQXDH against a published bundle");
+        for i in 0..6u8 {
+            alice.queue(&bob_ik, &[i; 32], 0).expect("queues");
+        }
+
+        let openers = alice
+            .outbox_envelopes_for_test()
+            .iter()
+            .filter(|e| matches!(e, SessionEnvelope::InitialSealed { .. }))
+            .count();
+        assert_eq!(
+            openers, 1,
+            "a six-payload batch produced {openers} openers. Each carries a full key agreement — \
+             after PRIV-3 that is ~3.4 KB apiece — so the redundant copies overflow the fixed fetch \
+             page and split a transfer across polls, which reaches the user as a file or avatar \
+             that never finishes assembling."
         );
     }
 }

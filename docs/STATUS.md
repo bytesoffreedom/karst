@@ -52,6 +52,79 @@ privacy budget, over is a message that disappears.
 Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
 margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
 
+### PRIV-3: the sealed opener goes post-quantum, and the ceiling moves a second time
+
+The inner handshake was hybrid; the OUTER seal that hides the social edge from the relay was not.
+`SkeletonSeal` was an ephemeral X25519 against the recipient's static identity key, so an adversary
+recording a first contact today and breaking X25519 later recovers who first wrote to whom. The
+`derive_key` slot for `pq_shared` had been left empty on purpose since the skeleton, and filling it
+was exactly that — a slot, not a rewrite.
+
+**Which KEM key, and why it is forced rather than chosen.** The outer seal encapsulates to the
+recipient's LONG-LIVED `kem_ek`, not the one-time unit the inner handshake uses. Which one-time unit
+a sender picked is recorded in `opk_pub` INSIDE the sealed key agreement, so a recipient cannot know
+which one-time secret to decapsulate with until it has already opened the seal. Same
+chicken-and-egg shape as PRIV-2's, resolved here by the choice of key rather than by a new mechanism.
+
+**The honest limit, and it is not a footnote: this layer has no forward secrecy.** Both of the
+recipient's keys are long-lived, so whoever later obtains the account's secret material can
+decapsulate recorded openers and recover the edge. Nothing got weaker — the classical half always
+had that property — what changed is that a quantum computer with no compromise at all no longer
+suffices. The claim is "harvest-now-decrypt-later against the social graph", not "forward-secret
+openers", and the field's own doc comment says so where someone reading the code will see it.
+
+**`MAX_PACKET_SIZE`: 2560 -> 3840.** The outer KEM ciphertext is +1088 bytes on the largest envelope
+in the protocol, and the old ceiling had no room:
+
+    1235 (sealed key agreement) + 1088 (outer KEM ciphertext)
+  + 1325 (padded plaintext + tag) + 64 (opener framing) + 128 (admission framing) = 3840
+
+Shrinking the envelope instead was impossible, not merely unattractive: `pad::PADDED_LEN` is derived
+from this constant, and taking 1088 out of it leaves ~29 bytes for a message whose largest legal
+`Content` is 1053. This is the same argument the first raise recorded (1400 -> 2560) — a design that
+mandates post-quantum protection and a ceiling too small to carry it are inconsistent, and the
+ceiling is the arbitrary part. 3840 rather than the tight 3648 because `pad::MAX_PAYLOAD`'s margin
+over the largest `Content` was down to 60 bytes; it is now 252. The cost is per-message bandwidth:
+every message is padded to one class (PRIV-1), so the block grew from 1113 to 1305 bytes.
+
+**A defect found while wiring it:** `Payload::approx_len` would not have counted `kem_ct`. That is
+the largest single field in the envelope, so the stage-0 size gate would have under-counted by more
+than a quarter of the packet — enforcing a ceiling with no relation to what is on the wire. Fixed in
+the same change.
+
+Tests assert the property rather than the plumbing: holding the right X25519 identity and the WRONG
+KEM secret must NOT open the envelope (discriminating — restore the empty `pq_shared` and it goes
+green, because the classical secret would again be sufficient), and the reverse; a swapped `kem_ct`
+is refused; malformed keys and ciphertexts off the wire are errors, never panics.
+
+Plumbing consequence worth noting: the skeleton `Recipient` mints its own KEM key, so a sender must
+now be built AFTER it and seal to `recip.kem_ek()`. One relay test asserted "a seal Bob can open" and
+had to be reordered — which mirrors the real path, where a sender fetches the bundle first. And
+`fetch_messages` now takes the account, because a recipient reloaded from a recovery phrase has to
+re-derive the SAME KEM key: a generated one makes every envelope sealed to that account unopenable
+after a restart, and the failure looks like "no mail" rather than like a bug.
+
+**The bug this uncovered, which is the more valuable half.** An avatar stopped assembling, and the
+cause was not the new ciphertext — it was that `send_session_batch` had always sent one opener PER
+PAYLOAD. `pending_initial` clears on an ACCEPTED transmit, which suits the immediate-send path; a
+batch encrypts everything before flushing anything, so nothing was accepted yet and all six
+envelopes of a six-part transfer carried their own full copy of the key agreement. It worked because
+six of them came to ~15.9 KB against the fixed 16 KB fetch page — a 96-byte margin, which is a
+coincidence, not a design. PRIV-3's ciphertext spent that coincidence and the transfer began
+arriving across two polls, surfacing as a file that never finishes.
+
+`Peer::queue` now clears `pending_initial` after building the envelope — safe precisely because the
+envelope is already built, so it only affects what LATER payloads encrypt to, and the opener still
+sits at the front of a FIFO outbox that retransmits exactly. That removes ~3.4 KB of waste per extra
+part. Pinned by a unit test that counts openers in the outbox, so it fails as soon as the waste
+exists rather than once it happens to cross a page boundary.
+
+`FETCH_PAGE_LEN = 16_000` was deliberately NOT raised: it is sized to sit under the Noise 16384
+bucket so a page costs ONE size class on the wire, and enlarging it would put a page in two — a
+privacy regression traded for throughput. `MAX_REQUEST_FRAME` needed no change either; it is derived
+from `MAX_PACKET_SIZE` and had been correct through both raises, while the comment beside it still
+said "= 1400". Numbers are out of that prose now too.
+
 ### PRIV-2, slice 1: the routing chain becomes possible (and the first design was wrong)
 
 `drop_seed` comes from `root_key`, which is fixed at key agreement, so anyone who once held a

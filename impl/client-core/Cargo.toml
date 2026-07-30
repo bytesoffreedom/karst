@@ -28,3 +28,4 @@ postcard = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
 karst-transport = { path = "../transport" }
+

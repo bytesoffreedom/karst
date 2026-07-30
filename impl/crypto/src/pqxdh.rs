@@ -437,6 +437,23 @@ impl Account {
 
     /// Долговременный identity-ключ (для отправки: sender_ik) — внутри крейта,
     /// сессионный слой берёт приватный ключ отсюда.
+    /// The account's LONG-LIVED ML-KEM decapsulation key, for opening a sealed opener (PRIV-3).
+    ///
+    /// Exposed by reference and never cloned out: the sealed opener has to be opened with the
+    /// long-lived key by construction (a one-time unit cannot be selected before the seal is open —
+    /// which unit was used is written inside it), so this is the one legitimate caller. A method
+    /// rather than a public field so that stays true.
+    pub fn kem_dk_ref(&self) -> &DecapsulationKey<MlKem768> {
+        &self.kem_dk
+    }
+
+    /// This account's KEM half packaged for the hybrid seal (PRIV-3) — deterministic from the seed,
+    /// which is what makes the skeleton path work: the sender can learn `ek()` out of band and the
+    /// recipient re-derives the same key after a reload.
+    pub fn seal_kem(&self) -> crate::seal::SealKemKeys {
+        crate::seal::SealKemKeys::from_dk(self.kem_dk.clone())
+    }
+
     pub fn ik(&self) -> &Identity {
         &self.ik
     }

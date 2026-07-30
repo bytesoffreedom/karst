@@ -45,9 +45,13 @@ fn end_to_end_message_delivered() {
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
     let mut bob = Recipient::new(transport, bob_id, relay_pub);
     let bob_pub = bob.public();
+    // A hybrid seal needs the recipient's ML-KEM key too (PRIV-3) — taken from the receiver that
+    // will actually open it, which is the whole point: any other key produces an envelope that
+    // authenticates and cannot be read.
+    let bob_kem = bob.kem_ek().to_vec();
 
     // Alice шлёт (первый раз — с cookie round-trip внутри).
-    let resp = alice.send(&bob_pub, b"hello bob", NOW);
+    let resp = alice.send(&bob_pub, &bob_kem, b"hello bob", NOW);
     assert!(matches!(resp, Response::Accepted), "получено: {:?}", resp);
 
     // Bob забирает (fetch-auth) и расшифровывает.
@@ -65,9 +69,13 @@ fn cookie_roundtrip_then_cached() {
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
     let mut bob = Recipient::new(transport, bob_id, relay_pub);
     let bob_pub = bob.public();
+    // A hybrid seal needs the recipient's ML-KEM key too (PRIV-3) — taken from the receiver that
+    // will actually open it, which is the whole point: any other key produces an envelope that
+    // authenticates and cannot be read.
+    let bob_kem = bob.kem_ek().to_vec();
 
-    assert!(matches!(alice.send(&bob_pub, b"first", NOW), Response::Accepted));
-    assert!(matches!(alice.send(&bob_pub, b"second", NOW), Response::Accepted));
+    assert!(matches!(alice.send(&bob_pub, &bob_kem, b"first", NOW), Response::Accepted));
+    assert!(matches!(alice.send(&bob_pub, &bob_kem, b"second", NOW), Response::Accepted));
     let msgs: Vec<_> = bob.receive(NOW).unwrap().into_iter().flatten().collect();
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0], b"first");
@@ -109,9 +117,13 @@ fn relay_tampering_admitted_but_e2e_rejects() {
     let mut alice = Client::new(tamper, capability([0x33; 32]), b"alice");
     let mut bob = Recipient::new(honest, bob_id, relay_pub);
     let bob_pub = bob.public();
+    // A hybrid seal needs the recipient's ML-KEM key too (PRIV-3) — taken from the receiver that
+    // will actually open it, which is the whole point: any other key produces an envelope that
+    // authenticates and cannot be read.
+    let bob_kem = bob.kem_ek().to_vec();
 
     // Admission ПРОШЁЛ, несмотря на подмену груза в транспорте.
-    assert!(matches!(alice.send(&bob_pub, b"secret", NOW), Response::Accepted));
+    assert!(matches!(alice.send(&bob_pub, &bob_kem, b"secret", NOW), Response::Accepted));
 
     // Но расшифровка проваливается — подмену поймал AEAD.
     let msgs = bob.receive(NOW).unwrap();
@@ -130,8 +142,12 @@ fn bad_capability_rejected_regardless_of_content() {
     let mut mallory = Client::new(transport.clone(), capability([0x99; 32]), b"mallory");
     let mut bob = Recipient::new(transport, bob_id, relay_pub);
     let bob_pub = bob.public();
+    // A hybrid seal needs the recipient's ML-KEM key too (PRIV-3) — taken from the receiver that
+    // will actually open it, which is the whole point: any other key produces an envelope that
+    // authenticates and cannot be read.
+    let bob_kem = bob.kem_ek().to_vec();
 
-    let resp = mallory.send(&bob_pub, b"perfectly valid content", NOW);
+    let resp = mallory.send(&bob_pub, &bob_kem, b"perfectly valid content", NOW);
     // Reject именно по credential (Ступень 4 crypto), а не по случайной другой
     // стадии — иначе тест «прошёл бы по неверной причине».
     match &resp {
@@ -158,8 +174,15 @@ fn attacker_knowing_pubkey_cannot_drain_mailbox() {
     let transport = InMemoryTransport::new(relay.clone());
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
     let bob_pub = bob_id.public;
+    // Bob is built BEFORE the send: he opens this envelope at the end of the test, and a hybrid
+    // seal (PRIV-3) has to name HIS ML-KEM key — `Recipient` mints its own, so there is nothing to
+    // seal to until it exists. Same ordering the real path has, where a sender fetches the bundle.
+    let mut bob = Recipient::new(transport.clone(), bob_id, relay_pub);
 
-    assert!(matches!(alice.send(&bob_pub, b"for bob only", NOW), Response::Accepted));
+    assert!(matches!(
+        alice.send(&bob_pub, bob.kem_ek(), b"for bob only", NOW),
+        Response::Accepted
+    ));
 
     // Злоумышленник: cookie-handshake на mailbox Bob, но proof подделать не может.
     let mailbox = bob_pub.to_bytes();
@@ -179,7 +202,6 @@ fn attacker_knowing_pubkey_cannot_drain_mailbox() {
     assert!(matches!(attack, FetchResponse::Rejected(_)), "чужой fetch должен быть отклонён");
 
     // ГЛАВНОЕ: очередь Bob НЕ тронута — законный Bob всё ещё получает сообщение.
-    let mut bob = Recipient::new(transport, bob_id, relay_pub);
     let got: Vec<_> = bob.receive(NOW).unwrap().into_iter().flatten().collect();
     assert_eq!(got, vec![b"for bob only".to_vec()], "чужой fetch не должен удалять сообщение");
 }
@@ -198,14 +220,18 @@ fn client_refreshes_cookie_on_expiry() {
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
     let mut bob = Recipient::new(transport, bob_id, relay_pub);
     let bob_pub = bob.public();
+    // A hybrid seal needs the recipient's ML-KEM key too (PRIV-3) — taken from the receiver that
+    // will actually open it, which is the whole point: any other key produces an envelope that
+    // authenticates and cannot be read.
+    let bob_kem = bob.kem_ek().to_vec();
 
     // t0: первый контакт, handshake, доставка.
-    assert!(matches!(alice.send(&bob_pub, b"m1", NOW), Response::Accepted));
+    assert!(matches!(alice.send(&bob_pub, &bob_kem, b"m1", NOW), Response::Accepted));
 
     // Далеко за TTL И за границу эпохи+grace (3 эпохи): кэш протух, ключ сменён.
     let later = NOW + 3 * EPOCH_DURATION_SECS;
     assert!(
-        matches!(alice.send(&bob_pub, b"m2", later), Response::Accepted),
+        matches!(alice.send(&bob_pub, &bob_kem, b"m2", later), Response::Accepted),
         "доставка должна пережить границу TTL/эпохи (клиент перевыдаёт cookie)"
     );
 
@@ -236,12 +262,16 @@ fn mailbox_cap_rejects_instead_of_silent_loss() {
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
     let mut bob = Recipient::new(transport, Identity::generate(), relay_pub);
     let bob_pub = bob.public();
+    // A hybrid seal needs the recipient's ML-KEM key too (PRIV-3) — taken from the receiver that
+    // will actually open it, which is the whole point: any other key produces an envelope that
+    // authenticates and cannot be read.
+    let bob_kem = bob.kem_ek().to_vec();
 
     for _ in 0..MAX_FETCH_SEALS {
-        assert!(matches!(alice.send(&bob_pub, b"x", NOW), Response::Accepted));
+        assert!(matches!(alice.send(&bob_pub, &bob_kem, b"x", NOW), Response::Accepted));
     }
     // Mailbox full -> backpressure, not a silent drop.
-    match alice.send(&bob_pub, b"overflow", NOW) {
+    match alice.send(&bob_pub, &bob_kem, b"overflow", NOW) {
         Response::Rejected(r) => assert!(r.contains("MailboxFull"), "got: {r}"),
         other => panic!("expected MailboxFull, got: {:?}", other),
     }
@@ -283,12 +313,16 @@ fn a_client_with_the_wrong_capability_secret_is_refused() {
     let mut alice = Client::new(transport.clone(), capability([0x99; 32]), b"alice");
     let mut bob = Recipient::new(transport, bob, relay_pub);
     let bob_pub = bob.public();
+    // A hybrid seal needs the recipient's ML-KEM key too (PRIV-3) — taken from the receiver that
+    // will actually open it, which is the whole point: any other key produces an envelope that
+    // authenticates and cannot be read.
+    let bob_kem = bob.kem_ek().to_vec();
 
     // The cookie round-trip may succeed (cookies are anti-spoofing, not the door), but the
     // capability check must refuse delivery. Try twice to get past the NeedCookie step.
     let mut accepted = false;
     for _ in 0..3 {
-        if matches!(alice.send(&bob_pub, b"let me in", NOW), Response::Accepted) {
+        if matches!(alice.send(&bob_pub, &bob_kem, b"let me in", NOW), Response::Accepted) {
             accepted = true;
             break;
         }
@@ -316,9 +350,13 @@ fn redepositing_the_same_ciphertext_does_not_duplicate_it_in_the_mailbox() {
     let (relay, bob_id, _relay_pub) = setup();
     let bob_pub = bob_id.public;
     let cap = capability([0x33; 32]);
+    // ONE recipient KEM key across both seals below: this test is about whether the RELAY
+    // deduplicates identical bytes, so the two envelopes must differ only in the plaintext.
+    let kem = node::seal::SealKemKeys::generate();
 
     // ONE sealed envelope, deposited twice — exactly what the outbox retransmits.
-    let payload = Payload::Skeleton(SkeletonSeal::seal(&bob_pub, b"same bytes"));
+    let payload =
+        Payload::Skeleton(SkeletonSeal::seal(&bob_pub, kem.ek(), b"same bytes").expect("seals"));
 
     let deposit = |relay: &Rc<RefCell<RelayNode>>, payload: &Payload, nonce: &[u8]| {
         let mut msg = WireMessage {
@@ -355,7 +393,7 @@ fn redepositing_the_same_ciphertext_does_not_duplicate_it_in_the_mailbox() {
     );
 
     // Control: a genuinely different message must still land.
-    let other = Payload::Skeleton(SkeletonSeal::seal(&bob_pub, b"different bytes"));
+    let other = Payload::Skeleton(SkeletonSeal::seal(&bob_pub, kem.ek(), b"different bytes").expect("seals"));
     assert!(matches!(deposit(&relay, &other, b"nonce-3"), Response::Accepted));
     assert_eq!(
         relay.borrow().mailbox_len_for_test(&bob_pub.to_bytes()),

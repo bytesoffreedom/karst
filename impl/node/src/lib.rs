@@ -19,6 +19,11 @@
 /// unaudited, first-contact openers keep the identity mailbox + DH proof). See the module.
 pub mod blobstore;
 pub mod discovery;
+// What a helper node may SEE, as a checked invariant rather than a table someone maintains
+// (NODE-2). Test-only, like `identity_guard` next door: it asserts a property about this
+// workspace's own shape, so it compiles away entirely in a release build.
+#[cfg(test)]
+mod helper_guard;
 pub mod protocol;
 
 // The crypto primitives live in their own crate now (#247). Re-exported so every `node::seal::…`

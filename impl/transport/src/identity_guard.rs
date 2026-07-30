@@ -45,13 +45,16 @@ const IDENTITY_VOCABULARY: &[&str] = &[
 /// What a would-be reverser has to solve first. Printed at the moment they try, which is the only
 /// moment it is useful.
 const REVERSAL_CONDITIONS: &str = "\
-Reversing this needs three things that do not exist yet, and all three are real work:
+Reversing this needs three questions answered, and all three are real work:
 
-  1. A SIGNED relay identity in the descriptor. `RelayDescriptor` is not signed as a document
-     today; discovery signs `location_id`, which is the relay-id and nothing else, and addresses
-     are deliberately unsigned hints validated by DIALLING them (gossip's verify-before-add). A
-     certificate fingerprint would therefore sit in the unsigned part, where an intermediary
-     substitutes it — which is exactly why QUIC-1 REFUSED that field.
+  1. A REASON the fingerprint belongs in the descriptor at all. This condition used to say the
+     descriptor was not signed as a document, so a fingerprint would sit in the unsigned part
+     where an intermediary substitutes it. That is no longer true: since NODE-1 a
+     `NodeDescriptor` IS a signed document (relay, policy, validity window), so a fingerprint
+     placed in it would be covered by the relay's own signature. The objection it was standing in for survives without
+     it — a fingerprint is only meaningful if TLS is what authenticates the relay, and it is not;
+     see (2). Corrected rather than deleted, because a reversal gate that quietly stopped being
+     true is the failure this whole file is about.
 
   2. One answer that holds on EVERY carrier. TLS exists only on QUIC and WSS. Direct TCP and
      TCP-through-SOCKS have none, and Tor carries no UDP at all. Two mechanisms means the carrier

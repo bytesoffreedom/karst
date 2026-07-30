@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 700" width="1240" height="700" font-family="Inter, 'Segoe UI', system-ui, sans-serif">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2ED7D1"/>
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#00F8FF"/>
     </marker>
     <style>
       .card   { fill:#171c1f; stroke:#2b3438; stroke-width:1.5; rx:14; }
@@ -11,7 +11,7 @@
       .sub    { fill:#7d8f96; font-size:12.5px; }
       .item   { fill:#cfdadd; font-size:13.5px; }
       .note   { fill:#8a9aa1; font-size:12px; }
-      .edge   { fill:#2ED7D1; font-size:12.5px; font-weight:500; }
+      .edge   { fill:#00F8FF; font-size:12.5px; font-weight:500; }
       .warn   { fill:#e0776a; font-size:12.5px; font-weight:600; letter-spacing:.04em; }
       .mono   { font-family: ui-monospace, 'DejaVu Sans Mono', monospace; }
     </style>
@@ -75,12 +75,12 @@
   <text class="note" x="940" y="327">unlinkable arrangement</text>
 
   <!-- ─────────── Flow arrows ─────────── -->
-  <path d="M 344 200 L 462 200" stroke="#2ED7D1" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 344 200 L 462 200" stroke="#00F8FF" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
   <text class="edge" x="403" y="180" text-anchor="middle">sealed</text>
   <text class="edge" x="403" y="196" text-anchor="middle">envelope</text>
   <text class="note" x="403" y="224" text-anchor="middle">deposit</text>
 
-  <path d="M 778 200 L 892 200" stroke="#2ED7D1" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 778 200 L 892 200" stroke="#00F8FF" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
   <text class="edge" x="835" y="180" text-anchor="middle">fetch</text>
   <text class="edge" x="835" y="196" text-anchor="middle">+ ACK</text>
   <text class="note" x="835" y="224" text-anchor="middle">owner-proved</text>
@@ -88,7 +88,7 @@
   <text class="note" x="620" y="386" text-anchor="middle">PQXDH (X25519 + ML-KEM-768) establishes the session · Double Ratchet carries every message after it</text>
 
   <!-- E2E span -->
-  <path d="M 190 406 L 190 430 L 1050 430 L 1050 406" stroke="#2ED7D1" stroke-width="1.5" fill="none" stroke-dasharray="5 5"/>
+  <path d="M 190 406 L 190 430 L 1050 430 L 1050 406" stroke="#00F8FF" stroke-width="1.5" fill="none" stroke-dasharray="5 5"/>
   <rect x="452" y="414" width="336" height="32" rx="8" fill="#0f1416"/>
   <text class="edge" x="620" y="435" text-anchor="middle">end-to-end encryption closes here</text>
 

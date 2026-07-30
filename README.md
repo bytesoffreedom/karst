@@ -10,7 +10,7 @@ Built in Rust around independently operated relays.
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![Status](https://img.shields.io/badge/status-pre--alpha%20%C2%B7%20unaudited-red)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
-[![Dev log on Telegram](https://img.shields.io/badge/dev%20log-%40karstmessenger-2ED7D1)](https://t.me/karstmessenger)
+[![Dev log on Telegram](https://img.shields.io/badge/dev%20log-%40karstmessenger-00F8FF)](https://t.me/karstmessenger)
 
 > [!WARNING]
 > KARST is an experimental pre-alpha reference implementation.

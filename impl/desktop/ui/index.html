@@ -6,8 +6,8 @@
   --bg:#0E1116; --panel:#151A21; --panel2:#1B222B; --rail:#0A0D11;
   --line:#242D38; --line-soft:#1B222B;
   --text:#E9EDF2; --muted:#8B95A4; --faint:#5B6572;
-  --accent:#2ED7D1; --accent-deep:#087E86; --accent-soft:rgba(46,215,209,.13);
-  --on-accent:#04252A; --bubble-them:#1C242E; --bubble-me:#0A6E75;
+  --accent:#00F8FF; --accent-deep:#008A8E; --accent-soft:rgba(0,248,255,.13);
+  --on-accent:#04252A; --bubble-them:#1C242E; --bubble-me:#00767B;
   --good:#45C08A; --warn:#E4A64C; --danger:#E06B5C;
   --shadow:0 12px 34px rgba(0,0,0,.5); --r:12px; --r-lg:16px;
   --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
@@ -16,8 +16,8 @@
 :root[data-theme="light"]{
   --bg:#EDF1F5; --panel:#FFFFFF; --panel2:#F2F5F8; --rail:#E6EBF0;
   --line:#E0E6EC; --line-soft:#EBEFF3; --text:#0F151C; --muted:#586472; --faint:#93a0ad;
-  --accent:#0C97AA; --accent-deep:#087E86; --accent-soft:rgba(12,151,170,.12);
-  --on-accent:#FFFFFF; --bubble-them:#EEF2F6; --bubble-me:#0C7C8C; --shadow:0 12px 34px rgba(20,40,60,.12);
+  --accent:#0CA6AA; --accent-deep:#088386; --accent-soft:rgba(12,166,170,.12);
+  --on-accent:#FFFFFF; --bubble-them:#EEF2F6; --bubble-me:#0C8A8E; --shadow:0 12px 34px rgba(20,40,60,.12);
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -222,7 +222,7 @@ select.field option{background:var(--panel);color:var(--text)}
 .netstrip{border-top:1px solid var(--line);padding:10px 15px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);flex:none;white-space:nowrap;overflow:hidden}
 .pulse{width:8px;height:8px;border-radius:50%;background:var(--good);flex:none}
 .netstrip b{color:var(--text);font-weight:600}
-.chat{display:flex;flex-direction:column;min-width:0;min-height:0;background:radial-gradient(1200px 500px at 70% -10%, rgba(46,215,209,.05), transparent 60%), var(--bg)}
+.chat{display:flex;flex-direction:column;min-width:0;min-height:0;background:radial-gradient(1200px 500px at 70% -10%, rgba(0,248,255,.05), transparent 60%), var(--bg)}
 .chead{display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line);flex:none}
 .chead .ava{width:40px;height:40px;font-size:15px}
 .chead .ct{min-width:0;flex:1}
@@ -251,7 +251,7 @@ select.field option{background:var(--panel);color:var(--text)}
 .fico{width:38px;height:38px;border-radius:9px;background:var(--accent-deep);color:#fff;display:grid;place-items:center;font-size:11px;font-weight:700;flex:none}
 .filecard .fbody{flex:1;min-width:0}
 .fname{font-weight:600;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.fmeta{font-size:12px;color:var(--muted)}
-.fdl{flex:none;font-size:12px;font-weight:600;color:var(--accent);background:rgba(46,215,209,.10);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;transition:.15s}
+.fdl{flex:none;font-size:12px;font-weight:600;color:var(--accent);background:rgba(0,248,255,.10);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;transition:.15s}
 .fdl:hover{background:var(--accent-deep);color:#fff;border-color:var(--accent-deep)}
 .rfrow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line-soft)}
 .rfrow:last-child{border-bottom:0}
@@ -260,7 +260,7 @@ select.field option{background:var(--panel);color:var(--text)}
 .rfname{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rfmeta{font-size:11px;color:var(--muted)}
 .rfdl{flex:none;font-size:11.5px;font-weight:600;color:var(--accent);cursor:pointer;padding:4px 8px;border-radius:7px;transition:.15s}
-.rfdl:hover{background:rgba(46,215,209,.12)}
+.rfdl:hover{background:rgba(0,248,255,.12)}
 /* Connection-channels (proxy/IK) list: scroll past a few so many channels never blow up the card.
    There is no "burned" row style: burning DELETES the channel and its secret (A6-4, #207), so a
    burned channel has nothing left to render. The styles that dimmed and tagged one are gone with
@@ -412,7 +412,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- UNLOCK -->
 <section class="screen" id="s-unlock"><div class="center"><div class="card">
-  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="brandmark" src="logo-small.svg" alt="KARST">
   <h1 class="wordmark">KARST</h1>
   <p class="subtitle" data-i18n="END-TO-END ENCRYPTED">END-TO-END ENCRYPTED</p>
   <div class="panelbox">
@@ -441,7 +441,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- WELCOME -->
 <section class="screen" id="s-welcome"><div class="center"><div class="card">
-  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="brandmark" src="logo-small.svg" alt="KARST">
   <h1 class="wordmark">KARST</h1>
   <p class="subtitle" data-i18n="A DECENTRALIZED, ENCRYPTED MESSENGER">A DECENTRALIZED, ENCRYPTED MESSENGER</p>
   <div class="panelbox">
@@ -463,7 +463,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- CREATE 1 -->
 <section class="screen" id="s-create1"><div class="center"><div class="card">
-  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="brandmark" src="logo-small.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Your recovery phrase">Your recovery phrase</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Write these 24 words down, in order. They are the only way to recover this account.">Write these 24 words down, in order. They are the only way to recover this account.</p>
   <div class="panelbox">
@@ -476,7 +476,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- CREATE 2 -->
 <section class="screen" id="s-create2"><div class="center"><div class="card">
-  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="brandmark" src="logo-small.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Confirm &amp; protect">Confirm &amp; protect</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Prove you saved the phrase, then set a device password.">Prove you saved the phrase, then set a device password.</p>
   <div class="panelbox">
@@ -504,7 +504,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- RELAY CONFIG (its own short step, so onboarding screens never scroll) -->
 <section class="screen" id="s-relaycfg"><div class="center"><div class="card">
-  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="brandmark" src="logo-small.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Connect to a relay">Connect to a relay</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Where your messages travel. Your relay prints all of these when it starts.">Where your messages travel. Your relay prints all of these when it starts.</p>
   <div class="panelbox">
@@ -522,7 +522,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
 
 <!-- RESTORE -->
 <section class="screen" id="s-restore"><div class="center"><div class="card">
-  <img class="brandmark" src="logo.svg" alt="KARST">
+  <img class="brandmark" src="logo-small.svg" alt="KARST">
   <h1 class="wordmark" style="font-size:26px" data-i18n="Restore account">Restore account</h1>
   <p class="subtitle" style="text-transform:none;letter-spacing:0" data-i18n="Enter your 24-word recovery phrase into an empty profile.">Enter your 24-word recovery phrase into an empty profile.</p>
   <div class="panelbox">
@@ -1049,7 +1049,7 @@ function setLang(code){
 }
 function relayCountLabel(n){return n===0?t('no relay'):(n===1?t('1 relay'):n+' '+t('relays'));}
 
-const PAL=["#7C6FE0","#45A06A","#087E86","#E4A64C","#E0655C","#4FB3D9","#5B8DEF","#B07CE0","#E0863C"];
+const PAL=["#7C6FE0","#45A06A","#008A8E","#E4A64C","#E0655C","#4FB3D9","#5B8DEF","#B07CE0","#E0863C"];
 function acolor(k){let h=0;for(const c of (k||''))h=(h*31+c.charCodeAt(0))>>>0;return PAL[h%PAL.length];}
 function initials(n){return ((n||'').trim()[0]||'?').toUpperCase();}
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}

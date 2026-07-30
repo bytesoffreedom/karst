@@ -10,4 +10,5 @@
 
 pub mod demo;
 pub mod drop;
+pub mod pad;
 pub mod peer;

@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use admission::capability::{Capability, Quota, Scope};
 use relay::node::{InMemoryTransport, Payload, RelayNode, SessionEnvelope};
+use karst_client_core::pad;
 use karst_client_core::peer::Peer;
 use node::pqxdh::{initiate_key_agreement, Account};
 use node::ratchet::{Header, RatchetMessage, Session};
@@ -22,6 +23,17 @@ use node::seal::Identity;
 use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;
+
+/// A ratchet plaintext the way the PRODUCT makes one: wrapped in the fixed-size block.
+///
+/// These tests hand-assemble openers, so they bypass `Peer::encrypt_next` — the one place that
+/// pads. Without this they would exercise a plaintext shape no real sender can emit, and the three
+/// that check "the genuine opener still works" would fail for a reason unrelated to what they test
+/// (PRIV-1). Deliberately calls the SAME function as the product rather than reproducing the layout.
+fn padded(plaintext: &[u8]) -> Vec<u8> {
+    pad::pad(plaintext).expect("test plaintexts are far under one envelope")
+}
+
 
 fn dev_cap() -> Capability {
     Capability {
@@ -92,7 +104,7 @@ fn a_forged_opener_neither_creates_a_session_nor_burns_a_one_time_prekey() {
     let (root, ka2) =
         initiate_key_agreement(&real_sender, &[3u8; 32], &bundle).expect("well-formed bundle");
     let mut sender = Session::init_sender(root, bundle.prekey_pub);
-    let msg = sender.encrypt(b"genuine first contact");
+    let msg = sender.encrypt(&padded(b"genuine first contact"));
     let honest = sealed_to(bob_ik, &ka2, msg);
 
     let got = bob.open_for_test(&honest).expect("the genuine opener must still be acceptable");
@@ -124,7 +136,7 @@ fn the_legacy_unsealed_opener_shape_cannot_become_a_session() {
     let alice = Identity::generate();
     let (root, ka) = initiate_key_agreement(&alice, &[5u8; 32], &bundle).expect("well-formed bundle");
     let mut sender = Session::init_sender(root, bundle.prekey_pub);
-    let msg = sender.encrypt(b"first contact");
+    let msg = sender.encrypt(&padded(b"first contact"));
 
     // The old wire shape, written by hand: variant index 0 (which `Initial` used to occupy)
     // followed by the agreement and the first ratchet message.
@@ -170,7 +182,7 @@ fn a_degenerate_mailbox_point_is_refused_on_both_sides() {
         initiate_key_agreement(&alice, &[0u8; 32], &bundle).expect("well-formed bundle");
     assert_eq!(ka.mailbox_a_pub, [0u8; 32], "the sender advertised the degenerate point");
     let mut sender = Session::init_sender(root, bundle.prekey_pub);
-    let msg = sender.encrypt(b"hello");
+    let msg = sender.encrypt(&padded(b"hello"));
     let sealed = sealed_to(bundle.ik_pub, &ka, msg);
     assert!(bob.open_for_test(&sealed).is_none(), "a degenerate sender mailbox must be refused");
     assert!(!bob.has_session(&alice.public.to_bytes()), "and must leave no session");
@@ -183,7 +195,7 @@ fn a_degenerate_mailbox_point_is_refused_on_both_sides() {
     ka.mailbox_a_pub = alice_m;
     let _ = &ka2;
     let mut sender2 = Session::init_sender(root2, bundle.prekey_pub);
-    let msg2 = sender2.encrypt(b"hello again");
+    let msg2 = sender2.encrypt(&padded(b"hello again"));
     let sealed2 = sealed_to(bundle.ik_pub, &ka2, msg2);
     assert!(bob.open_for_test(&sealed2).is_some(), "a real mailbox point still works");
 }

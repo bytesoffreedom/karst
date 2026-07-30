@@ -13,6 +13,45 @@ Clippy clean. See **"What landed since the last reconcile
 (2026-07-20 → 2026-07-24)"** immediately below for the current delta (proxy identity, the feed +
 publications/stories, the session simultaneous-first-contact fix, duress Tier 1, the PoW door).
 
+## What landed since the last reconcile (2026-07-29, seventh batch)
+
+**The relay no longer learns how much you wrote (PRIV-1).** Noise frames already ride fixed buckets
+and a fetch page is a fixed 16 000 bytes — but the relay is not an on-path observer, it TERMINATES
+Noise, so it read `msg.ciphertext.len()` and that was the plaintext's length plus a tag. A one-word
+reply and a full paragraph were different sizes to the one party the design explicitly does not ask
+you to trust. Measured, with padding removed: an ordinary envelope carrying nothing is 16 bytes, one
+byte is 17, a full-length message is 1129. That is the plaintext length, in the clear, to the relay.
+
+Every ratchet plaintext is now a fixed block (`karst_client_core::pad`), which leaves the wire with
+exactly two shapes: `Ratchet` (flat) and `InitialSealed` (flat, larger — it carries the sealed key
+agreement). Collapsing those two into one was refused rather than overlooked: `SessionEnvelope` is a
+`node::protocol` enum the relay deserializes, so "this is a first contact" is visible structurally,
+and paying ~1.2 KB on every ordinary message to hide what the enum tag announces is a bandwidth bill,
+not a privacy gain.
+
+**The block size is derived from the admission ceiling, never chosen.** An oversize packet is not an
+error — it is `DropNoReply(Oversize)`, so the message vanishes with no reply and no log. Rounding up
+to a pretty 1024 is how you ship a client whose first message to a new contact silently never
+arrives. `PADDED_LEN` is computed backwards from `MAX_PACKET_SIZE` through the opener, which is the
+binding case, and a test asserts the padded opener lands on the ceiling exactly: under is wasted
+privacy budget, over is a message that disappears.
+
+**Three things this turned up:**
+- **Cover traffic was about to become the tell.** `send_loop` used a fixed 96-byte ciphertext chosen
+  to resemble a short text. Once real traffic is uniform, a 96-byte envelope among uniform ones
+  labels every loop — and a relay that can identify loops can drop the real mail while faithfully
+  returning them, so the drop detector reports all-clear while messages vanish. Loops are now sized
+  from the same constant, not a literal beside it.
+- **A stale claim in `content.rs`.** It documented a 1400-byte ceiling and a ~1256-byte plaintext
+  budget; `MAX_PACKET_SIZE` has been 2560 since an ML-KEM opener failed to fit its own mandated
+  ceiling. The numbers are gone from the prose — the constants are the only source.
+- **The first draft of the property test proved nothing.** Without a transmit, `pending_initial`
+  never clears, so all three "ordinary" messages were still openers and the common `Ratchet` class
+  went untested while the test passed. It now asserts the variant it is measuring.
+
+Largest legal `Content` is `TextReply` at 1053 bytes against a 1113-byte envelope — 60 bytes of
+margin, reported by the test rather than left to be rediscovered by whoever adds the next variant.
+
 ## What landed since the last reconcile (2026-07-29, sixth batch)
 
 **QUIC went from written to working.** It had been built and unreachable at the same time: the

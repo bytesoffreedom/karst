@@ -2,9 +2,15 @@
 //! остаются content-agnostic; вся типизация здесь, в клиенте). Текст и файлы
 //! кодируются в `Content` и едут как обычный plaintext через `send_session`.
 //!
-//! # Файлы через 1400-байтный лимит
-//! Ступень-0 admission режет пакет по `MAX_PACKET_SIZE=1400` → одно Ratchet-
-//! сообщение несёт ≤ ~1256 Б plaintext. Файл поэтому **чанкуется**: манифест
+//! # Файлы через пакетный лимит
+//! Ступень-0 admission режет пакет по `admission::params::MAX_PACKET_SIZE`, и
+//! `karst_client_core::pad` выводит ИЗ этого потолка размер фиксированного
+//! блока: одно Ratchet-сообщение несёт ровно `pad::MAX_PAYLOAD` Б plaintext,
+//! сколько бы ни было полезных байт (PRIV-1 — реле не должно узнавать длину).
+//! Числа здесь не повторяются намеренно: их дважды меняли (1400 → 2560, потому
+//! что ML-KEM-опенер не влезал в собственный обязательный потолок), и оба раза
+//! этот абзац оставался с прежней цифрой, описывая проток, которого нет.
+//! Единственный источник правды — константы. Файл поэтому **чанкуется**: манифест
 //! (имя, размер, число чанков, SHA-256) + N чанков; получатель собирает и
 //! СВЕРЯЕТ хэш. Первый срез ограничен ОДНИМ mailbox (`MAX_FETCH_SEALS=256`):
 //! ≤250 чанков (~256 KiB), пересборка в памяти в пределах живого процесса
@@ -1458,5 +1464,137 @@ mod tests {
         assert!(!r.has_transfer(id), "not tracked before the manifest arrives");
         r.offer(manifest, 0).unwrap();
         assert!(r.has_transfer(id), "tracked once the manifest is admitted");
+    }
+}
+
+/// **Every `Content` variant still fits one padded envelope** (PRIV-1).
+///
+/// `pad::MAX_PAYLOAD` is derived from the admission ceiling, so it is a fact about the wire rather
+/// than a number anyone gets to choose. That makes this the check that matters: if a variant's
+/// largest legal instance exceeds it, the feature is broken — and broken in the worst way, because
+/// `pad` refuses at the SENDER with a message, while before padding an oversize payload was dropped
+/// by admission as `DropNoReply` and reached the user as "sent" followed by silence.
+///
+/// So this is not a padding test. It is the test that says which product limits the wire permits.
+#[cfg(test)]
+mod every_content_fits_one_envelope {
+    use super::*;
+    use karst_client_core::pad;
+
+    /// Build the LARGEST legal instance of each variant, per this module's own limits.
+    fn largest_of_each() -> Vec<(&'static str, Content)> {
+        let text = vec![b'x'; MAX_TEXT_BYTES];
+        let name = "n".repeat(MAX_FILENAME);
+        vec![
+            ("Text", Content::Text(text.clone())),
+            ("TextExpiring", Content::TextExpiring { text: text.clone(), expire_at: u64::MAX }),
+            ("TextStamped", Content::TextStamped { text: text.clone(), ts: u64::MAX }),
+            ("TextReply", Content::TextReply { text: text.clone(), ts: u64::MAX, reply_to: [7u8; 16] }),
+            ("DeleteForEveryone", Content::DeleteForEveryone { ts: u64::MAX, text: text.clone() }),
+            (
+                "EditMessage",
+                Content::EditMessage {
+                    target_msg_id: [7u8; 16],
+                    new_text: text.clone(),
+                    edit_ts: u64::MAX,
+                },
+            ),
+            (
+                "FileChunk",
+                Content::FileChunk { id: [7u8; 16], index: u32::MAX, data: vec![9u8; MAX_CHUNK_PAYLOAD] },
+            ),
+            (
+                "AvatarChunk",
+                Content::AvatarChunk { id: [7u8; 16], index: u32::MAX, data: vec![9u8; MAX_CHUNK_PAYLOAD] },
+            ),
+            (
+                "FileManifest",
+                Content::FileManifest {
+                    id: [7u8; 16],
+                    name: name.clone(),
+                    size: u64::MAX,
+                    chunks: u32::MAX,
+                    hash: [8u8; 32],
+                },
+            ),
+            (
+                "Profile",
+                Content::Profile {
+                    name: "n".repeat(MAX_PROFILE_NAME),
+                    bio: "b".repeat(MAX_PROFILE_BIO),
+                },
+            ),
+            ("Reaction", Content::Reaction { msg_id: [7u8; 16], emoji: "e".repeat(MAX_EMOJI_BYTES), add: true }),
+            (
+                "FileRef",
+                Content::FileRef {
+                    blob_id: [1u8; 32],
+                    key: [2u8; 32],
+                    hash: [3u8; 32],
+                    name,
+                    size: u64::MAX,
+                    chunks: u32::MAX,
+                },
+            ),
+            (
+                "Publication",
+                Content::Publication {
+                    id: [7u8; 16],
+                    text: "p".repeat(MAX_POST_TEXT),
+                    ts: u64::MAX,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_largest_legal_instance_of_every_variant_can_be_padded() {
+        let mut worst: (&str, usize) = ("<none>", 0);
+        for (name, c) in largest_of_each() {
+            let encoded = postcard::to_stdvec(&c).expect("Content serializes");
+            if encoded.len() > worst.1 {
+                worst = (name, encoded.len());
+            }
+            pad::pad(&encoded).unwrap_or_else(|e| {
+                panic!(
+                    "the largest legal `{name}` is {} bytes and does NOT fit one E2E envelope: {e}\n\
+                     This is a product limit meeting a wire limit. Either lower this module's cap \
+                     for that variant, or send it over the blob path — do NOT raise \
+                     pad::PADDED_LEN, which is derived from the admission ceiling and has no \
+                     headroom left (see pad's ceiling test).",
+                    encoded.len()
+                )
+            });
+        }
+        // Reported so the margin is visible in the test log rather than rediscovered by whoever
+        // adds the next variant and wonders how much room is left.
+        assert!(
+            worst.1 <= pad::MAX_PAYLOAD,
+            "largest variant `{}` is {} bytes vs a {} byte envelope",
+            worst.0,
+            worst.1,
+            pad::MAX_PAYLOAD
+        );
+        println!(
+            "largest legal Content: {} at {} bytes; envelope carries {} (margin {})",
+            worst.0,
+            worst.1,
+            pad::MAX_PAYLOAD,
+            pad::MAX_PAYLOAD - worst.1
+        );
+    }
+
+    /// `RouteOffer` carries a free-form `routes` string with no cap in this module, so it is the one
+    /// variant whose size the type system does not bound. Pinned separately: the failure it would
+    /// produce is a route offer that silently never arrives.
+    #[test]
+    fn a_route_offer_long_enough_to_overflow_is_refused_by_the_sender() {
+        let huge = Content::RouteOffer { relay_noise_pub: [1u8; 32], routes: "r".repeat(4096) };
+        let encoded = postcard::to_stdvec(&huge).expect("serializes");
+        assert!(
+            pad::pad(&encoded).is_err(),
+            "an over-long RouteOffer must be refused where the user can be told, not dropped by \
+             admission with no reply"
+        );
     }
 }

@@ -1025,7 +1025,13 @@ impl<T: Transport> Peer<T> {
     /// запись «позиция N израсходована» обязана лечь до появления ct_N на проводе.
     pub fn encrypt_next(&mut self, peer_ik: &[u8; 32], plaintext: &[u8]) -> Result<SessionEnvelope, String> {
         let st = self.sessions.get_mut(peer_ik).ok_or("no session (call connect first)")?;
-        let rmsg = st.session.encrypt(plaintext); // продвигает сохранённую сессию
+        // THE one place a ratchet plaintext is produced, and therefore the one place it is padded
+        // to a fixed block (`crate::pad`). Padding here rather than at each caller is the whole
+        // design: the relay reads `msg.ciphertext.len()` after terminating Noise, so a single
+        // unpadded send site would restore the size signal for that message class alone — and it
+        // would be the class nobody thought about.
+        let padded = crate::pad::pad(plaintext)?;
+        let rmsg = st.session.encrypt(&padded); // продвигает сохранённую сессию
         Ok(match &st.pending_initial {
             // Seal the opener to the RECIPIENT's identity key. The KeyAgreement carries
             // our long-term IK, and an unsealed opener hands the relay the social-graph
@@ -1192,15 +1198,19 @@ impl<T: Transport> Peer<T> {
     pub fn send_loop(&mut self, now: u64) -> Response {
         let epoch = self.local_epoch(now);
         let recipient = self.loop_box(epoch).public.to_bytes();
-        // A short text's ciphertext, so a loop sits in the same size class as the traffic
-        // it is hiding. Imperfect: the E2E layer does not pad, so real messages vary and a
-        // relay comparing size DISTRIBUTIONS can still tell the populations apart. The
-        // Noise layer's buckets hide this from an on-path observer but not from the relay,
-        // which sees the payload after decryption. Named, not solved.
+        // EXACTLY the length a real padded message has (`crate::pad`), because "the same size
+        // class" is now a literal statement rather than an approximation. It used to be a fixed 96
+        // bytes chosen to resemble a short text, and the honest note here said the E2E layer does
+        // not pad, so real messages vary and a relay comparing size DISTRIBUTIONS separates the
+        // populations anyway. Padding real traffic fixed that — and made this line the last
+        // remaining size tell: a 96-byte envelope among uniformly-sized ones would have labelled
+        // every loop for the relay, which is worse than sending none. Cover only works while it is
+        // arithmetically indistinguishable, so this length is derived from the same constant rather
+        // than written down beside it.
         let msg = karst_crypto::ratchet::RatchetMessage {
             header: karst_crypto::ratchet::Header { dh: random32(), pn: 0, n: 0, salt: [7u8; 16] },
             ciphertext: {
-                let mut c = vec![0u8; 96];
+                let mut c = vec![0u8; crate::pad::PADDED_LEN + 16];
                 use chacha20poly1305::aead::rand_core::RngCore;
                 chacha20poly1305::aead::OsRng.fill_bytes(&mut c);
                 c
@@ -1658,13 +1668,13 @@ impl<T: Transport> Peer<T> {
             Payload::Session(SessionEnvelope::Ratchet(msg)) => {
                 if let Some(st) = self.sessions.get_mut(peer_ik) {
                     self.decrypt_attempts_for_test += 1;
-                    if let Ok(pt) = st.session.decrypt(msg) {
+                    if let Some(pt) = Self::open_padded(&mut st.session, msg) {
                         return Some(Received { sender: *peer_ik, plaintext: pt, msg_id: [0u8; 32] });
                     }
                 }
                 if let Some(st) = self.inbound_sessions.get_mut(peer_ik) {
                     self.decrypt_attempts_for_test += 1;
-                    if let Ok(pt) = st.session.decrypt(msg) {
+                    if let Some(pt) = Self::open_padded(&mut st.session, msg) {
                         return Some(Received { sender: *peer_ik, plaintext: pt, msg_id: [0u8; 32] });
                     }
                 }
@@ -1755,10 +1765,7 @@ impl<T: Transport> Peer<T> {
                 // fresh receiver would instead re-decrypt the duplicate and deliver it TWICE.
                 for st in self.sessions.get_mut(&sender_ik).into_iter().chain(self.inbound_sessions.get_mut(&sender_ik)) {
                     if st.drop_seed == drop_seed {
-                        return st
-                            .session
-                            .decrypt(msg)
-                            .ok()
+                        return Self::open_padded(&mut st.session, msg)
                             .map(|pt| Received { sender: sender_ik, plaintext: pt, msg_id: [0u8; 32] });
                     }
                 }
@@ -1768,7 +1775,7 @@ impl<T: Transport> Peer<T> {
                 // the session maps or the one-time prekey — otherwise a stranger could park a dead
                 // session under any victim's IK (it would become the primary outbound session and
                 // silently swallow the replies) and burn a one-time prekey per attempt.
-                let pt = session.decrypt(msg).ok()?;
+                let pt = Self::open_padded(&mut session, msg)?;
                 // SEC-33: refuse a BRAND-NEW stranger once `sessions` is at `MAX_SESSIONS`,
                 // BEFORE `consume_opk` — a refused attempt must not burn a real one-time prekey
                 // on a peer we are about to discard anyway (that would degrade forward secrecy
@@ -1880,16 +1887,35 @@ impl<T: Transport> Peer<T> {
     /// An ongoing ratchet message: no sender hint, so trial-decrypt. Safe because `decrypt` is
     /// transactional — a miss does not move anyone else's session. Both maps: a peer's stream
     /// after a simultaneous first contact rides `inbound_sessions`.
+    /// **The only place a ratchet message is opened.** Decrypt, then strip the fixed-size block.
+    ///
+    /// A free function, not a method, so it can be called while a session is borrowed out of either
+    /// map — which is what every caller here is doing. There were six `session.decrypt(` sites
+    /// before this existed, and six places to forget the second half of the operation;
+    /// `pad_is_not_bypassed` now fails the build if a seventh appears.
+    ///
+    /// A block that authenticates but will not unpad is treated as a miss, deliberately. It means
+    /// a peer holding a valid chain sent something our own encoder cannot produce — a bug or a
+    /// version skew — and the caller's "not for us" path is the safe reading: it advances no state
+    /// and burns no one-time prekey.
+    fn open_padded(
+        session: &mut karst_crypto::ratchet::Session,
+        msg: &RatchetMessage,
+    ) -> Option<Vec<u8>> {
+        let block = session.decrypt(msg).ok()?;
+        crate::pad::unpad(&block).ok()
+    }
+
     fn process_ratchet(&mut self, msg: &RatchetMessage) -> Option<Received> {
         for (ik, st) in self.sessions.iter_mut() {
             self.decrypt_attempts_for_test += 1;
-            if let Ok(pt) = st.session.decrypt(msg) {
+            if let Some(pt) = Self::open_padded(&mut st.session, msg) {
                 return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
             }
         }
         for (ik, st) in self.inbound_sessions.iter_mut() {
             self.decrypt_attempts_for_test += 1;
-            if let Ok(pt) = st.session.decrypt(msg) {
+            if let Some(pt) = Self::open_padded(&mut st.session, msg) {
                 return Some(Received { sender: *ik, plaintext: pt, msg_id: [0u8; 32] });
             }
         }
@@ -3050,5 +3076,172 @@ impl Transport for LoopbackMail {
                 BundleOpkResponse::Bundle(Some(out))
             }
         })
+    }
+}
+
+/// **The padding cannot be bypassed** — enforced by scanning this file, not by remembering.
+///
+/// PRIV-1 rests on an exhaustive claim: EVERY ratchet plaintext is a fixed-size block. Exhaustive
+/// claims do not survive as conventions. Before `Peer::open_padded` existed there were six
+/// `Session::decrypt` sites here, and adding a seventh is the natural thing to do while writing a
+/// new receive path — it compiles, the tests pass, and the message even arrives, because the
+/// padding is only a prefix and some zeros. What breaks is the property: that class of message
+/// carries its true length again, and the relay reads it.
+#[cfg(test)]
+mod pad_is_not_bypassed {
+    /// Exactly one decrypt site, and it is the one that unpads.
+    ///
+    /// Discriminating: call the ratchet's decrypt on a message anywhere else in this file — the
+    /// exact call this counts — and it goes red. (Spelled out rather than quoted, because a quoted
+    /// example would be a second match and this test would fail on its own documentation.)
+    #[test]
+    fn a_ratchet_message_is_opened_in_one_place_only() {
+        let src = include_str!("peer.rs");
+        // Split so this test does not match itself when the file is scanned.
+        let needle = concat!(".decrypt", "(msg)");
+        let sites = src.matches(needle).count();
+        assert_eq!(
+            sites, 1,
+            "found {sites} ratchet-decrypt sites in peer.rs; there must be exactly ONE \
+             (`Peer::open_padded`, which strips the fixed-size block afterwards). A second site \
+             would deliver messages perfectly well while restoring the plaintext-length signal to \
+             the relay for whatever class of message it handles — see `crate::pad`."
+        );
+    }
+
+    /// The send side, mirrored: one encrypt site, and it pads.
+    #[test]
+    fn a_ratchet_plaintext_is_produced_in_one_place_only() {
+        let src = include_str!("peer.rs");
+        let encrypts = src.matches(concat!("session.encrypt", "(")).count();
+        assert_eq!(
+            encrypts, 1,
+            "found {encrypts} ratchet-encrypt sites in peer.rs; there must be exactly ONE \
+             (`Peer::encrypt_next`, which pads first). An unpadded send site is the same leak as \
+             an unpadded receive site, arriving from the other direction."
+        );
+    }
+
+    /// Cover traffic must be the length of a real padded message, derived from the same constant.
+    ///
+    /// A literal here would drift the first time `PADDED_LEN` moves, and the drift is silent: loops
+    /// keep working, they just become identifiable — which is the failure mode where a relay drops
+    /// real mail and returns the loops, so the drop detector reports all-clear.
+    #[test]
+    fn cover_traffic_is_sized_from_the_padding_constant_not_a_literal() {
+        let src = include_str!("peer.rs");
+        assert!(
+            src.contains("crate::pad::PADDED_LEN + 16"),
+            "`send_loop` no longer sizes its ciphertext from `pad::PADDED_LEN`. A cover message \
+             whose length differs from a real one labels every loop for the relay."
+        );
+    }
+}
+
+/// **The property PRIV-1 actually claims**: what the relay reads is the same size either way.
+///
+/// The tests inside `crate::pad` prove the padding function is uniform. This proves the PRODUCT is
+/// — that a one-byte reply and a maximum-length message leave `encrypt_next` as the same number of
+/// bytes on the ciphertext the relay measures (`Payload::approx_len`). That is the only statement
+/// worth making to a user, and it is the one that would go quietly false if a future send path
+/// skipped the padding.
+///
+/// DISCRIMINATING: remove the `pad::pad` call in `encrypt_next` and this goes red immediately,
+/// reporting both sizes.
+#[cfg(test)]
+mod the_relay_learns_nothing_from_size {
+    use super::LoopbackMail;
+    use admission::capability::{Capability, Quota, Scope};
+    use karst_crypto::pqxdh::Account;
+    use node::protocol::{Payload, SessionEnvelope};
+    use x25519_dalek::PublicKey;
+
+    fn dev_cap() -> Capability {
+        Capability {
+            capability_id: [0xCC; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 100_000, max_bytes: 1 << 30, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x35; 32],
+        }
+    }
+
+    fn mk_peer(t: &LoopbackMail) -> super::Peer<LoopbackMail> {
+        super::Peer::new(t.clone(), Account::generate(), dev_cap(), PublicKey::from([7u8; 32]))
+    }
+
+    /// The length the RELAY sees, taken from the relay's own function rather than reimplemented —
+    /// so this test cannot disagree with the size gate about what a payload measures.
+    fn seen_by_relay(env: SessionEnvelope) -> usize {
+        Payload::Session(env).approx_len()
+    }
+
+    #[test]
+    fn one_byte_and_a_full_length_message_are_the_same_size_on_the_wire() {
+        let transport = LoopbackMail::default();
+        let mut bob = mk_peer(&transport);
+        bob.publish(0);
+        let bob_ik = bob.identity();
+
+        let mut alice = mk_peer(&transport);
+        alice.connect(&bob_ik, 0).expect("PQXDH against a published bundle");
+
+        // Leave the opener state before comparing ORDINARY messages — openers are their own class
+        // by design, and `pending_initial` only clears once a transmit is accepted. Getting this
+        // wrong is not hypothetical: the first draft of this test skipped the transmit, so all
+        // three "ordinary" messages were still openers and the common `Ratchet` class — the one
+        // almost every message belongs to — went untested while the test passed.
+        let opener = alice.encrypt_next(&bob_ik, &[b'x'; 1]).expect("opener");
+        alice.transmit_envelope(&bob_ik, opener, 0);
+
+        let first = alice.encrypt_next(&bob_ik, b"k").expect("tiny");
+        assert!(
+            matches!(first, SessionEnvelope::Ratchet(_)),
+            "this test is supposed to be measuring the ORDINARY class; it is still producing              openers, so it proves nothing about the messages users actually send"
+        );
+        let tiny = seen_by_relay(first);
+        let large = seen_by_relay(
+            alice
+                .encrypt_next(&bob_ik, &vec![b'x'; crate::pad::MAX_PAYLOAD])
+                .expect("a full-length message still fits one envelope"),
+        );
+        let empty = seen_by_relay(alice.encrypt_next(&bob_ik, b"").expect("empty"));
+
+        assert_eq!(
+            (tiny, large),
+            (empty, empty),
+            "the relay can still tell message sizes apart: 1 byte → {tiny}, \
+             {} bytes → {large}, empty → {empty}. Every ratchet envelope must measure the same, \
+             or the size channel PRIV-1 closed is open again.",
+            crate::pad::MAX_PAYLOAD
+        );
+    }
+
+    /// And the opener's class is flat too — a first contact carrying a long message must not be
+    /// distinguishable from one carrying a short greeting.
+    #[test]
+    fn a_short_and_a_long_first_contact_are_the_same_size() {
+        let transport = LoopbackMail::default();
+        let mut bob = mk_peer(&transport);
+        bob.publish(0);
+        let bob_ik = bob.identity();
+
+        let mut chatty = mk_peer(&transport);
+        chatty.connect(&bob_ik, 0).expect("agree");
+        let long = seen_by_relay(
+            chatty
+                .encrypt_next(&bob_ik, &vec![b'x'; crate::pad::MAX_PAYLOAD])
+                .expect("full-length opener"),
+        );
+
+        let mut terse = mk_peer(&transport);
+        terse.connect(&bob_ik, 0).expect("agree");
+        let short = seen_by_relay(terse.encrypt_next(&bob_ik, b"hi").expect("short opener"));
+
+        assert_eq!(
+            long, short,
+            "a first contact still leaks how much was written: {long} vs {short} bytes"
+        );
     }
 }

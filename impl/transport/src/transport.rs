@@ -523,6 +523,71 @@ fn ip_is_globally_routable(ip: &IpAddr) -> bool {
 }
 
 #[cfg(test)]
+mod compartment_and_scope_are_two_axes {
+    use super::*;
+
+    /// **Two identities on ONE compartment token must still get different circuits.**
+    ///
+    /// This is the property a whole privacy model rests on, and it is easy to misread: a `Relay`
+    /// is built per device configuration, so several proxy identities legitimately share the
+    /// compartment token, and separation comes from the per-handle scope hashed together with it.
+    /// Reading only the token axis produces the confident, wrong conclusion that the proxies share
+    /// a circuit — I filed a privacy bug on exactly that misreading on 2026-07-29, and blocked a
+    /// connection-pool change behind it.
+    ///
+    /// DISCRIMINATING: make `credential` return the compartment token alone (drop `scope` from the
+    /// hash) and this goes red, which is the shape the mistaken bug report assumed.
+    #[test]
+    fn one_compartment_two_scopes_are_different_credentials() {
+        let a = Socks5Adapter::isolated("127.0.0.1:9050".parse().unwrap(), "device-compartment");
+        // Two proxy identities of the SAME device: same compartment, different handle-derived
+        // scopes (handle bytes are random per proxy, in each proxy's own sessions file).
+        let p1 = a.credential(Some("scope-of-proxy-1"));
+        let p2 = a.credential(Some("scope-of-proxy-2"));
+        assert!(p1.is_some() && p2.is_some(), "a scoped request must present a credential");
+        assert_ne!(
+            p1, p2,
+            "two proxy identities on one device produced the SAME SOCKS credential, so Tor would \
+             put them on ONE circuit and a relay would see them from one source — which links the \
+             identities the proxy model exists to keep apart"
+        );
+    }
+
+    /// And the other axis independently: same scope, different compartments must also differ.
+    #[test]
+    fn one_scope_two_compartments_are_different_credentials() {
+        let x = Socks5Adapter::isolated("127.0.0.1:9050".parse().unwrap(), "compartment-x");
+        let y = Socks5Adapter::isolated("127.0.0.1:9050".parse().unwrap(), "compartment-y");
+        assert_ne!(
+            x.credential(Some("same-scope")),
+            y.credential(Some("same-scope")),
+            "the compartment axis stopped separating: dropping it would trade one guarantee for \
+             the other, which is exactly what `credential`'s doc refuses"
+        );
+    }
+
+    /// The KNOWN residual, pinned so it is a decision rather than a surprise: an UNSCOPED request
+    /// hashes the same for every identity, so the public reads share a circuit. That is the
+    /// QUIC-13 position — scoping them would attach a channel label to requests that have none —
+    /// and it links interests, never identities.
+    #[test]
+    fn unscoped_requests_deliberately_share_one_credential() {
+        let a = Socks5Adapter::isolated("127.0.0.1:9050".parse().unwrap(), "device-compartment");
+        assert_eq!(
+            a.credential(None),
+            a.credential(None),
+            "unscoped requests are supposed to be indistinguishable from each other"
+        );
+        assert_ne!(
+            a.credential(None),
+            a.credential(Some("scope-of-proxy-1")),
+            "an unscoped request must not land on a SCOPED identity's circuit — that would put a \
+             public read on a channel's circuit and give the proxy operator the join"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

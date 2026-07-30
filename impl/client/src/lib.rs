@@ -323,9 +323,26 @@ pub struct Relay {
     pub proxy: Option<SocketAddr>,
     /// Routes in priority order: the primary, then the configured alternates.
     paths: Vec<Path>,
-    /// This compartment's SOCKS stream-isolation token — fresh per `Relay`, so each
-    /// account's traffic rides its own Tor circuit (see `Socks5Adapter::isolation`).
-    /// Two accounts sharing a circuit would be linked however different their keys are.
+    /// This compartment's SOCKS stream-isolation token — fresh per `Relay`. It is ONE of two
+    /// axes, and the wording matters: a `Relay` is built per DEVICE configuration, not per
+    /// account, so several proxy identities legitimately share this token. What separates THEM is
+    /// the second axis — the per-handle `scope` a `Peer` passes on every request, which
+    /// `Socks5Adapter::credential` HASHES TOGETHER with this token. Handle bytes are random per
+    /// `(relay, handle)` and live in each proxy's own `sessions.p<idx>.dat`, so two proxies never
+    /// produce the same credential and never share a circuit.
+    ///
+    /// Said this precisely because the older wording ("fresh per `Relay`, so each account's
+    /// traffic rides its own Tor circuit") reads as though this token alone did the separating.
+    /// It does not, and believing it does leads straight to the wrong conclusion: I filed a
+    /// privacy bug against this on 2026-07-29 after reading one axis and not the other. A
+    /// connection pool keyed on scope was blocked on that non-existent bug for the same reason.
+    ///
+    /// Known residual, and it is the already-decided position rather than an oversight: requests
+    /// that carry NO scope — the public reads (`get_policy`, `get_node_list`, `blob_stat`,
+    /// `lookup_discovery`, `fetch_bundle`) — hash to the same credential for every proxy, so they
+    /// do share a circuit. They carry no proxy identity, so this links no identities; what it can
+    /// link is INTERESTS (two lookups seen from one source). Scoping them was refused on purpose
+    /// (QUIC-13): a scope would attach a channel label to requests that have none.
     isolation: String,
     /// `proxy` is a mixnet (Nym) client's SOCKS port, not a bare SOCKS5/Tor proxy. Transport is
     /// identical (SOCKS5 to that port); this only makes the carrier read as `mixnet` and keeps

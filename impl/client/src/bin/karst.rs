@@ -67,7 +67,7 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "karst (SKELETON, not for production)\n\
+        "karst (REFERENCE, not for production)\n\
          \n\
          karst init                          create an account (prints the recovery phrase)\n\
          karst restore <24 words>            restore an account from the phrase (into an empty $KARST_HOME)\n\

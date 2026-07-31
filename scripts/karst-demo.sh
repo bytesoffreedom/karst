@@ -2,7 +2,7 @@
 # karst-demo.sh — bring up the WHOLE system locally and prove it with an
 # end-to-end exchange: a relay + two clients (Alice, Bob), a message in BOTH
 # directions, then clean up. One command answering "does it all work together?"
-# NOT for production (SKELETON relay).
+# NOT for production (REFERENCE relay).
 #
 #   scripts/karst-demo.sh [ADDR]        (default 127.0.0.1:9000)
 

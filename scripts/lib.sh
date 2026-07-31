@@ -2,7 +2,7 @@
 # Shared functions for the KARST run scripts. Source of truth for binary
 # locations and for waiting until the relay is ready.
 #
-# NOT for production — brings up a SKELETON relay (a dev capability with a public
+# NOT for production — brings up a REFERENCE relay (a dev capability with a public
 # secret).
 
 set -euo pipefail

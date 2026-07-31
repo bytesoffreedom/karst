@@ -1,6 +1,6 @@
 # Running KARST locally
 
-> **SKELETON, NOT for production.** Brings up a dev relay with a public
+> **REFERENCE, NOT for production.** Brings up a dev relay with a public
 > capability secret; the crypto is a reference and unaudited (see
 > [STATUS.md](STATUS.md)). The goal is to run the whole system on one machine and
 > confirm that it works.

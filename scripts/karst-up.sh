@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # karst-up.sh — bring up a local relay and leave it running, printing ready-to-use
 # commands for the clients (CLI and GUI). For the manual/GUI scenario.
-# Stop with: scripts/karst-down.sh. NOT for production (SKELETON relay).
+# Stop with: scripts/karst-down.sh. NOT for production (REFERENCE relay).
 #
 #   scripts/karst-up.sh [ADDR]          (default 127.0.0.1:9000)
 

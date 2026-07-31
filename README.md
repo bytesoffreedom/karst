@@ -28,13 +28,28 @@ The desktop client — no phone number, no signup; your identity is a 24-word ph
 
 <p align="center"><img src="docs/assets/screenshot-desktop.png" alt="KARST desktop client" width="620"></p>
 
-Anyone can run a relay with one command. It is a dumb, untrusted mailbox — it never sees your plaintext, and it can be toggled (open door / proof-of-work / off) live, discover other relays, and gossip about them (verified before trusting):
+A conversation. The safety number in the right-hand panel is what you read aloud to confirm nobody swapped your contact's keys; an arriving file is hash-checked before it is offered to you.
 
-<p align="center"><img src="docs/assets/screenshot-relay.png" alt="Running a KARST relay" width="760"></p>
+<p align="center"><img src="docs/assets/screenshot-app.png" alt="A KARST conversation, with the contact panel and safety number" width="820"></p>
 
-Two clients messaging end-to-end through a relay, both directions — real output from a real run:
+Your identity itself has no address. What you hand out is a disposable channel, and burning one touches neither your identity nor your other channels — Settings is where you make them, and where a relay, Tor, i2p or a mixnet is configured:
 
-<p align="center"><img src="docs/assets/screenshot-messaging.png" alt="End-to-end messaging demo" width="620"></p>
+<p align="center"><img src="docs/assets/screenshot-settings.png" alt="KARST settings: profile, disposable channels, network and relays" width="720"></p>
+
+Anyone can run a relay with one command. It is a dumb, untrusted mailbox — it never sees your plaintext — and it says what it is at startup: what survives a restart, what admission actually rests on, and what it serves to other relays. Admission can be toggled live (open door / proof-of-work / off), and with peers configured it converges on their node lists, verifying every descriptor before trusting it:
+
+```sh
+KARST_RELAY_MODE=public KARST_RELAY_POW_BITS=20 \
+  KARST_RELAY_ADVERTISE=relay.example.org:9443 \
+  KARST_RELAY_PEERS=relay2.example.org:9443@<128-hex relay-id> \
+  karst-relay 0.0.0.0:9443
+```
+
+<p align="center"><img src="docs/assets/screenshot-relay.png" alt="Running a KARST relay" width="860"></p>
+
+Two clients through that relay: a message each way, a file that arrives with its SHA verified, and the same relay reached over QUIC instead of TCP. Verbatim output of `scripts/karst-demo.sh`, which CI runs on every push — build noise removed, nothing added:
+
+<p align="center"><img src="docs/assets/screenshot-messaging.png" alt="End-to-end messaging, file transfer and QUIC demo" width="780"></p>
 
 ---
 

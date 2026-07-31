@@ -58,3 +58,8 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 postcard = { version = "1", features = ["use-std"] }
 karst-transport = { path = "../transport" }
 karst-client-core = { path = "../client-core" }
+
+[features]
+# Failure injection for crash-consistency tests. OFF by default and asserted so by a test: with
+# it on, anyone who can set KARST_FAILPOINTS can abort the process at a point of their choosing.
+failpoints = []

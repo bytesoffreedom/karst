@@ -3019,6 +3019,26 @@ if(TA){
     put('btn-duress-go','Set duress password');
     put('modal-channel-warn','Channel mode makes this account publicly subscribable. Anyone holding your public code can read what you publish here — it is not a way to be reached privately.');
     put('hiddenview-text','Rotate the drop-box seed before the trip. The old one stays valid for 48h.');
+    // The shared panel (received files / media / links) is filled by the backend, so the preview
+    // showed empty tabs. Give it plausible contents, and let ?panel=<tab> photograph one.
+    // ?empty=1 does the opposite — an empty conversation, which is a real state with its own
+    // layout and had never been captured either.
+    try{
+      _shared={
+        media:[{id:'m1',name:'reykjavik-relay.jpg',size:412_000,ts:1750000000},
+               {id:'m2',name:'drop-box-diagram.png',size:188_000,ts:1750000500}],
+        files:[{id:'f1',name:'relay-invite.json',size:2_048,ts:1750001000},
+               {id:'f2',name:'threat-model.pdf',size:1_260_000,ts:1750001500}],
+        links:[{url:'https://github.com/bytesoffreedom/karst',ts:1750002000}],
+        posts:[]};
+      const _qs=new URLSearchParams(location.search);
+      const pane=_qs.get('panel'); if(pane) _sharedTab=pane;
+      if(document.getElementById('dh-shared')) renderShared();
+    }catch(e){}
+    if(new URLSearchParams(location.search).get('empty')==='1'){
+      const box=document.getElementById('msgs');
+      if(box) box.innerHTML='<div class="mempty">No messages yet. Say something — it is encrypted before it leaves this device.</div>';
+    }
 
     // Let a screenshot open the feed directly: ?v=feed
   })();

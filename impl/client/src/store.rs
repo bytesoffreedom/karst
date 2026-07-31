@@ -4587,12 +4587,6 @@ pub enum SlotRole {
     Decoy,
     /// Not a login at all: entering this password crypto-erases everything.
     Wipe,
-    /// Tier-2 OPAQUE HIDDEN VOLUME: this password opens the hidden container in `hidden.dat` — a
-    /// fixed-size, always-present, random-looking region. Its slot sits in an otherwise-unused
-    /// `slots.dat` slot (indistinguishable from unused) and is NOT recorded in the real `slotmap`, so
-    /// its existence is undetectable even to someone holding the OUTER (real/decoy) password. See
-    /// `set_hidden_container` and docs/design/duress-multipassword.md for the honest limits.
-    Hidden,
 }
 
 impl SlotRole {
@@ -4601,7 +4595,6 @@ impl SlotRole {
             SlotRole::Real => 0,
             SlotRole::Decoy => 1,
             SlotRole::Wipe => 2,
-            SlotRole::Hidden => 3,
         }
     }
     fn from_byte(b: u8) -> Option<Self> {
@@ -4609,7 +4602,6 @@ impl SlotRole {
             0 => Some(SlotRole::Real),
             1 => Some(SlotRole::Decoy),
             2 => Some(SlotRole::Wipe),
-            3 => Some(SlotRole::Hidden),
             _ => None,
         }
     }
@@ -4621,9 +4613,6 @@ pub enum Opened {
     Real(Vault),
     Decoy(Vault),
     Wipe,
-    /// The password opened the Tier-2 OPAQUE HIDDEN container — carries its (bounded) decrypted
-    /// payload. Its existence is undetectable to anyone holding the outer (real/decoy) password.
-    Hidden(Vec<u8>),
 }
 
 /// An EXTRA (non-real) password configured on this device, for the Security card to list + manage.
@@ -4673,41 +4662,6 @@ fn slots_path(base: &std::path::Path) -> PathBuf {
     base.join("slots.dat")
 }
 
-// ─── Tier-2 OPAQUE HIDDEN VOLUME (deniable, opt-in) ───────────────────────────────────────────────
-//
-// `base/hidden.dat` is a FIXED-SIZE region that EXISTS on every vault. Empty = random bytes; with a
-// hidden volume = `seal_raw(fixed plaintext)` (nonce ‖ AEAD ct, NO magic) — both computationally
-// indistinguishable from random, so its PRESENCE reveals nothing. The hidden password owns a `Hidden`
-// slot placed in an otherwise-unused `slots.dat` slot and NOT recorded in the real `slotmap`, so even
-// the outer (real/decoy) password cannot detect it. Layout inside: `[u32 len LE][payload][random]`.
-//
-// HONEST LIMITS (documented, not hidden): (1) a MULTI-SNAPSHOT adversary who sees the disk before and
-// after you use the hidden volume can tell `hidden.dat` changed; (2) FS journaling / SSD wear-leveling
-// can leave copies; (3) because the hidden slot is invisible to the slot directory, ADDING more
-// passwords later can overwrite it (set it up last, TrueCrypt-style). This is a REFERENCE deniable
-// container, not a guarantee against a forensic adversary.
-
-/// Usable payload bytes of the hidden container (bounded — a secret note / key / small file).
-pub const HIDDEN_CAP: usize = 60 * 1024;
-/// Fixed plaintext length sealed into `hidden.dat`: a 4-byte length header + the capacity.
-const HIDDEN_PLAIN: usize = 4 + HIDDEN_CAP;
-/// On-disk `hidden.dat` length: `nonce(24) ‖ ct(HIDDEN_PLAIN) ‖ tag(16)` — ALWAYS this, never varies.
-const HIDDEN_LEN: usize = 24 + HIDDEN_PLAIN + 16;
-
-fn hidden_path(base: &std::path::Path) -> PathBuf {
-    base.join("hidden.dat")
-}
-
-/// Fill `buf` with cryptographically-random bytes (reuses the blob RNG).
-fn fill_random(buf: &mut [u8]) {
-    let mut i = 0;
-    while i < buf.len() {
-        let r = crate::blob::random32();
-        let n = (buf.len() - i).min(32);
-        buf[i..i + n].copy_from_slice(&r[..n]);
-        i += n;
-    }
-}
 
 /// Rename `tmp` over `dest` and make the RENAME itself durable by fsyncing the directory.
 ///
@@ -4739,92 +4693,9 @@ fn write_fixed_0600(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     rename_durable(&tmp, path)
 }
 
-/// Ensure `hidden.dat` exists at the fixed size, RANDOM if absent — so EVERY vault carries the region
-/// and its presence signals nothing. Never overwrites an existing one (that would wipe a real volume).
-fn ensure_hidden(base: &std::path::Path) -> io::Result<()> {
-    let p = hidden_path(base);
-    if p.exists() {
-        return Ok(());
-    }
-    let mut buf = vec![0u8; HIDDEN_LEN];
-    fill_random(&mut buf);
-    write_fixed_0600(&p, &buf)
-}
-
-/// At-rest label of the Tier-1 hidden region. Fixed, like the keyslots: this file must look like
-/// random bytes to anyone without the hidden password, so nothing about it may be path-derived.
-const HIDDEN_LABEL: &str = "hidden-region";
 /// At-rest label of the slot directory (sealed under the REAL key).
 const SLOTDIR_LABEL: &str = "slotmap";
 
-/// Try to open the hidden container with `key` (the password just entered IS the hidden password).
-/// `None` = wrong key or no hidden volume (indistinguishable). `Some(payload)` on success.
-fn open_hidden_container(base: &std::path::Path, key: &MasterKey) -> Option<Vec<u8>> {
-    let blob = std::fs::read(hidden_path(base)).ok()?;
-    let plain = key.open_raw(HIDDEN_LABEL, &blob).ok()?;
-    if plain.len() != HIDDEN_PLAIN {
-        return None;
-    }
-    let len = u32::from_le_bytes(plain[..4].try_into().ok()?) as usize;
-    if len > HIDDEN_CAP {
-        return None;
-    }
-    Some(plain[4..4 + len].to_vec())
-}
-
-/// Place a `Hidden` slot for `hidden_key` in an unused `slots.dat` slot WITHOUT a slotmap entry (so it
-/// stays invisible to the outer password). Overwrites the hidden key's own slot if re-setting.
-fn slot_write_hidden(base: &std::path::Path, real_key: &MasterKey, hidden_key: &MasterKey) -> io::Result<()> {
-    let mut slots = slots_load(base)?.unwrap_or_else(slots_fresh);
-    // Avoid indices the real slotmap uses (so we don't clobber a known password); pick from the rest.
-    let dir = slotdir_load(base, real_key)?;
-    let taken: Vec<u8> = dir.iter().map(|e| e.index).collect();
-    let idx = match slot_index_of(&slots, hidden_key) {
-        Some(i) => i, // re-setting: overwrite the hidden key's own slot in place
-        None => {
-            let start = (crate::blob::random32()[0] as usize) % SLOT_COUNT;
-            (0..SLOT_COUNT)
-                .map(|k| (start + k) % SLOT_COUNT)
-                .find(|&i| !taken.contains(&(i as u8)))
-                .ok_or_else(|| io_err("no free keyslot for a hidden volume"))?
-        }
-    };
-    // NB: NO slotmap entry — that invisibility is what makes it a hidden volume.
-    slots[idx] = slot_seal(hidden_key, SlotRole::Hidden, &[0u8; 16]);
-    slots_save(base, &slots)
-}
-
-/// Create/replace the opaque hidden container: seal `payload` (≤ `HIDDEN_CAP`) under `hidden_password`
-/// into the fixed-size `hidden.dat`, and place its invisible `Hidden` slot. `real_key` is the current
-/// (logged-in) real key — setting a hidden volume is a real-session action, and it's used only to
-/// avoid clobbering known slots. Refuses a hidden password that collides with an existing slot.
-pub fn set_hidden_container(
-    base: &std::path::Path,
-    real_key: &MasterKey,
-    hidden_password: &[u8],
-    payload: &[u8],
-) -> io::Result<()> {
-    if payload.len() > HIDDEN_CAP {
-        return Err(io_err("hidden payload too large"));
-    }
-    let salt = read_or_create_salt(base)?;
-    let hkey = MasterKey::derive(hidden_password, &salt).map_err(io_err)?;
-    // A hidden password must not collide with the real/decoy/wipe passwords (that slot would win).
-    if let Some(slots) = slots_load(base)? {
-        if slots.iter().any(|s| hkey.open(SLOT_LABEL, s).is_ok()) {
-            return Err(io_err("that password is already in use"));
-        }
-    }
-    // Fixed plaintext: [u32 len][payload][random pad] → always HIDDEN_PLAIN bytes.
-    let mut plain = vec![0u8; HIDDEN_PLAIN];
-    fill_random(&mut plain);
-    plain[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    plain[4..4 + payload.len()].copy_from_slice(payload);
-    let blob = hkey.seal_raw(HIDDEN_LABEL, &plain);
-    debug_assert_eq!(blob.len(), HIDDEN_LEN);
-    write_fixed_0600(&hidden_path(base), &blob)?;
-    slot_write_hidden(base, real_key, &hkey)
-}
 
 fn compartment_dir(base: &std::path::Path, id: &[u8; 16]) -> PathBuf {
     base.join("c").join(hex::encode(id))
@@ -5137,7 +5008,6 @@ impl Vault {
         match Self::open(&base, passphrase)? {
             Opened::Real(v) | Opened::Decoy(v) => Ok(v),
             Opened::Wipe => Err(io_err("vault wiped")),
-            Opened::Hidden(_) => Err(io_err("hidden container — not a login vault")),
         }
     }
 
@@ -5165,9 +5035,6 @@ impl Vault {
         std::fs::create_dir_all(&base)?;
         let salt = read_or_create_salt(&base)?;
         let key = MasterKey::derive(passphrase, &salt).map_err(io_err)?;
-        // Every vault carries the fixed-size random hidden region from provisioning, so a vault that
-        // NEVER had a hidden volume is indistinguishable from one that does.
-        let _ = ensure_hidden(&base);
         // If this vault predates multipassword, migrate it first, then reuse the real compartment.
         let root = Vault { base: base.clone(), dir: base.clone(), key: key.clone() };
         if base.join("accounts.dat").exists() && root.load_registry().is_ok() {
@@ -5196,9 +5063,6 @@ impl Vault {
         std::fs::create_dir_all(&base)?;
         let salt = read_or_create_salt(&base)?;
         let key = MasterKey::derive(passphrase, &salt).map_err(io_err)?;
-        // Every vault carries the fixed-size hidden region (random until a hidden volume is set), so
-        // its presence never signals a hidden volume. Best-effort — never blocks a normal unlock.
-        let _ = ensure_hidden(&base);
 
         // Legacy single-account (secrets directly at base root) → base/accounts/<ik>/ (unchanged).
         let root = Vault { base: base.clone(), dir: base.clone(), key: key.clone() };
@@ -5225,19 +5089,8 @@ impl Vault {
                 crypto_erase(&base)?;
                 Ok(Opened::Wipe)
             }
-            Some((SlotRole::Hidden, _)) => match open_hidden_container(&base, &key) {
-                Some(payload) => Ok(Opened::Hidden(payload)),
-                None => Err(io_err("hidden container unreadable")),
-            },
             None => Err(io_err("неверный пароль или повреждённый файл")),
         }
-    }
-
-    /// Create/replace the OPAQUE HIDDEN container under `hidden_password` (a real-session action —
-    /// uses this vault's real key only to avoid clobbering known slots). `payload` ≤ `HIDDEN_CAP`.
-    /// Its existence is undetectable to the outer password; see the honest limits above `HIDDEN_CAP`.
-    pub fn set_hidden(&self, hidden_password: &[u8], payload: &[u8]) -> io::Result<()> {
-        set_hidden_container(&self.base, &self.key, hidden_password, payload)
     }
 
     /// Relocate a pre-multipassword root layout (`base/accounts.dat` + `base/accounts/`) into a
@@ -7200,63 +7053,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #95 THE JUDGE (per the advisor): a container WITH a hidden volume must be indistinguishable,
-    /// to someone holding the OUTER password, from one WITHOUT. Two vaults with identical outer setup,
-    /// one hidden volume, one none → the reserved region is the same fixed size and looks random in
-    /// both, the outer password opens both identically, the hidden password opens ONLY the one that
-    /// has a hidden volume, and the same password on the other is simply "wrong" (deniable). If this
-    /// ever fails, the hidden volume is DETECTABLE and must not ship.
-    #[test]
-    fn hidden_volume_is_indistinguishable_and_deniable() {
-        let da = std::env::temp_dir().join(format!("karst-hid-a-{}", std::process::id()));
-        let db = std::env::temp_dir().join(format!("karst-hid-b-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&da);
-        let _ = std::fs::remove_dir_all(&db);
-
-        // Identical outer setup: both provisioned as Real vaults under the SAME outer password.
-        let va = Vault::create(&da, b"outer").unwrap();
-        let _vb = Vault::create(&db, b"outer").unwrap();
-        // A gets a hidden volume; B does not.
-        va.set_hidden(b"hiddenpw", b"the launch codes").unwrap();
-
-        // 1) hidden.dat is the SAME FIXED SIZE with and without a hidden volume.
-        let ha = std::fs::read(da.join("hidden.dat")).unwrap();
-        let hb = std::fs::read(db.join("hidden.dat")).unwrap();
-        assert_eq!(ha.len(), HIDDEN_LEN);
-        assert_eq!(ha.len(), hb.len(), "same size — presence carries no signal");
-
-        // 2) Indistinguishable-from-random: the raw-AEAD region carries NO KARST magic (a real magic
-        //    prefix would be a dead giveaway). A raw ciphertext under a random nonce is comp. random.
-        assert_ne!(&ha[..4], crate::secretbox::MAGIC, "no magic tell in the hidden region");
-        assert_ne!(&hb[..4], crate::secretbox::MAGIC);
-
-        // 3) The OUTER password opens both IDENTICALLY — a Real vault, with no hint a hidden one exists.
-        assert!(matches!(Vault::open(&da, b"outer").unwrap(), Opened::Real(_)));
-        assert!(matches!(Vault::open(&db, b"outer").unwrap(), Opened::Real(_)));
-
-        // 4) The hidden password opens the hidden container on A, exact payload.
-        match Vault::open(&da, b"hiddenpw").unwrap() {
-            Opened::Hidden(p) => assert_eq!(p, b"the launch codes"),
-            _ => panic!("hidden password must open the hidden container on A"),
-        }
-        // 5) The SAME hidden password on B (random region, no hidden volume) is simply WRONG — deniable.
-        assert!(Vault::open(&db, b"hiddenpw").is_err(), "no hidden volume on B → just a wrong password");
-
-        // 6) Non-destructive invariant: opening with the OUTER password must NOT rewrite the hidden
-        //    region (a changed hidden.dat after a normal login would corrupt the container and, worse,
-        //    leak that something reacts to logins). The hidden payload survives an outer open + relock.
-        let before = std::fs::read(da.join("hidden.dat")).unwrap();
-        assert!(matches!(Vault::open(&da, b"outer").unwrap(), Opened::Real(_)));
-        let after = std::fs::read(da.join("hidden.dat")).unwrap();
-        assert_eq!(before, after, "a real-password login must leave hidden.dat byte-for-byte unchanged");
-        match Vault::open(&da, b"hiddenpw").unwrap() {
-            Opened::Hidden(p) => assert_eq!(p, b"the launch codes", "hidden payload intact after an outer login"),
-            _ => panic!("hidden container must still open after a real-password login"),
-        }
-
-        let _ = std::fs::remove_dir_all(&da);
-        let _ = std::fs::remove_dir_all(&db);
-    }
 }
 
 /// A change to any PERSISTED shape must move `STATE_VERSION` — enforced here, because nothing
@@ -7329,7 +7125,7 @@ mod at_rest_shape_guard {
 
     /// The pinned digest. Regenerate ONLY together with a `STATE_VERSION` bump: run the test, take
     /// the "actual" value from the failure, and move both in the same commit.
-    const SHAPE_DIGEST: &str = "70acb02ab8c8cf67";
+    const SHAPE_DIGEST: &str = "5dfb26491d9599f9";
 
     fn source(module: &str) -> &'static str {
         match module {

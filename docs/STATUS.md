@@ -974,7 +974,9 @@ build; clippy clean.**
   (threat model A′).
 - **Multipassword Tier 2 — deniable CONTAINER with a hidden ACCOUNT (`impl/client::container` +
   `impl/desktop`, opt-in, UNDER EMBARGO — not announced).** Supersedes the earlier note-based
-  `hidden.dat`. One fixed-size `container.dat` of all-random bytes, byte-indistinguishable from noise
+  `hidden.dat`, which was DELETED on 2026‑07‑31 — it had survived beside its own replacement for five
+  days, offering the exact cover this design rejects ("a secret note proves you deliberately hid
+  something"). One fixed-size `container.dat` of all-random bytes, byte-indistinguishable from noise
   without a password; holds a whole serialized account per compartment (format-(b) blob + append-only
   history log, in-place region writes so a save never rewrites the whole file), with an in-container
   8-slot keyslot table so the number of passwords never leaks. **Three passwords:** P1 (main, protect),

@@ -18,7 +18,6 @@ fn main() {
         Opened::Real(v) => v,
         Opened::Decoy(_) => { println!("!! DECOY password — this is not the real account"); return; }
         Opened::Wipe => { println!("!! WIPE password"); return; }
-        Opened::Hidden(p) => { println!("!! HIDDEN container ({} bytes) — not the real account", p.len()); return; }
     };
     let reg = vault.load_registry().expect("registry");
     let id = reg.first().map(|e| e.id.clone()).expect("an account");

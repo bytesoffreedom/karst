@@ -234,9 +234,6 @@ struct App {
     /// arrives as a run of `file_push` chunks accumulated here, then dispatched by `file_commit`.
     /// This is what lets an attachment exceed the old ~8 MB single-payload ceiling (#35 / FT1).
     pending_sends: Mutex<HashMap<String, Vec<u8>>>,
-    /// The decrypted payload of an OPAQUE HIDDEN container, held only between an unlock that entered
-    /// the hidden password and the UI fetching it once. Not a session — a bounded secret to display.
-    hidden: Mutex<Option<Vec<u8>>>,
     /// Tier-2 REDESIGN (opt-in, not yet UI-exposed): when a container-backed account is open, this
     /// holds the `ContainerVault` so `container_flush` can snapshot the work dir back into the
     /// deniable container after changes. `None` for the normal file-tree vault path.
@@ -1137,12 +1134,6 @@ fn unlock(app: State<App>, password: String, vault_dir: Option<String>) -> Resul
         }
         // The wipe already happened inside `open`; signal the UI to show the fresh create screen.
         Opened::Wipe => Err("WIPED".to_string()),
-        // An OPAQUE HIDDEN container: stash its bounded payload for the UI to fetch + show once, and
-        // signal it (like WIPED) — this is not a login session, just a secret to display.
-        Opened::Hidden(payload) => {
-            *app.hidden.lock().unwrap() = Some(payload);
-            Err("HIDDEN".to_string())
-        }
     }
 }
 
@@ -1371,29 +1362,6 @@ fn container_add_wipe(app: State<App>, password: String) -> Result<(), String> {
     cv.add_wipe(password.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Fetch + CLEAR the opaque hidden container's payload after an unlock entered its password.
-#[tauri::command]
-fn hidden_payload(app: State<App>) -> Result<String, String> {
-    let p = app.hidden.lock().unwrap().take().ok_or("no hidden container open")?;
-    Ok(STANDARD.encode(&p))
-}
-
-/// Create/replace the OPAQUE HIDDEN container (a real-session action): store `text` under a separate
-/// `hidden_password`. Its existence is undetectable to the outer (real/decoy) password. Bounded.
-#[tauri::command]
-fn set_hidden_container(app: State<App>, hidden_password: String, text: String) -> Result<(), String> {
-    if hidden_password.trim().is_empty() {
-        return Err("choose a hidden password".into());
-    }
-    let g = app.session.lock().unwrap();
-    let s = g.as_ref().ok_or("locked")?;
-    if s.decoy {
-        return Err("not available in a decoy session".into());
-    }
-    s.vault
-        .set_hidden(hidden_password.as_bytes(), text.as_bytes())
-        .map_err(|e| e.to_string())
-}
 
 /// Configure the primary relay for the active account, persist it, re-announce.
 #[tauri::command]
@@ -4261,8 +4229,6 @@ fn main() {
             container_add_wipe,
             net_offline,
             set_net_offline,
-            hidden_payload,
-            set_hidden_container,
             set_relay,
             extra_relays,
             add_extra_relay,

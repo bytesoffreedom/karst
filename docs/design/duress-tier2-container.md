@@ -1,14 +1,21 @@
-# Tier 2 — deniable container + hidden ACCOUNT (design, pre-implementation)
+# Tier 2 — deniable container + hidden ACCOUNT
 
-Status: **DESIGN — supersedes the shipped note-based `hidden.dat` (#95, commit
-`3680b4a`).** That first cut sealed a *secret note* into an opaque fixed region and
-proved indistinguishability at rest. It is honest for what it is, but the user's
-verdict is decisive: **a hidden note is a bad cover — "по заметке тебя и спалят."**
-A password-protected secret note *proves you deliberately hid something*; a mundane
-empty account does not. So Tier 2 becomes a **hidden full account**, not a note.
+Status: **SHIPPED, and the note it replaced is now DELETED (2026‑07‑31).** The first
+cut (#95, commit `3680b4a`) sealed a *secret note* into an opaque fixed region and
+proved indistinguishability at rest. It is honest for what it is, and it is still the
+wrong shape: a password-protected secret note *proves the holder deliberately hid
+something*, while a mundane empty account proves nothing. So Tier 2 is a **hidden full
+account**, not a note.
 
-This note is the agreed contract before the storage rewrite. Source of truth is the
-code once it lands. Design converged with the user 2026‑07‑26.
+That was settled on 2026‑07‑26 and the hidden account was built — but `hidden.dat`
+stayed in the tree beside it, wired to its own Settings row one line above "Hidden
+account". Two almost identically named features, one of them the cover this design had
+already rejected. It is gone now: `set_hidden_container`, `Opened::Hidden`, the
+`Hidden` keyslot role, the always-present random region and both of its dialogs. A
+design decision that only lives in a document is not a decision the product has made.
+
+This document is the contract the storage rewrite was built against. The source of
+truth is the code.
 
 ---
 

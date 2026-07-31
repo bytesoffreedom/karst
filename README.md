@@ -45,6 +45,10 @@ KARST_RELAY_MODE=public KARST_RELAY_POW_BITS=20 \
   karst-relay 0.0.0.0:9443
 ```
 
+`KARST_RELAY_PEERS` is optional and takes `host:port@relay-id` — substitute a real 128-hex relay-id
+for the placeholder above, or drop the line and run without peers. A peer that does not parse is
+skipped with a warning rather than failing the start.
+
 <p align="center"><img src="docs/assets/screenshot-relay.png" alt="Running a KARST relay" width="860"></p>
 
 Two clients through that relay: a message each way, a file that arrives with its SHA verified, and the same relay reached over QUIC instead of TCP. Verbatim output of `scripts/karst-demo.sh`, which CI runs on every push — build noise removed, nothing added:

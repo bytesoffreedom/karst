@@ -1115,11 +1115,17 @@ fn run_relay(addr: String) -> io::Result<()> {
         eprintln!("  BOUND, not Sybil resistance. See docs/STATUS.md.");
     }
     // "known" was ambiguous once self counts: an operator reading "1 relay(s) known" cannot tell
-    // whether that one is themselves or somebody else. Say what is actually in the served page.
+    // whether that one is themselves or somebody else. Say what is actually in the served page —
+    // and say a DIFFERENT thing when self is not in it, so this line does not promise "this relay
+    // plus…" three lines under a warning explaining that this relay is not advertising itself.
     eprintln!(
-        "node-list: serving {known_relays} entr{} via GetNodeList — this relay plus any it verified \
-         (clients: karst relays)",
-        if known_relays == 1 { "y" } else { "ies" }
+        "node-list: serving {known_relays} entr{} via GetNodeList — {} (clients: karst relays)",
+        if known_relays == 1 { "y" } else { "ies" },
+        if is_routable_advertise(&advertise) {
+            "this relay plus any it verified"
+        } else {
+            "relays it verified; self not advertised, see above"
+        }
     );
 
     // Owner control of a RUNNING relay (turn PoW off/open/on live — early on there may be no

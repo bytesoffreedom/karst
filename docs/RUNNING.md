@@ -10,23 +10,29 @@ The Android client is a separate large effort and is not here.
 
 ## Quick check — one command
 
-Brings up a relay and two clients, sends a message in both directions, and cleans
-up after itself:
+Brings up a relay and two clients, sends a message in both directions, transfers a
+file and checks its hash, reaches the same relay over QUIC, and cleans up after
+itself:
 
 ```sh
-scripts/karst-demo.sh
+scripts/karst-demo.sh                 # or: scripts/karst-demo.sh 127.0.0.1:9401
 ```
+
+It defaults to `127.0.0.1:9000`; pass an address if something already listens
+there (the script says so rather than failing obscurely).
 
 Expected tail of the output:
 
 ```
-[<Alice's IK>…] hi Bob — this is Alice        (Bob received)
-[<Bob's IK>…]   hi Alice — got it             (Alice received)
-== DONE: end-to-end text exchange in both directions + file transfer ==
+   file intact: SHA matched (2de57f80…)
+   carried by: quic ✓
+   with --socks5: no QUIC path built, request refused rather than escaping the proxy ✓
+== DONE: end-to-end text exchange in both directions + file transfer + QUIC ==
 ```
 
 If that printed, the core of the system (relay, §12 discovery, PQXDH+ratchet E2E,
-mailbox, sender attribution) works end-to-end between real processes.
+mailbox, sender attribution, chunked file transfer, the QUIC carrier and its
+refusal to escape a proxy) works end-to-end between real processes.
 
 ## Manual run (GUI or CLI)
 
@@ -71,9 +77,9 @@ relay-id to paste in. In each window (first run of a profile):
    OTHER window (manually pasting the IK = out-of-band trust; there is no "search
    by name" on the relay, which would reintroduce a MITM).
 3. Expand the **safety number** and confirm it matches in both windows.
-4. Type text; send a file (the **📎** field → "Send file") — it lands in the
-   recipient's `received/`. For Tor/obfs4, use the **SOCKS5** field (e.g.
-   `127.0.0.1:9050`).
+4. Type text; attach a file with the **📎** button in the composer — it lands in
+   the recipient's `received/`. For Tor/obfs4, use the **SOCKS5** field under
+   Settings → Network & relays (e.g. `127.0.0.1:9050`).
 
 ### CLI (terminal)
 
@@ -97,9 +103,14 @@ KARST_HOME=/tmp/a KARST_PASSPHRASE=pw karst send-file $R --to <IK> --file ./pic.
 KARST_HOME=/tmp/b KARST_PASSPHRASE=pw karst recv $R        # fetch; files are stored SEALED (see `karst files` / `export-file`)
 ```
 
-File transfer: the first slice handles up to ~256 KiB (chunked under the
-1400-byte limit, reassembled with a SHA-256 check). In the GUI, use the "📎 file
-path" field + "Send file".
+File transfer: small files go **inline** — chunked under the ratchet packet
+budget and reassembled with a SHA-256 check. The inline ceiling is
+`MAX_FILE_SIZE` in `impl/client/src/content.rs` (48 KiB today, and bounded by the
+per-capability request quota rather than by the mailbox). Anything larger is
+streamed as an **E2E blob** with a small `FileRef` in the message, and that path
+is **resumable**: re-running the same command after a broken connection continues
+from the relay's watermark. In the desktop client, use the **📎** button in the
+composer.
 
 ## Running a PUBLIC relay (operator guide)
 
@@ -252,7 +263,8 @@ We iterate until everything is green:
 - [x] sessions/history survive a process restart
 - [x] a route through a SOCKS5 PT works and fails hard with no silent direct fallback
 - [x] **the desktop UI launches and renders** — the Tauri `karst-desktop` opens its
-      welcome screen (verified by screenshot at a display, 2026-07-19)
+      welcome screen (verified by screenshot at a display; frames re-taken and the
+      README images regenerated from them, 2026-07-31)
 - [ ] **GUI full flow by hand: unlock, copy IK, send/receive text between two
       windows, safety number matches, and a FILE (the "📎" field) → the
       recipient's `received/` byte-for-byte** — the two-window interactive exchange

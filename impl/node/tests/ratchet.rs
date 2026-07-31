@@ -1,20 +1,20 @@
-//! §2.1 Double Ratchet — состязательные чёрноящичные тесты. Несущие свойства
-//! ratchet, не happy-path ради галочки:
-//! - двусторонний ping-pong с DH-шагами (обе стороны продвигают ratchet);
-//! - **транзакционность**: битый пакет отвергается И следующий валидный
-//!   расшифровывается (сессия не «заклинена» — критично для ratchet);
-//! - **out-of-order терпимость** (skipped-keys): пропуск/reorder в цепочке и на
-//!   границе цепочек догоняется, replay потреблённого — отвергается;
-//! - **header-binding**: подмена dh/pn/n в заголовке ловится AEAD-AAD.
+//! §2.1 Double Ratchet — adversarial black-box tests. The load-bearing properties of a ratchet,
+//! not a happy path for the sake of it:
+//! - a two-way ping-pong with DH steps (both sides advance the ratchet);
+//! - **transactionality**: a corrupt packet is rejected AND the next valid one still decrypts (the
+//!   session is not wedged — critical for a ratchet);
+//! - **out-of-order tolerance** (skipped keys): a gap or a reorder inside a chain and across a
+//!   chain boundary is caught up; a replay of a consumed message is rejected;
+//! - **header binding**: substituting dh/pn/n in the header is caught by the AEAD AAD.
 //!
-//! (Дискриминирующие white-box FS-non-retention и PCS-нагруженность DH — в
-//! `#[cfg(test)]` самого модуля `ratchet`, где доступны приватные поля.)
+//! (The discriminating white-box tests for FS non-retention and DH load-bearing PCS live in the
+//! `#[cfg(test)]` module of `ratchet` itself, where the private fields are reachable.)
 
 use node::ratchet::{RatchetError, RatchetMessage, Session, SessionSnapshot};
 use node::seal::Identity;
 
-/// Установить пару сессий из общего root_key (как даст PQXDH: root_key + prekey
-/// Bob'а — его ratchet-ключ). Bob засевается своим prekey, Alice — его pubkey.
+/// Establish a session pair from a shared root_key (as PQXDH provides: root_key plus Bob's prekey
+/// as his ratchet key). Bob is seeded with his prekey, Alice with its public half.
 fn establish() -> (Session, Session) {
     let root = [42u8; 32];
     let bob_prekey = Identity::generate();
@@ -27,41 +27,41 @@ fn establish() -> (Session, Session) {
 fn bidirectional_ping_pong_with_dh_ratchet() {
     let (mut alice, mut bob) = establish();
 
-    // Alice → Bob (первое сообщение запускает DH-шаг у Bob, даёт ему send-цепочку).
+    // Alice → Bob (the first message triggers a DH step at Bob, giving him a send chain).
     let m1 = alice.encrypt(b"hi bob");
     assert_eq!(bob.decrypt(&m1).unwrap(), b"hi bob");
 
-    // Bob → Alice (Bob теперь на новом ratchet-ключе; Alice делает DH-шаг).
+    // Bob → Alice (Bob is on a new ratchet key now; Alice takes a DH step).
     let m2 = bob.encrypt(b"hi alice");
     assert_eq!(alice.decrypt(&m2).unwrap(), b"hi alice");
 
-    // Несколько подряд в одной цепочке.
+    // Several in a row within one chain.
     let a1 = alice.encrypt(b"a1");
     let a2 = alice.encrypt(b"a2");
     assert_eq!(bob.decrypt(&a1).unwrap(), b"a1");
     assert_eq!(bob.decrypt(&a2).unwrap(), b"a2");
 
-    // Полный разворот направления снова.
+    // A full direction reversal again.
     let b1 = bob.encrypt(b"b1");
     assert_eq!(alice.decrypt(&b1).unwrap(), b"b1");
 }
 
 #[test]
 fn distinct_key_per_message() {
-    // Базовая проверка (НЕ FS — FS это non-retention в module-тестах): каждое
-    // сообщение шифруется своим ключом → шифртексты разные при одном plaintext.
+    // A basic check (NOT forward secrecy — that is non-retention, in the module tests): every
+    // message is encrypted under its own key, so ciphertexts differ for identical plaintext.
     let (mut alice, mut bob) = establish();
     let m1 = alice.encrypt(b"same");
     let m2 = alice.encrypt(b"same");
-    assert_ne!(m1.ciphertext, m2.ciphertext, "цепочка должна давать разный ключ на сообщение");
+    assert_ne!(m1.ciphertext, m2.ciphertext, "the chain must give a different key per message");
     assert_eq!(bob.decrypt(&m1).unwrap(), b"same");
     assert_eq!(bob.decrypt(&m2).unwrap(), b"same");
 }
 
 #[test]
 fn tampered_message_rejected_and_session_survives() {
-    // ТРАНЗАКЦИОННОСТЬ — ratchet-специфичный «нельзя заклинить»: битый пакет
-    // отвергается, но НЕ двигает/ломает цепочку — следующий валидный проходит.
+    // TRANSACTIONALITY — the ratchet-specific "cannot be wedged": a corrupt packet is rejected
+    // but does NOT advance or break the chain, so the next valid one still decrypts.
     let (mut alice, mut bob) = establish();
 
     let good0 = alice.encrypt(b"zero");
@@ -70,102 +70,102 @@ fn tampered_message_rejected_and_session_survives() {
     let m1 = alice.encrypt(b"one");
     let mut bad = m1.clone();
     bad.ciphertext[0] ^= 0x01;
-    assert_eq!(bob.decrypt(&bad), Err(RatchetError::Decrypt), "битый шифртекст отвергнут");
+    assert_eq!(bob.decrypt(&bad), Err(RatchetError::Decrypt), "a corrupt ciphertext is rejected");
 
-    // Сессия НЕ заклинена: исходный валидный m1 (n=1) всё ещё расшифровывается.
-    assert_eq!(bob.decrypt(&m1).unwrap(), b"one", "битый пакет не должен ломать сессию");
+    // The session is NOT wedged: the original valid m1 (n=1) still decrypts.
+    assert_eq!(bob.decrypt(&m1).unwrap(), b"one", "a corrupt packet must not break the session");
 }
 
 #[test]
 fn header_tampering_is_caught() {
-    // Заголовок связан в AAD: подмена номера/pn/dh → AEAD не сойдётся.
+    // The header is bound in the AAD: substituting the number, pn or dh makes the AEAD fail.
     let (mut alice, mut bob) = establish();
     let m = alice.encrypt(b"payload");
 
     let mut tn = m.clone();
     tn.header.n ^= 0x01;
-    assert!(bob.decrypt(&tn).is_err(), "подмена n в заголовке должна ловиться");
+    assert!(bob.decrypt(&tn).is_err(), "substituting n in the header must be caught");
 
     let mut tp = m.clone();
     tp.header.pn ^= 0x01;
-    assert!(bob.decrypt(&tp).is_err(), "подмена pn в заголовке должна ловиться");
+    assert!(bob.decrypt(&tp).is_err(), "substituting pn in the header must be caught");
 
     let mut td = m.clone();
     td.header.dh[0] ^= 0x01;
-    assert!(bob.decrypt(&td).is_err(), "подмена ratchet-pubkey в заголовке должна ловиться");
+    assert!(bob.decrypt(&td).is_err(), "substituting the ratchet public key must be caught");
 
-    // Оригинал всё ещё проходит (транзакционность — отказы не сдвинули цепочку).
+    // The original still passes (transactionality — the refusals did not advance anything).
     assert_eq!(bob.decrypt(&m).unwrap(), b"payload");
 }
 
 #[test]
 fn out_of_order_within_chain_is_tolerated() {
-    // Out-of-order В ОДНОЙ цепочке ТЕРПИМ (skipped-keys): пропущенный номер
-    // сохраняется, догнавшее сообщение расшифровывается. Именно то, что даёт
-    // mailbox-пачка. Раньше m2 после m0 → OutOfOrder; теперь проходит.
+    // Out of order WITHIN one chain is TOLERATED (skipped keys): the missed number is stored and
+    // the late message decrypts. Exactly what a mailbox batch produces. Previously m2 after m0
+    // gave OutOfOrder; now it passes.
     let (mut alice, mut bob) = establish();
 
     let m0 = alice.encrypt(b"m0"); // n=0
-    let m1 = alice.encrypt(b"m1"); // n=1 — доставим ПОСЛЕ m2
+    let m1 = alice.encrypt(b"m1"); // n=1 — delivered AFTER m2
     let m2 = alice.encrypt(b"m2"); // n=2
 
     assert_eq!(bob.decrypt(&m0).unwrap(), b"m0");
-    assert_eq!(bob.decrypt(&m2).unwrap(), b"m2", "пропуск n=1 → ключ сохранён, m2 проходит");
-    assert_eq!(bob.decrypt(&m1).unwrap(), b"m1", "догнавший m1 — из skipped-store");
-    // Повтор уже ПОТРЕБЛЁННОГО пропущенного — отвергнут (ключ удалён при потреблении).
-    assert!(bob.decrypt(&m1).is_err(), "replay потреблённого сообщения отвергается");
+    assert_eq!(bob.decrypt(&m2).unwrap(), b"m2", "skipping n=1 stores the key, m2 passes");
+    assert_eq!(bob.decrypt(&m1).unwrap(), b"m1", "the late m1 comes from the skipped store");
+    // A repeat of an already CONSUMED skipped message is rejected (the key was deleted).
+    assert!(bob.decrypt(&m1).is_err(), "a replay of a consumed message is rejected");
 }
 
 #[test]
 fn reorder_across_ratchet_boundary_is_tolerated() {
-    // Пропуск на ГРАНИЦЕ цепочек (mailbox-пачка / DTN-reorder) ТЕРПИМ: хвост
-    // цепочки A сохраняется при DH-шаге и расшифровывается после сообщения из
-    // цепочки B. Раньше отвергалось; теперь догоняется без потери.
+    // A gap ACROSS a chain boundary (a mailbox batch or a DTN reorder) is TOLERATED: the tail of
+    // chain A is stored during the DH step and decrypts after a message from chain B. It used to
+    // be rejected; now it is caught up without loss.
     let (mut alice, mut bob) = establish();
 
     let m0 = alice.encrypt(b"m0"); // chain A, n=0
-    let m1 = alice.encrypt(b"m1"); // chain A, n=1 — доставим ПОСЛЕ разворота
+    let m1 = alice.encrypt(b"m1"); // chain A, n=1 — delivered AFTER the reversal
     assert_eq!(bob.decrypt(&m0).unwrap(), b"m0"); // bob.nr = 1
 
-    // Разворот направления → Alice делает DH-шаг на следующей отправке.
+    // A direction reversal → Alice takes a DH step on her next send.
     let r0 = bob.encrypt(b"r0");
     assert_eq!(alice.decrypt(&r0).unwrap(), b"r0");
 
-    let m2 = alice.encrypt(b"m2"); // chain B, pn=2 (в A было 2), n=0
-    assert_eq!(bob.decrypt(&m2).unwrap(), b"m2", "сообщение из новой цепочки проходит");
-    // Догнавший хвост цепочки A — из сохранённого при DH-шаге.
-    assert_eq!(bob.decrypt(&m1).unwrap(), b"m1", "непринятый хвост A догоняется, не теряется");
+    let m2 = alice.encrypt(b"m2"); // chain B, pn=2 (A had 2), n=0
+    assert_eq!(bob.decrypt(&m2).unwrap(), b"m2", "a message from the new chain passes");
+    // The late tail of chain A — from what was stored during the DH step.
+    assert_eq!(bob.decrypt(&m1).unwrap(), b"m1", "the unreceived tail of A is caught up, not lost");
 }
 
 #[test]
 fn replay_of_consumed_message_rejected() {
-    // Повтор уже принятого ПО ПОРЯДКУ сообщения: ключ израсходован и не хранится
-    // (не был пропущенным) → расшифровать нечем → отказ. Replay-защита цела.
+    // A repeat of a message already received IN ORDER: the key was consumed and deleted (it was
+    // never a skipped one), so there is nothing to decrypt with → refused. Replay protection.
     let (mut alice, mut bob) = establish();
     let m0 = alice.encrypt(b"m0");
     assert_eq!(bob.decrypt(&m0).unwrap(), b"m0");
-    assert!(bob.decrypt(&m0).is_err(), "повтор n=0 отвергается (ключ израсходован)");
+    assert!(bob.decrypt(&m0).is_err(), "a repeat of n=0 is rejected (the key was consumed)");
 }
 
 #[test]
 fn populated_skipped_store_survives_postcard_roundtrip() {
-    // Airtight-версия load-bearing: пропущенный ключ переживает ТУ ЖЕ postcard-
-    // сериализацию, что клиент гоняет в save_sessions/load_sessions (не только
-    // in-memory snapshot/restore). Догнавший gap-filler расшифровывается после
-    // круга через байты.
+    // The airtight version of the load-bearing test: a skipped key survives THE SAME postcard
+    // serialisation the client runs in save_sessions/load_sessions (not only an in-memory
+    // snapshot/restore). The late gap filler decrypts after a round trip through bytes.
+    // a round trip through bytes.
     let (mut alice, mut bob) = establish();
     let m0 = alice.encrypt(b"m0");
-    let m1 = alice.encrypt(b"m1"); // будет задержан → сохранён в store
+    let m1 = alice.encrypt(b"m1"); // will be delayed → stored in the skipped store
     let m2 = alice.encrypt(b"m2");
     assert_eq!(bob.decrypt(&m0).unwrap(), b"m0");
-    assert_eq!(bob.decrypt(&m2).unwrap(), b"m2"); // m1 в skipped-store
+    assert_eq!(bob.decrypt(&m2).unwrap(), b"m2"); // m1 is in the skipped store
 
-    // Круг через postcard (как PersistedSession у клиента).
+    // A round trip through postcard (as the client's PersistedSession does).
     let bytes = postcard::to_allocvec(&bob.snapshot()).unwrap();
     let snap: SessionSnapshot = postcard::from_bytes(&bytes).unwrap();
     let mut bob2 = Session::restore(snap);
 
-    assert_eq!(bob2.decrypt(&m1).unwrap(), b"m1", "gap-filler из store, пережившего байты");
+    assert_eq!(bob2.decrypt(&m1).unwrap(), b"m1", "the gap filler came from a store that survived bytes");
 }
 
 /// CRYPTO-06 — a small-order ratchet key must be REFUSED, not folded into the DH step. Its
@@ -195,7 +195,7 @@ fn a_small_order_ratchet_key_is_refused_without_wedging_the_session() {
 
 #[test]
 fn cross_message_serialization_roundtrip() {
-    // Сообщение переживает сериализацию (пойдёт в wire/mailbox позже).
+    // The message survives serialisation (it will go to the wire/mailbox later).
     let (mut alice, mut bob) = establish();
     let m = alice.encrypt(b"over the wire");
     let bytes = postcard::to_allocvec(&m).unwrap();

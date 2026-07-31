@@ -1,7 +1,7 @@
-//! Сквозной путь сообщения Alice → relay → Bob — первый раз, когда куски §7
-//! складываются в СООБЩЕНИЕ. Несущее — разделение слоёв: admission (§7) гейтит
-//! по credential и слеп к содержимому; E2E (§2.1-скелет) ловит подмену и не
-//! зависит от допуска. Это доказательство композиции, остальное — обвязка.
+//! The end-to-end message path Alice → relay → Bob — the first time the pieces of §7 add up to a
+//! MESSAGE. The load-bearing part is the layer separation: admission (§7) gates on the credential
+//! and is blind to the contents; E2E (the §2.1 skeleton) catches substitution and does not depend
+//! on admission. This is the proof that they compose; the rest is detail.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -28,7 +28,7 @@ fn capability(secret: [u8; 32]) -> Capability {
     }
 }
 
-/// Relay с выданной capability + Bob. Возвращает (relay, bob-identity, relay-pub).
+/// A relay with an issued capability plus Bob. Returns (relay, bob identity, relay public key).
 fn setup() -> (Rc<RefCell<RelayNode>>, Identity, PublicKey) {
     let mut relay = RelayNode::new(NOW);
     relay.issue_capability(capability([0x33; 32]));
@@ -50,20 +50,20 @@ fn end_to_end_message_delivered() {
     // authenticates and cannot be read.
     let bob_kem = bob.kem_ek().to_vec();
 
-    // Alice шлёт (первый раз — с cookie round-trip внутри).
+    // Alice sends (the first time, with a cookie round trip inside).
     let resp = alice.send(&bob_pub, &bob_kem, b"hello bob", NOW);
-    assert!(matches!(resp, Response::Accepted), "получено: {:?}", resp);
+    assert!(matches!(resp, Response::Accepted), "got: {:?}", resp);
 
-    // Bob забирает (fetch-auth) и расшифровывает.
-    let msgs = bob.receive(NOW).expect("fetch должен пройти");
+    // Bob collects (fetch-auth) and decrypts.
+    let msgs = bob.receive(NOW).expect("the fetch must succeed");
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].as_deref(), Some(b"hello bob".as_ref()));
 }
 
 #[test]
 fn cookie_roundtrip_then_cached() {
-    // Второе сообщение той же Alice уже не требует нового cookie (кэширован),
-    // но всё равно проходит admission и доставляется.
+    // A second message from the same Alice needs no new cookie (it is cached), but still goes
+    // through admission and is delivered.
     let (relay, bob_id, relay_pub) = setup();
     let transport = InMemoryTransport::new(relay.clone());
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
@@ -82,10 +82,10 @@ fn cookie_roundtrip_then_cached() {
     assert_eq!(msgs[1], b"second");
 }
 
-// ---------- Несущее: разделение слоёв ----------
+// ---------- Load-bearing: the layer separation ----------
 
-/// Транспорт-«MITM/злонамеренный relay», флипающий байт запечатанного груза в
-/// пути. Admission он не трогает — proof остаётся валидным.
+/// A "MITM / malicious relay" transport that flips a byte of the sealed payload in flight. It does
+/// not touch admission — the proof stays valid.
 #[derive(Clone)]
 struct TamperTransport {
     inner: InMemoryTransport,
@@ -95,7 +95,7 @@ impl Transport for TamperTransport {
         let mut tampered = msg.clone();
         if let Payload::Skeleton(s) = &mut tampered.payload {
             if !s.ciphertext.is_empty() {
-                s.ciphertext[0] ^= 0x01; // подмена содержимого
+                s.ciphertext[0] ^= 0x01; // substitute the contents
             }
         }
         self.inner.send(&tampered, now)
@@ -107,9 +107,9 @@ impl Transport for TamperTransport {
 
 #[test]
 fn relay_tampering_admitted_but_e2e_rejects() {
-    // Слой допуска пропускает (credential валиден, груз он не проверяет), но
-    // E2E ловит подмену: Bob'ов open() возвращает None. Узел не может ни
-    // прочитать, ни подделать содержимое — ключа у него нет.
+    // The admission layer lets it through (the credential is valid and it does not inspect the
+    // payload), while E2E catches the substitution: Bob's open() returns None. The node can
+    // neither read nor forge the contents — it holds no key.
     let (relay, bob_id, relay_pub) = setup();
     let honest = InMemoryTransport::new(relay.clone());
     let tamper = TamperTransport { inner: honest.clone() };
@@ -122,23 +122,23 @@ fn relay_tampering_admitted_but_e2e_rejects() {
     // authenticates and cannot be read.
     let bob_kem = bob.kem_ek().to_vec();
 
-    // Admission ПРОШЁЛ, несмотря на подмену груза в транспорте.
+    // Admission PASSED despite the payload being substituted in transport.
     assert!(matches!(alice.send(&bob_pub, &bob_kem, b"secret", NOW), Response::Accepted));
 
-    // Но расшифровка проваливается — подмену поймал AEAD.
+    // But decryption fails — the AEAD caught the substitution.
     let msgs = bob.receive(NOW).unwrap();
     assert_eq!(msgs.len(), 1);
-    assert_eq!(msgs[0], None, "подменённый груз не должен расшифроваться");
+    assert_eq!(msgs[0], None, "a substituted payload must not decrypt");
 }
 
 #[test]
 fn bad_capability_rejected_regardless_of_content() {
-    // Идеально валидный груз, но credential не тот (секрет не совпадает с
-    // выданным relay) → допуск отклоняет, независимо от содержимого. Обратная
-    // сторона ортогональности слоёв.
-    let (relay, bob_id, relay_pub) = setup(); // relay знает секрет 0x33
+    // A perfectly valid payload but the wrong credential (the secret does not match what the relay
+    // issued) → admission refuses, whatever the contents. The other side of the layers being
+    // orthogonal.
+    let (relay, bob_id, relay_pub) = setup(); // the relay knows the secret 0x33
     let transport = InMemoryTransport::new(relay.clone());
-    // Клиент держит capability с ДРУГИМ секретом.
+    // The client holds a capability with a DIFFERENT secret.
     let mut mallory = Client::new(transport.clone(), capability([0x99; 32]), b"mallory");
     let mut bob = Recipient::new(transport, bob_id, relay_pub);
     let bob_pub = bob.public();
@@ -148,28 +148,28 @@ fn bad_capability_rejected_regardless_of_content() {
     let bob_kem = bob.kem_ek().to_vec();
 
     let resp = mallory.send(&bob_pub, &bob_kem, b"perfectly valid content", NOW);
-    // Reject именно по credential (Ступень 4 crypto), а не по случайной другой
-    // стадии — иначе тест «прошёл бы по неверной причине».
+    // The reject must be on the credential (Stage 4 crypto) rather than at some other stage —
+    // otherwise the test would pass for the wrong reason.
     match &resp {
         Response::Rejected(reason) => assert!(
             reason.contains("Capability") || reason.contains("BadMac") || reason.contains("Crypto"),
-            "ожидался reject по credential, получено: {}",
+            "expected a reject on the credential, got: {}",
             reason
         ),
-        other => panic!("ожидался Rejected, получено: {:?}", other),
+        other => panic!("expected Rejected, got: {:?}", other),
     }
 
-    // В mailbox ничего не легло (Bob аутентифицируется, но выборка пуста).
+    // Nothing landed in the mailbox (Bob authenticates, but the fetch is empty).
     assert!(bob.receive(NOW).unwrap().is_empty());
 }
 
 #[test]
 fn attacker_knowing_pubkey_cannot_drain_mailbox() {
-    // Несущее для fetch-auth: злоумышленник знает pubkey-адрес Bob (он публичен),
-    // но НЕ его приватный ключ → не может вычислить DH-доказательство владения и
-    // слить очередь. Проверяем не только Rejected, а что СООБЩЕНИЕ ОСТАЛОСЬ на
-    // месте (Rejected без drain — вот свойство; проверка только кода ответа
-    // прошла бы, даже если drain случился).
+    // Load-bearing for fetch-auth: an attacker knows Bob's public address (it is public) but NOT
+    // his private key, so they cannot compute the DH proof and drain the queue. We check not only
+    // that it is Rejected but that THE MESSAGE IS STILL THERE (rejected without a drain is the
+    // property; checking the response code alone would pass even if the drain had happened).
+    // would pass even if the drain had happened).
     let (relay, bob_id, relay_pub) = setup();
     let transport = InMemoryTransport::new(relay.clone());
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
@@ -184,37 +184,37 @@ fn attacker_knowing_pubkey_cannot_drain_mailbox() {
         Response::Accepted
     ));
 
-    // Злоумышленник: cookie-handshake на mailbox Bob, но proof подделать не может.
+    // The attacker: a cookie handshake against Bob's mailbox, but the proof cannot be forged.
     let mailbox = bob_pub.to_bytes();
     let attacker_req = |cookie| FetchRequest {
         mailbox,
         client_addr: b"attacker".to_vec(),
         carrier_id: b"mem".to_vec(),
         cookie,
-        proof: [0xAB; 16], // не тот proof — DH без секрета Bob не сошёлся
+        proof: [0xAB; 16], // the wrong proof — the DH without Bob's secret does not match
         own_proof: Vec::new(),
     };
     let cookie = match transport.fetch(&attacker_req(None), NOW) {
         FetchResponse::NeedCookie(c) => c,
-        other => panic!("ожидался challenge, получено иное: {:?}", matches!(other, FetchResponse::Rejected(_))),
+        other => panic!("expected a challenge, got something else: {:?}", matches!(other, FetchResponse::Rejected(_))),
     };
     let attack = transport.fetch(&attacker_req(Some(cookie)), NOW);
-    assert!(matches!(attack, FetchResponse::Rejected(_)), "чужой fetch должен быть отклонён");
+    assert!(matches!(attack, FetchResponse::Rejected(_)), "a foreign fetch must be rejected");
 
-    // ГЛАВНОЕ: очередь Bob НЕ тронута — законный Bob всё ещё получает сообщение.
+    // THE POINT: Bob's queue is UNTOUCHED — the legitimate Bob still receives the message.
     let got: Vec<_> = bob.receive(NOW).unwrap().into_iter().flatten().collect();
-    assert_eq!(got, vec![b"for bob only".to_vec()], "чужой fetch не должен удалять сообщение");
+    assert_eq!(got, vec![b"for bob only".to_vec()], "a foreign fetch must not delete the message");
 }
 
 #[test]
 fn client_refreshes_cookie_on_expiry() {
-    // Проверяет КЛИЕНТСКИЙ cookie-refresh: когда время идёт, кэшированный cookie
-    // протухает и сервер challeng'ит — клиент сам перевыдаёт и доставка выживает
-    // (а не «cookie отклонён», что документировало бы баг). ВНИМАНИЕ: свежесть
-    // cookie здесь роняет 30-сек TTL (`COOKIE_TTL_SECS`), он всегда срабатывает
-    // раньше epoch-grace (600с), поэтому этот тест НЕ пиннит проводку эпох —
-    // сброс replay-фильтра по эпохе запиннен отдельно в admission
-    // (`roll_epoch_clears_replay_filter`). Здесь — именно клиентский повтор.
+    // This checks the CLIENT's cookie refresh: as time passes the cached cookie expires and the
+    // server challenges — the client re-obtains one itself and delivery succeeds (rather than
+    // "cookie rejected", which would document a bug). NOTE: a fresh cookie here is killed by the
+    // 30-second TTL (`COOKIE_TTL_SECS`), which always fires before the epoch grace (600s), so this
+    // test does NOT pin the epoch wiring — the epoch clearing the replay filter is pinned
+    // separately in admission (`roll_epoch_clears_replay_filter`). This is the client retry.
+
     let (relay, bob_id, relay_pub) = setup();
     let transport = InMemoryTransport::new(relay.clone());
     let mut alice = Client::new(transport.clone(), capability([0x33; 32]), b"alice");
@@ -225,14 +225,15 @@ fn client_refreshes_cookie_on_expiry() {
     // authenticates and cannot be read.
     let bob_kem = bob.kem_ek().to_vec();
 
-    // t0: первый контакт, handshake, доставка.
+    // t0: first contact, handshake, delivery.
     assert!(matches!(alice.send(&bob_pub, &bob_kem, b"m1", NOW), Response::Accepted));
 
-    // Далеко за TTL И за границу эпохи+grace (3 эпохи): кэш протух, ключ сменён.
+    // Well past the TTL and past the epoch+grace boundary (3 epochs): the cache is stale and the
+    // key has rotated.
     let later = NOW + 3 * EPOCH_DURATION_SECS;
     assert!(
         matches!(alice.send(&bob_pub, &bob_kem, b"m2", later), Response::Accepted),
-        "доставка должна пережить границу TTL/эпохи (клиент перевыдаёт cookie)"
+        "delivery must survive the TTL/epoch boundary (the client re-obtains a cookie)"
     );
 
     let msgs: Vec<_> = bob.receive(later).unwrap().into_iter().flatten().collect();
@@ -249,8 +250,8 @@ fn mailbox_cap_rejects_instead_of_silent_loss() {
     relay.issue_capability(Capability {
         capability_id: [0xCA; 16],
         scope: Scope::MessageDelivery,
-        // max_requests с запасом над MAX_FETCH_SEALS, чтобы упереться именно в
-        // потолок mailbox, а не в квоту.
+        // max_requests with headroom over MAX_FETCH_SEALS, so the test hits the mailbox ceiling
+        // rather than the quota.
         quota: Quota { max_requests: (MAX_FETCH_SEALS as u32) + 50, max_bytes: 1 << 24, window_secs: 600 },
         not_before: 0,
         not_after: u32::MAX,

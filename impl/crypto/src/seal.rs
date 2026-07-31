@@ -1,47 +1,47 @@
-//! Гибридный (X25519 + ML-KEM-768) sealed-box для СКЕЛЕТА.
+//! A hybrid (X25519 + ML-KEM-768) sealed box for the SKELETON.
 //!
-//! # ЭТО НЕ §2.1. Явно и громко:
+//! # THIS IS NOT §2.1. Explicitly and loudly:
 //!
-//! `SkeletonSeal` — sealed-box (эфемерный X25519 → статический ключ получателя,
-//! HKDF-SHA256 → ChaCha20-Poly1305). У него **НЕТ**:
-//! - **аутентификации отправителя.** Sealed-box даёт Бобу конфиденциальность,
-//!   но НЕ говорит, что сообщение от Alice — запечатать Бобу может кто угодно,
-//!   кто дотянулся до relay. Настоящий §2.1 (X3DH/PQXDH) аутентифицирует
-//!   отправителя её долговременным ключом; здесь sender-auth ноль.
-//!   Следствие: admission (§7) аутентифицирует Alice ПЕРЕД RELAY, а не перед
-//!   Бобом — это разные стороны; уверенность получателя может дать только
-//!   E2E-слой, которого тут (пока) нет;
-//! - forward secrecy и Double Ratchet (ключ выводится из статического ключа
-//!   получателя — компрометация его секрета раскрывает все прошлые сообщения);
-//! - forward secrecy и Double Ratchet (ключ выводится из СТАТИЧЕСКИХ ключей
-//!   получателя — компрометация его секретов раскрывает все прошлые конверты).
+//! `SkeletonSeal` is a sealed box (ephemeral X25519 to the recipient's static key, HKDF-SHA256,
+//! ChaCha20-Poly1305). It does **NOT** have:
+//! - **sender authentication.** A sealed box gives Bob confidentiality but says nothing about the
+//!   message being from Alice — anyone who can reach the relay can seal to Bob. Real §2.1
+//!   (X3DH/PQXDH) authenticates the sender by her long-term key; here sender auth is zero.
+//!   Consequence: admission (§7) authenticates Alice TO THE RELAY, not to Bob — different
+//!   parties; only an E2E layer can give the recipient assurance, and there is none here (yet);
 //!
-//! # Постквантовая защита ЕСТЬ (PRIV-3), и границу надо назвать точно
 //!
-//! Ключ AEAD выводится из ДВУХ секретов: эфемерный X25519 против статического
-//! `ik` получателя И ML-KEM-768 против его долгоживущего `kem_ek`. Слот
-//! `pq_shared` в `derive_key` был оставлен заранее именно под это — добавление
+//! - forward secrecy and a Double Ratchet (the key is derived from the recipient's STATIC keys —
+//!   compromising those secrets reveals every past message).
+//!
+//!
+//!
+//! # Post-quantum protection IS present (PRIV-3), and the boundary must be stated precisely
+//!
+//! The AEAD key is derived from TWO secrets: an ephemeral X25519 against the recipient's static
+//! `ik`, AND ML-KEM-768 against their long-lived `kem_ek`. The `pq_shared` slot in `derive_key`
+//! was left for exactly this — adding it turned out to be filling a slot rather than a rewrite.
 //! оказалось заполнением слота, а не переписью.
 //!
-//! Что это ЗАКРЫЛО: harvest-now-decrypt-later против социального графа.
-//! Противник, записавший opener сегодня, больше не восстановит «кто первым
-//! написал кому», сломав один X25519 квантовым компьютером — оба секрета нужны
-//! одновременно, а ML-KEM-768 квантовому перебору не поддаётся.
+//! What it CLOSED: harvest-now-decrypt-later against the social graph. An adversary who recorded
+//! an opener today can no longer reconstruct "who wrote to whom first" by breaking one X25519 with
+//! a quantum computer — both secrets are needed at once, and ML-KEM-768 does not yield to quantum
+//! search.
 //!
-//! Что это НЕ закрыло, и это не мелкая оговорка: **forward secrecy тут по-
-//! прежнему нет.** Оба ключа получателя долгоживущие (одноразовый KEM-ключ
-//! использовать нельзя — какой юнит взят, записано ВНУТРИ запечатанного
-//! конверта, см. поле `kem_ct`), поэтому кто позже получит секретный материал
-//! аккаунта, расшифрует записанные openers. Стало не хуже: классическая
-//! половина всегда обладала этим свойством. Изменилось то, что одного
-//! квантового компьютера без компрометации больше не хватает.
+//! What it did NOT close, and this is not a small caveat: **there is still no forward secrecy
+//! here.** Both of the recipient's keys are long-lived (a one-time KEM key cannot be used — which
+//! unit was taken is recorded INSIDE the sealed envelope, see the `kem_ct` field), so whoever
+//! later obtains the account's secret material can decrypt recorded openers. It did not get
+//! worse: the classical half always had this property. What changed is that a quantum computer
+//! alone, without a compromise, is no longer enough.
 //!
-//! Sender-auth по-прежнему ноль, и это НЕ дефект: именно отсутствие подписи
-//! отправителя делает конверт анонимным для реле. Кто написал на самом деле,
-//! говорит только внутренний PQXDH.
 //!
-//! Назначение остальной части — доказать, что путь сообщения (admission §7 ↔
-//! E2E) компонуется. Настоящий E2E-слой — PQXDH + Double Ratchet.
+//! Sender auth is still zero, and that is NOT a defect: it is precisely the absence of a sender
+//! signature that makes the envelope anonymous to the relay. Who actually wrote it is stated only
+//! by the PQXDH inside.
+//!
+//! The purpose of the rest is to prove that the message path (admission §7 ↔ E2E) composes. The
+//! real E2E layer is PQXDH plus the Double Ratchet.
 
 use ml_kem::array::Array;
 use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport, Kem, TryKeyInit};
@@ -55,8 +55,8 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-/// Статический идентификатор получателя (для скелета — долгоживущий X25519).
-/// Настоящий §2.1 заменит на prekey-bundle.
+/// The recipient's static identifier (for the skeleton, a long-lived X25519 key).
+/// Real §2.1 replaces it with a prekey bundle.
 #[derive(Clone)]
 pub struct Identity {
     secret: StaticSecret,
@@ -70,26 +70,26 @@ impl Identity {
         Identity { secret, public }
     }
 
-    /// Сериализовать секрет для хранения. **ВНИМАНИЕ:** это приватный ключ в
-    /// ОТКРЫТОМ виде. Вызывающий обязан писать его под 0600; at-rest шифрование
-    /// (парольный KDF) — отложенная защита, здесь не реализована.
+    /// Serialise the secret for storage. **CAUTION:** this is a private key IN THE CLEAR. The
+    /// caller must write it under 0600; at-rest encryption (a password KDF) is deferred and not
+    /// implemented here.
     pub fn to_secret_bytes(&self) -> [u8; 32] {
         self.secret.to_bytes()
     }
 
-    /// Восстановить identity из сохранённого секрета.
+    /// Restore an identity from a stored secret.
     pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
         let secret = StaticSecret::from(bytes);
         let public = PublicKey::from(&secret);
         Identity { secret, public }
     }
 
-    /// Static-static Diffie–Hellman с чужим публичным ключом. Основа
-    /// fetch-auth (§7-владение mailbox): `X25519(id_sec, peer)` симметрично
-    /// `X25519(peer_sec, id_pub)`, поэтому обе стороны получают общий секрет.
-    /// НЕ раскрывает секрет — отдаёт только общий DH. Второе применение
-    /// identity-ключа в DH (первое — эфемерно-статический seal); домены
-    /// разделены на уровне KDF (`fetch_auth` vs `seal`).
+    /// Static-static Diffie–Hellman with a foreign public key. The basis of fetch-auth (§7 mailbox
+    /// ownership): `X25519(id_sec, peer)` is symmetric with `X25519(peer_sec, id_pub)`, so both
+    /// sides obtain the same shared secret. It does NOT reveal the secret — only the shared DH.
+    /// This is the identity key's second use in a DH (the first being the ephemeral-static seal);
+    /// the domains are separated at the KDF level (`fetch_auth` vs `seal`).
+
     pub fn dh(&self, peer: &PublicKey) -> [u8; 32] {
         self.secret.diffie_hellman(peer).to_bytes()
     }
@@ -122,10 +122,10 @@ impl Identity {
     }
 }
 
-/// Запечатанное сообщение на проводе.
+/// A sealed message on the wire.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkeletonSeal {
-    /// Эфемерный публичный ключ отправителя.
+    /// The sender's ephemeral public key.
     pub ephemeral_pub: [u8; 32],
     /// **ML-KEM-768 ciphertext to the recipient's LONG-LIVED encapsulation key** (PRIV-3).
     ///
@@ -146,14 +146,14 @@ pub struct SkeletonSeal {
     pub ciphertext: Vec<u8>,
 }
 
-/// Вывести ключ AEAD из общего секрета — гибрид X25519 + ML-KEM-768.
+/// Derive the AEAD key from the shared secret — a hybrid of X25519 and ML-KEM-768.
 ///
-/// `pq_shared` больше НЕ пуст: слот, оставленный под ML-KEM, заполнен (PRIV-3). Порядок в `ikm`
-/// фиксирован (classical, затем PQ) и является частью формата: перестановка даёт другой ключ и
-/// молча ломает совместимость, поэтому она обязана быть сломом версии, а не правкой.
+/// `pq_shared` is no longer empty: the slot left for ML-KEM is filled (PRIV-3). The order is fixed
+/// (classical, then PQ) and is part of the format: swapping it silently breaks compatibility, so
+/// it must be a version break rather than an edit.
 ///
-/// Оба публичных ключа (получателя и эфемерный отправителя) связываются в `info` — иначе конверт
-/// перепривязываем (тот же урок «связать весь транскрипт», что в Fiat–Shamir).
+/// Both public keys (the recipient's and the sender's ephemeral) are bound in — the same "bind the
+/// whole transcript" lesson as in Fiat–Shamir.
 fn derive_key(
     classical_dh: &[u8; 32],
     pq_shared: &[u8],
@@ -173,12 +173,12 @@ fn derive_key(
     *Key::from_slice(&okm)
 }
 
-/// Дополнительные аутентифицируемые данные — связывающие ключи И PQ-шифртекст.
+/// Additional authenticated data — binding the keys AND the PQ ciphertext.
 ///
-/// `kem_ct` входит сюда намеренно: без этого он остаётся неаутентифицированным полем на проводе.
-/// Подменённый `kem_ct` дал бы другой `pq_shared`, то есть другой AEAD-ключ, и конверт просто не
-/// открылся бы — но «не открылся» и «отвергнут как подделанный» это разные вещи для того, кто
-/// потом читает лог. Связав его, мы получаем ровно одну причину отказа.
+/// `kem_ct` is included deliberately: without it, it stays unauthenticated. A substituted `kem_ct`
+/// would give a different `pq_shared`, hence a different AEAD key, and the envelope would not
+/// open — but "did not open" and "rejected as forged" are different things to whoever reads the
+/// log afterwards. Binding it leaves exactly one reason for the refusal.
 fn aad(recipient_pub: &[u8; 32], ephemeral_pub: &[u8; 32], kem_ct: &[u8]) -> Vec<u8> {
     let mut a = Vec::with_capacity(64 + kem_ct.len());
     a.extend_from_slice(recipient_pub);
@@ -228,12 +228,12 @@ impl SealKemKeys {
 }
 
 impl SkeletonSeal {
-    /// Запечатать `plaintext` для получателя: X25519 `recipient_pub` + ML-KEM `recipient_kem_ek`.
+    /// Seal `plaintext` for the recipient: X25519 `recipient_pub` plus ML-KEM `recipient_kem_ek`.
     ///
-    /// `recipient_kem_ek` — долгоживущий `kem_ek` из bundle получателя (см. поле `kem_ct` о том,
-    /// почему именно долгоживущий, а не одноразовый). Возвращает `Err`, а не паникует, потому что
-    /// это ключ С ПРОВОДА: подпись bundle покрывает его, но подпись ничего не говорит о том, что
-    /// байты разбираются как ML-KEM-ключ — тот же урок, что CRYPTO-08.
+    /// `recipient_kem_ek` is the long-lived `kem_ek` from the recipient's bundle (see the `kem_ct`
+    /// field for why long-lived rather than one-time). It returns `Err` rather than panicking:
+    /// this key comes FROM THE WIRE — the bundle signature covers it, but a signature says nothing
+    /// about the bytes parsing as an ML-KEM key. The same lesson as CRYPTO-08.
     pub fn seal(
         recipient_pub: &PublicKey,
         recipient_kem_ek: &[u8],
@@ -265,8 +265,8 @@ impl SkeletonSeal {
         Ok(SkeletonSeal { ephemeral_pub: ep, kem_ct, nonce: nonce_bytes, ciphertext: ct })
     }
 
-    /// Расшифровать своим статическим секретом. `None` — если AEAD не сошёлся
-    /// (подмена/повреждение — ровно то, что ловит тест разделения слоёв).
+    /// Decrypt with our own static secret. `None` when the AEAD does not verify (substitution or
+    /// corruption — exactly what the layer-separation test catches).
     pub fn open(
         &self,
         recipient: &Identity,

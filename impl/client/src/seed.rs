@@ -1,21 +1,21 @@
-//! Мнемоническая фраза (BIP39) как **единый корень личности** KARST.
+//! The mnemonic phrase (BIP39) as KARST's **single identity root**.
 //!
-//! Одна 12-словная фраза — это ВСЁ, что нужно, чтобы восстановить личность на
-//! любом устройстве. Из неё детерминированно выводятся ОБА секрета:
-//! - `seal` — relay-facing X25519 (владение mailbox, §7 fetch-auth);
-//! - `account` — §2.1 PQXDH (ik‖prekey‖ML-KEM-seed); его `ik` — адрес mailbox.
+//! One phrase is EVERYTHING needed to restore an identity on any device. Both secrets are derived
+//! from it deterministically:
+//! - `seal` — the relay-facing X25519 key (mailbox ownership, §7 fetch-auth);
+//! - `account` — the §2.1 PQXDH material (ik‖prekey‖ML-KEM seed); its `ik` is the mailbox address.
 //!
-//! Одна и та же фраза → тот же IK (адрес) и то же владение mailbox на любой
-//! машине. Пароль (`Store::unlock`) шифрует корень НА ЭТОМ диске; фраза
-//! восстанавливает его ГДЕ УГОДНО. Это разные вещи: потеря пароля ≠ потеря
-//! личности (перевосстановишь по фразе), потеря фразы = потеря личности НАВСЕГДА
-//! (бэкдора нет — см. `docs/STATUS.md`).
+//! The same phrase yields the same IK (address) and the same mailbox ownership on any machine. The
+//! password (`Store::unlock`) encrypts the root ON THIS disk; the phrase restores it ANYWHERE.
+//! These are different things: losing the password is not losing the identity (restore from the
+//! phrase), while losing the phrase IS losing the identity — there is no back door (see
+//! `docs/STATUS.md`).
 //!
-//! # Дисциплина крипты. Контур вывода (`derive`) — **ЗАМОРОЖЕН НАВСЕГДА**:
+//! # Crypto discipline. The derivation (`derive`) is **FROZEN FOREVER**:
 //! moment a person writes down the 24 words, `mnemonic → IK` is fixed. Any
-//! изменение домена/порядка/seed-функции осиротит все записанные фразы. Пинится
-//! `frozen_derivation_vector`. Схема НЕ совместима с кошельками (KARST-свой
-//! HKDF поверх BIP39-seed), reference-код, независимо НЕ аудирован.
+//! changing the domain, the order or the seed function would orphan every phrase ever written
+//! down. Pinned by `frozen_derivation_vector`. The scheme is NOT wallet-compatible (a KARST-
+//! specific HKDF over the BIP39 seed), is reference code, and is not independently audited.
 
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
@@ -26,7 +26,7 @@ use sha2::Sha256;
 use node::pqxdh::Account;
 use node::seal::Identity;
 
-/// Домен HKDF-Expand — **ЗАМОРОЖЕН НАВСЕГДА** (см. заголовок модуля).
+/// The HKDF-Expand domain — **FROZEN FOREVER** (see the module header).
 const HKDF_INFO: &[u8] = b"KARST-identity-derive-v1";
 
 /// 32 bytes of entropy = 24 words.
@@ -68,7 +68,7 @@ pub const DEMO_PHRASE: &str = "abandon abandon abandon abandon abandon abandon a
 const ROOT_COVERS_ML_KEM_768: () = assert!(ENTROPY_BYTES * 8 >= 192);
 const _: () = ROOT_COVERS_ML_KEM_768;
 
-/// Выведенные из фразы секреты. Оба детерминированы от одной энтропии.
+/// The secrets derived from the phrase. Both are deterministic from one entropy value.
 pub struct DerivedIdentity {
     pub seal: Identity,
     pub account: Account,
@@ -92,22 +92,22 @@ pub fn confirm_positions() -> [usize; 3] {
     }
 }
 
-/// Свежая 12-словная фраза из ОС-CSPRNG (`OsRng`).
+/// A fresh phrase from the OS CSPRNG (`OsRng`).
 pub fn generate_mnemonic() -> Mnemonic {
     let mut entropy = [0u8; ENTROPY_BYTES];
     OsRng.fill_bytes(&mut entropy);
     Mnemonic::from_entropy(&entropy).expect("32 bytes of entropy → a valid 24-word phrase")
 }
 
-/// Разобрать введённую пользователем фразу (английский словарь) СО СВЕРКОЙ
-/// контрольной суммы: опечатка или переставленное слово будут отвергнуты, а не
-/// молча приняты как чужая личность. Пробелы по краям срезаются.
+/// Parse a user-entered phrase (the English wordlist) WITH the checksum verified: a typo or a
+/// transposed word is rejected rather than silently accepted as a different identity. Surrounding
+/// whitespace is trimmed.
 pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, String> {
-    // Нормализация ДО разбора: схлопнуть любые пробелы/переносы (multiline-поле,
-    // вставка с разбивкой на строки) и привести к нижнему регистру (BIP39-слова
-    // нижним регистром; «Abandon» с автозаглавной иначе не распознался бы). Без
-    // этого верная фраза отвергалась из-за форматирования — реальный провал
-    // восстановления.
+    // Normalise BEFORE parsing: collapse any whitespace and newlines (a multi-line paste split
+    // across lines) and lowercase it (the BIP39 wordlist is lowercase; "Abandon" with an
+    // auto-capitalised first letter would otherwise not be recognised). Without this a correct
+    // phrase was rejected because of formatting — a real failure during restore.
+
     let normalized =
         phrase.split_whitespace().map(|w| w.to_lowercase()).collect::<Vec<_>>().join(" ");
     let m = Mnemonic::parse_in(Language::English, &normalized)
@@ -118,22 +118,22 @@ pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, String> {
     Ok(m)
 }
 
-/// Энтропия фразы (16 байт) — корень, который кладётся на диск.
+/// The phrase entropy (16 bytes) — the root that is written to disk.
 pub fn entropy_of(m: &Mnemonic) -> [u8; ENTROPY_BYTES] {
     let (arr, len) = m.to_entropy_array();
     debug_assert_eq!(len, ENTROPY_BYTES, "24 words → 32 bytes of entropy");
     arr[..ENTROPY_BYTES].try_into().expect("16 bytes")
 }
 
-/// Восстановить фразу из энтропии (для экрана «показать фразу восстановления»).
+/// Reconstruct the phrase from the entropy (for the "show recovery phrase" screen).
 pub fn mnemonic_of_entropy(entropy: &[u8; ENTROPY_BYTES]) -> Mnemonic {
     Mnemonic::from_entropy(entropy).expect("32 bytes → a valid 24-word phrase")
 }
 
-/// **ЗАМОРОЖЕННЫЙ** вывод обоих секретов из энтропии фразы.
+/// The **FROZEN** derivation of both secrets from the phrase entropy.
 ///
 /// ```text
-/// bip39_seed = BIP39 to_seed(passphrase="")   // PBKDF2-HMAC-SHA512, 2048 итер, 64 Б
+/// bip39_seed = BIP39 to_seed(passphrase="")   // PBKDF2-HMAC-SHA512, 2048 iterations, 64 B
 /// PRK        = HKDF-Extract(SHA-256, salt=∅, ikm=bip39_seed)
 /// okm[160]   = HKDF-Expand(PRK, info="KARST-identity-derive-v1")
 /// seal(32)   = okm[0..32]
@@ -152,35 +152,35 @@ pub fn derive(entropy: &[u8; ENTROPY_BYTES]) -> DerivedIdentity {
     DerivedIdentity { seal, account }
 }
 
-/// HKDF-домен вывода ПРОКСИ-личности ИЗ ЕЁ СОБСТВЕННОГО секрета — НЕ из фразы (#207, A6-4).
+/// The HKDF domain for deriving a PROXY identity FROM ITS OWN secret — NOT from the phrase.
 ///
-/// История: раньше здесь стоял `derive_proxy(entropy, index)` — прокси были HD-потомками той
-/// же фразы по индексу, а «сжигание» прокси (`Store::set_proxy_active`) только гасило флаг
-/// `active` в реестре. Ключи прокси оставались выводимы из фразы НАВСЕГДА: тот, у кого есть
-/// 12 слов, мог заново вычислить закрытый ключ ЛЮБОГО прошлого индекса, сверить его с историей
-/// relay-логов, перечислить ещё не созданные прокси наперёд и связать личности, которые UI
-/// показывал как независимо уничтоженные. «Сжигание» было эксплуатационной пометкой, а не
-/// уничтожением — то есть ничем не отличалось от простого «перестать пользоваться».
+/// History: this used to be `derive_proxy(entropy, index)` — proxies were HD descendants of the
+/// same phrase by index, and "burning" a proxy (`Store::set_proxy_active`) only cleared `active`
+/// in the registry. A proxy's keys stayed derivable from the phrase FOREVER: anyone holding the
+/// phrase could recompute the private key of ANY past index, correlate it with relay logs,
+/// enumerate not-yet-created proxies in advance, and link identities the UI presented as
+/// independently destroyed. "Burning" was an exploitable non-destruction — indistinguishable from
+/// simply ceasing to use the proxy.
 ///
-/// Фикс: у каждого прокси — свой случайный 32-байтный секрет, который минтится
-/// (`OsRng`) при создании и живёт ТОЛЬКО в запечатанном реестре (`Store::create_proxy`,
-/// `store.rs`), никогда не выводится из фразы. Сжигание удаляет запись и секрет из
-/// реестра целиком — после этого личность не восстановит НИКТО, включая владельца фразы,
-/// потому что взять её неоткуда. Отсюда честное следствие: фраза восстанавливает КОРЕНЬ
-/// (`derive`, выше), но НЕ прокси — «recoverable» и «destroyable» это один и тот же вопрос,
-/// и это дизайн, не баг (см. `docs/design/proxy-identity.md`).
+/// The fix: every proxy has its own random 32-byte secret, minted with `OsRng` at creation, living
+/// ONLY in the sealed registry (`Store::create_proxy`, `store.rs`), never derived from the phrase.
+/// Burning deletes the record and the secret from the registry entirely — after that NOBODY can
+/// restore the identity, the phrase holder included, because there is nowhere to take it from.
+/// The honest consequence: the phrase restores the root (`derive`, above) but NOT the proxies —
+/// "recoverable" and "destroyable" are the same question with opposite answers, and this is the
+/// design rather than a bug (see `docs/design/proxy-identity.md`).
 const HKDF_PROXY_SECRET_INFO: &[u8] = b"KARST-proxy-secret-derive-v1";
 
-/// Вывести прокси-личность из её собственного случайного секрета (см. `HKDF_PROXY_SECRET_INFO`
-/// выше). Раскладка та же (seal ‖ account), что у `derive` — прокси остаётся полноценной сетевой
-/// личностью, — но домен HKDF свой, отдельный и от корневого `derive`, и от старого (удалённого)
-/// `derive_proxy(entropy, index)`, так что вывод прокси никогда не совпадёт ни с корнем, ни со
-/// значением, которое давал прежний HD-контракт.
+/// Derive a proxy identity from its own random secret (see the `HKDF` note above). The layout is
+/// the same (seal ‖ account) as in `derive` — a proxy remains a full identity — but the HKDF
+/// domain is its own, separate both from the root `derive` and from the former
+/// `derive_proxy(entropy, index)`, so a proxy derivation can never coincide with the root or with
+/// a value the old HD contract produced.
 ///
-/// НЕ заморожен как контракт совместимости, в отличие от `derive`: секрет — сам по себе
-/// единственная резервная копия (он живёт только в сожжённом виде в `proxies.dat`), никто не
-/// записывает его на бумаге вручную, поэтому смена этой функции в будущем осиротит только те
-/// секреты, которые ещё не были подставлены сюда — не миллион розданных фраз.
+/// It is NOT frozen as a compatibility contract, unlike `derive`: the secret is its own only
+/// backup (it lives solely inside the sealed registry, and nobody writes it down on paper), so
+/// changing this function in the future would affect secrets that have not yet been fed into it —
+/// not a million phrases already handed out.
 pub fn derive_proxy_from_secret(secret: &[u8; 32]) -> DerivedIdentity {
     let hk = Hkdf::<Sha256>::new(None, secret);
     let mut okm = zeroize::Zeroizing::new([0u8; 160]);
@@ -212,17 +212,17 @@ mod tests {
 
     use super::*;
 
-    /// **Контракт совместимости — НЕ МЕНЯТЬ значения.**
+    /// **A compatibility contract — DO NOT change the values.**
     ///
     /// The vector was regenerated ONCE, deliberately (CRYPTO-32, #193): the root widened from 16
     /// bytes (12 words) to 32 (24 words), so both the test phrase and everything derived from it
     /// are different. No users means no written-down phrases, so nothing was broken. From here
     /// the vector is frozen again.
     ///
-    /// Фиксирует
-    /// `известная фраза → точный IK`. Если этот тест покраснел не потому, что вы
-    /// осознанно ввели НОВЫЙ формат, — вы сломали восстановление у всех, кто уже
-    /// записал фразу. (Как `conformance_vectors_match_frozen` в крипто-ядре.)
+    /// It pins
+    /// `a known phrase → an exact IK`. If this test goes red and it is not because a NEW format
+    /// was introduced deliberately, restore is broken for everyone who wrote their phrase down.
+    /// (The same discipline as `conformance_vectors_match_frozen` in the crypto core.)
     #[test]
     fn frozen_derivation_vector() {
         // The standard 24-word BIP39 test phrase (entropy = 32 zero bytes).
@@ -254,11 +254,11 @@ mod tests {
         );
     }
 
-    /// Прокси-личность зависит ТОЛЬКО от её случайного секрета, не от фразы: тот же секрет (даже
-    /// под другим корнем) → тот же IK/seal, разные секреты → разные личности, и ни один прокси не
-    /// совпадает с корневой личностью, выведенной из этой же фразы. Это ровно то поведение, на
-    /// котором держится #207 — если бы вывод прокси хоть как-то зависел от `entropy`, секрет можно
-    /// было бы восстановить по фразе, и сжигание перестало бы что-либо уничтожать.
+    /// A proxy identity depends ONLY on its own random secret, not on the phrase: the same secret
+    /// (even under a different root) gives the same IK/seal, different secrets give different
+    /// identities, and none of them coincides with the root identity derived from that same
+    /// phrase. This is exactly what #207 rests on — if a proxy derivation depended on `entropy` in
+    /// any way, it would be restorable from the phrase and burning would stop destroying anything.
     #[test]
     fn proxy_identity_depends_only_on_its_own_secret_not_on_the_phrase() {
         let secret_a = [11u8; 32];
@@ -280,8 +280,8 @@ mod tests {
             "different secrets yield different identities"
         );
 
-        // Корень, выведенный из фразы (ЛЮБОЙ фразы), никогда не совпадает с прокси: секрет
-        // прокси не зависит от энтропии фразы вообще, домены полностью разделены.
+        // A root derived from a phrase (ANY phrase) never coincides with a proxy: the proxy does
+        // not depend on the phrase entropy at all, and the domains are fully separated.
         let root = derive(&[0u8; ENTROPY_BYTES]);
         assert_ne!(
             a1.account.identity_public(),
@@ -296,29 +296,29 @@ mod tests {
         let b = generate_mnemonic();
         assert_ne!(entropy_of(&a), entropy_of(&b), "two generations differ");
 
-        // Восстановление: та же энтропия → тот же IK и тот же seal.
+        // Restore: the same entropy gives the same IK and the same seal.
         let d1 = derive(&entropy_of(&a));
         let d2 = derive(&entropy_of(&a));
         assert_eq!(d1.account.identity_public(), d2.account.identity_public());
         assert_eq!(d1.seal.public.to_bytes(), d2.seal.public.to_bytes());
 
-        // Разные фразы → разные личности.
+        // Different phrases give different identities.
         let e = derive(&entropy_of(&b));
         assert_ne!(d1.account.identity_public(), e.account.identity_public());
     }
 
     #[test]
     fn corrupted_phrase_rejected_not_silently_accepted() {
-        // Валидная фраза с ОДНИМ переставленным словом → контрольная сумма не
-        // сойдётся → parse ДОЛЖЕН отвергнуть (иначе человек «восстановит» чужую
-        // или пустую личность вместо ошибки).
+        // A valid phrase with ONE word transposed fails the checksum, so parse MUST reject it
+        // (otherwise a person "restores" someone else's or an empty identity instead of seeing an
+        // error).
         let bad = "abandon abandon abandon abandon abandon abandon abandon abandon \
                    abandon abandon abandon abandon abandon abandon abandon abandon \
                    abandon abandon abandon abandon abandon abandon art abandon";
         assert!(parse_mnemonic(bad).is_err(), "a broken checksum must be refused");
-        // Мусор — тоже.
+        // Garbage too.
         assert!(parse_mnemonic("not a mnemonic at all").is_err());
-        // Правильная — принимается.
+        // The correct one is accepted.
         let good = "abandon abandon abandon abandon abandon abandon abandon abandon \
                     abandon abandon abandon abandon abandon abandon abandon abandon \
                     abandon abandon abandon abandon abandon abandon abandon art";
@@ -327,8 +327,8 @@ mod tests {
 
     #[test]
     fn phrase_normalized_over_case_and_whitespace() {
-        // Верная фраза с ЗАГЛАВНЫМИ буквами, переносами строк и двойными пробелами
-        // (как из вставки в multiline-поле) должна дать ТУ ЖЕ энтропию, что канон.
+        // A correct phrase in UPPERCASE with newlines and double spaces (as if pasted into a
+        // multi-line field) must give THE SAME entropy as the canonical form.
         let canon = "abandon abandon abandon abandon abandon abandon abandon abandon \
                      abandon abandon abandon abandon abandon abandon abandon abandon \
                      abandon abandon abandon abandon abandon abandon abandon art";

@@ -1,84 +1,84 @@
-//! §7.3 — Anonymous Admission Token (Privacy Pass-подобный).
+//! §7.3 — the Anonymous Admission Token (Privacy Pass-like).
 //!
-//! Предъявление токена — БЕЗ явного `issuer_id`, через **threshold ring
-//! signature** (Bresson–Stern–Szydlo, CRYPTO 2002) по набору доверенных
-//! issuer'ов: «подписано совместно не менее чем t из N», не раскрывая,
-//! какими именно. Это скрывает, каким issuer'ом выдан токен, — иначе
-//! анонимность-сет сужается до пользователей конкретного issuer'а (§7.3).
+//! A token is presented WITHOUT an explicit `issuer_id`, through a **threshold ring signature**
+//! (Bresson–Stern–Szydlo, CRYPTO 2002) over a set of trusted issuers: "at least t of N signed this
+//! jointly", without revealing which ones. That hides which issuer issued the token — otherwise
+//! the anonymity set shrinks to the users of one particular issuer (§7.3).
 //!
-//! # Почему здесь trait + mock, а не реализация
 //!
-//! Threshold ring signatures Bresson–Stern–Szydlo НЕ имеют готового,
-//! проверенного crate на crates.io (в отличие от Ed25519, HMAC, RLN-поля,
-//! которые реализованы «по-настоящему» в соседних модулях). Реализовывать
-//! пороговую кольцевую подпись с нуля в референс-скелете — значит поставить
-//! непроаудированную крипту в основание; это ХУЖЕ, чем честная заглушка.
+//! # Why a trait and a mock here instead of an implementation
 //!
-//! Поэтому здесь определён `AdmissionTokenVerifier` — trait, против которого
-//! компонуется весь конвейер (§7.5, Ступень 4, шаг 2), и `MockRingVerifier`
-//! — заведомо НЕ криптографическая заглушка для интеграционных тестов
-//! пайплайна. Это одна из находок, которые prose-аудит структурно пропускал:
-//! спека называла примитив по имени, но «назван по имени» ≠ «существует
-//! готовая реализация, которая компонуется с остальным».
+//! Bresson–Stern–Szydlo threshold ring signatures have NO ready, reviewed crate on crates.io
+//! (unlike Ed25519, HMAC or the RLN field arithmetic, which are implemented for real in the
+//! neighbouring modules). Writing a threshold ring signature from scratch inside a reference
+//! skeleton would put unaudited crypto in the foundation; that is WORSE than an honest stub.
 //!
-//! # Итог обследования экосистемы (перед попыткой реализации)
 //!
-//! Проверка crates.io зафиксировала исход «внешней зависимости», а не
-//! «сейчас реализую»:
+//! So this module defines `AdmissionTokenVerifier` — the trait the whole pipeline composes against
+//! (§7.5, Stage 4, step 2) — and `MockRingVerifier`, a deliberately NON-cryptographic stub for
+//! pipeline integration tests. This is one of the findings a prose audit structurally misses: the
+//! spec named the primitive, and "named" is not "a ready implementation exists that composes with
+//! the rest".
 //!
-//! - Пороговой кольцевой подписи Bresson–Stern–Szydlo в Rust НЕ существует.
-//! - Все доступные кольцевые крейты — 1-of-N (Monero-семейство: SAG/bLSAG/
-//!   CLSAG/MLSAG), не покрывают «2 из 5».
-//! - FROST-семейство даёт «t из N», но НЕ анонимно (подписанты известны) и
-//!   требует DKG/общего группового ключа — другая модель доверия, чем
-//!   ad-hoc кольцо N независимых issuer'ов.
-//! - Сам BSS построен на RSA/trapdoor-перестановках (RST), а стек KARST —
-//!   Curve25519/Ed25519: буквальный BSS не компонуется. Корректная замена —
-//!   curve-friendly discrete-log пороговая кольцевая конструкция, которую
-//!   ещё нужно выбрать и проверить. См. §7.3 спецификации.
 //!
-//! Реализовывать пороговую кольцевую крипту с нуля здесь ОПАСНЕЕ, чем
-//! оставить честную заглушку (happy-path тесты на самодельной крипте
-//! фабрикуют ложную уверенность в security-критичном примитиве). Поэтому
-//! stub остаётся рабочим кодом до выбора и аудита конкретной конструкции.
+//! # The ecosystem survey (done before attempting an implementation)
+//!
+//! Checking crates.io settled the outcome as "an external dependency", not "I will implement it
+//! now":
+//!
+//! - The Bresson–Stern–Szydlo threshold ring signature does NOT exist in Rust.
+//! - Every available ring crate is 1-of-N (the Monero family: SAG/bLSAG/CLSAG/MLSAG) and does not
+//!   cover "2 of 5".
+//! - The FROST family gives "t of N" but NOT anonymously (the signers are known) and needs a DKG
+//!   or a shared group key — a different trust model from an ad-hoc ring of N independent
+//!   issuers.
+//! - BSS itself is built on RSA / trapdoor permutations (RST), while the KARST stack is
+//!   Curve25519/Ed25519: literal BSS does not compose. The correct replacement is a
+//!   curve-friendly discrete-log threshold ring construction, which still has to be chosen and
+//!   reviewed. See §7.3 of the specification.
+//!
+//! Implementing threshold ring crypto from scratch here is MORE DANGEROUS than leaving an honest
+//! stub (happy-path tests over homemade crypto manufacture false confidence in a
+//! security-critical primitive). So the stub stays as working code until a specific construction
+//! is chosen and audited.
 
-/// Токен в том виде, как он предъявляется relay (§7.3). `ring_sig` —
-/// непрозрачные байты пороговой кольцевой подписи над `t`.
+/// The token as it is presented to a relay (§7.3). `ring_sig` is the opaque bytes of a threshold
+/// ring signature over `t`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionToken {
-    /// Пороговая кольцевая подпись над `t` по набору доверенных issuer-ключей.
+    /// The threshold ring signature over `t` by the set of trusted issuer keys.
     pub ring_sig: Vec<u8>,
-    /// Разслеплённый nonce токена (bytes[32]).
+    /// The token's unblinded nonce (bytes[32]).
     pub t: [u8; 32],
     pub epoch_id: u32,
 }
 
-/// Публичные ключи доверенных issuer'ов и требуемый порог t из N.
+/// The public keys of the trusted issuers and the required threshold t of N.
 #[derive(Debug, Clone)]
 pub struct IssuerRing {
     pub issuer_pubkeys: Vec<[u8; 32]>,
-    /// Порог: сколько issuer'ов ДОЛЖНЫ совместно подписать (1..=N). Покрывает
-    /// и «1 из 5», и «2 из 5» одним примитивом (§7.3).
+    /// The threshold: how many issuers MUST sign jointly (1..=N). One primitive covers both
+    /// "1 of 5" and "2 of 5" (§7.3).
     pub threshold_t: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenError {
-    /// Порог вне [1, N].
+    /// The threshold is outside [1, N].
     BadThreshold,
-    /// Подпись не прошла проверку по кольцу.
+    /// The signature failed verification against the ring.
     BadRingSignature,
-    /// Токен уже виден в этой эпохе (double-spend) — детектируется вызывающим
-    /// через replay-фильтр (§7.5, Ступень 3), не самим verifier'ом.
+    /// The token was already seen this epoch (double spend) — detected by the caller through the
+    /// replay filter (§7.5, Stage 3), not by the verifier itself.
     Replayed,
 }
 
-/// Контракт, против которого компонуется конвейер (§7.5, Ступень 4 шаг 2).
-/// Реальный verifier (порт BSS) и mock реализуют один и тот же trait —
-/// пайплайн от подмены не меняется.
+/// The contract the pipeline composes against (§7.5, Stage 4 step 2). The real verifier (a BSS
+/// port) and the mock implement the same trait, so the pipeline does not change when one is
+/// swapped for the other.
 pub trait AdmissionTokenVerifier {
-    /// Проверить, что `token.ring_sig` — валидная пороговая кольцевая подпись
-    /// над `token.t` по `ring`, для эпохи `expected_epoch`.
+    /// Check that `token.ring_sig` is a valid threshold ring signature over `token.t` by `ring`,
+    /// for the epoch `expected_epoch`.
     fn verify(
         &self,
         token: &AdmissionToken,
@@ -87,12 +87,12 @@ pub trait AdmissionTokenVerifier {
     ) -> Result<(), TokenError>;
 }
 
-/// НЕ КРИПТОГРАФИЧЕСКАЯ заглушка для интеграционных тестов пайплайна.
+/// A NON-CRYPTOGRAPHIC stub for pipeline integration tests.
 ///
-/// Проверяет только структурную осмысленность (порог в диапазоне, эпоха
-/// совпала, подпись непустая и её длина закодирована ожидаемо). НИКОГДА не
-/// должна использоваться в бою — единственная её задача — дать конвейеру
-/// объект нужного типа, пока настоящий BSS-verifier не портирован.
+/// It checks only structural sanity (the threshold is in range, the epoch matches, the signature
+/// is non-empty and its length is encoded as expected). It must NEVER be used in production — its
+/// only job is to give the pipeline an object of the right type until a real BSS verifier is
+/// ported.
 /// Constructible only through `for_tests_only()`, whose name is the point: the private field
 /// makes `MockRingVerifier` impossible to write by accident (`MockRingVerifier` as a unit value
 /// no longer compiles), so any use of it has to name what it is at the call site and survive
@@ -129,10 +129,10 @@ impl AdmissionTokenVerifier for NoTokenVerifier {
     }
 }
 
-/// Формат mock-«подписи»: первый байт — заявленное число подписантов,
-/// далее это число 32-байтовых «пустых» слотов. Ровно достаточно, чтобы
-/// пайплайн-тест мог сконструировать «валидный по структуре» токен и
-/// «невалидный» (недобор порога), не претендуя на крипто-стойкость.
+/// The mock "signature" format: the first byte is the claimed number of signers, followed by that
+/// many 32-byte empty slots. Just enough for a pipeline test to construct a token that is
+/// "structurally valid" and one that is not (below the threshold), without pretending to any
+/// cryptographic strength.
 pub const MOCK_SIG_SLOT: usize = 32;
 
 impl AdmissionTokenVerifier for MockRingVerifier {
@@ -149,13 +149,13 @@ impl AdmissionTokenVerifier for MockRingVerifier {
         if token.epoch_id != expected_epoch {
             return Err(TokenError::BadRingSignature);
         }
-        // «Число подписантов» из первого байта mock-подписи.
+        // The "number of signers" from the first byte of the mock signature.
         let claimed_signers = *token.ring_sig.first().ok_or(TokenError::BadRingSignature)? as usize;
         let expected_len = 1 + claimed_signers * MOCK_SIG_SLOT;
         if token.ring_sig.len() != expected_len {
             return Err(TokenError::BadRingSignature);
         }
-        // Порог: подписантов должно быть не меньше t и не больше N.
+        // Threshold: there must be at least t signers and no more than N.
         if claimed_signers < ring.threshold_t || claimed_signers > n {
             return Err(TokenError::BadRingSignature);
         }
@@ -164,7 +164,7 @@ impl AdmissionTokenVerifier for MockRingVerifier {
 }
 
 impl MockRingVerifier {
-    /// Собрать mock-токен, «подписанный» `signers` issuer'ами, для тестов.
+    /// Build a mock token "signed" by `signers` issuers, for tests.
     pub fn mock_token(t: [u8; 32], epoch_id: u32, signers: usize) -> AdmissionToken {
         let mut ring_sig = Vec::with_capacity(1 + signers * MOCK_SIG_SLOT);
         ring_sig.push(signers as u8);
@@ -177,18 +177,18 @@ impl MockRingVerifier {
     }
 }
 
-/// Настоящий verifier поверх пороговой кольцевой подписи §7.3 (tring).
-/// РЕФЕРЕНС, НЕ ПРОШЁЛ АУДИТ — только за feature-флагом `unaudited-crypto`.
+/// The real verifier over the §7.3 threshold ring signature (tring).
+/// REFERENCE, NOT AUDITED — available only behind the `unaudited-crypto` feature flag.
 ///
-/// Композиция, ради которой существует trait: конвейер (§7.5, Ступень 4 шаг 2)
-/// теперь может исполняться против настоящей крипты, а не только mock.
+/// This is the composition the trait exists for: the pipeline (§7.5, Stage 4 step 2) can now run
+/// against real crypto rather than only against the mock.
 ///
-/// **Граница.** Кольцевая подпись доказывает «≥ t issuer'ов подписали nonce
-/// токена `t`». `epoch_id` НЕ входит в саму подпись (issuer в модели Privacy
-/// Pass подписывает токен однократно вслепую, не зная будущую эпоху) —
-/// свежесть по эпохе обеспечивает отдельный replay-фильтр конвейера,
-/// привязанный к quota-эпохе (§7.5, Ступень 3). Здесь проверяется только,
-/// что заявленная эпоха токена совпала с ожидаемой.
+/// **The boundary.** The ring signature proves "at least t issuers signed the token nonce `t`".
+/// `epoch_id` is NOT part of the signature itself (in the Privacy Pass model an issuer signs a
+/// token once, blindly, without knowing the future epoch) — epoch freshness comes from the
+/// pipeline's separate replay filter, tied to the quota epoch (§7.5, Stage 3). All that is checked
+/// here is that the token's claimed epoch matches the expected one.
+
 #[cfg(feature = "unaudited-crypto")]
 pub struct RealRingVerifier;
 
@@ -207,13 +207,13 @@ impl AdmissionTokenVerifier for RealRingVerifier {
         if token.epoch_id != expected_epoch {
             return Err(TokenError::BadRingSignature);
         }
-        // Декодировать issuer-ключи кольца в точки Ristretto.
+        // Decode the ring's issuer keys into Ristretto points.
         let mut ring_points = Vec::with_capacity(n);
         for pk in &ring.issuer_pubkeys {
             let p = crate::tring::point_from_bytes(pk).ok_or(TokenError::BadRingSignature)?;
             ring_points.push(p);
         }
-        // Разобрать подпись и проверить против nonce токена как сообщения.
+        // Parse the signature and verify it against the token nonce as the message.
         let sig = crate::tring::ThresholdRingSig::from_bytes(&token.ring_sig)
             .ok_or(TokenError::BadRingSignature)?;
         if sig.challenges.len() != n {

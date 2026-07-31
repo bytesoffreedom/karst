@@ -1,5 +1,5 @@
-//! Тонкие RelayNode и Client + транспорт. Ровно столько, чтобы провести одно
-//! сообщение Alice → relay → Bob. Богатый API узла — задача следующих срезов.
+//! A thin RelayNode and Client plus the transport. Exactly enough to carry one message
+//! Alice → relay → Bob. A richer node API belongs to later slices.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -29,9 +29,9 @@ use node::discovery::{self, DiscoveryRecord};
 use node::pqxdh::PreKeyBundle;
 use node::seal::Identity;
 
-/// Потолок числа опубликованных bundle (§12): при полноте — отказ на публикацию
-/// нового IK, НЕ тихий сброс (та же дисциплина, что `MAX_FETCH_SEALS`).
-/// Перезапись СВОЕГО bundle всегда разрешена (не считается новым).
+/// The ceiling on published bundles (§12): when full, publishing a NEW IK is refused rather than
+/// silently dropped (the same discipline as `MAX_FETCH_SEALS`).
+/// Overwriting ONE'S OWN bundle is always allowed (it does not count as new).
 pub const MAX_BUNDLES: usize = 100_000;
 
 /// What one signed one-time prekey costs the relay, for quota purposes: the 32-byte key, its
@@ -169,7 +169,7 @@ pub fn blob_get_chunk(
     BlobResponse::Chunk(store.get_chunk(&req.blob_id, req.index))
 }
 
-/// Свежий случайный ключ cookie-эпохи (для инициализации и ротации).
+/// A fresh random cookie-epoch key (for initialisation and rotation).
 fn random_key() -> [u8; 32] {
     let mut k = [0u8; 32];
     OsRng.fill_bytes(&mut k);
@@ -273,8 +273,8 @@ impl BlobQuotaTracker {
     }
 }
 
-/// Relay-узел: гоняет admission-конвейер (§7) на входящих capsule и, при
-/// Admit, кладёт ЗАПЕЧАТАННЫЙ (нечитаемый для узла) груз в mailbox получателя.
+/// The relay node: it runs the admission pipeline (§7) over incoming capsules and, on Admit, puts
+/// the SEALED payload (unreadable to the node) into the recipient's mailbox.
 /// The mail plane: per-recipient queues plus their optional durable log (#142).
 ///
 /// Split out of `RelayNode` so it can live behind its own lock. Everything that decides WHETHER a
@@ -309,10 +309,10 @@ impl MailStore {
         if !self.mailboxes.contains_key(&recipient) && self.mailboxes.len() >= MAX_MAILBOXES {
             return Response::Rejected("MailboxTableFull".into());
         }
-        // Cap на ВСТАВКЕ держит инвариант «mailbox всегда влезает в один кадр ответа» по
-        // построению → fetch никогда не упрётся в FrameTooLarge ПОСЛЕ drain'а (иначе — тихая
-        // потеря всей очереди офлайн-получателя). Полный ящик = backpressure отправителю, не
-        // молчаливый сброс. В духе admission-троттлинга.
+        // The cap ON INSERTION maintains the invariant "a mailbox always fits in one frame" by
+        // construction → a fetch can never hit FrameTooLarge AFTER a drain (which would lose the
+        // whole queue of an offline recipient). A full box is backpressure, refused rather than
+        // silently dropped. In the spirit of admission throttling.
         let mbox = self.mailboxes.entry(recipient).or_default();
         // IDEMPOTENT deposit (R2-7). The transport deliberately does NOT retry a request once it
         // has been written to the connection: the relay may already have applied it, and a blind
@@ -501,7 +501,7 @@ impl MailStore {
     }
 }
 
-/// Узел никогда не видит открытый текст — ключа у него нет.
+/// The node never sees plaintext — it holds no key.
 pub struct RelayNode {
     keyring: CookieKeyring,
     capabilities: CapabilityTable,
@@ -534,18 +534,18 @@ pub struct RelayNode {
     /// while holding the relay lock — never has to take the mail lock (#142). It is set once, by
     /// `enable_durable_mail`, before the relay serves anything.
     mail_durable: bool,
-    /// §12 discovery: опубликованные prekey-bundle по IK владельца. Публичный
-    /// материал; запись гейтится ownership-proof, чтение открыто. Ограничен
-    /// `MAX_BUNDLES` (отказ при полноте, не тихий сброс).
+    /// §12 discovery: published prekey bundles by the owner's IK. Public material; writing is
+    /// gated by an ownership proof, reading is open. Bounded by `MAX_BUNDLES` (refusal when full,
+    /// never a silent drop).
     bundles: HashMap<[u8; 32], BundleSlot>,
     /// One-time prekey batches per IK; a fetch pops one (see `PublishRequest::opks`).
     opk_batches: HashMap<[u8; 32], VecDeque<node::pqxdh::SignedOpk>>,
     /// Rotating start offset for `node_list`, so advertisement is fair rather than always
     /// favouring whoever was learned first (A3-13). `Cell` because serving a list is a READ.
     gossip_cursor: std::sync::atomic::AtomicUsize,
-    /// Статический ключ узла: основа fetch-auth (и §12 publish-auth). Задаётся
-    /// извне (`with_identity`) для персистентности — `karst-relay` хранит его на
-    /// диске, relay-id стабилен между перезапусками.
+    /// The node's static key: the basis of fetch-auth (and §12 publish auth). Supplied from
+    /// outside (`with_identity`) for persistence — `karst-relay` stores it on disk, so the
+    /// relay-id is stable across restarts.
     relay_identity: Identity,
     /// §15 large-file blob store (disk-backed). `None` = blobs disabled (default; keeps
     /// the in-memory constructors/tests unchanged). Enabled via `enable_blobs`.
@@ -609,9 +609,9 @@ impl RelayNode {
         Self::with_identity(now, Identity::generate())
     }
 
-    /// Как `new`, но с ЗАДАННЫМ fetch-auth ключом узла — для персистентности
-    /// ключа relay (стабильный relay-id между перезапусками). Cookie-ключи всё
-    /// ещё эфемерны (ротируются по эпохам — это by design, не влияет на relay-id).
+    /// Like `new`, but with a GIVEN fetch-auth key for the node — for relay key persistence (a
+    /// stable relay-id across restarts). The cookie keys are still ephemeral (they rotate by epoch
+    /// — by design, and it does not affect the relay-id).
     pub fn with_identity(now: u64, relay_identity: Identity) -> Self {
         let epoch = cookie_epoch_id(now, EPOCH_DURATION_SECS);
         RelayNode {
@@ -850,8 +850,8 @@ impl RelayNode {
         self.blobs.as_ref()?.lock().expect("blob store mutex").stat(blob_id)
     }
 
-    /// Публичный ключ узла — клиент узнаёт его вне канала (как адрес) и
-    /// использует для fetch-auth DH. Бинарь печатает его при старте.
+    /// The node's public key — a client learns it out of band (as an address) and uses it for the
+    /// fetch-auth DH. The binary prints it at startup.
     pub fn relay_public(&self) -> PublicKey {
         self.relay_identity.public
     }
@@ -906,9 +906,9 @@ impl RelayNode {
         (self.bundles.len(), self.discovery.len())
     }
 
-    /// Выдать capability клиенту (relay — сам issuer, §7.2). Возвращает копию,
-    /// которую клиент хранит для построения proof'ов; секрет-запись остаётся и
-    /// у relay для верификации.
+    /// Issue a capability to a client (the relay is the issuer itself, §7.2). Returns the copy the
+    /// client keeps for building proofs; the secret record stays at the relay for verification.
+
     pub fn issue_capability(&mut self, cap: Capability) {
         self.capabilities.insert(cap);
     }
@@ -1265,13 +1265,13 @@ impl RelayNode {
         })
     }
 
-    /// Продвинуть эпоху по часам сервера. МОНОТОННО (`e > self.epoch`): регресс
-    /// стенных часов не откатит эпоху и не обнулит replay-фильтр через
-    /// `roll_epoch`. Ключ генерим ЛЕНИВО — только при реальной смене эпохи.
-    /// pipeline-epoch и ротация cookie-ключей оба выведены из
-    /// `cookie_epoch_id(now)` → когерентны по построению. (Остаётся именованным:
-    /// регресс часов ВНУТРИ эпохи всё ещё смещает 30-сек freshness cookie;
-    /// настоящий фикс — монотонные часы, вне среза.)
+    /// Advance the epoch by the server's clock. MONOTONIC (`e > self.epoch`): a wall-clock
+    /// regression cannot roll the epoch back or clear the replay filter through `roll_epoch`. The
+    /// key is generated LAZILY — only on a real epoch change. The pipeline epoch and the cookie
+    /// key rotation are both derived from `cookie_epoch_id(now)`, so they are coherent by
+    /// construction. (Named limitation: a clock regression WITHIN an epoch still shifts the
+    /// 30-second cookie freshness; the real fix is a monotonic clock, outside this slice.)
+
     fn advance_epoch(&mut self, now: u64) {
         let e = cookie_epoch_id(now, EPOCH_DURATION_SECS);
         if e > self.epoch {
@@ -1328,7 +1328,7 @@ impl RelayNode {
         self.discovery.retain(|_, rec| rec.expiry > now);
     }
 
-    /// Обработать входящее сообщение. `now` — часы узла. One-step wrapper for callers that are
+    /// Handle an incoming message. `now` is the node's clock. One-step wrapper for callers t
     /// not the serve loop (tests, the in-process transport): admits, then deposits immediately.
     /// The serve loop uses `admit_send` and does the deposit after releasing the relay lock.
     pub fn handle(&mut self, msg: &WireMessage, now: u64) -> Response {
@@ -1344,7 +1344,7 @@ impl RelayNode {
     pub fn admit_send(&mut self, msg: &WireMessage, now: u64) -> Result<AdmittedDeposit, Response> {
         self.advance_epoch(now);
 
-        // raw_len ≈ размер груза + служебные поля (для Ступени 0).
+        // raw_len ≈ the payload size plus the framing fields (for Stage 0).
         let raw_len = msg.payload.approx_len() + 128;
         let req = Request {
             raw_len,
@@ -1374,7 +1374,7 @@ impl RelayNode {
         );
         match outcome {
             Outcome::Challenge(_) => {
-                // Первый контакт: выдать cookie, привязанный к адресу клиента.
+                // First contact: issue a cookie bound to the client's address.
                 let cookie = self.keyring.issue(&msg.client_addr, &msg.carrier_id, now as u32);
                 Err(Response::NeedCookie(cookie))
             }
@@ -1383,10 +1383,10 @@ impl RelayNode {
         }
     }
 
-    /// Аутентифицированный fetch (§7-владение mailbox). Требует cookie
-    /// (DoS-гейт + свежесть, как send) И доказательство владения приватным
-    /// ключом `mailbox`. Без доказательства — `Reject`, **mailbox НЕ трогается**
-    /// (иначе кто угодно, зная pubkey-адрес, сливал бы чужую очередь).
+    /// An authenticated fetch (§7 mailbox ownership). It requires a cookie (a DoS gate plus
+    /// freshness, as on send) AND a proof of possession of the `mailbox` private key. Without the
+    /// proof it is a `Reject` and **the mailbox is NOT touched** (otherwise anyone knowing the
+    /// public address could drain someone else's queue).
     ///
     /// One-step wrapper; the serve loop uses `admit_fetch` and serves the page after releasing
     /// the relay lock (#142).
@@ -1402,7 +1402,7 @@ impl RelayNode {
     pub fn admit_fetch(&mut self, req: &FetchRequest, now: u64) -> Result<AdmittedFetch, FetchResponse> {
         self.advance_epoch(now);
 
-        // Cookie: нет/невалиден → challenge (как на send).
+        // Cookie: missing or invalid → challenge (as on send).
         let cookie = match req.cookie {
             Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => c,
             _ => {
@@ -1474,10 +1474,10 @@ impl RelayNode {
         })
     }
 
-    /// §12 публикация bundle. Cookie-gate (DoS/свежесть, как fetch) + fixed-length check on
+    /// §12 bundle publication. Cookie-gated (DoS and freshness, as with fetch) plus a fixed-length
     /// `kem_ek`/`prekey_sig` (A10-1, #231 — both are stored verbatim, never parsed, here) +
-    /// ownership-proof владения IK. `bundle.ik_pub` — ключ хранения. Перезапись своего —
-    /// всегда; новый IK при полном хранилище → отказ (не тихий сброс).
+    /// ownership proof of the IK. `bundle.ik_pub` is the storage key. Overwriting one's own is
+    /// always allowed; a new IK when storage is full is refused (never a silent drop).
     pub fn handle_publish(&mut self, req: &PublishRequest, now: u64) -> PublishResponse {
         self.advance_epoch(now);
 
@@ -1504,7 +1504,7 @@ impl RelayNode {
 
         let ik = req.bundle.ik_pub;
         let shared = self.relay_identity.dh(&PublicKey::from(ik));
-        // Low-order guard (как fetch-auth): нулевой общий секрет известен атакующему.
+        // Low-order guard (as in fetch-auth): a zero shared secret is known to the attacker.
         if shared.ct_eq(&[0u8; 32]).unwrap_u8() == 1 {
             return PublishResponse::Rejected("publish auth failed".into());
         }
@@ -1513,7 +1513,7 @@ impl RelayNode {
             return PublishResponse::Rejected("publish auth failed".into());
         }
 
-        // Bounded: перезапись существующего IK — ок; новый при полноте — отказ.
+        // Bounded: overwriting an existing IK is fine; a new one when full is refused.
         let is_new_slot = !self.bundles.contains_key(&ik);
         if is_new_slot && self.bundles.len() >= MAX_BUNDLES {
             return PublishResponse::Rejected("BundleStoreFull".into());
@@ -1614,9 +1614,9 @@ impl RelayNode {
         PublishResponse::Published
     }
 
-    /// §12 fetch bundle — ПУБЛИЧНЫЙ (bundle = публичный материал, без auth).
-    /// `None` — не опубликован. Внимание: relay НЕ доверенный якорь личности —
-    /// подлинность возвращённого IK проверяется вне канала (см. STATUS).
+    /// §12 bundle fetch — PUBLIC (a bundle is public material, no auth).
+    /// `None` means it was never published. Note: the relay is NOT a trusted identity anchor —
+    /// the authenticity of the returned IK is checked out of band (see STATUS).
     pub fn get_bundle(&self, ik: &[u8; 32]) -> Option<PreKeyBundle> {
         // NEVER carries a one-time prekey. This read is unauthenticated, and handing out an OPK
         // is destructive — that combination let anyone drain a victim's batch and push every
@@ -1697,8 +1697,8 @@ impl RelayNode {
 
 
 
-/// In-process транспорт: клиент и relay — разные объекты, общаются через этот
-/// канал (не прямой вызов), чтобы loopback моделировал две реальные точки.
+/// The in-process transport: the client and the relay are separate objects talking through this
+/// channel (not a direct call), so the loopback models two real endpoints.
 #[derive(Clone)]
 pub struct InMemoryTransport {
     relay: Rc<RefCell<RelayNode>>,
@@ -1976,9 +1976,9 @@ mod tests {
         );
     }
 
-    /// §12 write-side auth: опубликовать bundle под чужим IK нельзя. Владелец
-    /// (proof своим IK) — ок; чужой (proof своим IK под IK жертвы) — отказ.
-    /// Останавливает deliverability-DoS (перезапись чужого bundle).
+    /// §12 write-side auth: publishing a bundle under someone else's IK is impossible. The owner
+    /// (a proof with their own IK) succeeds; a stranger (a proof with their own key under the
+    /// victim's IK) is refused. This stops a deliverability DoS (overwriting someone's bundle).
     #[test]
     fn publish_requires_ik_ownership_proof() {
         let mut relay = RelayNode::new(NOW);
@@ -1993,7 +1993,7 @@ mod tests {
         relay.issue_capability(cap.clone());
         let nonce = b"publish-nonce-1".to_vec();
 
-        // Владелец: proof под приватным IK Bob против relay — публикуется.
+        // The owner: a proof under Bob's private IK against the relay — publishes.
         let good = publish_proof(&bob.ik().dh(&relay_pub), &cookie.mac, &bundle);
         let ok = PublishRequest {
             bundle: bundle.clone(),
@@ -2009,8 +2009,8 @@ mod tests {
         assert!(matches!(relay.handle_publish(&ok, NOW), PublishResponse::Published));
         assert!(relay.get_bundle(&bundle.ik_pub).is_some());
 
-        // Чужой: Mallory заявляет IK Bob, но подписать может лишь СВОИМ ключом —
-        // relay сверяет через DH(relay, bob_ik) → не сойдётся → отказ.
+        // The stranger: Mallory claims Bob's IK but can only sign with HER OWN key, and the relay
+        // checks through DH(relay, bob_ik) → it does not match → refused.
         let mallory = Account::generate();
         let mut forged = mallory.prekey_bundle();
         forged.ik_pub = bundle.ik_pub; // impersonate Bob
@@ -2031,7 +2031,7 @@ mod tests {
             matches!(relay.handle_publish(&attack, NOW), PublishResponse::Rejected(_)),
             "a stranger must not overwrite the bundle under Bob's IK"
         );
-        // bundle Bob не тронут (тот же prekey, что опубликовал он).
+        // Bob's bundle is untouched (the same prekey he published).
         assert_eq!(relay.get_bundle(&bundle.ik_pub).unwrap().prekey_pub, bundle.prekey_pub);
     }
 
@@ -2096,7 +2096,7 @@ mod tests {
         assert!(relay.get_bundle(&bob.identity_public()).is_some());
     }
 
-    /// Публикация без cookie → challenge (DoS-gate, как fetch).
+    /// Publishing without a cookie → challenge (a DoS gate, as with fetch).
     #[test]
     fn publish_without_cookie_is_challenged() {
         let mut relay = RelayNode::new(NOW);

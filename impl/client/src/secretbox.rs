@@ -1,34 +1,34 @@
-//! At-rest шифрование client-секретов.
+//! At-rest encryption of the client's secrets.
 //!
-//! `Argon2id(passphrase, salt)` → мастер-ключ (выводится ОДИН раз на процесс),
-//! `XChaCha20-Poly1305` со СВЕЖИМ random 24-байтным nonce на КАЖДУЮ запись.
-//! 192-битный nonce делает случайную свежесть безопасной без счётчика — критично,
-//! т.к. `sessions.dat` перезаписывается на каждую отправку/приём под ФИКСИРОВАННЫМ
-//! ключом (повтор nonce = катастрофа keystream-reuse).
+//! `Argon2id(passphrase, salt)` gives a master key (derived ONCE per process), and
+//! `XChaCha20-Poly1305` uses a FRESH random 24-byte nonce on EVERY write.
+//! A 192-bit nonce makes random freshness safe without a counter — which is critical, since
+//! `sessions.dat` is rewritten on every send and receive under a FIXED key (a repeated nonce is a
+//! keystream-reuse catastrophe).
 //!
-//! # Что это защищает — и что НЕТ (честно):
-//! Защищает **ХОЛОДНЫЙ диск**: украденный ноутбук, бэкап, синхронизированный
-//! `~/.config`. НЕ защищает работающий процесс: пароль из env читаем из
-//! `/proc/<pid>/environ` живого хоста → дыру «живая принимающая цепочка на диске»
-//! при ГОРЯЧЕЙ компрометации это НЕ закрывает. Заявляем только cold-disk.
+//! # What this protects — and what it does NOT (honestly):
+//! It protects a **COLD disk**: a stolen laptop, a backup, a synced `~/.config`. It does NOT
+//! protect a running process: a password in the environment is readable from `/proc/<pid>/environ`
+//! on a live host, so the "a live receiving chain is on disk" hole is NOT closed under a HOT
+//! compromise. The claim is cold-disk only.
 //!
-//! # Формат v2: контекст, а не один ключ на всё
+//! # Format v2: context, not one key for everything
 //!
-//! Blob: `MAGIC(4) ‖ state_version(2 LE) ‖ nonce(24) ‖ AEAD-ciphertext`, где ключ —
-//! НЕ мастер-ключ, а `HKDF(master, label)`, и `label` (логическое имя файла внутри
-//! аккаунта) плюс версия входят в AAD.
+//! The blob is `MAGIC(4) ‖ state_version(2 LE) ‖ nonce(24) ‖ AEAD ciphertext`, where the key is NOT
+//! the master key but `HKDF(master, label)`, and `label` (the logical file name inside the account)
+//! plus the version go into the AAD.
 //!
-//! Раньше все файлы всех аккаунтов шифровались ОДНИМ ключом без AAD (CRYPTO-05):
-//! противник с доступом к диску мог подложить `contacts.dat` одного аккаунта вместо
-//! другого или `sessions.dat` вместо `net.dat` — всё расшифровывалось штатно, потому
-//! что шифртекст ничем не был связан с местом, где лежит. Теперь связан дважды:
-//! разные `label` → разные ключи (чужой файл просто не откроется), и AAD ловит
-//! случай, если ключевой вывод когда-нибудь совпадёт.
+//! Previously every file of every account was encrypted with ONE key and no AAD (CRYPTO-05): an
+//! adversary with disk access could swap one account's `contacts.dat` for another's, or
+//! `sessions.dat` in place of `net.dat` — everything decrypted normally, because the ciphertext was
+//! bound to nothing about where it lay. Now it is bound: different `label`s give different keys (a
+//! foreign file simply does not open), and the AAD catches the case where two key derivations ever
+//! coincide.
 //!
-//! `state_version` — это версия СХЕМЫ состояния, а не magic (A6-5). Magic ловит смену
-//! формата конверта один раз; версия обязана расти при каждом изменении структур,
-//! которые сюда сериализуются, и старый бинарник, встретив бо́льшую версию, ОТКАЖЕТ
-//! громко вместо того чтобы «дочитать с дефолтами» и записать обратно с потерей полей.
+//! `state_version` is the version of the state SCHEMA, not a magic value (A6-5). The magic catches
+//! an envelope-format change once; the version must rise on every change to the structures
+//! serialised into it, so that an old binary meeting a higher version fails LOUDLY instead of
+//! "reading it with defaults" and writing it back.
 
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
@@ -36,17 +36,17 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-/// Версионный префикс: меняем при смене формата КОНВЕРТА (не схемы состояния). `KRS2` = v2.
+/// The version prefix: bump it when the ENVELOPE format changes (not the state schema).
 pub(crate) const MAGIC: &[u8; 4] = b"KRS2";
 
-/// Версия СХЕМЫ состояния. Поднимать при ЛЮБОМ изменении структур, которые сериализуются
-/// под этот конверт (`Prefs`, `ContactRecord`, `SessionSnapshot`, `PendingUpload`, …).
+/// The version of the state SCHEMA. Raise it on ANY change to the structures serialised under this
+/// envelope (`Prefs`, `ContactRecord`, `SessionSnapshot`, `PendingUpload`, …).
 ///
-/// Зачем отдельно от magic: postcard позиционен, и `serde(default)` на хвостовом поле
-/// заставляет старый бинарник ПРИНЯТЬ новый файл, подставить дефолты и записать обратно —
-/// новые поля тихо исчезают (A6-5). Теперь такой файл не читается вовсе: «written by a newer
-/// KARST». Обратная сторона — осознанная: поднятие версии ЛОМАЕТ существующие локальные
-/// данные. Пользователей нет, миграций нет (см. docs/POSITIONING.md), ломать сейчас дёшево.
+/// Why it is separate from the magic: postcard is positional, and `serde(default)` on a trailing
+/// field makes an old binary ACCEPT a new file, substitute defaults and write it back, so the new
+/// fields silently disappear (A6-5). Such a file is now unreadable instead: "not KARST". The
+/// downside is deliberate: raising the version BREAKS existing local data. There are no users and
+/// no migrations (see docs/POSITIONING.md), so breaking it now is free.
 /// v5: the one-time prekey secrets moved INSIDE the session state file so the pair commits in
 /// one durable write (CRYPTO-26) — `sessions.dat` now holds `(generation, state, opks)` and
 /// `opks.dat` is gone. v6: the recovery phrase widened to 24 words, so the seed file is 32 bytes
@@ -78,7 +78,7 @@ pub const STATE_VERSION: u16 = 11;
 /// HONEST LIMIT, since `STATE_VERSION` might imply otherwise: a KDF change cannot produce the
 /// loud "written by an older/newer KARST" error. That message lives INSIDE the sealed blob, and
 /// reading it needs the right key — which is exactly what a changed profile no longer derives. So
-/// raising this constant makes existing local data fail as «неверный пароль», the misleading
+/// raising this constant makes existing local data fail as "wrong password", the misleading
 /// shape we remove everywhere else. It is unavoidable here: the deniable container has no
 /// plaintext header to carry a profile id, and adding one would be a tell. Version bumps of the
 /// KDF are therefore release-note events, not self-describing ones.
@@ -107,7 +107,7 @@ const NONCE_LEN: usize = 24;
 /// `MAGIC(4) ‖ state_version(2) ‖ nonce(24)`.
 const HEADER_LEN: usize = 4 + 2 + NONCE_LEN;
 
-/// Свежая 16-байтная соль (не секрет; уникальна на установку, пишется plaintext).
+/// A fresh 16-byte salt (not a secret; unique per installation, written in plaintext).
 pub fn random_salt() -> [u8; 16] {
     use chacha20poly1305::aead::rand_core::RngCore;
     let mut s = [0u8; 16];
@@ -131,8 +131,8 @@ pub fn random_salt() -> [u8; 16] {
 pub struct MasterKey([u8; 32]);
 
 impl MasterKey {
-    /// `Argon2id(passphrase, salt)` under the PINNED KARST profile. `salt` НЕ секрет (лежит
-    /// рядом plaintext), но должен быть уникален на установку (≥ 8 байт). Дорогой вызов — один раз.
+    /// `Argon2id(passphrase, salt)` under the PINNED KARST profile. `salt` is NOT a secret (it lies
+    /// beside the data in plaintext) but must be unique per installation (≥ 8 bytes). Expensive.
     ///
     /// The parameters are ours, not the library's. `Argon2::default()` used to decide them, which
     /// means a dependency bump that changes those defaults would silently derive a DIFFERENT key
@@ -187,10 +187,10 @@ impl MasterKey {
         self.0
     }
 
-    /// Ключ ИМЕННО для `label` — не мастер-ключ. Чужой файл, подложенный под это имя,
-    /// выводит другой ключ и не открывается (CRYPTO-05). `label` — логический путь файла
-    /// внутри аккаунта (`acct:<id>/net/sessions.dat`), а НЕ путь на диске: перенос каталога
-    /// не должен ничего ломать.
+    /// The key for THIS `label` specifically — not the master key. A foreign file dropped in its
+    /// place derives a different key and does not open (CRYPTO-05). `label` is a logical path
+    /// inside the account (`acct:<id>/net/sessions.dat`), NOT a path on disk: moving the directory
+    /// must break nothing.
     fn subkey(&self, label: &str) -> [u8; 32] {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
         let mut info = Vec::with_capacity(20 + label.len());
@@ -202,8 +202,8 @@ impl MasterKey {
         key
     }
 
-    /// AAD конверта: длино-префиксованный `label` + версии. Второй пояс поверх subkey —
-    /// и ровно то, что делает `state_version` неподделываемым.
+    /// The envelope's AAD: a length-prefixed `label` plus the versions. A second belt on top of
+    /// the key separation, and exactly what makes `state_version` unforgeable.
     fn context_aad(label: &str, version: u16) -> Vec<u8> {
         let mut a = Vec::with_capacity(10 + label.len());
         a.extend_from_slice(MAGIC);
@@ -213,8 +213,8 @@ impl MasterKey {
         a
     }
 
-    /// Зашифровать секрет ДЛЯ КОНКРЕТНОГО МЕСТА (`label`). СВЕЖИЙ random 24-байтный nonce
-    /// на каждый вызов (192 бита — случайной свежести достаточно без счётчика).
+    /// Encrypt a secret FOR A SPECIFIC PLACE (`label`). A FRESH random 24-byte nonce on every call
+    /// (192 bits — random freshness is enough without a counter).
     pub fn seal(&self, label: &str, plaintext: &[u8]) -> Vec<u8> {
         let key = self.subkey(label);
         let cipher = XChaCha20Poly1305::new((&key).into());
@@ -264,17 +264,18 @@ impl MasterKey {
             .map_err(|_| "no hidden volume / wrong key".to_string())
     }
 
-    /// Расшифровать содержимое `label`. Три РАЗЛИЧИМЫХ отказа:
-    /// не наш формат (нужен re-init); файл написан другой версией схемы (нужен другой
-    /// бинарник, а не «дочитаем с дефолтами»); неверный пароль / порча / файл не отсюда.
+    /// Decrypt the contents of `label`. Three DISTINGUISHABLE failures: not our format (re-init
+    /// needed); the file was written by a different schema version (a newer binary is needed, not
+    /// "read it with defaults"); wrong password, corruption, or a foreign file.
     pub fn open(&self, label: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
         if blob.len() < HEADER_LEN || &blob[..4] != MAGIC {
             return Err("not a KARST at-rest ciphertext (incompatible format — re-init needed?)".into());
         }
         let version = u16::from_le_bytes([blob[4], blob[5]]);
         if version != STATE_VERSION {
-            // Обе стороны громкие НАМЕРЕННО. Больше — файл новее нас (тихо дочитать = потерять
-            // поля при обратной записи, A6-5); меньше — старый формат, а миграций у нас нет.
+            // Both directions are loud DELIBERATELY. Higher means the file is newer than us
+            // (silently dropping fields on write-back, A6-5); lower means an old format, and there
+            // are no migrations.
             let side = if version > STATE_VERSION { "newer" } else { "older" };
             return Err(format!(
                 "state file written by a {side} KARST (format v{version}, this build speaks \
@@ -346,7 +347,7 @@ mod tests {
         assert_eq!(k.open(L, &blob).unwrap(), b"secret key material");
     }
 
-    /// Несущее: неверный пароль → AEAD-ОТКАЗ, не тихий мусор.
+    /// Load-bearing: a wrong password gives an AEAD FAILURE, not silent garbage.
     #[test]
     fn wrong_passphrase_fails_not_garbage() {
         let good = MasterKey::derive(b"correct horse", SALT).unwrap();
@@ -355,8 +356,8 @@ mod tests {
         assert!(bad.open(L, &blob).is_err(), "a wrong password must FAIL rather than return garbage");
     }
 
-    /// Несущее (не no-op): на диске нет открытых байтов секрета. Та же форма, что
-    /// wire_bytes_are_ciphertext для Noise — ловит «случайно записали plaintext».
+    /// Load-bearing (not a no-op): there are no plaintext bytes of the secret on disk. The same
+    /// shape as wire_bytes_are_ciphertext for Noise — it catches "we accidentally wrote plaintext".
     #[test]
     fn ciphertext_does_not_contain_plaintext() {
         let k = MasterKey::derive(b"pw", SALT).unwrap();
@@ -368,8 +369,8 @@ mod tests {
         );
     }
 
-    /// Ветка НЕ-нашего формата (нет magic) → ошибка «re-init», отдельная от
-    /// AEAD-провала. Пиннит поведение версионного magic (миграция pre-at-rest).
+    /// The not-our-format branch (no magic) gives a "re-init" error, distinct from an AEAD
+    /// failure. It pins the behaviour of the versioned magic (migration from pre-at-rest).
     #[test]
     fn missing_magic_is_reinit_error_not_aead() {
         let k = MasterKey::derive(b"pw", SALT).unwrap();
@@ -378,8 +379,8 @@ mod tests {
         assert!(err.contains("re-init"), "a foreign format must name re-init explicitly, got: {err}");
     }
 
-    /// Несущее: два seal ОДИНАКОВОГО текста → РАЗНЫЕ nonce/ciphertext. Пиннит
-    /// свежий-nonce-на-запись (фикс.ключ + повтор nonce = keystream-reuse).
+    /// Load-bearing: two seals of the SAME text give DIFFERENT nonces and ciphertexts. It pins
+    /// fresh-nonce-per-write (a fixed key plus a repeated nonce is keystream reuse).
     #[test]
     fn identical_plaintext_yields_fresh_nonce() {
         let k = MasterKey::derive(b"pw", SALT).unwrap();

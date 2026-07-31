@@ -20,8 +20,8 @@
 //!
 //! The AEAD key is derived from TWO secrets: an ephemeral X25519 against the recipient's static
 //! `ik`, AND ML-KEM-768 against their long-lived `kem_ek`. The `pq_shared` slot in `derive_key`
+//! `ik`, AND ML-KEM-768 against their long-lived `kem_ek`. The `pq_shared` slot in `derive_key`
 //! was left for exactly this — adding it turned out to be filling a slot rather than a rewrite.
-//! оказалось заполнением слота, а не переписью.
 //!
 //! What it CLOSED: harvest-now-decrypt-later against the social graph. An adversary who recorded
 //! an opener today can no longer reconstruct "who wrote to whom first" by breaking one X25519 with

@@ -893,3 +893,108 @@ mod routing_contribution_is_derivable_by_both_sides {
         );
     }
 }
+
+/// **Public protocol vectors, and a SECOND implementation that must agree with them** (QA-4).
+///
+/// Our own tests are written by whoever wrote the code and inherit its misunderstandings. A test
+/// that says "`kdf_rk` returns what `kdf_rk` returned last time" catches a typo and nothing else;
+/// it cannot catch a misread specification, because both sides of the comparison come from the
+/// same reading. So the vectors below are checked twice: once here against the live code, and once
+/// by `scripts/verify_vectors.py`, which reimplements the key schedule from the written rules
+/// using only Python's standard library — no shared code, no shared crate, no shared reading.
+///
+/// **Why the key schedule and not the ciphertext.** ChaCha20-Poly1305 is not in Python's standard
+/// library, and pulling in a dependency would put a third party's reading of RFC 8439 in the place
+/// where an INDEPENDENT reading is supposed to be. HKDF-SHA256 and HMAC-SHA256 are stdlib, so the
+/// derivation chain — where a misread spec actually bites, and where a mistake silently produces
+/// keys that agree with themselves forever — is fully covered without importing anyone's opinion.
+///
+/// Pre-alpha means these may be regenerated deliberately (`KARST_REGEN_VECTORS=1`), but BOTH
+/// implementations must then be updated and agree again, or the exercise is theatre.
+#[cfg(test)]
+mod protocol_vectors {
+    use super::*;
+
+    const VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/ratchet_kdf.json");
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Deterministic inputs, chosen to be obviously arbitrary rather than accidentally special:
+    /// no all-zero keys (which hide a missing salt), no equal inputs (which hide a swapped
+    /// argument).
+    fn cases() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let rk = [0x11u8; 32];
+        let dh = [0x22u8; 32];
+        let ck = [0x33u8; 32];
+        let mk = [0x44u8; 32];
+        let salt = [0x55u8; SALT_LEN];
+
+        out.push(("routing_contrib".into(), hex(&routing_contrib(&dh))));
+        let (new_rk, chain) = kdf_rk(&rk, &dh);
+        out.push(("kdf_rk.new_rk".into(), hex(&new_rk)));
+        out.push(("kdf_rk.ck".into(), hex(&chain)));
+        let (next_ck, msg_key) = kdf_ck(&ck);
+        out.push(("kdf_ck.next_ck".into(), hex(&next_ck)));
+        out.push(("kdf_ck.mk".into(), hex(&msg_key)));
+        let (key, nonce) = message_aead(&mk, &salt);
+        out.push(("message_aead.key".into(), hex(&key)));
+        out.push(("message_aead.nonce".into(), hex(&nonce)));
+
+        // The AAD byte layout is part of the wire contract: a reordering here breaks every peer
+        // while every local test still passes, because both sides would reorder together.
+        let header = Header { dh: [0x66u8; 32], pn: 0x0102_0304, n: 0x0506_0708, salt };
+        out.push(("aad".into(), hex(&aad(&header))));
+        out
+    }
+
+    fn render(cases: &[(String, String)]) -> String {
+        let body: Vec<String> =
+            cases.iter().map(|(k, v)| format!("  \"{k}\": \"{v}\"")).collect();
+        format!("{{\n{}\n}}\n", body.join(",\n"))
+    }
+
+    /// The checked-in vectors are what this build produces.
+    ///
+    /// DISCRIMINATING by construction: change any constant in the key schedule — an info string, a
+    /// salt argument, the 0x01/0x02 HMAC tags, the AAD field order — and this reds with the two
+    /// values side by side.
+    #[test]
+    fn the_checked_in_vectors_match_this_build() {
+        let produced = render(&cases());
+        if std::env::var_os("KARST_REGEN_VECTORS").is_some() {
+            std::fs::write(VECTORS, &produced).expect("writing vectors");
+            eprintln!("KARST_REGEN_VECTORS: rewrote {VECTORS} — update verify_vectors.py to match");
+        }
+        let on_disk = std::fs::read_to_string(VECTORS).unwrap_or_default();
+        assert_eq!(
+            on_disk, produced,
+            "the key schedule changed. If that was deliberate: regenerate with \
+             KARST_REGEN_VECTORS=1 AND update scripts/verify_vectors.py, which must reach the \
+             same numbers from the written rules alone. Updating only one of the two turns this \
+             into a test of nothing."
+        );
+    }
+
+    /// The INDEPENDENT implementation agrees.
+    ///
+    /// Fails rather than skips when `python3` is missing. A vector check that quietly skips is the
+    /// exact failure this file exists to prevent: green, and verifying nothing.
+    #[test]
+    fn an_independent_implementation_reaches_the_same_numbers() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/verify_vectors.py");
+        let out = std::process::Command::new("python3")
+            .arg(script)
+            .arg(VECTORS)
+            .output()
+            .expect("python3 is required for the independent vector check — install it");
+        assert!(
+            out.status.success(),
+            "the independent implementation disagrees with ours:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

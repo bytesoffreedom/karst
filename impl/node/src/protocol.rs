@@ -682,16 +682,8 @@ impl SignedDescriptor {
     /// never lapses: without it, `expires_at` is a promise the signer makes to itself, and one line
     /// of a hostile fork removes it.
     pub fn verified(&self, now: u64) -> Option<&NodeDescriptor> {
-        if self.desc.expires_at.saturating_add(DESCRIPTOR_SKEW_SECS) <= now {
-            return None; // lapsed
-        }
-        if self.desc.expires_at
-            > self.desc.issued_at.saturating_add(DESCRIPTOR_TTL_SECS + DESCRIPTOR_SKEW_SECS)
-        {
-            return None; // a validity window longer than the protocol allows
-        }
-        if self.desc.issued_at > now.saturating_add(DESCRIPTOR_SKEW_SECS) {
-            return None; // signed in the future
+        if !self.window_contains(now) {
+            return None;
         }
         let ok = crate::discovery::verify(
             &self.desc.relay.noise_pub,
@@ -699,6 +691,33 @@ impl SignedDescriptor {
             &self.sig,
         );
         ok.then_some(&self.desc)
+    }
+
+    /// The validity-window half of [`verified`], WITHOUT the signature check — arithmetic on three
+    /// `u64`s and nothing else.
+    ///
+    /// This exists because re-verifying is not free and, on a stored descriptor, not needed. A
+    /// descriptor only enters `known_relays` through `add_relay`, which refuses anything whose
+    /// signature does not verify; bytes in memory do not stop being signed. What DOES change with
+    /// time is the window, so that is what a re-check has to look at.
+    ///
+    /// Getting this wrong made `GetNodeList` — a PUBLIC read, with no admission gate — do up to
+    /// `MAX_KNOWN_RELAYS` XEdDSA verifications under the relay lock, once per request, on behalf of
+    /// anyone who asked. That is a work amplifier handed to strangers, and it was introduced by the
+    /// commit that made the list signed in the first place.
+    pub fn window_contains(&self, now: u64) -> bool {
+        if self.desc.expires_at.saturating_add(DESCRIPTOR_SKEW_SECS) <= now {
+            return false; // lapsed
+        }
+        if self.desc.expires_at
+            > self.desc.issued_at.saturating_add(DESCRIPTOR_TTL_SECS + DESCRIPTOR_SKEW_SECS)
+        {
+            return false; // a validity window longer than the protocol allows
+        }
+        if self.desc.issued_at > now.saturating_add(DESCRIPTOR_SKEW_SECS) {
+            return false; // signed in the future
+        }
+        true
     }
 }
 /// §15 large-file upload: one ciphertext chunk of an E2E-encrypted blob. Cookie-gated

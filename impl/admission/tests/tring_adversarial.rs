@@ -1,8 +1,8 @@
-//! Состязательные тесты пороговой кольцевой подписи §7.3 (tring).
+//! Adversarial tests for the §7.3 threshold ring signature (tring).
 //!
-//! Весь файл под feature-флагом `unaudited-crypto`. Именно эти тесты несут
-//! вес: happy-path на security-крипте ничего не доказывает — доказывает то,
-//! что ДОЛЖНО провалиться и проваливается. Запуск:
+//! The whole file sits behind the `unaudited-crypto` feature flag. These are the tests that carry
+//! the weight: a happy path over security crypto proves nothing — what proves something is what
+//! MUST fail and does. Run with:
 //!   cargo test --features unaudited-crypto --test tring_adversarial
 #![cfg(feature = "unaudited-crypto")]
 
@@ -11,7 +11,7 @@ use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use sha2::{Digest, Sha512};
 
-/// Детерминированный секрет issuer из seed (для воспроизводимых тестов).
+/// A deterministic issuer secret from a seed (for reproducible tests).
 fn keypair(seed: &[u8]) -> IssuerKeypair {
     let mut h = Sha512::new();
     h.update(b"tring-test-key");
@@ -21,7 +21,7 @@ fn keypair(seed: &[u8]) -> IssuerKeypair {
     IssuerKeypair::from_secret(Scalar::from_bytes_mod_order_wide(&wide))
 }
 
-/// Кольцо из N issuer'ов + их секреты по индексам.
+/// A ring of N issuers plus their secrets by index.
 fn make_ring(n: usize) -> (Vec<RistrettoPoint>, Vec<Scalar>) {
     let mut pubs = Vec::new();
     let mut secs = Vec::new();
@@ -37,7 +37,7 @@ fn signers(secs: &[Scalar], idxs: &[usize]) -> Vec<(usize, Scalar)> {
     idxs.iter().map(|&i| (i, secs[i])).collect()
 }
 
-// ---------- Базовая корректность (необходимый минимум, не доказательство) ----------
+// ---------- Basic correctness (the necessary minimum, not a proof) ----------
 
 #[test]
 fn valid_t_of_n_verifies() {
@@ -46,41 +46,41 @@ fn valid_t_of_n_verifies() {
     assert!(verify(b"admission-token-nonce", &ring, 2, &sig));
 }
 
-// ---------- Направление неравенства: ≥ t, не = t ----------
+// ---------- The direction of the inequality: ≥ t, not = t ----------
 
 #[test]
 fn more_than_t_signers_still_verifies_under_t_policy() {
-    // 3 подписанта под политикой t=2 — сильнее требуемого, ДОЛЖНО проходить.
+    // Three signers under a policy of t=2 — stronger than required, and it MUST pass.
     let (ring, secs) = make_ring(5);
     let sig = sign(b"m", &ring, 2, &signers(&secs, &[0, 2, 4])).unwrap();
-    assert!(verify(b"m", &ring, 2, &sig), "t+1 подписантов обязаны проходить политику t");
+    assert!(verify(b"m", &ring, 2, &sig), "t+1 signers must satisfy a policy of t");
 }
 
 #[test]
 fn fewer_than_t_signers_fails_under_t_policy() {
-    // ВНИМАНИЕ: это тест enforcement ПОЛИТИКИ на ЧЕСТНО построенной подписи,
-    // НЕ тест неподделываемости. Он показывает, что легитимная подпись порога
-    // t=1 не засчитывается под политику t=2 (степень полинома n−1 > n−2).
-    // Устойчивость к подделке злонамеренным sub-threshold-подписантом держится
-    // на теореме soundness CDS + Fiat–Shamir (ROM) и unit-тестом не
-    // проверяется — не путать одно с другим (см. doc модуля tring).
+    // NOTE: this tests POLICY enforcement on an HONESTLY built signature, NOT unforgeability. It
+    // shows that a legitimate t=1 signature does not count under a policy of t=2 (the polynomial
+    // degree n−1 > n−2). Resistance to forgery by a malicious sub-threshold signer rests on the
+    // CDS soundness theorem plus Fiat–Shamir (ROM) and is not checked by a unit test — do not
+    // confuse the two (see the tring module docs).
+
     let (ring, secs) = make_ring(5);
     let sig_t1 = sign(b"m", &ring, 1, &signers(&secs, &[3])).unwrap();
-    assert!(verify(b"m", &ring, 1, &sig_t1), "sanity: t=1 подпись валидна под t=1");
+    assert!(verify(b"m", &ring, 1, &sig_t1), "sanity: a t=1 signature is valid under t=1");
     assert!(
         !verify(b"m", &ring, 2, &sig_t1),
-        "подпись одного подписанта НЕ должна проходить политику '2 из 5'"
+        "a single-signer signature must NOT satisfy a policy of two or more"
     );
 }
 
 #[test]
 fn cannot_sign_below_threshold() {
-    // API не даёт собрать подпись, имея меньше t секретов.
+    // The API does not let a signature be built with fewer than t secrets.
     let (ring, secs) = make_ring(5);
     assert!(sign(b"m", &ring, 3, &signers(&secs, &[0, 1])).is_err());
 }
 
-// ---------- Подделка: любое искажение подписи ломает проверку ----------
+// ---------- Forgery: any distortion of the signature breaks verification ----------
 
 #[test]
 fn tampering_any_challenge_fails() {
@@ -108,94 +108,94 @@ fn all_zero_signature_fails() {
     assert!(!verify(b"m", &ring, 2, &sig));
 }
 
-// ---------- Сильный Fiat–Shamir: привязка к сообщению, кольцу, порогу ----------
+// ---------- Strong Fiat–Shamir: binding to the message, the ring and the threshold ----------
 
 #[test]
 fn wrong_message_fails() {
     let (ring, secs) = make_ring(5);
     let sig = sign(b"message-A", &ring, 2, &signers(&secs, &[0, 1])).unwrap();
-    assert!(!verify(b"message-B", &ring, 2, &sig), "подпись не привязана к сообщению");
+    assert!(!verify(b"message-B", &ring, 2, &sig), "the signature is not bound to the message");
 }
 
 #[test]
 fn reordered_ring_fails() {
     let (mut ring, secs) = make_ring(5);
     let sig = sign(b"m", &ring, 2, &signers(&secs, &[0, 1])).unwrap();
-    ring.swap(0, 4); // то же множество ключей, другой порядок
-    assert!(!verify(b"m", &ring, 2, &sig), "подпись не привязана к порядку кольца");
+    ring.swap(0, 4); // the same key set, a different order
+    assert!(!verify(b"m", &ring, 2, &sig), "the signature is not bound to the ring order");
 }
 
 #[test]
 fn different_ring_member_fails() {
     let (mut ring, secs) = make_ring(5);
     let sig = sign(b"m", &ring, 2, &signers(&secs, &[0, 1])).unwrap();
-    ring[2] = keypair(b"outsider").public; // подмена одного члена кольца
+    ring[2] = keypair(b"outsider").public; // substituting one ring member
     assert!(!verify(b"m", &ring, 2, &sig));
 }
 
 #[test]
 fn threshold_in_hash_binds_policy() {
-    // Подпись, сделанная под t=2, проверяется по хэшу, куда t входит явно →
-    // проверка под другим t считает другой мастер-challenge. (Отдельно от
-    // проверки степени — здесь именно привязка t к Fiat–Shamir.)
+    // A signature made under t=2 is verified against a hash that t enters, so verifying under a
+    // different t computes a different master challenge. (Separately from the degree check — this
+    // is specifically about t being bound into Fiat–Shamir.)
     let (ring, secs) = make_ring(5);
     let sig = sign(b"m", &ring, 2, &signers(&secs, &[0, 1, 2])).unwrap();
-    // Под t=2 проходит; под t=1 (другой мастер-challenge) — нет, хотя
-    // «3 подписанта ≥ 1» по количеству. Это ловит именно привязку t в хэше.
+    // Under t=2 it passes; under t=1 (a different master challenge) it does not, even though
+    // "3 signers ≥ 1" by count. That is what catches the binding of t.
     assert!(verify(b"m", &ring, 2, &sig));
     assert!(!verify(b"m", &ring, 1, &sig));
 }
 
-// ---------- Несвязываемость / анонимность (НЕОБХОДИМОЕ, не достаточное) ----------
-// Полная анонимность держится на симуляционном (HVZK) аргументе — это
-// доказательство, а не assertEq. Тесты ниже проверяют лишь необходимые
-// признаки; имена честны и не заявляют «доказано, что анонимно».
+// ---------- Unlinkability / anonymity (NECESSARY, not sufficient) ----------
+// Full anonymity rests on a simulation (HVZK) argument — a proof, not an assertEq. The tests below
+// check only the necessary symptoms; their names are honest and do not claim "proven anonymous".
+
 
 #[test]
 fn signatures_are_format_identical_across_signer_sets() {
-    // Наблюдатель не должен отличать наборы подписантов по форме подписи.
+    // An observer must not be able to tell signer sets apart by the shape of the signature.
     let (ring, secs) = make_ring(5);
     let a = sign(b"m", &ring, 2, &signers(&secs, &[0, 1])).unwrap();
     let b = sign(b"m", &ring, 2, &signers(&secs, &[2, 4])).unwrap();
     assert_eq!(a.challenges.len(), b.challenges.len());
     assert_eq!(a.responses.len(), b.responses.len());
-    // Разные наборы → разные подписи (иначе набор бы утекал через равенство).
+    // Different sets give different signatures (otherwise the set would leak through equality).
     assert_ne!(a, b);
     assert!(verify(b"m", &ring, 2, &a) && verify(b"m", &ring, 2, &b));
 }
 
 #[test]
 fn deterministic_repro_but_ring_rebinds_nonce() {
-    // (1) Тот же вход → та же подпись: нет двух разных c при том же k → нет
-    //     утечки секрета (класс two-shares из RLN §7.4).
+    // (1) The same input gives the same signature: no two different challenges under the same k,
+    //     which is the secret-leak class (two shares, RLN §7.4).
     let (ring, secs) = make_ring(5);
     let s1 = sign(b"m", &ring, 2, &signers(&secs, &[0, 1])).unwrap();
     let s2 = sign(b"m", &ring, 2, &signers(&secs, &[0, 1])).unwrap();
-    assert_eq!(s1, s2, "детерминированная воспроизводимость нарушена");
+    assert_eq!(s1, s2, "deterministic reproducibility is broken");
 
-    // (2) Тот же подписант+сообщение, но ДРУГОЕ кольцо → ответ подписанта
-    //     меняется (nonce привязан к кольцу), а не остаётся при том же k.
+    // (2) The same signer and message but a DIFFERENT ring → the signer's response changes (the
+    //     nonce is bound to the ring) rather than staying at the same k.
     let (mut ring2, secs2) = make_ring(5);
     ring2[4] = keypair(b"different-5th").public;
     let mut secs2b = secs2.clone();
     secs2b[4] = keypair(b"different-5th").secret;
     let s3 = sign(b"m", &ring2, 2, &signers(&secs2b, &[0, 1])).unwrap();
-    // Ответ подписанта 0 не должен совпасть с таковым из s1 (иначе k не
-    // перепривязался бы к кольцу).
-    assert_ne!(s1.responses[0], s3.responses[0], "nonce не перепривязан к кольцу");
+    // Signer 0's response must not match the one from s1 (otherwise k was not rebound to the
+    // ring).
+    assert_ne!(s1.responses[0], s3.responses[0], "the nonce was not rebound to the ring");
 
-    // (3) То же кольцо+сообщение, но ДРУГОЙ набор подписантов ([0,1] vs [0,2]).
-    //     Это более прямой случай same-k-different-c: ответ подписанта 0
-    //     обязан измениться (nonce привязан к составу через sim_seed), иначе
-    //     при том же k и другом c_0 утёк бы секрет x_0.
+    // (3) The same ring and message but a DIFFERENT signer set ([0,1] vs [0,2]). A more direct
+    //     same-k-different-c case: signer 0's response must change (the nonce is bound to the
+    //     composition through sim_seed), otherwise the same k with a different c_0 would leak the
+    //     secret x_0.
     let s4 = sign(b"m", &ring, 2, &signers(&secs, &[0, 2])).unwrap();
     assert_ne!(
         s1.responses[0], s4.responses[0],
-        "nonce не перепривязан к набору подписантов (риск утечки класса RLN)"
+        "the nonce was not rebound to the signer set (the leak class above)"
     );
 }
 
-// ---------- Крайние значения порога ----------
+// ---------- Threshold edge values ----------
 
 #[test]
 fn threshold_one_is_plain_ring_signature() {
@@ -209,7 +209,7 @@ fn threshold_equals_n_requires_all() {
     let (ring, secs) = make_ring(4);
     let all = sign(b"m", &ring, 4, &signers(&secs, &[0, 1, 2, 3])).unwrap();
     assert!(verify(b"m", &ring, 4, &all));
-    // Три подписанта не могут удовлетворить t=N=4.
+    // Three signers cannot satisfy t=N=4.
     let three = sign(b"m", &ring, 3, &signers(&secs, &[0, 1, 2])).unwrap();
     assert!(!verify(b"m", &ring, 4, &three));
 }

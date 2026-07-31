@@ -1,10 +1,10 @@
-//! Тест-векторы для admission-протокола (§7).
+//! Test vectors for the admission protocol (§7).
 //!
-//! Детерминированные векторы генерируются из фиксированных ключей/входов и
-//! сериализуются в `vectors.json` (язык-агностичный формат), плюс проверяются
-//! свойства на стороне Rust. Цель — не только «наш код себя воспроизводит», а
-//! дать эталон, против которого можно писать вторую независимую реализацию
-//! (§14 требует независимых реализаций — им нужны общие векторы).
+//! Deterministic vectors are generated from fixed keys and serialised into `vectors.json` (a
+//! language-agnostic format), plus property checks on the Rust side. The goal is not merely "our
+//! code reproduces itself" but to provide a reference a second, independent implementation can be
+//! written against (§14 requires independent implementations, and they need shared vectors).
+
 
 use admission::capability::{Capability, CapabilityTable, Quota, Scope};
 use admission::cookie::{Cookie, CookieKeyring, COOKIE_WIRE_SIZE};
@@ -31,21 +31,21 @@ fn cookie_roundtrip_and_reject() {
 
     let cookie = keyring.issue(client, carrier, issued_at);
 
-    // Верный cookie принимается.
+    // A correct cookie is accepted.
     assert!(keyring.verify(&cookie, client, carrier, now).is_ok());
 
-    // Изменённый адрес → BadMac (MAC привязан к client_addr).
+    // A changed address gives BadMac (the MAC is bound to client_addr).
     assert!(keyring
         .verify(&cookie, b"198.51.100.8:44321", carrier, now)
         .is_err());
 
-    // Изменённый carrier → BadMac (амплификация через смену carrier закрыта).
+    // A changed carrier gives BadMac (amplification by switching carrier is closed).
     assert!(keyring.verify(&cookie, client, b"carrier-B", now).is_err());
 
-    // Просроченный по TTL → отказ.
+    // Past its TTL → refused.
     assert!(keyring.verify(&cookie, client, carrier, now + 1000).is_err());
 
-    // Сериализация фиксированного размера round-trips.
+    // The fixed-size serialisation round-trips.
     let bytes = cookie.to_bytes();
     assert_eq!(bytes.len(), COOKIE_WIRE_SIZE);
     let parsed = Cookie::from_bytes(&bytes).unwrap();
@@ -79,50 +79,50 @@ fn capability_proof_verifies_and_scope_enforced() {
     let epoch = 42u32;
     let proof = cap.prove(nonce, epoch);
 
-    // Верный proof + верный scope.
+    // A correct proof with the correct scope.
     assert!(table
         .verify(&proof, nonce, Scope::MessageDelivery, 1000)
         .is_ok());
 
-    // Неверный scope → ScopeMismatch.
+    // A wrong scope gives ScopeMismatch.
     assert!(table
         .verify(&proof, nonce, Scope::MailboxFetch, 1000)
         .is_err());
 
-    // Неверный nonce → BadMac.
+    // A wrong nonce gives BadMac.
     assert!(table
         .verify(&proof, b"other-nonce", Scope::MessageDelivery, 1000)
         .is_err());
 }
 
-// ---------- §7.4 RLN slashing — несущее свойство корректности ----------
+// ---------- §7.4 RLN slashing — the load-bearing correctness property ----------
 
 #[test]
 fn rln_two_shares_recover_secret() {
     let secret = IdentitySecret(Field::from(0x0BADC0DE_u64) + Field::from(7u64));
     let ext = external_nullifier(99, b"relay-scope-1");
 
-    // Два РАЗНЫХ сообщения в одну эпоху → превышение квоты (limit 1).
+    // Two DIFFERENT messages in one epoch → the quota (limit 1) is exceeded.
     let m1 = Field::from(111u64);
     let m2 = Field::from(222u64);
     let s1 = secret.share(&ext, m1);
     let s2 = secret.share(&ext, m2);
 
-    // Оба предъявления несут один и тот же публичный nullifier (детекция повтора).
+    // Both presentations carry the same public nullifier (that is the detection).
     assert_eq!(s1.nullifier, s2.nullifier);
 
-    // Slashing восстанавливает ровно identity_secret.
+    // Slashing recovers exactly the identity_secret.
     match slash(&s1, &s2) {
         SlashResult::Recovered(bytes) => assert_eq!(bytes, secret.0.to_bytes()),
-        other => panic!("ожидалось Recovered, получено {:?}", other),
+        other => panic!("expected Recovered, got {:?}", other),
     }
 }
 
 #[test]
 fn nullifier_is_not_the_slope() {
-    // Необходимое условие находки §7.4: публичный nullifier НЕ равен наклону.
-    // (Достаточность неразглашения из одной доли держится на preimage-
-    // стойкости H(slope) — её этот тест НЕ проверяет, лишь неравенство.)
+    // The necessary condition of the §7.4 finding: the public nullifier is NOT the slope.
+    // (Sufficiency — that one share reveals nothing — rests on the preimage resistance of
+    // H(slope), which this test does NOT check; only the inequality.)
     let secret = IdentitySecret(Field::from(123456789u64));
     let ext = external_nullifier(5, b"scope");
     let share = secret.share(&ext, Field::from(1000u64));
@@ -138,7 +138,7 @@ fn rln_different_identities_do_not_slash() {
     let ext = external_nullifier(1, b"scope");
     let sa = a.share(&ext, Field::from(10u64));
     let sb = b.share(&ext, Field::from(20u64));
-    // Разные nullifier'ы → это не двойное предъявление, восстановления нет.
+    // Different nullifiers → this is not a double presentation, and nothing is recovered.
     assert_eq!(slash(&sa, &sb), SlashResult::DifferentNullifier);
 }
 
@@ -148,7 +148,7 @@ fn rln_same_message_is_not_a_violation() {
     let ext = external_nullifier(2, b"scope");
     let m = Field::from(42u64);
     let share = s.share(&ext, m);
-    // Идентичный повтор (тот же message_hash) — не восстанавливаем (x1==x2).
+    // An identical repeat (the same message_hash) is not recoverable (x1==x2).
     assert_eq!(slash(&share, &share), SlashResult::SameMessage);
 }
 
@@ -157,7 +157,7 @@ fn rln_same_message_is_not_a_violation() {
 fn issuer_ring() -> IssuerRing {
     IssuerRing {
         issuer_pubkeys: vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32], [5u8; 32]],
-        threshold_t: 2, // «2 из 5»
+        threshold_t: 2, // "2 of 5"
     }
 }
 
@@ -181,7 +181,7 @@ fn pipeline_first_contact_gets_challenge() {
         max_raw_len: admission::params::MAX_PACKET_SIZE,
         client_addr: b"203.0.113.5:5000",
         carrier_id: b"c",
-        cookie: None, // первый контакт
+        cookie: None, // first contact
         request_nonce: b"n",
         requested_scope: Scope::MessageDelivery,
         credential: Credential::RlnQuota,
@@ -224,9 +224,9 @@ fn pipeline_capability_admits_then_replay_rejects() {
         credential: Credential::Capability(proof),
     };
 
-    // Первый раз — допущен.
+    // The first time — admitted.
     assert_eq!(pipe.process(&mk(), now, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()), Outcome::Admit);
-    // Повтор того же proof в ту же эпоху — replay.
+    // The same proof again in the same epoch — a replay.
     assert_eq!(
         pipe.process(&mk(), now, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()),
         Outcome::Reject(RejectReason::Replay)
@@ -250,7 +250,7 @@ fn pipeline_token_threshold_enforced() {
     let carrier = b"c";
     let cookie = keyring.issue(client, carrier, now as u32);
 
-    // Токен, «подписанный» 2 issuer'ами (порог соблюдён) — допущен.
+    // A token "signed" by 2 issuers (the threshold is met) — admitted.
     let good = MockRingVerifier::mock_token([0x77; 32], 0, 2);
     let mut replay = ReplayFilter::new(0, 1024);
     let req_good = admission::pipeline::Request {
@@ -265,7 +265,7 @@ fn pipeline_token_threshold_enforced() {
     };
     assert_eq!(pipe.process(&req_good, now, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()), Outcome::Admit);
 
-    // Токен всего с 1 подписантом (недобор порога 2) — отказ.
+    // A token with only 1 signer (below the threshold of 2) — refused.
     let weak = MockRingVerifier::mock_token([0x88; 32], 0, 1);
     let mut replay2 = ReplayFilter::new(0, 1024);
     let req_weak = admission::pipeline::Request {
@@ -314,7 +314,7 @@ fn pipeline_oversize_dropped_silently() {
     );
 }
 
-// ---------- Экспорт JSON тест-векторов ----------
+// ---------- Exporting the JSON test vectors ----------
 
 #[derive(Serialize)]
 struct CookieVector {
@@ -351,11 +351,11 @@ struct Vectors {
     rln: RlnVector,
 }
 
-// Замороженные ожидаемые значения (byte-level pin). Вторая независимая
-// реализация ОБЯЗАНА воспроизвести ровно эти байты — иначе конформанс не
-// достигнут. Тест ниже падает при любом дрейфе (другой hash_to_field,
-// другая сериализация, другой MAC), а не пересчитывает «правильный» ответ
-// на лету. Регенерация — только явно, через KARST_REGEN_VECTORS=1.
+// Frozen expected values (a byte-level pin). A second independent implementation MUST reproduce
+// exactly these bytes — otherwise consensus has not been reached. The test below fails on any
+// drift (a different hash_to_field, a different serialisation, a different MAC) rather than
+// recomputing the "right" answer on the fly. Regeneration is explicit only, through
+// KARST_REGEN_VECTORS=1.
 //
 // REGENERATED 2026-07-28, deliberately, for ONE reason: the cookie MAC input became
 // canonical (domain tag ‖ version ‖ length-prefixed client_addr ‖ length-prefixed
@@ -377,7 +377,7 @@ const FROZEN_RLN_NULLIFIER_HEX: &str =
 
 #[test]
 fn conformance_vectors_match_frozen() {
-    // Cookie-вектор.
+    // The cookie vector.
     let now = 1_000_000u64;
     let keyring = CookieKeyring::new(EPOCH_DURATION_SECS, now, RELAY_KEY_CUR, RELAY_KEY_PREV);
     let client = b"198.51.100.7:44321";
@@ -385,11 +385,11 @@ fn conformance_vectors_match_frozen() {
     let cookie = keyring.issue(client, carrier, now as u32);
     let verifies = keyring.verify(&cookie, client, carrier, now).is_ok();
 
-    // Byte-level pin: вычисленное обязано совпасть с замороженным.
+    // Byte-level pin: what was computed must equal what was frozen.
     assert_eq!(
         hex::encode(cookie.to_bytes()),
         FROZEN_COOKIE_WIRE_HEX,
-        "cookie wire-байты разошлись с замороженным вектором"
+        "the cookie wire bytes diverged from the frozen vector"
     );
 
     let cookie_vec = CookieVector {
@@ -404,7 +404,7 @@ fn conformance_vectors_match_frozen() {
         verifies,
     };
 
-    // RLN-вектор.
+    // The RLN vector.
     let secret = IdentitySecret(Field::from(0x0BADC0DEu64) + Field::from(7u64));
     let ext = external_nullifier(99, b"relay-scope-1");
     let m1 = Field::from(111u64);
@@ -416,7 +416,7 @@ fn conformance_vectors_match_frozen() {
         _ => (String::new(), false),
     };
 
-    // Byte-level pin для RLN: доли, nullifier и восстановленный секрет.
+    // A byte-level pin for RLN: the shares, the nullifier and the recovered secret.
     assert_eq!(hex::encode(secret.0.to_bytes()), FROZEN_RLN_SECRET_HEX);
     assert_eq!(hex::encode(s1.a1.to_bytes()), FROZEN_RLN_A1_1_HEX);
     assert_eq!(hex::encode(s2.a1.to_bytes()), FROZEN_RLN_A1_2_HEX);
@@ -447,9 +447,9 @@ fn conformance_vectors_match_frozen() {
         rln: rln_vec,
     };
 
-    // Регенерация committed-артефакта — только по явному запросу. По умолчанию
-    // тест герметичен и НИЧЕГО не пишет: он лишь сверяет вычисленное с
-    // замороженными константами выше. Обновлять vectors.json осознанно:
+    // Regenerating the committed artefact happens only on an explicit request. By default this
+    // test is hermetic and writes NOTHING: it only compares what was computed against the frozen
+    // constants above. Updating vectors.json is a deliberate act.
     //   KARST_REGEN_VECTORS=1 cargo test conformance_vectors_match_frozen
     if std::env::var("KARST_REGEN_VECTORS").is_ok() {
         let json = serde_json::to_string_pretty(&vectors).unwrap();

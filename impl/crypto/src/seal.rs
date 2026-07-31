@@ -89,7 +89,6 @@ impl Identity {
     /// sides obtain the same shared secret. It does NOT reveal the secret — only the shared DH.
     /// This is the identity key's second use in a DH (the first being the ephemeral-static seal);
     /// the domains are separated at the KDF level (`fetch_auth` vs `seal`).
-
     pub fn dh(&self, peer: &PublicKey) -> [u8; 32] {
         self.secret.diffie_hellman(peer).to_bytes()
     }

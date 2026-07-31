@@ -40,7 +40,6 @@ pub type Field = Scalar;
 /// substitution does NOT affect the property being checked (recovering the secret from two
 /// shares) — that is purely a field property and independent of the hash; Poseidon matters only
 /// so the same computation is cheap INSIDE a zk circuit, which does not exist here.
-
 fn hash_to_field(parts: &[&[u8]]) -> Field {
     let mut h = Sha512::new();
     for p in parts {
@@ -72,7 +71,6 @@ impl IdentitySecret {
     /// `H(identity_secret || external_nullifier)` — adopted here; the slope must be stable per
     /// epoch (otherwise two shares do not lie on one line) and secret (otherwise see the NOTE
     /// about the nullifier below).
-
     pub fn slope(&self, ext_nullifier: &Field) -> Field {
         hash_to_field(&[
             b"karst-rln-slope",
@@ -92,8 +90,6 @@ impl IdentitySecret {
     /// SEPARATE tag that is not the slope. Standard RLN does exactly that:
     /// `internal_nullifier = Poseidon(slope)` (a hash of the slope, not the slope itself). The
     /// correct variant is implemented here; the spec formula needs the fix (see the §7.4 patch).
-
-
     pub fn nullifier(&self, ext_nullifier: &Field) -> Field {
         let slope = self.slope(ext_nullifier);
         hash_to_field(&[b"karst-rln-null", slope.as_bytes()])
@@ -151,7 +147,6 @@ pub enum SlashResult {
 /// Two points (x1,y1),(x2,y2) on the line `y = s + slope*x` determine it uniquely:
 /// `slope = (y2-y1)/(x2-x1)`, `s = y1 - slope*x1`. This is the "economic penalty": exceed the
 /// quota (more than one share per epoch) and the secret is revealed.
-
 pub fn slash(s1: &Share, s2: &Share) -> SlashResult {
     if s1.nullifier != s2.nullifier {
         return SlashResult::DifferentNullifier;

@@ -698,7 +698,6 @@ fn carrier_adapter(proxy: Option<SocketAddr>, isolation: &str) -> Arc<dyn Transp
 /// A dev capability for LOCAL testing: the secret `[0x33;32]` is PUBLIC and matches what
 /// `karst-relay` hands out. Anyone can forge it — this is NOT "provisioning works". Real
 /// capability issuance (§7.2, from an issuer) is a separate layer and is not here.
-
 pub fn dev_capability() -> Capability {
     Capability {
         capability_id: [0xCA; 16],

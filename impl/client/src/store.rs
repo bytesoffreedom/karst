@@ -4142,7 +4142,6 @@ impl Store {
     /// (this is not a ratchet). A torn tail is dropped naturally in the process: only whole
     /// records are rewritten. Unlike append (O(1)) this is O(n) — call it on a user action or a
     /// sweep, never per message.
-
     pub fn rewrite_history(
         &self,
         mut keep: impl FnMut(&HistoryRecord) -> bool,
@@ -5379,7 +5378,6 @@ impl Vault {
     }
 
     /// Read the account registry (empty when the file is absent). Decrypted with the vault key.
-
     pub fn load_registry(&self) -> io::Result<Vec<AccountEntry>> {
         match std::fs::read(self.registry_path()) {
             Ok(blob) => {

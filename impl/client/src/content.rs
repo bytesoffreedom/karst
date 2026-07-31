@@ -48,7 +48,6 @@ pub const MAX_CHUNK_PAYLOAD: usize = 1024;
 /// and already round-trips through a relay — so 1024 bytes of text certainly fit in one Ratchet
 /// packet. It gates the UI (by byte length, so that two-byte characters are counted honestly),
 /// otherwise long text would silently fail as "could not send".
-
 pub const MAX_TEXT_BYTES: usize = MAX_CHUNK_PAYLOAD;
 /// The maximum number of chunks in an inline file. The binding limit is NOT the mailbox
 /// (`MAX_FETCH_SEALS=256`) but the capability quota on the admission path: every chunk is its own
@@ -158,7 +157,6 @@ const MSG_ID_DOMAIN: &[u8] = b"KARST-msg-id-v1";
 /// reactions, replies and edits hang on it. Including the text removes the `ts` collision (one
 /// second of granularity). Well defined for STAMPED messages (`ts` is the sender's clock, shared
 /// by both sides); for legacy `Text` (unstamped, `ts` is local arrival) it is best-effort.
-
 pub fn msg_id(author_ik: &[u8; 32], ts: u64, text: &[u8]) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(MSG_ID_DOMAIN);

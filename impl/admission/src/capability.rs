@@ -359,7 +359,6 @@ impl CapabilityQuotaTracker {
     /// asks about any more, so the relay calls `reap` occasionally. Not security-critical (the
     /// number of windows is bounded by the number of issued capabilities, not by an attacker) but
     /// memory hygiene. Returns the number of records removed.
-
     pub fn reap(&mut self, now: u64, default_window_secs: u64) -> usize {
         let before = self.windows.len();
         let window_of = std::mem::take(&mut self.window_of);

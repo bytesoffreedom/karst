@@ -98,3 +98,23 @@ karst_wait_port() {
 karst_relay_id_from_log() {
   grep -oE 'relay-id[[:space:]]+[0-9a-f]{16,}' "$1" | awk '{print $2}' | tail -1 || true
 }
+
+# Wait until the relay-id has actually been PRINTED, and return it.
+#
+# `karst_wait_port` is not a substitute, and CI proved it: the relay binds its listener before it
+# writes the startup banner, and the relay-id sits in the connect box that is deliberately printed
+# LAST. So the port answers while the log is still half-written, and a caller that reads the log the
+# moment the port opens gets an empty id — then dies several steps later with "relay-id должен быть
+# 64 байта, дано 0", which points at the client rather than at the race that caused it.
+#
+# This lost on a loaded runner while passing on every developer machine, which is the signature of a
+# race being decided by timing rather than by correctness.
+karst_wait_relay_id() {
+  local log="$1" i rid=""
+  for i in $(seq 1 200); do          # 200 × 0.1s = 20s, the same budget as karst_wait_port
+    rid="$(karst_relay_id_from_log "$log")"
+    if [ -n "$rid" ]; then printf '%s' "$rid"; return 0; fi
+    sleep 0.1
+  done
+  return 1
+}

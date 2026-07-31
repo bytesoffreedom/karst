@@ -48,7 +48,7 @@ KARST_RELAY_HOME="$WORK/relay" KARST_RELAY_TLS_CERT="$CERT" KARST_RELAY_TLS_KEY=
   "$(karst_bin karst-relay)" "$ADDR" >"$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
 karst_wait_port "$ADDR" || { echo "relay did not come up; log:"; cat "$WORK/relay.log"; exit 1; }
-RID="$(karst_relay_id_from_log "$WORK/relay.log")"
+RID="$(karst_wait_relay_id "$WORK/relay.log")" || { echo "could not read relay-id; log:"; cat "$WORK/relay.log"; exit 1; }
 grep -q "WebSocket-over-TLS" "$WORK/relay.log" || { echo "relay did not enable wss; log:"; cat "$WORK/relay.log"; exit 1; }
 echo "   relay-id ${RID:0:24}…  carrier: wss"
 

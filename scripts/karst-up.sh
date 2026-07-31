@@ -28,7 +28,7 @@ KARST_RELAY_MODE=public KARST_RELAY_POW_BITS=8 \
   KARST_RELAY_HOME="$RUN/relay" "$(karst_bin karst-relay)" "$ADDR" >"$RELAY_LOG" 2>&1 &
 echo $! >"$RUN/relay.pid"
 karst_wait_port "$ADDR" || { echo "relay did not come up; log:"; cat "$RELAY_LOG"; exit 1; }
-RID="$(karst_relay_id_from_log "$RELAY_LOG")"
+RID="$(karst_wait_relay_id "$RELAY_LOG")" || { echo "could not read relay-id; log:"; cat "$RELAY_LOG"; exit 1; }
 echo "$RID" >"$RUN/relay-id"
 echo "$ADDR" >"$RUN/relay-addr"
 

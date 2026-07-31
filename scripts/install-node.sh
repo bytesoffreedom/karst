@@ -270,7 +270,7 @@ KARST_RELAY_HOME="$RHOME" KARST_RELAY_MODE="$MODE" KARST_RELAY_QUIC="$QUIC" $POW
 PRIME_PID=$!
 RELAY_ID=""
 if karst_wait_port "$PROBE"; then
-  RELAY_ID="$(karst_relay_id_from_log "$PLOG")"
+  RELAY_ID="$(karst_wait_relay_id "$PLOG")" || true
 fi
 kill "$PRIME_PID" 2>/dev/null || true
 wait "$PRIME_PID" 2>/dev/null || true

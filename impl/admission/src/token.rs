@@ -188,7 +188,6 @@ impl MockRingVerifier {
 /// token once, blindly, without knowing the future epoch) — epoch freshness comes from the
 /// pipeline's separate replay filter, tied to the quota epoch (§7.5, Stage 3). All that is checked
 /// here is that the token's claimed epoch matches the expected one.
-
 #[cfg(feature = "unaudited-crypto")]
 pub struct RealRingVerifier;
 

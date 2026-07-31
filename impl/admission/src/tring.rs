@@ -224,7 +224,6 @@ fn lagrange_eval(points: &[(Scalar, Scalar)], x_target: Scalar) -> Scalar {
 /// if the same signer signs the same message in a different composition or simulation, the nonce
 /// changes too — otherwise, with the same `k` and a different `c_j`, the secret would leak through
 /// `s = k + c·x` (the same class of leak as two shares in RLN §7.4).
-
 pub fn sign(
     msg: &[u8],
     ring: &[RistrettoPoint],

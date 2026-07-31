@@ -1,14 +1,14 @@
-//! Сокет-транспорт поверх Noise-сессии (§15). Несущее покрытие:
-//! - **malformed-кадр не роняет сервер** (handshake-reader — новая внешняя
-//!   граница доверия): oversized/truncated/garbage;
-//! - **на проводе только шифртекст** — метаданные (pubkey получателя) НЕ видны
-//!   пассивному наблюдателю (иначе Noise был бы no-op — та же ловушка «тест
-//!   слабее имени»);
-//! - **MITM с чужим Noise-ключом проваливает handshake** (relay аутентифицирован).
+//! The socket transport over a Noise session (§15). The load-bearing coverage:
+//! - **a malformed frame does not bring the server down** (the handshake reader is the new
+//!   external trust boundary): oversized, truncated, garbage;
+//! - **only ciphertext is on the wire** — the metadata (the recipient's public key) is NOT visible
+//!   to a passive observer (otherwise Noise would be a no-op — the same "the test is weaker than
+//!   its name" trap);
+//! - **a MITM with a foreign Noise key fails the handshake** (the relay is authenticated).
 //!
-//! Границы честно: on-path replay в пределах сессии закрыт (per-session эфемеры),
-//! но это конфиденциальность+анти-MITM, НЕ обфускация транспорта — трафик опознаваем анализом трафика и
-//! блокируем по IP:port (обфускация транспорта §15 — следующий срез).
+//! The boundaries, honestly: on-path replay within a session is closed (per-session ephemerals),
+//! but this is confidentiality plus anti-MITM, NOT transport obfuscation — the traffic is still
+//! blockable by IP:port (transport shaping, §15, is the next slice).
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -41,8 +41,8 @@ fn capability(secret: [u8; 32]) -> Capability {
     }
 }
 
-/// Поднять relay на эфемерном порту с фиксированными часами (детерминизм).
-/// Возвращает (адрес, Noise-pub, fetch-auth-pub).
+/// Bring up a relay on an ephemeral port with a fixed clock (determinism).
+/// Returns (address, Noise public key, fetch-auth public key).
 fn spawn_relay(with_cap: bool) -> (SocketAddr, [u8; 32], [u8; 32]) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -59,8 +59,8 @@ fn spawn_relay(with_cap: bool) -> (SocketAddr, [u8; 32], [u8; 32]) {
     (addr, noise_pub, fetch_pub)
 }
 
-/// Отправить сырые байты (БЕЗ Noise-handshake), закрыть запись, вернуть ответ.
-/// Сервер ждёт handshake первым — мусор должен дать чистую ошибку, не панику.
+/// Send raw bytes (WITHOUT a Noise handshake), close the write side, return the reply.
+/// The server expects a handshake first — garbage must give a clean error, not a panic.
 fn raw_exchange(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -72,8 +72,8 @@ fn raw_exchange(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Проба живости: полноценная Noise-сессия + Fetch без cookie → `NeedCookie`.
-/// Доказывает, что сервер пережил враждебное соединение и всё ещё договаривается.
+/// A liveness probe: a full Noise session plus a Fetch without a cookie → `NeedCookie`.
+/// It proves the server survived the hostile connection and still serves.
 fn server_alive(addr: SocketAddr, noise_pub: [u8; 32]) -> bool {
     let t = SocketTransport::new(addr, noise_pub);
     let req = FetchRequest {
@@ -89,30 +89,31 @@ fn server_alive(addr: SocketAddr, noise_pub: [u8; 32]) -> bool {
 
 #[test]
 fn relay_with_fixed_noise_key_handshakes() {
-    // Персистентность ключа relay: заданная Noise-пара (generate_noise_keypair →
-    // persist → with_noise_keypair) должна давать РАБОЧИЙ handshake — т.е.
-    // хранимый pub согласован с тем, что snow выводит из priv. Регресс на случай
-    // рассинхрона деривации pub из priv.
+    // Relay key persistence: a supplied Noise pair (generate_noise_keypair → persist →
+    // with_noise_keypair) must produce a WORKING handshake — that is, the stored public key agrees
+    // with what snow derives from the private one. A regression guard against a derivation
+    // mismatch.
     let (npriv, npub) = relay::server::generate_noise_keypair();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let relay = relay::node::RelayNode::with_identity(NOW, Identity::generate());
     let server = RelayServer::with_noise_keypair(relay, Arc::new(move || NOW), npriv, npub);
-    assert_eq!(server.noise_public(), npub, "сервер отдаёт заданный pub");
+    assert_eq!(server.noise_public(), npub, "the server serves the supplied public key");
     thread::spawn(move || {
         let _ = server.serve_listener(listener);
     });
-    // Клиент с ХРАНИМЫМ pub — handshake должен пройти (Fetch без cookie → challenge).
-    assert!(server_alive(addr, npub), "handshake с персистентным ключом должен работать");
+    // A client with the STORED public key — the handshake must succeed (Fetch without a cookie →
+    // challenge).
 }
 
 #[test]
 fn oversized_length_rejected_without_alloc() {
-    // Первые 2 байта (handshake-длина LE) = 0xFFFF > потолка → отказ до аллокации.
+    // The first 2 bytes (the handshake length, LE) = 0xFFFF, above the cap → refused before
+    // allocation.
     let (addr, npub, _) = spawn_relay(false);
     let resp = raw_exchange(addr, &u32::MAX.to_le_bytes());
-    assert!(resp.is_empty(), "на oversized сервер не должен отвечать");
-    assert!(server_alive(addr, npub), "сервер должен пережить oversized-кадр");
+    assert!(resp.is_empty(), "the server must not answer an oversized frame");
+    assert!(server_alive(addr, npub), "the server must survive an oversized frame");
 }
 
 #[test]
@@ -121,24 +122,24 @@ fn truncated_frame_errors_cleanly() {
     let mut framed = 100u32.to_le_bytes().to_vec();
     framed.extend_from_slice(&[0xAB; 10]);
     let resp = raw_exchange(addr, &framed);
-    assert!(resp.is_empty(), "на обрезанный кадр сервер не должен отвечать");
-    assert!(server_alive(addr, npub), "сервер должен пережить обрезанный кадр");
+    assert!(resp.is_empty(), "the server must not answer a truncated frame");
+    assert!(server_alive(addr, npub), "the server must survive a truncated frame");
 }
 
 #[test]
 fn garbage_body_rejected() {
-    // Валидная маленькая handshake-длина, но тело — не Noise-msg1 → чистая ошибка.
+    // A valid small handshake length, but the body is not a Noise msg1 → a clean error.
     let (addr, npub, _) = spawn_relay(false);
     let mut framed = 1u32.to_le_bytes().to_vec();
     framed.push(0x05);
     let resp = raw_exchange(addr, &framed);
-    assert!(resp.is_empty(), "на мусорное тело сервер не должен отвечать");
-    assert!(server_alive(addr, npub), "сервер должен пережить мусорное тело");
+    assert!(resp.is_empty(), "the server must not answer a garbage body");
+    assert!(server_alive(addr, npub), "the server must survive a garbage body");
 }
 
 #[test]
 fn loopback_happy_path() {
-    // Реальный сокет + Noise-сессия: Alice → relay-в-потоке → Bob забирает.
+    // A real socket plus a Noise session: Alice → relay in a thread → Bob collects.
     let (addr, npub, fpub) = spawn_relay(true);
 
     let mut alice = Client::new(SocketTransport::new(addr, npub), capability([0x33; 32]), b"alice");
@@ -148,19 +149,19 @@ fn loopback_happy_path() {
     let bob_kem = bob.kem_ek().to_vec();
 
     let resp = alice.send(&bob_pub, &bob_kem, b"hello over noise", NOW);
-    assert!(matches!(resp, Response::Accepted), "получено: {:?}", resp);
+    assert!(matches!(resp, Response::Accepted), "got: {:?}", resp);
 
-    let msgs = bob.receive(NOW).expect("fetch должен пройти");
+    let msgs = bob.receive(NOW).expect("the fetch must succeed");
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].as_deref(), Some(b"hello over noise".as_ref()));
 }
 
 #[test]
 fn session_publish_connect_send_over_socket() {
-    // §2.1 E2E по РЕАЛЬНОМУ сокету+Noise: Bob публикует bundle (§12), Alice
-    // забирает его у relay, инициирует PQXDH+ratchet, шлёт; Bob расшифровывает.
-    // Проверяет §12-wire (PublishBundle/FetchBundle) + сериализацию Account
-    // через провод + сессионный путь end-to-end поверх транспорта.
+    // §2.1 E2E over a REAL socket and Noise: Bob publishes his bundle (§12), Alice fetches it from
+    // the relay, initiates PQXDH plus the ratchet and sends; Bob decrypts. This exercises the §12
+    // wire (PublishBundle/FetchBundle), Account serialisation across the wire, and the session path
+    // end to end over the transport.
     let (addr, npub, fpub) = spawn_relay(true);
     let relay_pub = PublicKey::from(fpub);
 
@@ -168,18 +169,18 @@ fn session_publish_connect_send_over_socket() {
     let mut alice = Peer::new(SocketTransport::new(addr, npub), Account::generate(), capability([0x33; 32]), relay_pub);
     let bob_ik = bob.identity();
 
-    assert!(matches!(bob.publish(NOW), PublishResponse::Published), "publish по сокету");
-    alice.connect(&bob_ik, NOW).expect("connect (fetch bundle) по сокету");
+    assert!(matches!(bob.publish(NOW), PublishResponse::Published), "publish over the socket");
+    alice.connect(&bob_ik, NOW).expect("connect (fetch bundle) over the socket");
     assert!(matches!(alice.send(&bob_ik, b"hi via discovery over noise", NOW), Response::Accepted));
 
     let got: Vec<_> = bob.receive(NOW).unwrap().into_iter().flatten().map(|r| r.plaintext).collect();
     assert_eq!(got, vec![b"hi via discovery over noise".to_vec()]);
 }
 
-// ---------- Несущее: реально ли шифрует и аутентифицирует ----------
+// ---------- Load-bearing: does it really encrypt and authenticate ----------
 
-/// Записывающий TCP-прокси: пересылает байты в обе стороны и КОПИТ всё, что
-/// проходит. Наблюдатель на проводе.
+/// A recording TCP proxy: it forwards bytes in both directions and ACCUMULATES everything that
+/// passes. An observer on the wire.
 fn spawn_recording_proxy(upstream: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -222,10 +223,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[test]
 fn wire_bytes_are_ciphertext_recipient_metadata_hidden() {
-    // Дискриминирующий: pubkey получателя лежит в WireMessage.recipient ОТКРЫТЫМ
-    // postcard'ом — БЕЗ Noise он был бы на проводе. С Noise его там нет. Значит
-    // тест провалится, если шифрование окажется no-op (в отличие от проверки
-    // самого plaintext-сообщения — оно и так E2E-зашифровано SkeletonSeal).
+    // Discriminating: the recipient's public key sits in WireMessage.recipient as plain postcard —
+    // WITHOUT Noise it would be on the wire. With Noise it is not there. So the test fails if the
+    // encryption turns out to be a no-op (unlike checking the plaintext message itself, which is
+    // E2E-encrypted by SkeletonSeal anyway).
     let (relay_addr, npub, _fpub) = spawn_relay(true);
     let (proxy_addr, recorded) = spawn_recording_proxy(relay_addr);
 
@@ -233,22 +234,22 @@ fn wire_bytes_are_ciphertext_recipient_metadata_hidden() {
     let bob_pub = bob.public.to_bytes();
     let mut alice = Client::new(SocketTransport::new(proxy_addr, npub), capability([0x33; 32]), b"alice");
 
-    // send синхронен: вернулся Accepted → полный round-trip прошёл через прокси.
+    // send is synchronous: Accepted came back → a full round trip went through the proxy.
     assert!(matches!(alice.send(&bob.public, node::seal::SealKemKeys::generate().ek(), b"secret payload", NOW), Response::Accepted));
 
     let rec = recorded.lock().unwrap();
-    assert!(!rec.is_empty(), "прокси должен был записать шифртекст");
+    assert!(!rec.is_empty(), "the proxy must have recorded ciphertext");
     assert!(
         !contains(&rec, &bob_pub),
-        "pubkey получателя (метаданные) не должен появляться на проводе — Noise его прячет"
+        "the recipient public key (metadata) must not appear on the wire"
     );
-    assert!(!contains(&rec, b"secret payload"), "текст не должен быть на проводе");
+    assert!(!contains(&rec, b"secret payload"), "the text must not be on the wire");
 }
 
 #[test]
 fn mitm_wrong_noise_key_fails_handshake() {
-    // Клиент с ЧУЖИМ Noise-pub узла: handshake проваливается (relay
-    // аутентифицирован своим static), данные не текут.
+    // A client with a FOREIGN Noise public key for the node: the handshake fails (the relay is
+    // authenticated by its static), and no data flows.
     let (addr, _npub, _fpub) = spawn_relay(true);
     let wrong = [0x77u8; 32];
     let mut alice = Client::new(SocketTransport::new(addr, wrong), capability([0x33; 32]), b"alice");
@@ -256,7 +257,7 @@ fn mitm_wrong_noise_key_fails_handshake() {
     let resp = alice.send(&bob.public, node::seal::SealKemKeys::generate().ek(), b"hi", NOW);
     assert!(
         matches!(resp, Response::Rejected(_)),
-        "handshake к чужому ключу должен провалиться, получено: {:?}",
+        "a handshake to a foreign key must fail, got: {:?}",
         resp
     );
 }

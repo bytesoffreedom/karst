@@ -1,11 +1,11 @@
-//! §2.1 сессионный E2E: PQXDH + Double Ratchet поверх РЕАЛЬНОГО пути сообщения
-//! (admission §7 → mailbox → fetch-auth), через `karst_client_core::peer::Peer`.
+//! The §2.1 session E2E: PQXDH plus the Double Ratchet over the REAL message path (admission §7 →
+//! mailbox → fetch-auth), through `karst_client_core::peer::Peer`.
 //!
-//! Несущее (не single-roundtrip, который не тронул бы ни цепочку, ни переход
-//! Initial→Ratchet): МУЛЬТИсообщение в ОБЕ стороны через настоящий mailbox с
-//! batch-fetch, первый конверт `Initial` затем `Ratchet`, и ВТОРОЙ раунд
-//! send→fetch, продолжающий ТУ ЖЕ сессию (цепочки переживают fetch'и). Заодно —
-//! seam: pqxdh-`root_key` реально засевает рабочую ratchet-сессию.
+//! Load-bearing (not a single round trip, which would touch neither the chain nor the
+//! Initial→Ratchet transition): MULTIPLE messages in BOTH directions through a real mailbox with a
+//! batch fetch, the first envelope `Initial` and then `Ratchet`, plus a SECOND send→fetch round
+//! that continues THE SAME session (the chains survive fetches). Along the way it pins the seam:
+//! the PQXDH `root_key` really seeds a working ratchet session.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -29,7 +29,7 @@ fn dev_cap() -> Capability {
     }
 }
 
-/// Общий relay + транспорт, на которых тест поднимает произвольно много peer'ов.
+/// A shared relay and transport on which the test brings up as many peers as it needs.
 fn shared() -> (InMemoryTransport, PublicKey) {
     let mut relay = RelayNode::new(NOW);
     relay.issue_capability(dev_cap());
@@ -41,7 +41,7 @@ fn peer(transport: &InMemoryTransport, relay_pub: PublicKey) -> Peer<InMemoryTra
     Peer::new(transport.clone(), Account::generate(), dev_cap(), relay_pub)
 }
 
-/// Только не-`None` расшифровки, в порядке.
+/// Only the non-`None` decryptions, in order.
 fn plaintexts(v: Vec<Option<karst_client_core::peer::Received>>) -> Vec<Vec<u8>> {
     v.into_iter().flatten().map(|r| r.plaintext).collect()
 }
@@ -54,29 +54,29 @@ fn bidirectional_multi_message_across_fetches() {
     let bob_ik = bob.identity();
     let alice_ik = alice.identity();
 
-    // Alice инициирует сессию к Bob по его bundle (вне канала — §12 отложен).
+    // Alice initiates a session to Bob from his bundle (out of band — §12 is deferred).
     alice.connect_with_bundle(&bob.bundle()).unwrap();
 
-    // --- Раунд 1: Alice → Bob, два сообщения (Initial затем Ratchet) ---
+    // --- Round 1: Alice → Bob, two messages (Initial then Ratchet) ---
     assert!(matches!(alice.send(&bob_ik, b"m0", NOW), Response::Accepted));
     assert!(matches!(alice.send(&bob_ik, b"m1", NOW), Response::Accepted));
 
     let got = plaintexts(bob.receive(NOW).expect("bob fetch"));
-    assert_eq!(got, vec![b"m0".to_vec(), b"m1".to_vec()], "batch-fetch: Initial+Ratchet по порядку");
+    assert_eq!(got, vec![b"m0".to_vec(), b"m1".to_vec()], "batch fetch: Initial+Ratchet in order");
 
-    // --- Bob отвечает (по установленной сессии — DH-ratchet у обоих) ---
+    // --- Bob replies (over the established session — a DH ratchet at both ends) ---
     assert!(matches!(bob.send(&alice_ik, b"r0", NOW), Response::Accepted));
     let got = plaintexts(alice.receive(NOW).expect("alice fetch"));
-    assert_eq!(got, vec![b"r0".to_vec()], "ответ расшифрован (Alice делает DH-шаг)");
+    assert_eq!(got, vec![b"r0".to_vec()], "the reply decrypted (Alice takes a DH step)");
 
-    // --- Раунд 2: Alice продолжает ТУ ЖЕ сессию через новый fetch-цикл ---
-    // (Alice уже перешла на цепочку B, приняв r0 → это ratchet-переход границы.)
+    // --- Round 2: Alice continues THE SAME session through a new fetch cycle ---
+    // (Alice already moved to chain B by receiving r0 → this is a ratchet boundary crossing.)
     assert!(matches!(alice.send(&bob_ik, b"m2", NOW), Response::Accepted));
     assert!(matches!(alice.send(&bob_ik, b"m3", NOW), Response::Accepted));
     let got = plaintexts(bob.receive(NOW).expect("bob fetch 2"));
-    assert_eq!(got, vec![b"m2".to_vec(), b"m3".to_vec()], "цепочки переживают fetch'и");
+    assert_eq!(got, vec![b"m2".to_vec(), b"m3".to_vec()], "the chains survive fetches");
 
-    // --- И ещё разворот: Bob → Alice снова ---
+    // --- And one more reversal: Bob → Alice again ---
     assert!(matches!(bob.send(&alice_ik, b"r1", NOW), Response::Accepted));
     let got = plaintexts(alice.receive(NOW).expect("alice fetch 2"));
     assert_eq!(got, vec![b"r1".to_vec()]);
@@ -84,9 +84,9 @@ fn bidirectional_multi_message_across_fetches() {
 
 #[test]
 fn receive_attributes_sender_across_two_peers() {
-    // Несущее (атрибуция): два разных отправителя → Bob; каждое входящее должно
-    // нести ПРАВИЛЬНЫЙ sender-IK (для раскладки по чатам в UI). Initial несёт IK
-    // в KA; Ratchet атрибутируется по сессии, которая расшифровала.
+    // Load-bearing (attribution): two different senders → Bob; every incoming message must carry
+    // the CORRECT sender IK (so the UI can sort them into chats). An Initial carries the IK in the
+    // KA; a Ratchet is attributed by the session that decrypted it.
     let (transport, relay_pub) = shared();
     let mut alice = peer(&transport, relay_pub);
     let mut carol = peer(&transport, relay_pub);
@@ -111,13 +111,13 @@ fn receive_attributes_sender_across_two_peers() {
         (carol_ik.to_vec(), b"from carol".to_vec()),
     ];
     want.sort();
-    assert_eq!(got, want, "каждое входящее атрибутировано верному отправителю");
+    assert_eq!(got, want, "every incoming message is attributed to the right sender");
 }
 
 #[test]
 fn recipient_only_sees_own_mailbox_and_eve_gets_nothing() {
-    // Изоляция mailbox: Alice шлёт Bob; Eve (третий peer) забирает СВОЙ mailbox —
-    // пусто. Груз Bob'а ей недоступен (адресован ik Bob, лежит в его ящике).
+    // Mailbox isolation: Alice sends to Bob; Eve (a third peer) collects HER OWN mailbox and finds
+    // it empty. Bob's payload is unreachable for her (addressed to Bob's ik, sitting in his box).
     let (transport, relay_pub) = shared();
     let mut alice = peer(&transport, relay_pub);
     let mut bob = peer(&transport, relay_pub);
@@ -126,12 +126,12 @@ fn recipient_only_sees_own_mailbox_and_eve_gets_nothing() {
     alice.connect_with_bundle(&bob.bundle()).unwrap();
     assert!(matches!(alice.send(&bob.identity(), b"secret", NOW), Response::Accepted));
 
-    assert!(plaintexts(eve.receive(NOW).expect("eve fetch")).is_empty(), "Eve не видит чужой mailbox");
+    assert!(plaintexts(eve.receive(NOW).expect("eve fetch")).is_empty(), "Eve does not see a foreign mailbox");
     assert_eq!(plaintexts(bob.receive(NOW).expect("bob fetch")), vec![b"secret".to_vec()]);
 }
 
-/// Транспорт-«кран»: отвергает ПЕРВУЮ отправку, дальше пропускает; записывает
-/// каждый ушедший WireMessage (шифртекст УЖЕ у relay — в модели угроз).
+/// A "tap" transport: it refuses the FIRST send and lets everything through afterwards, recording
+/// every WireMessage that left (the ciphertext is ALREADY at the relay, in the threat model).
 #[derive(Clone)]
 struct TapTransport {
     inner: InMemoryTransport,
@@ -153,10 +153,10 @@ impl Transport for TapTransport {
 
 #[test]
 fn failed_send_never_reuses_ratchet_position() {
-    // НЕСУЩЕЕ (keystream-reuse): цепочка продвигается безусловно, поэтому даже
-    // после ОТКАЗа отправки следующий (другой) plaintext НЕ занимает ту же
-    // позицию цепочки. Нулевой nonce безопасен только при уникальном mk на
-    // сообщение — пиннит, что отказ не воскрешает mk.
+    // LOAD-BEARING (keystream reuse): the chain advances unconditionally, so we prove that after a
+    // REFUSED send the next (different) plaintext does NOT take the same chain position. A zero
+    // nonce is safe only with a unique mk per message — this pins that a refusal does not
+    // resurrect an mk.
     let (transport, relay_pub) = shared();
     let tap = TapTransport {
         inner: transport,
@@ -168,14 +168,14 @@ fn failed_send_never_reuses_ratchet_position() {
     let bob_ik = bob.identity();
 
     alice.connect_with_bundle(&bob.bundle()).unwrap();
-    // Первый cookie-challenge проходит (не считается reject_next? — да, NeedCookie
-    // не наш reject). reject_next срабатывает на первом реальном send-кадре.
-    let _ = alice.send(&bob_ik, b"AAAA", NOW); // отвергнут краном
-    let _ = alice.send(&bob_ik, b"BBBB", NOW); // другой plaintext
+    // The first cookie challenge goes through (it is not counted as reject_next — NeedCookie is
+    // not our reject). reject_next fires on the first real send frame.
+    let _ = alice.send(&bob_ik, b"AAAA", NOW); // refused by the tap
+    let _ = alice.send(&bob_ik, b"BBBB", NOW); // a different plaintext
 
-    // Инвариант: одинаковая позиция `(dh,n)` ⇒ одинаковый шифртекст (cookie-retry
-    // легитимно дослыает ТОТ ЖЕ конверт). Разные plaintext ОБЯЗАНЫ занять разные
-    // позиции — иначе один `mk`+нулевой nonce на два текста (keystream-reuse).
+    // The invariant: the same position `(dh,n)` implies the same ciphertext (a cookie retry
+    // legitimately resends THE SAME envelope). Different plaintexts MUST take different positions
+    // — otherwise one `mk` and a zero nonce cover two texts (keystream reuse).
     let mut seen: std::collections::HashMap<([u8; 32], u32), Vec<u8>> =
         std::collections::HashMap::new();
     for m in tap.sent.borrow().iter() {
@@ -207,7 +207,7 @@ fn failed_send_never_reuses_ratchet_position() {
             match seen.get(&(h.dh, h.n)) {
                 Some(prev) => assert_eq!(
                     *prev, ct,
-                    "позиция (dh,n) переиспользована под ДРУГОЙ шифртекст → keystream-reuse"
+                    "position (dh,n) reused under a DIFFERENT ciphertext → keystream reuse"
                 ),
                 None => {
                     seen.insert((h.dh, h.n), ct);
@@ -216,5 +216,5 @@ fn failed_send_never_reuses_ratchet_position() {
         }
     }
     let ns: std::collections::BTreeSet<u32> = seen.keys().map(|(_, n)| *n).collect();
-    assert!(ns.contains(&0) && ns.contains(&1), "оба plaintext эмитнуты на разных позициях");
+    assert!(ns.contains(&0) && ns.contains(&1), "both plaintexts were emitted at different positions");
 }

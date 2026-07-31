@@ -74,9 +74,16 @@ never to a root identity, and the root has no address at all.
 emergency channel that a normal client rarely touches. The stable address stops being the *default*
 place you are found, which is what makes polling it a signal.
 
-**Cost:** a rendezvous box has to be published somewhere a stranger can find it — that is the
-discovery problem, and it can quietly reintroduce a stable identifier at a different layer. The
-design must say where the rendezvous address is published *before* it is built.
+**Cost — and the shape of it was already settled, which this document got wrong on first writing.**
+The obvious objection is "a rendezvous box has to be published somewhere a stranger can find it,
+which reintroduces a stable identifier one layer down". #261 does not publish them at all: a set of
+single-use addresses is handed over *during contact exchange*, and further sets are delivered inside
+the established E2E session. So the stable address is needed only by someone who has never had your
+contact code — which is exactly the emergency channel it is being demoted to.
+
+What remains genuinely open is narrower: what a client does when a set is exhausted and the session
+is cold, and whether set exhaustion is itself observable (a peer that suddenly falls back to the
+stable box has told the relay something).
 
 ### 3. Timing is now the loudest signal we still emit
 

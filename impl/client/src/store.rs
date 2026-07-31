@@ -3480,6 +3480,10 @@ impl Store {
         // the anchor, which reads as fine — the state is newer, not older. Writing the anchor
         // first would make the same crash look exactly like a rollback and refuse to open a
         // perfectly good account.
+        //
+        // That claim was prose until now. This is where a crash test cuts the power (QA-2), so the
+        // paragraph above is checked rather than believed.
+        node::fail_point!("store.sessions.after_rename_before_anchor");
         self.write_sealed(&self.sessions_anchor_path(), &postcard::to_stdvec(&generation).map_err(io_err)?)
     }
 

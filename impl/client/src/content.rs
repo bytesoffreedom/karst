@@ -1,36 +1,36 @@
-//! Контент-конверт сообщения — слой НАД байтовым E2E-путём (`node`/`peer`
-//! остаются content-agnostic; вся типизация здесь, в клиенте). Текст и файлы
-//! кодируются в `Content` и едут как обычный plaintext через `send_session`.
+//! The message content envelope — a layer ABOVE the byte-level E2E path (`node`/`peer` stay
+//! content-agnostic; all typing lives here, in the client). Text and files are encoded into
+//! `Content` and travel as ordinary plaintext through `send_session`.
 //!
-//! # Файлы через пакетный лимит
-//! Ступень-0 admission режет пакет по `admission::params::MAX_PACKET_SIZE`, и
-//! `karst_client_core::pad` выводит ИЗ этого потолка размер фиксированного
-//! блока: одно Ratchet-сообщение несёт ровно `pad::MAX_PAYLOAD` Б plaintext,
-//! сколько бы ни было полезных байт (PRIV-1 — реле не должно узнавать длину).
-//! Числа здесь не повторяются намеренно: их дважды меняли (1400 → 2560, потому
-//! что ML-KEM-опенер не влезал в собственный обязательный потолок), и оба раза
-//! этот абзац оставался с прежней цифрой, описывая проток, которого нет.
-//! Единственный источник правды — константы. Файл поэтому **чанкуется**: манифест
-//! (имя, размер, число чанков, SHA-256) + N чанков; получатель собирает и
-//! СВЕРЯЕТ хэш. Инлайн-путь ограничен `MAX_FILE_CHUNKS` (см. константу — предел
-//! ставит capability-quota на admission-пути, а НЕ mailbox), пересборка в памяти
-//! в пределах живого процесса (worker держит `Reassembler` между poll'ами).
-//! Всё, что больше `MAX_FILE_SIZE`, уходит E2E-blob'ом + `FileRef` — этот путь
-//! ВОЗОБНОВЛЯЕМЫЙ (повтор продолжает с watermark релея), см. `client::blob`.
+//! # Files against the packet ceiling
+//! Stage-0 admission caps a packet at `admission::params::MAX_PACKET_SIZE`, and
+//! `karst_client_core::pad` derives the fixed block size FROM that ceiling: one Ratchet message
+//! carries exactly `pad::MAX_PAYLOAD` bytes of plaintext no matter how many useful bytes there
+//! are (PRIV-1 — the relay must not learn the length).
+//! The numbers are deliberately not repeated here: they were changed twice (1400 → 2560, because
+//! the ML-KEM opener did not fit under its own mandatory ceiling), and both times this paragraph
+//! kept the old figure, describing a protocol that did not exist.
+//! The constants are the only source of truth. A file is therefore **chunked**: a manifest
+//! (name, size, chunk count, SHA-256) plus N chunks; the recipient reassembles and VERIFIES the
+//! hash. The inline path is bounded by `MAX_FILE_CHUNKS` (see the constant — the binding limit is
+//! the capability quota on the admission path, NOT the mailbox), and reassembly happens in memory
+//! within a live process (the worker holds the `Reassembler` between polls).
+//! Anything larger than `MAX_FILE_SIZE` goes out as an E2E blob plus a `FileRef` — that path is
+//! RESUMABLE (repeating it continues from the relay's watermark), see `client::blob`.
 //!
-//! Этот абзац протухал уже дважды (см. выше) и один раз — так: он обещал «≤250
-//! чанков (~256 KiB), возобновление — следующий срез», когда константа рядом
-//! была 48, а blob-путь давно существовал. Поэтому здесь больше нет ни одного
-//! числа: считать — по константам ниже.
+//! This paragraph has gone stale twice (see above), once like this: it promised "≤250 chunks
+//! (~256 KiB), resumption is the next slice" while the constant three lines below said 48 and the
+//! blob path had existed for a while. So there is not a single number in it any more: count from
+//! the constants below.
 //!
-//! # Анти-DoS
-//! Манифест с абсурдным числом чанков/размером отвергается ДО аллокации
-//! (как `MAX_SKIP` в ratchet); число одновременных передач ограничено ПЕР ОТПРАВИТЕЛЬ
-//! (`MAX_CONCURRENT_TRANSFERS`). Это НЕ бьёт число отправителей и общий RAM всех
-//! `Reassembler` сразу (SEC-43: IK свободно генерируется) — тот бюджет считает
-//! ВЫЗЫВАЮЩИЙ (см. `client::{offer_reassembly, reap_reassemblers, MAX_REASSEMBLY_SENDERS,
-//! MAX_REASSEMBLY_TOTAL_BYTES}` в `lib.rs`), опираясь на `bytes_in_flight`/`has_transfer`
-//! отсюда.
+//! # Anti-DoS
+//! A manifest with an absurd chunk count or size is refused BEFORE any allocation (like `MAX_SKIP`
+//! in the ratchet); the number of concurrent transfers is bounded PER SENDER
+//! (`MAX_CONCURRENT_TRANSFERS`). That does NOT bound the number of senders or the total RAM of all
+//! `Reassembler`s at once (SEC-43: an IK is free to generate) — that budget is the CALLER's (see
+//! `client::{offer_reassembly, reap_reassemblers, MAX_REASSEMBLY_SENDERS, MAX_REASSEMBLY_TOTAL_BYTES}`
+//! in `lib.rs`), which leans on `bytes_in_flight`/`has_transfer` from here.
+//!
 
 use std::collections::HashMap;
 
@@ -39,32 +39,32 @@ use chacha20poly1305::aead::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Полезная нагрузка файла на чанк. Консервативно под Ratchet-лимитом (~1256 Б
-/// plaintext минус postcard-обвязка конверта) — валидируется round-trip-тестом
-/// через настоящий relay.
+/// The file payload carried per chunk. Conservatively under the Ratchet limit (~1256 plaintext
+/// bytes minus the postcard envelope framing) — validated by a round-trip test through a real
+/// relay.
 pub const MAX_CHUNK_PAYLOAD: usize = 1024;
-/// Максимум байт ОДНОГО текстового сообщения (`Content::Text`). Берём тот же
-/// проверенный бюджет, что и чанк файла: `FileChunk` несёт 1024 Б данных ПЛЮС
-/// больше обвязки (id+index), чем `Text`, и уже проходит round-trip через relay
-/// — значит 1024 Б текста заведомо влезают в один Ratchet-пакет. Гейтит UI
-/// (байтовая длина, чтобы кириллица 2 Б/симв считалась честно), иначе длинный
-/// текст молча падал бы «отправка не удалась».
+/// The maximum size of ONE text message (`Content::Text`). It reuses the same proven budget as a
+/// file chunk: `FileChunk` carries 1024 bytes of data PLUS more framing (id+index) than `Text`,
+/// and already round-trips through a relay — so 1024 bytes of text certainly fit in one Ratchet
+/// packet. It gates the UI (by byte length, so that two-byte characters are counted honestly),
+/// otherwise long text would silently fail as "could not send".
+
 pub const MAX_TEXT_BYTES: usize = MAX_CHUNK_PAYLOAD;
-/// Максимум чанков на inline-файл. Связывающий лимит — НЕ mailbox
-/// (`MAX_FETCH_SEALS=256`), а capability-quota на admission-пути: каждый чанк —
-/// отдельный запрос к relay, а dev-cap разрешает `max_requests=100` за окно
-/// (600 с). Файл в 150+ чанков молча упирался в `CapabilityQuota` где-то на
-/// ~100-м чанке и «отправка не удавалась». Держим 48: 48 чанков + манифест = 49
-/// запросов, ~50 запросов остаётся на попутный текст/чанки в том же окне. Файлы
-/// крупнее уходят по blob-пути (§15, cookie-gated, вне message-quota).
+/// The maximum number of chunks in an inline file. The binding limit is NOT the mailbox
+/// (`MAX_FETCH_SEALS=256`) but the capability quota on the admission path: every chunk is its own
+/// request to the relay, and the dev capability allows `max_requests=100` per 600-second window.
+/// A file of 150+ chunks used to hit `CapabilityQuota` silently around the 100th chunk and
+/// "sending failed". We keep 48: 48 chunks plus the manifest is 49 requests, leaving ~50 for text
+/// and other chunks in the same window. Larger files go down the blob path (§15, cookie-gated,
+/// outside the message quota).
 pub const MAX_FILE_CHUNKS: u32 = 48;
-/// Максимальный размер inline-файла (48 KiB). Всё, что больше, GUI шлёт по
-/// E2E-blob-пути (`client::blob` + `Content::FileRef`).
+/// The maximum size of an inline file (48 KiB). Anything larger is sent by the GUI down the E2E
+/// blob path (`client::blob` + `Content::FileRef`).
 pub const MAX_FILE_SIZE: u64 = MAX_CHUNK_PAYLOAD as u64 * MAX_FILE_CHUNKS as u64;
-/// Лимит длины имени файла (манифест должен влезать даже как Initial-конверт,
-/// у которого plaintext ~104 Б из-за KEM-ct).
+/// The file-name length limit (the manifest must fit even as an Initial envelope, whose plaintext
+/// is only ~104 bytes because of the KEM ciphertext).
 pub const MAX_FILENAME: usize = 48;
-/// Максимум одновременных незавершённых передач в `Reassembler` (анти-память-DoS).
+/// The maximum number of concurrent unfinished transfers in a `Reassembler` (anti memory DoS).
 pub const MAX_CONCURRENT_TRANSFERS: usize = 8;
 /// A half-assembled transfer with no new chunk for this long is abandoned (a failed/aborted
 /// `send_file`) and gets evicted, so it cannot pin a `MAX_CONCURRENT_TRANSFERS` slot forever.
@@ -78,8 +78,8 @@ pub const MAX_CONCURRENT_TRANSFERS: usize = 8;
 /// `lib.rs` now also drives this from the ordinary receive path, across EVERY sender, so it fires
 /// on the next poll regardless of what the abandoning sender does.
 pub const STALE_PARTIAL_SECS: u64 = 300;
-/// Верхняя граница байтовой длины эмодзи реакции. С запасом на ZWJ/составные
-/// грапхемы (флаги, семьи), но отсекает абсурд ДО аллокации (анти-DoS на приёме).
+/// The upper bound on the byte length of a reaction emoji. Generous enough for ZWJ and composite
+/// graphemes (flags, families), but it cuts off the absurd BEFORE allocation (anti-DoS on receive).
 pub const MAX_EMOJI_BYTES: usize = 64;
 /// Byte cap on the (self-declared) profile display name. Rejects an absurd received
 /// profile BEFORE allocation.
@@ -148,17 +148,17 @@ pub fn gallery_fits_inline(packed_len: usize) -> bool {
     chunks + 2 < node::protocol::MAX_FETCH_SEALS
 }
 
-/// Домен для канонического идентификатора сообщения (разделение доменов — как у
-/// остальных KDF/хэш-констант проекта).
+/// The domain for the canonical message identifier (domain separation, like every other KDF and
+/// hash constant in the project).
 const MSG_ID_DOMAIN: &[u8] = b"KARST-msg-id-v1";
 
-/// **Канонический сквозной идентификатор сообщения.** `H(domain ‖ author_ik ‖ ts
-/// ‖ text)`, усечён до 16 Б. `author_ik` — АБСОЛЮТНЫЙ автор (у отправителя = свой
-/// IK, у получателя = IK собеседника), поэтому обе стороны считают ОДИН и тот же
-/// id из одного и того же сообщения — на нём стоят реакции/ответы/правки. Текст в
-/// хэше снимает коллизию `ts` (секундная гранулярность). Корректно определён для
-/// ШТАМПОВАННЫХ сообщений (`ts` — время отправителя, общее для обеих сторон);
-/// для legacy `Text` (без штампа, `ts` — локальное прибытие) — best-effort.
+/// **The canonical end-to-end message identifier.** `H(domain ‖ author_ik ‖ ts ‖ text)`, truncated
+/// to 16 bytes. `author_ik` is the ABSOLUTE author (on the sender's side its own IK, on the
+/// recipient's side the peer's IK), so both sides compute the SAME id from the same message — and
+/// reactions, replies and edits hang on it. Including the text removes the `ts` collision (one
+/// second of granularity). Well defined for STAMPED messages (`ts` is the sender's clock, shared
+/// by both sides); for legacy `Text` (unstamped, `ts` is local arrival) it is best-effort.
+
 pub fn msg_id(author_ik: &[u8; 32], ts: u64, text: &[u8]) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(MSG_ID_DOMAIN);
@@ -169,52 +169,52 @@ pub fn msg_id(author_ik: &[u8; 32], ts: u64, text: &[u8]) -> [u8; 16] {
     full[..16].try_into().expect("16 ≤ 32")
 }
 
-/// Типизированный контент сообщения. Едет как postcard-байты в E2E-plaintext.
+/// Typed message content. Travels as postcard bytes inside the E2E plaintext.
 ///
-/// ВНИМАНИЕ к порядку вариантов: postcard кодирует вариант ПОЗИЦИОННЫМ индексом
-/// (0,1,2,…), не именем. Новые варианты добавлять ТОЛЬКО В КОНЕЦ — иначе поедут
-/// индексы и старые сообщения раскодируются как чужой вариант.
+/// MIND the variant order: postcard encodes a variant by its POSITIONAL index (0,1,2,…), not by
+/// name. New variants go ONLY AT THE END — otherwise the indices shift and old messages decode as
+/// a different variant.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Content {
-    /// Обычное текстовое сообщение (UTF-8 в байтах).
+    /// An ordinary text message (UTF-8 bytes).
     Text(Vec<u8>),
-    /// Заголовок передачи файла: собирает получатель.
+    /// The header of a file transfer: what the recipient reassembles from.
     FileManifest { id: [u8; 16], name: String, size: u64, chunks: u32, hash: [u8; 32] },
-    /// Один чанк файла по `id`, позиция `index`.
+    /// One chunk of file `id`, at position `index`.
     FileChunk { id: [u8; 16], index: u32, data: Vec<u8> },
-    /// Исчезающий текст: `expire_at` — АБСОЛЮТНОЕ unix-время (секунды) «умереть»,
-    /// = момент отправки + TTL. Симметрично для обеих сторон (таймер от ОТПРАВКИ,
-    /// не от прочтения — read-receipt'ов у нас нет). Получатель, забравший капсулу
-    /// после `expire_at`, просто не показывает её (пришло мёртвым). Исчезающие
-    /// НИКОГДА не пишутся в историю на диск — контроль хранения только на
-    /// сотрудничающих клиентах; навязать удаление недобросовестному получателю
-    /// нельзя (капсула лежит в mailbox до fetch).
+    /// Disappearing text: `expire_at` is the ABSOLUTE unix time (seconds) at which it dies,
+    /// computed as the send time plus the TTL. Symmetric for both sides (the timer runs from
+    /// SENDING, not from reading — there are no read receipts here). A recipient who collects the
+    /// capsule after `expire_at` simply does not display it (it arrived dead). Disappearing
+    /// messages are NEVER written to the on-disk history — storage control lives only on
+    /// cooperating clients; deletion cannot be imposed on a dishonest recipient (the capsule sits
+    /// in the mailbox until it is fetched).
     TextExpiring { text: Vec<u8>, expire_at: u64 },
-    /// Текст со ШТАМПОМ времени ОТПРАВИТЕЛЯ (`ts`). Получатель хранит ИМЕННО этот
-    /// ts (а не своё время прибытия) — так обе стороны согласны по (peer, ts, text)
-    /// и это работает как СКВОЗНОЙ идентификатор сообщения: на нём стоят «удалить у
-    /// всех», реакции, ответы. `Text` (без ts) остаётся для обратной совместимости.
+    /// Text carrying the SENDER's timestamp (`ts`). The recipient stores THAT ts (not its own
+    /// arrival time), so both sides agree on (peer, ts, text) and it works as an END-TO-END message
+    /// identifier: delete-for-everyone, reactions and replies all hang on it. `Text` (without a ts)
+    /// remains for backwards compatibility.
     TextStamped { text: Vec<u8>, ts: u64 },
-    /// Удалить У ВСЕХ: просьба стереть сообщение (`ts` + `text`), которое ОТПРАВИТЕЛЬ
-    /// этого control-сообщения ранее послал получателю. Кооперативно: навязать
-    /// недобросовестному клиенту нельзя (та же честная граница, что у исчезающих).
+    /// Delete FOR EVERYONE: a request to erase a message (`ts` + `text`) that the SENDER of this
+    /// control message had previously sent to the recipient. Cooperative: it cannot be imposed on a
+    /// dishonest client (the same honest boundary as disappearing messages).
     DeleteForEveryone { ts: u64, text: Vec<u8> },
-    /// Реакция на сообщение по каноническому `msg_id` (см. `msg_id`). `add=true` —
-    /// поставить, `add=false` — снять. Автор реакции = отправитель этого control-
-    /// сообщения (получатель атрибутирует по расшифровавшей сессии, как обычный
-    /// текст). Маленький E2E-конверт; не файл. `msg_id` уже несёт автора+ts+текст
-    /// цели, поэтому обе стороны сходятся на одном сообщении без относительных полей.
+    /// A reaction to a message by its canonical `msg_id` (see `msg_id`). `add=true` adds it,
+    /// `add=false` removes it. The reaction's author is the sender of this control message (the
+    /// recipient attributes it by the session that decrypted it, exactly as for ordinary text). A
+    /// small E2E envelope, not a file. `msg_id` already carries the target's author, ts and text,
+    /// so both sides converge on one message without any relative fields.
     Reaction { msg_id: [u8; 16], emoji: String, add: bool },
-    /// Текст-ОТВЕТ (цитата): как `TextStamped` (`text`+`ts` отправителя), плюс
-    /// `reply_to` — `msg_id` сообщения, на которое отвечают. Получатель показывает
-    /// текст как обычное сообщение и рисует над ним цитату цели (найдя её по
-    /// `reply_to` в своей истории). `reply_to` — тот же id у обеих сторон.
+    /// A REPLY (quote): like `TextStamped` (the sender's `text` and `ts`), plus `reply_to` — the
+    /// `msg_id` of the message being replied to. The recipient shows the text as an ordinary
+    /// message and draws the quoted target above it (found by `reply_to` in its own history).
+    /// `reply_to` is the same id on both sides.
     TextReply { text: Vec<u8>, ts: u64, reply_to: [u8; 16] },
-    /// ПРАВКА своего ранее отправленного сообщения `target_msg_id`. Overlay: текст
-    /// истории не переписывается (иначе `msg_id` уехал бы), новый текст показывается
-    /// поверх. Кооперативно (как удалить-у-всех) И только автор цели: получатель
-    /// применяет, лишь если `target_msg_id` — сообщение, которое ЭТОТ отправитель
-    /// ему прислал (иначе кто угодно правил бы чужие/ваши сообщения на вашем экране).
+    /// An EDIT of one's own earlier message `target_msg_id`. An overlay: the history text is not
+    /// rewritten (that would move `msg_id`), the new text is shown on top. Cooperative (like
+    /// delete-for-everyone) AND author-only: the recipient applies it only if `target_msg_id` is a
+    /// message THIS sender sent them (otherwise anyone could edit someone else's — or your own —
+    /// messages on your screen).
     EditMessage { target_msg_id: [u8; 16], new_text: Vec<u8>, edit_ts: u64 },
     /// Sender's SELF-DECLARED profile (name + bio). Rides the existing E2E channel
     /// as a control message; the receiver caches it per-contact (`peer_profiles.dat`)
@@ -380,12 +380,12 @@ pub enum Content {
     GalleryRef { blob_id: [u8; 32], key: [u8; 32], hash: [u8; 32], size: u64, chunks: u32 },
 }
 
-/// Сериализовать конверт в plaintext-байты.
+/// Serialise the envelope into plaintext bytes.
 pub fn encode(c: &Content) -> Vec<u8> {
     postcard::to_stdvec(c).expect("postcard serialize Content")
 }
 
-/// Разобрать plaintext-байты в конверт. Чужой/битый груз → ошибка (не паника).
+/// Parse plaintext bytes into an envelope. A foreign or corrupt payload is an error, not a panic.
 pub fn decode(bytes: &[u8]) -> Result<Content, String> {
     postcard::from_bytes(bytes).map_err(|e| format!("content did not decode: {e}"))
 }
@@ -421,7 +421,7 @@ pub fn manifest_declared_size(c: &Content) -> Option<u64> {
     }
 }
 
-/// Завершённая, собранная и проверенная по хэшу передача файла.
+/// A finished file transfer, reassembled and hash-verified.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedFile {
     /// The manifest id — a per-transfer identifier. Used as a **dedup key** when saving, so a
@@ -449,14 +449,14 @@ pub enum Assembled {
     Gallery { bytes: Vec<u8> },
 }
 
-/// Разбить файл на (манифест, чанки). Отвергает слишком длинное имя / большой файл.
+/// Split a file into (manifest, chunks). Refuses a name that is too long or a file that is too big.
 pub fn chunk_file(name: &str, bytes: &[u8]) -> Result<(Content, Vec<Content>), String> {
     if name.is_empty() || name.len() > MAX_FILENAME {
         return Err(format!("file name must be 1..{MAX_FILENAME} bytes"));
     }
     if bytes.is_empty() {
-        // Пустой файл дал бы манифест с chunks=0, который получатель отвергает —
-        // асимметрия (отправитель «успех», получатель «мимо»). Отсекаем у источника.
+        // An empty file would produce a manifest with chunks=0, which the recipient refuses — an
+        // asymmetry ("success" for the sender, "nothing" for the recipient). Cut it off at the source.
         return Err("empty file (0 bytes)".into());
     }
     if bytes.len() as u64 > MAX_FILE_SIZE {
@@ -659,7 +659,7 @@ enum TransferKind {
     Gallery,
 }
 
-/// Незавершённая передача: метаданные из манифеста + пришедшие чанки.
+/// An unfinished transfer: the manifest metadata plus the chunks that have arrived.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Partial {
     kind: TransferKind,
@@ -672,8 +672,8 @@ struct Partial {
     last_seen: u64,
 }
 
-/// Собиратель файлов из потока `Content`. Держится ВЫЗЫВАЮЩИМ (worker/CLI) между
-/// recv-вызовами — пересборка в памяти живого процесса. Текст проходит мимо.
+/// Reassembles files out of a stream of `Content`. Held by the CALLER (worker/CLI) between recv
+/// calls — reassembly happens in the memory of a live process. Text passes straight through.
 #[derive(Default)]
 pub struct Reassembler {
     transfers: HashMap<[u8; 16], Partial>,
@@ -719,8 +719,8 @@ impl Reassembler {
     /// overflow.
     pub fn offer(&mut self, c: Content, now: u64) -> Result<Option<Assembled>, String> {
         match c {
-            // Текст/исчезающий/штампованный/control — не файлы; собиратель их
-            // пропускает (маршрутизируются раньше, в worker'е). Здесь — оборонительно.
+            // Text, disappearing, stamped and control messages are not files; the reassembler
+            // skips them (they are routed earlier, in the worker). This arm is defensive.
             Content::Text(_)
             | Content::TextExpiring { .. }
             | Content::TextStamped { .. }
@@ -752,7 +752,7 @@ impl Reassembler {
             // A gallery blob pointer — the worker persists it as a pending gallery + downloads it.
             | Content::GalleryRef { .. } => Ok(None),
             Content::FileManifest { id, name, size, chunks, hash } => {
-                // Анти-DoS: отвергаем абсурд ДО аллокации.
+                // Anti-DoS: refuse the absurd BEFORE allocating.
                 if chunks == 0 || chunks > MAX_FILE_CHUNKS || size > MAX_FILE_SIZE {
                     return Err("manifest outside its limits (chunks/size)".into());
                 }
@@ -794,11 +794,11 @@ impl Reassembler {
             }
             Content::FileChunk { id, index, data } | Content::AvatarChunk { id, index, data } => {
                 let Some(p) = self.transfers.get_mut(&id) else {
-                    // ИНВАРИАНТ: манифест приходит ДО своих чанков. Держится тем,
-                    // что send_file шлёт манифест первым, mailbox — FIFO, а ratchet
-                    // in-order в пределах цепочки. Если это сломать (напр.
-                    // распараллелить отправку чанков), передача будет молча гибнуть
-                    // здесь — НЕ оптимизировать порядок, не сняв это ограничение.
+                    // INVARIANT: the manifest arrives BEFORE its chunks. It holds because
+                    // send_file sends the manifest first, the mailbox is FIFO, and the ratchet is
+                    // in-order within a chain. Break that (for example by parallelising chunk
+                    // sends) and transfers will die silently right here — do NOT optimise the
+                    // ordering without lifting this constraint first.
                     return Err("chunk without a manifest".into());
                 };
                 if index >= p.total {
@@ -853,7 +853,7 @@ impl Reassembler {
         before - self.transfers.len()
     }
 
-    /// Число незавершённых передач (для тестов/диагностики).
+    /// The number of unfinished transfers (for tests and diagnostics).
     pub fn pending(&self) -> usize {
         self.transfers.len()
     }
@@ -905,7 +905,7 @@ impl Reassembler {
         }
         let got: [u8; 32] = Sha256::digest(&bytes).into();
         if got != p.hash {
-            // ОБНАРУЖЕННАЯ порча — не тихо принять.
+            // Corruption DETECTED — never silently accepted.
             return Err("SHA-256 of the reassembled file does not match (corruption or substitution)".into());
         }
         Ok(Some(match p.kind {
@@ -925,7 +925,7 @@ mod tests {
     use super::*;
 
     fn feed_all(r: &mut Reassembler, manifest: Content, chunks: Vec<Content>) -> Option<Assembled> {
-        // Кодируем/декодируем каждый конверт — как на проводе.
+        // Encode and decode every envelope, exactly as on the wire.
         let mut out = None;
         for c in std::iter::once(manifest).chain(chunks) {
             let wire = encode(&c);
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn file_roundtrips_byte_identical_across_multiple_chunks() {
-        // Несколько чанков (2.5 KiB → 3 чанка по 1024).
+        // Several chunks (2.5 KiB → 3 chunks of 1024).
         let data: Vec<u8> = (0..2560u32).map(|i| (i * 31) as u8).collect();
         let (m, ch) = chunk_file("photo.jpg", &data).unwrap();
         assert!(ch.len() >= 3, "expected more than one chunk");
@@ -1087,7 +1087,7 @@ mod tests {
     fn corrupted_chunk_is_detected_not_silently_accepted() {
         let data: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
         let (m, mut ch) = chunk_file("f.bin", &data).unwrap();
-        // Портим байт в первом чанке.
+        // Corrupt a byte in the first chunk.
         if let Content::FileChunk { data, .. } = &mut ch[0] {
             data[0] ^= 0xFF;
         }
@@ -1108,7 +1108,7 @@ mod tests {
         let (m, ch) = chunk_file("f.bin", &data).unwrap();
         let mut r = Reassembler::new();
         r.offer(m, 0).unwrap();
-        // Подаём все, КРОМЕ последнего.
+        // Offer every chunk EXCEPT the last.
         let n = ch.len();
         for c in ch.into_iter().take(n - 1) {
             assert_eq!(r.offer(c, 0).unwrap(), None, "an incomplete transfer does not complete");
@@ -1139,7 +1139,7 @@ mod tests {
 
     #[test]
     fn empty_file_rejected_at_source() {
-        // Иначе манифест chunks=0 → получатель отвергает, а отправитель «успех».
+        // Otherwise a manifest with chunks=0 → the recipient refuses while the sender saw success.
         assert!(chunk_file("empty.bin", b"").is_err(), "an empty file is refused at the source");
     }
 
@@ -1151,11 +1151,11 @@ mod tests {
 
     #[test]
     fn expiring_text_roundtrips_and_reassembler_ignores_it() {
-        // Новый вариант кодируется/декодируется как есть.
+        // A new variant encodes and decodes as itself.
         let c = Content::TextExpiring { text: b"self-destruct".to_vec(), expire_at: 1_700_000_030 };
         let back = decode(&encode(&c)).unwrap();
         assert_eq!(back, c);
-        // Не файл → собиратель пропускает.
+        // Not a file → the reassembler skips it.
         let mut r = Reassembler::new();
         assert_eq!(r.offer(c, 0).unwrap(), None);
     }
@@ -1173,12 +1173,12 @@ mod tests {
 
     #[test]
     fn adding_variant_kept_positional_indices_for_old_variants() {
-        // Дискриминирующий против перестановки вариантов enum: postcard кодирует
-        // вариант ПОЗИЦИОННЫМ индексом. Text должен остаться индексом 0 — первый
-        // байт закодированного `Text` = 0 (иначе старые сообщения раскодируются
-        // как чужой вариант).
+        // Discriminating against a reordering of the enum variants: postcard encodes a variant by
+        // its POSITIONAL index. Text must stay index 0 — the first byte of an encoded `Text` is 0
+        // (otherwise old messages decode as a different variant).
+
         assert_eq!(encode(&Content::Text(b"x".to_vec()))[0], 0, "Text is variant 0");
-        // И Text по-прежнему декодируется в Text, не в TextExpiring.
+        // And Text still decodes into Text, never into TextExpiring.
         assert!(matches!(decode(&encode(&Content::Text(b"x".to_vec()))).unwrap(), Content::Text(_)));
     }
 
@@ -1186,15 +1186,15 @@ mod tests {
     fn reaction_roundtrips_and_is_not_a_file() {
         let c = Content::Reaction { msg_id: [7u8; 16], emoji: "👍".into(), add: true };
         assert_eq!(decode(&encode(&c)).unwrap(), c);
-        // Не файл → собиратель пропускает.
+        // Not a file → the reassembler skips it.
         let mut r = Reassembler::new();
         assert_eq!(r.offer(c, 0).unwrap(), None);
     }
 
     #[test]
     fn reaction_variant_appended_last_keeps_old_indices() {
-        // Дискриминирующий против перестановки: Reaction — ПОСЛЕДНИЙ вариант (индекс
-        // 6, после DeleteForEveryone=5). Text по-прежнему 0, DFE по-прежнему 5.
+        // Discriminating against reordering: Reaction is the LAST variant (index 6, after
+        // DeleteForEveryone=5). Text is still 0 and DFE is still 5.
         assert_eq!(encode(&Content::Text(b"x".to_vec()))[0], 0, "Text is variant 0");
         assert_eq!(encode(&Content::DeleteForEveryone { ts: 1, text: vec![] })[0], 5, "DFE — 5");
         assert_eq!(
@@ -1270,9 +1270,9 @@ mod tests {
     fn msg_id_is_deterministic_and_sensitive_to_every_input() {
         let a = [1u8; 32];
         let base = msg_id(&a, 100, b"hello");
-        // Детерминизм: те же входы → тот же id (обе стороны сойдутся).
+        // Determinism: the same inputs give the same id (both sides converge).
         assert_eq!(base, msg_id(&a, 100, b"hello"));
-        // Чувствительность к КАЖДОМУ входу (иначе реакция сядет не на то сообщение):
+        // Sensitivity to EVERY input (otherwise a reaction lands on the wrong message):
         assert_ne!(base, msg_id(&[2u8; 32], 100, b"hello"), "the author changes the id");
         assert_ne!(base, msg_id(&a, 101, b"hello"), "the timestamp changes the id");
         assert_ne!(base, msg_id(&a, 100, b"hell0"), "the text changes the id (breaks a same-timestamp collision)");
@@ -1280,9 +1280,9 @@ mod tests {
 
     #[test]
     fn msg_id_disambiguates_same_second_different_text() {
-        // Два сообщения одного автора в ОДНУ секунду, но разный текст → разные id.
-        // (Без текста в хэше реакция была бы неоднозначна — это ловит neuter-тест
-        // в контроллере, здесь фиксируем сам примитив.)
+        // Two messages from one author in the SAME second but with different text → different ids.
+        // (Without the text in the hash a reaction would be ambiguous — the neutered test in the
+        // controller catches that; here we pin the primitive itself.)
         let a = [5u8; 32];
         assert_ne!(msg_id(&a, 424_242, b"first"), msg_id(&a, 424_242, b"second"));
     }

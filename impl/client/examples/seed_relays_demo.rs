@@ -32,7 +32,7 @@ fn main() {
         let rid = client::RelayId::parse(&id_hex).expect("relay-id hex");
         store.save_capability_for(&rid, &client::dev_capability()).unwrap();
     }
-    vault.save_registry(&[AccountEntry { id: id.clone(), label: "Демо".into(), ik }]).unwrap();
+    vault.save_registry(&[AccountEntry { id: id.clone(), label: "Demo".into(), ik }]).unwrap();
 
     store
         .save_net(&NetSettings {

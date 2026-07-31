@@ -1,8 +1,8 @@
-//! Несущий e2e клиента: Alice шлёт → relay(в потоке) → Bob забирает.
-//! Дискриминирующая деталь — **identity Bob сохраняется и ПЕРЕЗАГРУЖАЕТСЯ с
-//! диска** до приёма. Тест «сгенерил-и-использовал-в-памяти» прошёл бы, ни разу
-//! не проверив персистентность (та же ловушка, что roll_epoch/TTL). Только
-//! reload-then-decrypt доказывает, что сохранённый секрет цел.
+//! The client's load-bearing e2e: Alice sends → relay (in a thread) → Bob collects.
+//! The discriminating detail is that **Bob's identity is saved and RELOADED FROM DISK** before
+//! receiving. A generate-and-use-in-memory test would pass without checking persistence at all
+//! (the same trap as roll_epoch/TTL). Only reload-then-decrypt proves the stored secret is intact.
+
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use x25519_dalek::PublicKey;
 
 const NOW: u64 = 1_000_000;
 
-/// Уникальный временный каталог состояния (свой на вызов).
+/// A unique temporary state directory (one per invocation).
 fn temp_dir(tag: &str) -> PathBuf {
     // Uniqueness must not rest on the clock alone: tests in one binary run on several threads
     // with the SAME pid, and a coarse timer hands two of them the same nanosecond — which showed
@@ -40,8 +40,8 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Relay на эфемерном порту с выданной дев-capability и фиксированными часами.
-/// Возвращает (адрес, relay-id = Noise-pub ‖ fetch-auth-pub).
+/// A relay on an ephemeral port with a dev capability issued and a fixed clock.
+/// Returns (address, relay-id = Noise-pub ‖ fetch-auth-pub).
 fn spawn_relay() -> (SocketAddr, client::RelayId) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1493,9 +1493,9 @@ fn recv_multi(store: &Store, relays: &[client::Relay], now: u64) -> Result<clien
     Ok(poll)
 }
 
-/// Провижининг корня (энтропии свежей фразы) в стор; возвращает энтропию, чтобы
-/// тест мог вывести ожидаемые seal/account (`seed::derive`) для сверки. В новой
-/// модели identity+account — не независимые секреты, а вывод из ЕДИНОГО корня.
+/// Provision the root (the entropy of a fresh phrase) into the store; returns the entropy so the
+/// test can derive the expected seal/account (`seed::derive`) for comparison. In the new model
+/// identity and account are not independent secrets but derivations from a SINGLE root.
 fn seed_provision(s: &Store) -> [u8; client::seed::ENTROPY_BYTES] {
     let e = client::seed::entropy_of(&client::seed::generate_mnemonic());
     s.save_seed(&e).unwrap();
@@ -1702,37 +1702,37 @@ fn store_identity_roundtrip() {
     assert_eq!(
         loaded.public.to_bytes(),
         expected,
-        "перезагруженный seal-pubkey должен совпасть с выводом из корня — корень цел"
+        "the reloaded seal public key must match the derivation from the root",
     );
 
-    // create_new: повторный save_seed НЕ должен перезаписывать корень.
+    // create_new: a repeated save_seed must NOT overwrite the root.
     let other = client::seed::entropy_of(&client::seed::generate_mnemonic());
-    assert!(s.save_seed(&other).is_err(), "не должно перезаписывать корень");
+    assert!(s.save_seed(&other).is_err(), "must not overwrite the root");
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn at_rest_wrong_passphrase_cannot_load_and_disk_is_encrypted() {
-    // Проводка at-rest через Store: (1) корень под другим паролем не читается;
-    // (2) на диске нет открытой энтропии (не no-op шифрование).
+    // At-rest wiring through the Store: (1) the root does not open under a different password;
+    // (2) there is no plaintext entropy on disk (the encryption is not a no-op).
     let dir = temp_dir("atrest");
     let s = Store::unlock(&dir, b"right-pass").unwrap();
     let e = seed_provision(&s);
     let acct = client::seed::derive(&e).account;
 
-    // Неверный пароль → fail-fast на unlock (верификатор), до любого чтения.
-    assert!(Store::unlock(&dir, b"wrong-pass").is_err(), "неверный пароль → отказ на unlock");
+    // A wrong password fails fast at unlock (the verifier), before any read.
+    assert!(Store::unlock(&dir, b"wrong-pass").is_err(), "a wrong password is refused at unlock");
 
-    // Верный пароль → тот же IK (выведенный из корня).
+    // The right password gives the same IK (derived from the root).
     let right = Store::unlock(&dir, b"right-pass").unwrap();
     assert_eq!(right.load_account().unwrap().identity_public(), acct.identity_public());
 
-    // На диске (seed.key) — не открытая энтропия (иначе шифрование было бы no-op).
+    // On disk (seed.key) there is no plaintext entropy (otherwise the encryption would be a no-op).
     let on_disk = std::fs::read(dir.join("seed.key")).unwrap();
     assert!(
         !on_disk.windows(e.len()).any(|w| w == e),
-        "открытая энтропия корня не должна присутствовать в seed.key"
+        "the plaintext root entropy must not appear in seed.key"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1773,26 +1773,26 @@ fn a_pre_vault_single_account_layout_is_not_silently_adopted() {
 
 #[test]
 fn store_contacts_roundtrip_with_verified_flag() {
-    // Контакты (имена + флаг сверки) переживают перезапуск процесса и at-rest.
+    // Contacts (names plus the verified flag) survive a process restart.
     use client::store::ContactRecord;
     let dir = temp_dir("contacts");
     let contacts = vec![
         ContactRecord { name: "Alice".into(), ik: [1u8; 32], verified: true },
-        ContactRecord { name: "неизв. deadbeef".into(), ik: [2u8; 32], verified: false },
+        ContactRecord { name: "unknown deadbeef".into(), ik: [2u8; 32], verified: false },
     ];
     Store::unlock(&dir, b"pw").unwrap().save_contacts(&contacts).unwrap();
 
-    // Новый Store (как после рестарта) читает тот же список.
+    // A new Store (as after a restart) reads the same list.
     let loaded = Store::unlock(&dir, b"pw").unwrap().load_contacts().unwrap();
-    assert_eq!(loaded, contacts, "контакты стабильны через диск, флаг сверки цел");
+    assert_eq!(loaded, contacts, "contacts are stable across the disk, the verified flag intact");
 
-    // На диске — не открытое имя (шифрование не no-op).
+    // On disk there is no plaintext name (the encryption is not a no-op).
     let on_disk = std::fs::read(dir.join("contacts.dat")).unwrap();
     assert!(
         !on_disk.windows(5).any(|w| w == b"Alice"),
-        "открытое имя контакта не должно лежать в contacts.dat"
+        "a plaintext contact name must not lie in contacts.dat"
     );
-    // Пустой профиль → пустой список (не ошибка).
+    // An empty profile gives an empty list (not an error).
     let empty = temp_dir("contacts-empty");
     assert!(Store::unlock(&empty, b"pw").unwrap().load_contacts().unwrap().is_empty());
 
@@ -1802,8 +1802,8 @@ fn store_contacts_roundtrip_with_verified_flag() {
 
 #[test]
 fn store_account_roundtrip() {
-    // §2.1-account переживает диск: IK/bundle стабильны (включая KEM-seed) —
-    // выводятся из корня детерминированно.
+    // The §2.1 account survives the disk: the IK and bundle are stable (including the KEM seed) —
+    // they are derived from the root deterministically.
     let dir = temp_dir("acct");
     let s = Store::unlock(&dir, b"test-pw").unwrap();
     let e = seed_provision(&s);
@@ -1812,35 +1812,35 @@ fn store_account_roundtrip() {
     let ek = expected.prekey_bundle().kem_ek;
 
     let loaded = Store::unlock(&dir, b"test-pw").unwrap().load_account().unwrap();
-    assert_eq!(loaded.identity_public(), ik, "IK стабилен через диск");
-    assert_eq!(loaded.prekey_bundle().kem_ek, ek, "KEM ek стабилен (seed восстановлен)");
+    assert_eq!(loaded.identity_public(), ik, "the IK is stable across the disk");
+    assert_eq!(loaded.prekey_bundle().kem_ek, ek, "the KEM ek is stable (the seed was restored)");
 
-    // create_new: смена корня запрещена (сломала бы discovery/сессии).
+    // create_new: changing the root is refused (it would break discovery and sessions).
     let other = client::seed::entropy_of(&client::seed::generate_mnemonic());
-    assert!(s.save_seed(&other).is_err(), "не должно перезаписывать корень");
+    assert!(s.save_seed(&other).is_err(), "must not overwrite the root");
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn bob_reloads_account_from_disk_and_publishes() {
-    // Слой-1 e2e: Bob кладёт корень, ЗАБЫВАЕТ, перезагружает с диска (вывод
-    // account) и публикует bundle у relay. Reload-then-publish доказывает, что
-    // сохранённый корень цел и выведенный bundle согласован.
+    // Layer-1 e2e: Bob writes the root, FORGETS it, reloads from disk (deriving the account) and
+    // publishes the bundle at the relay. Reload-then-publish proves the stored root is intact and
+    // the derived bundle is consistent.
     let (relay, relay_id) = spawn_relay();
     let bob_dir = temp_dir("bob-acct");
     let bob_store = Store::unlock(&bob_dir, b"test-pw").unwrap();
-    seed_provision(&bob_store); // корень на диск; ниже — только диск.
+    seed_provision(&bob_store); // the root goes to disk; everything below reads only the disk.
 
     let reloaded = bob_store.load_account().unwrap();
     let resp = client::publish_bundle(&ctx(relay, &relay_id), reloaded, client::dev_capability(), NOW);
-    assert!(matches!(resp, PublishResponse::Published), "получено: {:?}", resp);
+    assert!(matches!(resp, PublishResponse::Published), "got: {:?}", resp);
 
     std::fs::remove_dir_all(&bob_dir).ok();
 }
 
-/// Мок-транспорт: всегда `Accepted`, записывает каждый ушедший WireMessage.
-/// Send+Sync для использования из потоков (шифртекст «ушёл» — в модели угроз).
+/// A mock transport: always `Accepted`, recording every WireMessage that left.
+/// Send+Sync so it can be used from threads (a ciphertext that "left" is, in this model, gone).
 #[derive(Clone)]
 struct RecordingTransport {
     sent: Arc<Mutex<Vec<WireMessage>>>,
@@ -1857,20 +1857,20 @@ impl Transport for RecordingTransport {
 
 #[test]
 fn concurrent_sends_under_lock_never_reuse_ratchet_position() {
-    // НЕСУЩЕЕ (персистентный keystream-reuse): два «процесса» (потока) шлют по
-    // одной сессии, каждый под flock делает load→send(advance)→save. Замок обязан
-    // сериализовать их так, чтобы КАЖДЫЙ send занял свою позицию цепочки. Если
-    // замок сломан (напр. на переименованном inode), оба загрузят позицию N и
-    // зашифруют РАЗНЫЕ тексты одним mk+нулевым nonce. Проверяем отсутствие
-    // повтора (dh,n) среди всех ушедших конвертов. Детерминирован при любом
-    // порядке (замок работает → нет дублей; сломан → есть).
+    // LOAD-BEARING (persistent keystream reuse): two "processes" (threads) send over one session,
+    // each doing load→send(advance)→save under the flock. The lock must serialise them so that
+    // EVERY send takes its own chain position. If the lock is broken (for example on a renamed
+    // inode), both load position N and encrypt DIFFERENT texts under the same mk and zero nonce.
+    // We check that no (dh,n) pair repeats among the envelopes that left. Deterministic under any
+    // ordering (the lock works → no duplicates; broken → duplicates).
+
     let dir = temp_dir("concurrent");
     let store = Store::unlock(&dir, b"test-pw").unwrap();
     let account = client::seed::derive(&seed_provision(&store)).account;
     let acct_bytes = account.to_secret_bytes();
-    let relay_pub = PublicKey::from([7u8; 32]); // мок — DH не используется в send
+    let relay_pub = PublicKey::from([7u8; 32]); // mock — the DH is unused in send
     let bob_ik = {
-        // Установить сессию и сохранить стартовое состояние.
+        // Establish the session and save the starting state.
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut peer = Peer::new(
             RecordingTransport { sent },
@@ -1896,7 +1896,7 @@ fn concurrent_sends_under_lock_never_reuse_ratchet_position() {
         handles.push(thread::spawn(move || {
             let store = Store::unlock(&dir, b"test-pw").unwrap();
             for i in 0..PER_THREAD {
-                let g = store.lock_sessions().unwrap(); // блокирующий эксклюзив
+                let g = store.lock_sessions().unwrap(); // blocking exclusive lock
                 let transport = RecordingTransport { sent: recorded.clone() };
                 let mut peer =
                     Peer::new(transport, Account::from_secret_bytes(&acct_bytes), client::dev_capability(), relay_pub);
@@ -1904,7 +1904,7 @@ fn concurrent_sends_under_lock_never_reuse_ratchet_position() {
                 let msg = format!("t{t}-{i}");
                 assert!(matches!(peer.send(&bob_ik, msg.as_bytes(), NOW), Response::Accepted));
                 store.save_sessions(&peer.export_state()).unwrap();
-                drop(g); // снять замок
+                drop(g); // release the lock
             }
         }));
     }
@@ -1912,9 +1912,9 @@ fn concurrent_sends_under_lock_never_reuse_ratchet_position() {
         h.join().unwrap();
     }
 
-    // Собрать (dh,n) всех ушедших Session-конвертов — дублей быть не должно.
+    // Collect the (dh,n) of every Session envelope that left — there must be no duplicates.
     let sent = recorded.lock().unwrap();
-    assert_eq!(sent.len(), 2 * PER_THREAD, "все отправки прошли");
+    assert_eq!(sent.len(), 2 * PER_THREAD, "every send went through");
     let mut positions: Vec<([u8; 32], u32)> = sent
         .iter()
         .filter_map(|m| match &m.payload {
@@ -1925,18 +1925,18 @@ fn concurrent_sends_under_lock_never_reuse_ratchet_position() {
     let total = positions.len();
     positions.sort();
     positions.dedup();
-    assert_eq!(positions.len(), total, "две отправки не должны делить позицию цепочки (dh,n)");
+    assert_eq!(positions.len(), total, "two sends must not share a chain position");
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn crash_between_transmit_and_save_never_reuses_position() {
-    // НЕСУЩЕЕ (crash-axis keystream-reuse): «процесс 1» шифрует+передаёт (ct_N уже
-    // ушёл к relay), затем ПАДАЕТ до post-save. «Процесс 2» грузит с диска и шлёт
-    // ДРУГОЙ текст. Порядок encrypt_next→pre-save→transmit гарантирует, что
-    // позиция N стала durable ДО ухода ct_N → процесс 2 берёт N+1, не N. Save-
-    // после-transmit оставил бы окно: диск на N → повтор позиции → reuse.
+    // LOAD-BEARING (the crash axis of keystream reuse): "process 1" encrypts and transmits (ct_N
+    // has already left for the relay), then CRASHES before the post-save. "Process 2" loads from
+    // disk and encrypts DIFFERENT text. The order encrypt_next → pre-save → transmit guarantees
+    // that position N was durable BEFORE ct_N left, so process 2 takes N+1 rather than N. Saving
+    // after transmit would leave the window: disk at N → a repeated position → reuse.
     let dir = temp_dir("crash");
     let store = Store::unlock(&dir, b"test-pw").unwrap();
     let account = client::seed::derive(&seed_provision(&store)).account;
@@ -1944,7 +1944,7 @@ fn crash_between_transmit_and_save_never_reuses_position() {
     let relay_pub = PublicKey::from([7u8; 32]);
     let recorded = Arc::new(Mutex::new(Vec::new()));
 
-    // Установить сессию, сохранить стартовое состояние.
+    // Establish the session and save the starting state.
     let bob_ik = {
         let mut peer = Peer::new(
             RecordingTransport { sent: recorded.clone() },
@@ -1961,7 +1961,7 @@ fn crash_between_transmit_and_save_never_reuses_position() {
         ik
     };
 
-    // Хелпер: одна отправка в порядке send_session, но с опцией «крах» до post-save.
+    // Helper: one send in send_session order, with an option to "crash" before the post-save.
     let send_once = |plaintext: &[u8], crash_before_post_save: bool| {
         let g = store.lock_sessions().unwrap();
         let mut peer = Peer::new(
@@ -1972,16 +1972,16 @@ fn crash_between_transmit_and_save_never_reuses_position() {
         );
         peer.import_state(store.load_sessions().unwrap());
         let env = peer.encrypt_next(&bob_ik, plaintext).unwrap();
-        store.save_sessions(&peer.export_state()).unwrap(); // PRE-transmit save (фикс)
-        peer.transmit_envelope(&bob_ik, env, NOW); // ct ушёл к relay (записан)
+        store.save_sessions(&peer.export_state()).unwrap(); // PRE-transmit save (the fix)
+        peer.transmit_envelope(&bob_ik, env, NOW); // the ct left for the relay (recorded)
         if !crash_before_post_save {
-            store.save_sessions(&peer.export_state()).unwrap(); // post (очистка)
+            store.save_sessions(&peer.export_state()).unwrap(); // post (cleanup)
         }
         drop(g);
     };
 
-    send_once(b"AAAA", true); // процесс 1: краш после transmit, до post-save
-    send_once(b"BBBB", false); // процесс 2: грузит с диска, шлёт другой текст
+    send_once(b"AAAA", true); // process 1: crashes after transmit, before the post-save
+    send_once(b"BBBB", false); // process 2: loads from disk and sends different text
 
     let sent = recorded.lock().unwrap();
     let positions: Vec<([u8; 32], u32)> = sent
@@ -1994,7 +1994,7 @@ fn crash_between_transmit_and_save_never_reuses_position() {
     let mut uniq = positions.clone();
     uniq.sort();
     uniq.dedup();
-    assert_eq!(positions.len(), uniq.len(), "краш до post-save не должен дать повтор позиции (dh,n)");
+    assert_eq!(positions.len(), uniq.len(), "a crash before the post-save must not repeat a position");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2003,7 +2003,7 @@ fn crash_between_transmit_and_save_never_reuses_position() {
 fn alice_sends_bob_reloads_from_disk_and_decrypts() {
     let (relay, relay_id) = spawn_relay();
 
-    // Bob: создать корень, сохранить, затем ЗАБЫТЬ и перезагрузить с диска.
+    // Bob: create the root, save it, then FORGET it and reload from disk.
     let bob_dir = temp_dir("bob");
     let bob_store = Store::unlock(&bob_dir, b"test-pw").unwrap();
     // Bob's KEM key comes from the SAME phrase as his identity, so it survives the reload below
@@ -2013,11 +2013,11 @@ fn alice_sends_bob_reloads_from_disk_and_decrypts() {
         let d = client::seed::derive(&e);
         (d.seal.public.to_bytes(), d.account.seal_kem().ek().to_vec())
     };
-    // ← identity выше вышла из области видимости; ниже работаем только с диском.
+    // ← the identity above went out of scope; below we work only from the disk.
     let bob_reloaded = bob_store.load_identity().unwrap();
     assert_eq!(bob_reloaded.public.to_bytes(), bob_pub);
 
-    // Alice: дев-capability, шлёт на pubkey Bob (внутри Noise-сессии).
+    // Alice: a dev capability, sending to Bob's public key (inside a Noise session).
     let resp = client::send_message(
         &ctx(relay, &relay_id),
         client::dev_capability(),
@@ -2026,19 +2026,19 @@ fn alice_sends_bob_reloads_from_disk_and_decrypts() {
         b"hi bob",
         NOW,
     );
-    assert!(matches!(resp, Response::Accepted), "получено: {:?}", resp);
+    assert!(matches!(resp, Response::Accepted), "got: {:?}", resp);
 
-    // Bob: забрать перезагруженной identity (Noise + fetch-auth) → расшифровать.
+    // Bob: collect with the reloaded identity (Noise + fetch-auth) and decrypt.
     let bob_account = bob_store.load_account().expect("account re-derives from the stored phrase");
     let msgs = client::fetch_messages(&ctx(relay, &relay_id), bob_reloaded, &bob_account, NOW)
         .expect("fetch");
-    let got: Vec<_> = msgs.into_iter().flatten().collect(); // skeleton-путь: Vec<u8>
-    assert_eq!(got, vec![b"hi bob".to_vec()], "Bob должен расшифровать своим сохранённым ключом");
+    let got: Vec<_> = msgs.into_iter().flatten().collect(); // the skeleton path: Vec<u8>
+    assert_eq!(got, vec![b"hi bob".to_vec()], "Bob must decrypt with his stored identity");
 
     std::fs::remove_dir_all(&bob_dir).ok();
 }
 
-// ---- Зашифрованный append-лог истории ----
+// ---- The encrypted append log of history ----
 
 #[test]
 fn history_append_then_reload_roundtrips_in_order() {
@@ -2054,9 +2054,9 @@ fn history_append_then_reload_roundtrips_in_order() {
     for r in &recs {
         s.append_history(r).unwrap();
     }
-    // Перезагрузка НОВЫМ Store (как новый процесс) — читает с диска, не из памяти.
+    // Reloading with a NEW Store (as a new process) reads from disk, not from memory.
     let loaded = Store::unlock(&dir, b"test-pw").unwrap().load_history().unwrap();
-    assert_eq!(loaded, recs.to_vec(), "порядок и содержимое сохранены");
+    assert_eq!(loaded, recs.to_vec(), "order and contents preserved");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2065,17 +2065,17 @@ fn history_records_use_fresh_nonce_no_keystream_reuse() {
     use client::store::HistoryRecord;
     let dir = temp_dir("hist-nonce");
     let s = Store::unlock(&dir, b"test-pw").unwrap();
-    // Две ОДИНАКОВЫЕ записи → на диске должны дать РАЗНЫЕ шифртексты (свежий nonce).
+    // Two IDENTICAL records must give DIFFERENT ciphertexts on disk.
     let r = HistoryRecord { from_me: true, peer_ik: [1; 32], text: b"same".to_vec(), ts: 42 };
     s.append_history(&r).unwrap();
     s.append_history(&r).unwrap();
     let raw = std::fs::read(dir.join("history.dat")).unwrap();
-    // Две записи с одинаковым len-префиксом; их запечатанные тела не равны.
+    // Two records with the same length prefix; their sealed bodies must differ.
     let len = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
     let first = &raw[4..4 + len];
     let second = &raw[4 + len + 4..4 + len + 4 + len];
-    assert_ne!(first, second, "одинаковый plaintext → разный шифртекст (nonce свеж)");
-    // И обе всё равно читаются.
+    assert_ne!(first, second, "identical plaintext → different ciphertext (the nonce is fresh)");
+    // And both are still readable.
     let loaded = s.load_history().unwrap();
     assert_eq!(loaded, vec![r.clone(), r]);
     std::fs::remove_dir_all(&dir).ok();
@@ -2090,22 +2090,22 @@ fn history_torn_tail_is_truncated_and_future_appends_survive() {
     {
         let s = Store::unlock(&dir, b"test-pw").unwrap();
         s.append_history(&good).unwrap();
-        // Симулируем крах на середине append: дописываем рваный хвост (длина обещает
-        // байты, которых нет + мусор).
+        // Simulate a crash mid-append: write a torn tail (a length prefix for bytes that are not
+        // there, plus garbage).
         let mut f =
             std::fs::OpenOptions::new().append(true).open(dir.join("history.dat")).unwrap();
         f.write_all(&999u32.to_le_bytes()).unwrap();
         f.write_all(b"\x00\x01\x02garbage").unwrap();
     }
-    // load на старте: отдаёт только целую запись И усекает мусор.
+    // load at startup: it returns only the whole record AND truncates the garbage.
     let s2 = Store::unlock(&dir, b"test-pw").unwrap();
     let loaded = s2.load_history().unwrap();
-    assert_eq!(loaded, vec![good.clone()], "рваный хвост отброшен, целое сохранено");
-    // Критично: после усечения будущий append снова парсится (хвост не отравлен).
+    assert_eq!(loaded, vec![good.clone()], "the torn tail is dropped, the whole record kept");
+    // Critical: after truncation a future append parses again (the tail did not poison the file).
     let next = HistoryRecord { from_me: true, peer_ik: [3; 32], text: b"after".to_vec(), ts: 6 };
     s2.append_history(&next).unwrap();
     let after = Store::unlock(&dir, b"test-pw").unwrap().load_history().unwrap();
-    assert_eq!(after, vec![good, next], "append после восстановления читается");
+    assert_eq!(after, vec![good, next], "an append after recovery is readable");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2123,13 +2123,13 @@ fn rewrite_history_drops_filtered_records_and_persists_atomically() {
     for r in &recs {
         s.append_history(r).unwrap();
     }
-    // Очистить переписку с [9;32] (как «удалить чат»): оставить только peer != [9;32].
+    // Clear the conversation with [9;32] (as in "delete chat"): keep only the others.
     let removed = s.rewrite_history(|r| r.peer_ik != [9; 32]).unwrap();
-    assert_eq!(removed.len(), 2, "удалены обе записи чата [9;32]");
-    assert!(removed.iter().all(|r| r.peer_ik == [9; 32]), "вернулись именно удалённые записи");
-    // НОВЫЙ Store (как после рестарта): фильтр пережил перезапись, порядок сохранён.
+    assert_eq!(removed.len(), 2, "both records of chat [9;32] were removed");
+    assert!(removed.iter().all(|r| r.peer_ik == [9; 32]), "exactly the removed records came back");
+    // A NEW Store (as after a restart): the filter survived the rewrite, and so did the order.
     let loaded = Store::unlock(&dir, b"test-pw").unwrap().load_history().unwrap();
-    assert_eq!(loaded, vec![recs[0].clone(), recs[2].clone()], "оставлены только keep-* по порядку");
+    assert_eq!(loaded, vec![recs[0].clone(), recs[2].clone()], "only the kept records, in order");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2142,9 +2142,9 @@ fn rewrite_history_noop_when_nothing_filtered() {
     s.append_history(&r).unwrap();
     let before = std::fs::read(dir.join("history.dat")).unwrap();
     let removed = s.rewrite_history(|_| true).unwrap();
-    assert!(removed.is_empty(), "keep-all ничего не удаляет");
-    // Файл не тронут (тот же inode/содержимое — не переписывали зря).
-    assert_eq!(std::fs::read(dir.join("history.dat")).unwrap(), before, "keep-all не переписывает файл");
+    assert!(removed.is_empty(), "keep-all removes nothing");
+    // The file is untouched (same contents — no pointless rewrite).
+    assert_eq!(std::fs::read(dir.join("history.dat")).unwrap(), before, "keep-all does not rewrite the file");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2158,16 +2158,16 @@ fn rewrite_history_can_clear_all_and_file_stays_valid_for_append() {
             .unwrap();
     }
     let removed = s.rewrite_history(|_| false).unwrap();
-    assert_eq!(removed.len(), 3, "удалено всё");
-    assert!(s.load_history().unwrap().is_empty(), "история пуста после полной очистки");
-    // Файл валиден: последующий append парсится (не отравлен пустой перезаписью).
+    assert_eq!(removed.len(), 3, "everything was removed");
+    assert!(s.load_history().unwrap().is_empty(), "the history is empty after a full clear");
+    // The file is valid: a later append parses (it was not poisoned by the empty rewrite).
     let next = HistoryRecord { from_me: false, peer_ik: [1; 32], text: b"after".to_vec(), ts: 4 };
     s.append_history(&next).unwrap();
     assert_eq!(Store::unlock(&dir, b"test-pw").unwrap().load_history().unwrap(), vec![next]);
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ---- Метаданные сообщений (реакции), at-rest sidecar meta.dat ----
+// ---- Message metadata (reactions), the at-rest sidecar meta.dat ----
 
 #[test]
 fn reactions_survive_restart_and_are_at_rest_encrypted() {
@@ -2176,18 +2176,18 @@ fn reactions_survive_restart_and_are_at_rest_encrypted() {
     let s = Store::unlock(&dir, b"test-pw").unwrap();
     let id = msg_id(&[7; 32], 42, b"hi");
     s.set_reaction(id, "👍", [1; 32], true).unwrap();
-    s.set_reaction(id, "👍", [2; 32], true).unwrap(); // второй автор той же реакции
+    s.set_reaction(id, "👍", [2; 32], true).unwrap(); // a second author of the same reaction
     s.set_reaction(id, "🔥", [1; 32], true).unwrap();
 
-    // At-rest: сырой файл НЕ содержит эмодзи в открытом виде.
+    // At rest: the raw file does NOT contain the emoji in the clear.
     let raw = std::fs::read(dir.join("meta.dat")).unwrap();
-    assert!(!raw.windows("👍".len()).any(|w| w == "👍".as_bytes()), "эмодзи не в plaintext на диске");
+    assert!(!raw.windows("👍".len()).any(|w| w == "👍".as_bytes()), "the emoji is not plaintext on disk");
 
-    // Рестарт: карта пережила и корректна.
+    // Restart: the map survived and is correct.
     let map = Store::unlock(&dir, b"test-pw").unwrap().load_meta().unwrap();
-    let mm = map.get(&id).expect("есть метаданные сообщения");
-    assert_eq!(mm.reactions.get("👍").unwrap().len(), 2, "два автора 👍");
-    assert!(mm.reactions.get("🔥").unwrap().contains(&[1; 32]), "🔥 от автора 1");
+    let mm = map.get(&id).expect("the message has metadata");
+    assert_eq!(mm.reactions.get("👍").unwrap().len(), 2, "two authors of 👍");
+    assert!(mm.reactions.get("🔥").unwrap().contains(&[1; 32]), "🔥 from author 1");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2198,10 +2198,10 @@ fn reaction_toggle_add_then_remove_collapses_to_empty_and_removes_file() {
     let s = Store::unlock(&dir, b"test-pw").unwrap();
     let id = msg_id(&[3; 32], 9, b"m");
     s.set_reaction(id, "❤", [1; 32], true).unwrap();
-    assert!(dir.join("meta.dat").exists(), "файл появился");
-    s.set_reaction(id, "❤", [1; 32], false).unwrap(); // снятие последней
-    assert!(s.load_meta().unwrap().is_empty(), "снятие последней реакции → пусто");
-    assert!(!dir.join("meta.dat").exists(), "пустая карта удаляет файл (не держим мусор)");
+    assert!(dir.join("meta.dat").exists(), "the file appeared");
+    s.set_reaction(id, "❤", [1; 32], false).unwrap(); // removing the last one
+    assert!(s.load_meta().unwrap().is_empty(), "removing the last reaction leaves it empty");
+    assert!(!dir.join("meta.dat").exists(), "an empty map deletes the file (no leftovers)");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2216,7 +2216,7 @@ fn prune_meta_drops_only_named_ids() {
     s.set_reaction(gone, "👍", [1; 32], true).unwrap();
     s.prune_meta(&[gone]).unwrap();
     let map = s.load_meta().unwrap();
-    assert!(map.contains_key(&keep) && !map.contains_key(&gone), "удалён только названный id");
+    assert!(map.contains_key(&keep) && !map.contains_key(&gone), "only the named id was removed");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2226,10 +2226,10 @@ fn reaction_rejects_absurd_emoji_before_write() {
     let dir = temp_dir("meta-caps");
     let s = Store::unlock(&dir, b"test-pw").unwrap();
     let id = msg_id(&[1; 32], 1, b"m");
-    assert!(s.set_reaction(id, "", [1; 32], true).is_err(), "пустой эмодзи отвергнут");
+    assert!(s.set_reaction(id, "", [1; 32], true).is_err(), "an empty emoji is refused");
     let huge = "x".repeat(MAX_EMOJI_BYTES + 1);
-    assert!(s.set_reaction(id, &huge, [1; 32], true).is_err(), "оверсайз эмодзи отвергнут");
-    assert!(!dir.join("meta.dat").exists(), "отвергнутое НЕ записано на диск");
+    assert!(s.set_reaction(id, &huge, [1; 32], true).is_err(), "an oversized emoji is refused");
+    assert!(!dir.join("meta.dat").exists(), "what was refused is NOT written to disk");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2242,7 +2242,7 @@ fn set_reply_persists_across_restart() {
     let target = msg_id(&[2; 32], 3, b"original");
     s.set_reply(reply_msg, target).unwrap();
     let map = Store::unlock(&dir, b"test-pw").unwrap().load_meta().unwrap();
-    assert_eq!(map.get(&reply_msg).unwrap().reply_to, Some(target), "reply_to пережил рестарт");
+    assert_eq!(map.get(&reply_msg).unwrap().reply_to, Some(target), "reply_to survived the restart");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2254,29 +2254,29 @@ fn set_edit_persists_across_restart() {
     let id = msg_id(&[1; 32], 5, b"typo");
     s.set_edit(id, 9, b"fixed").unwrap();
     let map = Store::unlock(&dir, b"test-pw").unwrap().load_meta().unwrap();
-    assert_eq!(map.get(&id).unwrap().edited, Some((9, b"fixed".to_vec())), "правка пережила рестарт");
+    assert_eq!(map.get(&id).unwrap().edited, Some((9, b"fixed".to_vec())), "the edit survived the restart");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn incoming_edit_allowed_only_for_messages_the_sender_authored() {
-    // GUARD против спуфинга: правку применяем ТОЛЬКО если её отправитель — автор
-    // цели (у нас — входящее от него). Нельзя править ВАШЕ (или чужое) сообщение.
+    // A GUARD against spoofing: an edit is applied ONLY if its sender is the target's author (for
+    // us, an incoming message from them). Editing YOUR (or a third party's) message is refused.
     use client::content::msg_id;
     use client::store::HistoryRecord;
     let sender = [2u8; 32];
     let me = [1u8; 32];
     let recs = vec![
-        // Их сообщение (входящее от sender): from_me=false, peer=sender.
+        // Their message (incoming from sender): from_me=false, peer=sender.
         HistoryRecord { from_me: false, peer_ik: sender, text: b"theirs".to_vec(), ts: 5 },
-        // Моё сообщение (исходящее к sender): from_me=true, автор = me.
+        // My message (outgoing to sender): from_me=true, author = me.
         HistoryRecord { from_me: true, peer_ik: sender, text: b"mine".to_vec(), ts: 6 },
     ];
-    // Правка ИХ сообщения (автор = sender) — разрешена.
+    // Editing THEIR message (author = sender) is allowed.
     assert!(client::incoming_edit_allowed(&recs, &sender, msg_id(&sender, 5, b"theirs")));
-    // Правка МОЕГО сообщения от sender — ЗАПРЕЩЕНА (иначе он подменил бы мой текст).
+    // Editing MY message from sender is REFUSED (otherwise they could rewrite my text).
     assert!(!client::incoming_edit_allowed(&recs, &sender, msg_id(&me, 6, b"mine")));
-    // Незнакомый target — запрещён.
+    // An unknown target is refused.
     assert!(!client::incoming_edit_allowed(&recs, &sender, [0xFF; 16]));
 }
 
@@ -2286,12 +2286,12 @@ fn blocked_set_persists_and_toggles_off_removes_file() {
     let s = Store::unlock(&dir, b"test-pw").unwrap();
     assert!(s.load_blocked().unwrap().is_empty());
     s.set_blocked([9; 32], true).unwrap();
-    // Пережил рестарт.
+    // It survived the restart.
     assert!(Store::unlock(&dir, b"test-pw").unwrap().load_blocked().unwrap().contains(&[9; 32]));
-    // Разблокировать → пусто → файл удалён.
+    // Unblock → empty → the file is deleted.
     s.set_blocked([9; 32], false).unwrap();
     assert!(s.load_blocked().unwrap().is_empty());
-    assert!(!dir.join("blocked.dat").exists(), "пустой блок-лист удаляет файл");
+    assert!(!dir.join("blocked.dat").exists(), "an empty block list deletes the file");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2372,17 +2372,17 @@ fn corrupt_profile_files_load_as_empty_not_error() {
 fn corrupt_meta_file_loads_as_empty_not_error() {
     let dir = temp_dir("meta-corrupt");
     let s = Store::unlock(&dir, b"test-pw").unwrap();
-    // Мусор вместо запечатанного blob — метаданные best-effort, история не должна
-    // падать из-за битого meta.dat.
+    // Garbage instead of a sealed blob — metadata is best-effort, and the history must not fall
+    // over because meta.dat is corrupt.
     std::fs::write(dir.join("meta.dat"), b"not a sealed metadata blob").unwrap();
-    assert!(s.load_meta().unwrap().is_empty(), "битый meta.dat → пусто, не ошибка");
+    assert!(s.load_meta().unwrap().is_empty(), "a corrupt meta.dat gives empty, not an error");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ---- Передача файлов через relay (чанкинг + пересборка) ----
+// ---- File transfer through a relay (chunking plus reassembly) ----
 
-/// Провизия §2.1-клиента: account + дев-capability ДЛЯ ДАННОГО relay на диске
-/// (capability теперь привязана к relay — CRYPTO-24).
+/// Provision a §2.1 client: an account plus a dev capability FOR THIS relay on disk (a capability
+/// is bound to a relay now — CRYPTO-24).
 fn provision(tag: &str, relay: &client::RelayId) -> (PathBuf, Store, [u8; 32]) {
     let dir = temp_dir(tag);
     let store = Store::unlock(&dir, b"pw").unwrap();
@@ -2399,7 +2399,7 @@ fn file_transfer_roundtrips_through_relay_byte_identical() {
     let (adir, astore, _aik) = provision("file-alice", &relay_id);
     let (bdir, bstore, bob_ik) = provision("file-bob", &relay_id);
 
-    // Bob публикует bundle (§12) — иначе Alice не инициирует сессию.
+    // Bob publishes his bundle (§12) — otherwise Alice cannot initiate a session.
     let pr = client::publish_bundle(
         &ctx(relay, &relay_id),
         bstore.load_account().unwrap(),
@@ -2408,33 +2408,33 @@ fn file_transfer_roundtrips_through_relay_byte_identical() {
     );
     assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
 
-    // Alice: текст (устанавливает сессию → манифест поедет как Ratchet), затем файл
-    // ~5 KiB (несколько чанков по 1024, валидирует chunk-размер против 1400-лимита).
-    client::send_text(&astore, &ctx(relay, &relay_id), &bob_ik, "привет".as_bytes(), NOW, NOW).unwrap();
+    // Alice: text (which establishes the session, so the manifest travels as a Ratchet), then a
+    // ~5 KiB file (several 1024-byte chunks, validating the chunk size against the 1400 limit).
+    client::send_text(&astore, &ctx(relay, &relay_id), &bob_ik, "hello".as_bytes(), NOW, NOW).unwrap();
     let file: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
     client::send_file(&astore, &ctx(relay, &relay_id), &bob_ik, "report.bin", &file, NOW).unwrap();
 
-    // Bob забирает ВСЁ одним recv (один mailbox), декодирует, собирает.
+    // Bob collects EVERYTHING in one recv (a single mailbox), decodes and reassembles.
     let msgs = client::recv_session(&bstore, &ctx(relay, &relay_id), NOW).unwrap();
     let mut re = Reassembler::new();
     let (mut got_text, mut got_file) = (None, None);
     for r in msgs.into_iter().flatten() {
-        match decode(&r.plaintext).expect("контент разобран") {
+        match decode(&r.plaintext).expect("the content decoded") {
             Content::Text(t) | Content::TextStamped { text: t, .. } => got_text = Some(t),
             c => {
-                if let Some(f) = re.offer(c, NOW).expect("пересборка без ошибок") {
+            if let Some(f) = re.offer(c, NOW).expect("reassembly without errors") {
                     got_file = Some(f);
                 }
             }
         }
     }
-    assert_eq!(got_text.as_deref(), Some("привет".as_bytes()), "текст доехал");
+    assert_eq!(got_text.as_deref(), Some("hello".as_bytes()), "the text arrived");
     let f = match got_file.expect("file assembled from chunks") {
         client::content::Assembled::File(f) => f,
         other => panic!("expected a file, got {other:?}"),
     };
     assert_eq!(f.name, "report.bin");
-    assert_eq!(f.bytes, file, "файл байт-в-байт через настоящий relay");
+    assert_eq!(f.bytes, file, "the file is byte for byte through a real relay");
 
     std::fs::remove_dir_all(&adir).ok();
     std::fs::remove_dir_all(&bdir).ok();
@@ -3056,7 +3056,7 @@ fn simultaneous_first_contact_publications_both_deliver() {
 
     // Idempotency / no re-delivery storm: an extra poll after everything is drained must simply
     // return Ok with nothing — never re-run key agreement (which consumes the OPK) and never
-    // resurface an un-decryptable payload every cycle (the `чанк без манифеста` → Killed hang).
+    // resurface an un-decryptable payload every cycle (the `chunk without a manifest` → Killed hang).
     let extra = recv_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
     assert!(extra.messages.into_iter().flatten().count() == 0, "B re-delivered mail after a clean drain");
 

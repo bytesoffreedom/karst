@@ -104,8 +104,8 @@ karst_relay_id_from_log() {
 # `karst_wait_port` is not a substitute, and CI proved it: the relay binds its listener before it
 # writes the startup banner, and the relay-id sits in the connect box that is deliberately printed
 # LAST. So the port answers while the log is still half-written, and a caller that reads the log the
-# moment the port opens gets an empty id — then dies several steps later with "relay-id должен быть
-# 64 байта, дано 0", which points at the client rather than at the race that caused it.
+# moment the port opens gets an empty id — then dies several steps later with "relay-id must be 64
+# bytes (128 hex), got 0", which points at the client rather than at the race that caused it.
 #
 # This lost on a loaded runner while passing on every developer machine, which is the signature of a
 # race being decided by timing rather than by correctness.

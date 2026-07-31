@@ -17,6 +17,31 @@
 //! behind from the parent. That is more machinery than `#[should_panic]`, and it is the machinery
 //! the property actually requires.
 //!
+//! # What this models, and what it does NOT
+//!
+//! `abort` kills the PROCESS. It does not power off the machine, and the difference decides which
+//! properties are testable with it.
+//!
+//! Bytes written with `write` but not yet `fsync`ed are in the kernel's page cache, not in the
+//! process. Killing the process leaves them there, and the OS writes them out regardless — so a
+//! reader after the "crash" sees them. Only losing the machine loses them.
+//!
+//! Therefore:
+//!
+//! - **Testable:** ordering properties — "A is durable before B is written", "a crash between the
+//!   two leaves a state that still opens". The failpoint sits between two operations and the
+//!   question is what the surviving on-disk state means.
+//! - **NOT testable:** anything whose expected behaviour depends on unsynced writes being LOST.
+//!   `relay::mailstore` documents exactly such a property: deletions are deliberately not fsynced,
+//!   so a crash in the window "recipient got it" → "delete record reached the platter" is supposed
+//!   to resurrect the message. Under `abort` the delete record survives in the page cache and the
+//!   message stays deleted. A test written naively against that paragraph would conclude the
+//!   documentation is wrong. It is not — the tool is aimed at the wrong failure.
+//!
+//! Reaching that second class needs something else: a filesystem that can be told to drop unsynced
+//! writes, or a VM snapshot. Recorded here rather than discovered by someone whose test disagreed
+//! with a correct comment.
+//!
 //! # Off in production, structurally
 //!
 //! Everything here is behind `#[cfg(feature = "failpoints")]`, off by default. With the feature

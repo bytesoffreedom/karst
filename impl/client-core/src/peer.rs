@@ -571,6 +571,31 @@ impl BoxAuth {
     }
 }
 
+/// One fetch, built and authorised but not yet sent.
+///
+/// The split exists so the network phase needs nothing mutable: building this MINTS a handle and
+/// reads a cookie (both `&mut self`), sending it needs only `&self.transport`. Everything the
+/// response handler will need is carried here rather than re-derived, because re-deriving
+/// `client_addr` after the fact would mint a DIFFERENT handle and file the ACK receipt under an
+/// address the relay never saw.
+struct PreparedFetch {
+    req: FetchRequest,
+    client_addr: Vec<u8>,
+    scope: Option<String>,
+    /// The cookie the request was signed with — the ACK must re-present this exact one, and by the
+    /// time the response is absorbed the cookie map may already hold a newer one.
+    cookie: Option<Cookie>,
+}
+
+/// What a fetch response means to the caller, once the `&mut self` bookkeeping is done.
+enum Absorbed {
+    Fetched(Vec<Payload>),
+    /// The relay issued a fresh cookie; it is banked, and the same box should be asked again. The
+    /// caller bounds how many times — one retry, exactly as before the split.
+    Retry,
+    Rejected(String),
+}
+
 /// Send one ACK, best-effort, refreshing the cookie once on a `NeedCookie`. Free (not a
 /// method) so single- and multi-homed receive share exactly one copy of the retry: the
 /// single path acks through the `Peer`'s own transport, the multi path acks a carried-out
@@ -1660,84 +1685,125 @@ impl<T: Transport> Peer<T> {
         handle: Handle,
         now: u64,
     ) -> Result<Vec<Payload>, String> {
+        // One box, one round trip at a time — the shape every caller had before the fetch was
+        // split into phases. It is now written in terms of that split (`prepare_fetch` →
+        // transport → `absorb_fetch`) rather than beside it, so there is exactly one description
+        // of how a fetch is built, authorised and remembered. Two implementations of that would
+        // drift, and the half that drifts is the one that records ACK receipts — mail nobody
+        // deletes, or worse, mail deleted twice.
+        for _ in 0..2 {
+            let prepared = self.prepare_fetch(&auth, &handle);
+            let resp = self.transport.fetch_isolated(&prepared.req, now, prepared.scope.as_deref());
+            match self.absorb_fetch(&auth, &prepared, resp) {
+                Absorbed::Fetched(payloads) => return Ok(payloads),
+                Absorbed::Retry => continue,
+                Absorbed::Rejected(r) => return Err(r),
+            }
+        }
+        Err("persistent cookie challenge".into())
+    }
+
+    /// Phase 1 of a fetch: everything that needs `&mut self`, and nothing that touches the network.
+    ///
+    /// Minting the handle and reading the cookie both mutate, so this cannot happen while several
+    /// requests are in flight. Doing it for ALL boxes first is what lets the transport phase take
+    /// only `&self` — see `fetch_boxes` — and it is why this is a separate function rather than a
+    /// block inside the loop.
+    fn prepare_fetch(&mut self, auth: &BoxAuth, handle: &Handle) -> PreparedFetch {
         let mailbox = auth.mailbox();
         let client_addr = self.handle(handle.clone());
-        let scope = self.scope_for(&handle);
+        let scope = self.scope_for(handle);
         let rid = self.relay_id();
-
-        for _ in 0..2 {
-            let cookie = self.cookies.get(&(rid, client_addr.clone())).copied();
-            // Ownership proof for THIS cookie: DH for the identity mailbox, Schnorr (bound to the
-            // cookie MAC) for a blinded drop-box.
-            let (proof, own_proof) = match (&auth, cookie) {
-                (BoxAuth::Identity(id), Some(c)) => {
-                    (fetch_proof(&id.dh(&self.relay_pub), &c.mac, &mailbox), Vec::new())
-                }
-                (BoxAuth::DropBox { fetch_secret, .. }, Some(c)) => {
-                    let own = karst_crypto::blind::FetchOwnershipProof::prove(fetch_secret, &mailbox, &c.mac)
-                        .map(|p| p.to_bytes().to_vec())
-                        .unwrap_or_default();
-                    ([0u8; 16], own)
-                }
-                (_, None) => ([0u8; 16], Vec::new()),
-            };
-            let req = FetchRequest {
+        let cookie = self.cookies.get(&(rid, client_addr.clone())).copied();
+        // Ownership proof for THIS cookie: DH for the identity mailbox, Schnorr (bound to the
+        // cookie MAC) for a blinded drop-box.
+        let (proof, own_proof) = match (&auth, cookie) {
+            (BoxAuth::Identity(id), Some(c)) => {
+                (fetch_proof(&id.dh(&self.relay_pub), &c.mac, &mailbox), Vec::new())
+            }
+            (BoxAuth::DropBox { fetch_secret, .. }, Some(c)) => {
+                let own = karst_crypto::blind::FetchOwnershipProof::prove(fetch_secret, &mailbox, &c.mac)
+                    .map(|p| p.to_bytes().to_vec())
+                    .unwrap_or_default();
+                ([0u8; 16], own)
+            }
+            (_, None) => ([0u8; 16], Vec::new()),
+        };
+        PreparedFetch {
+            req: FetchRequest {
                 mailbox,
                 client_addr: client_addr.clone(),
                 carrier_id: self.carrier_id.clone(),
                 cookie,
                 proof,
                 own_proof,
-            };
-            match self.transport.fetch_isolated(&req, now, scope.as_deref()) {
-                FetchResponse::NeedCookie(c) => {
-                    self.cookies.insert((rid, client_addr.clone()), c);
-                    continue;
-                }
-                FetchResponse::Fetched(payloads) => {
-                    // Under lease, remember what to delete: the messages stay on the relay
-                    // until the ACK runs (after the caller persists the ratchet). The
-                    // receipt captures the cookie that just authorised this fetch, so it can
-                    // be acked later without the Peer. Empty pages leave nothing to ACK.
-                    // ALWAYS record a receipt (#179 follow-up). This used to be gated on an
-                    // `enable_ack` flag, which made sense while the flag ALSO selected the
-                    // relay's behaviour: a non-lease fetch destroyed its messages, so there was
-                    // nothing to remember. Now every fetch leases, so a receive that records
-                    // nothing leaves mail sitting on the relay with no receipt anywhere — it
-                    // redelivers when the lease lapses, silently, and no caller can choose to
-                    // clean it up. Recording costs a Vec entry; the real control is `ack_all`,
-                    // which the caller still only runs once the ratchet is durable.
-                    if !payloads.is_empty() {
-                        // The later ACK re-proves ownership: DH needs `shared`, a drop-box needs
-                        // its fetch secret.
-                        let (shared, own_fetch_secret) = match &auth {
-                            BoxAuth::Identity(id) => (id.dh(&self.relay_pub), None),
-                            BoxAuth::DropBox { fetch_secret, .. } => ([0u8; 32], Some(*fetch_secret)),
-                        };
-                        // A caller that never runs `ack_all` (a probe, a test, an aborted
-                        // receive) must not grow this without bound. Dropping the OLDEST
-                        // receipt is the safe direction: that mail stays on the relay and
-                        // redelivers when its lease lapses, exactly as if the ACK had failed.
-                        if self.pending_ack.len() >= MAX_PENDING_ACKS {
-                            self.pending_ack.remove(0);
-                        }
-                        self.pending_ack.push(AckReceipt {
-                            mailbox,
-                            client_addr: client_addr.clone(),
-                            carrier_id: self.carrier_id.clone(),
-                            shared,
-                            cookie,
-                            scope: scope.clone(),
-                            ids: payloads.iter().map(payload_id).collect(),
-                            own_fetch_secret,
-                        });
-                    }
-                    return Ok(payloads);
-                }
-                FetchResponse::Rejected(r) => return Err(r),
-            }
+            },
+            client_addr,
+            scope,
+            cookie,
         }
-        Err("persistent cookie challenge".into())
+    }
+
+    /// Phase 3 of a fetch: everything that needs `&mut self` again — bank a fresh cookie, or
+    /// record what this box leased so it can be acked once the ratchet is durable.
+    ///
+    /// Takes the response by value and returns what the caller should do next, so the SAME
+    /// function serves one sequential fetch and a whole fanned-out batch. Payload decryption is
+    /// deliberately NOT here: it belongs to the caller, which knows the box's owning peer.
+    fn absorb_fetch(
+        &mut self,
+        auth: &BoxAuth,
+        prepared: &PreparedFetch,
+        resp: FetchResponse,
+    ) -> Absorbed {
+        let rid = self.relay_id();
+        match resp {
+            FetchResponse::NeedCookie(c) => {
+                self.cookies.insert((rid, prepared.client_addr.clone()), c);
+                Absorbed::Retry
+            }
+            FetchResponse::Fetched(payloads) => {
+                // Under lease, remember what to delete: the messages stay on the relay
+                // until the ACK runs (after the caller persists the ratchet). The
+                // receipt captures the cookie that just authorised this fetch, so it can
+                // be acked later without the Peer. Empty pages leave nothing to ACK.
+                // ALWAYS record a receipt (#179 follow-up). This used to be gated on an
+                // `enable_ack` flag, which made sense while the flag ALSO selected the
+                // relay's behaviour: a non-lease fetch destroyed its messages, so there was
+                // nothing to remember. Now every fetch leases, so a receive that records
+                // nothing leaves mail sitting on the relay with no receipt anywhere — it
+                // redelivers when the lease lapses, silently, and no caller can choose to
+                // clean it up. Recording costs a Vec entry; the real control is `ack_all`,
+                // which the caller still only runs once the ratchet is durable.
+                if !payloads.is_empty() {
+                    // The later ACK re-proves ownership: DH needs `shared`, a drop-box needs
+                    // its fetch secret.
+                    let (shared, own_fetch_secret) = match auth {
+                        BoxAuth::Identity(id) => (id.dh(&self.relay_pub), None),
+                        BoxAuth::DropBox { fetch_secret, .. } => ([0u8; 32], Some(*fetch_secret)),
+                    };
+                    // A caller that never runs `ack_all` (a probe, a test, an aborted
+                    // receive) must not grow this without bound. Dropping the OLDEST
+                    // receipt is the safe direction: that mail stays on the relay and
+                    // redelivers when its lease lapses, exactly as if the ACK had failed.
+                    if self.pending_ack.len() >= MAX_PENDING_ACKS {
+                        self.pending_ack.remove(0);
+                    }
+                    self.pending_ack.push(AckReceipt {
+                        mailbox: prepared.req.mailbox,
+                        client_addr: prepared.client_addr.clone(),
+                        carrier_id: self.carrier_id.clone(),
+                        shared,
+                        cookie: prepared.cookie,
+                        scope: prepared.scope.clone(),
+                        ids: payloads.iter().map(payload_id).collect(),
+                        own_fetch_secret,
+                    });
+                }
+                Absorbed::Fetched(payloads)
+            }
+            FetchResponse::Rejected(r) => Absorbed::Rejected(r),
+        }
     }
 
     /// Delete every message leased during this receive. MUST be called only AFTER the

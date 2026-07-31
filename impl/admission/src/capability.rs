@@ -1,9 +1,9 @@
-//! §7.2 — Capability (приглашённый доступ).
+//! §7.2 — the capability (invited access).
 //!
-//! Relay — сам issuer своих capability: симметричная HMAC-схема, PKI не
-//! нужна. Таблица `capability_id → secret/scope/quota` локальна у relay и
-//! ограничена им самим, не атакующим. По проводу идёт только
-//! `CapabilityProof` — сам `secret` устройство не раскрывает.
+//! A relay is the issuer of its own capabilities: a symmetric HMAC scheme, no PKI needed. The
+//! table `capability_id → secret/scope/quota` is local to the relay and bounded by the relay
+//! itself, not by an attacker. Only the `CapabilityProof` travels on the wire — the device never
+//! reveals the `secret` itself.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -17,8 +17,8 @@ pub enum Scope {
     MailboxFetch,
 }
 
-/// Квота на capability. `window` — секунды; учёт квоты (расход max_requests/
-/// max_bytes) ведёт relay в своей локальной таблице — здесь только пределы.
+/// A capability's quota. `window` is in seconds; the accounting (spending max_requests and
+/// max_bytes) is kept by the relay in its local table — only the limits live here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Quota {
     pub max_requests: u32,
@@ -40,9 +40,9 @@ impl Quota {
     }
 }
 
-/// Секретная запись, живущая ТОЛЬКО у relay (§7.2). Никогда не уходит на
-/// провод. serde — для локального хранения клиентом (capability.json, 0600);
-/// это НЕ провод.
+/// The secret record, which lives ONLY at the relay (§7.2). It never goes on the wire. The serde
+/// impl is for local storage by the client (capability.json, 0600); that is NOT the wire.
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Capability {
     pub capability_id: [u8; 16],
@@ -53,7 +53,7 @@ pub struct Capability {
     pub secret: [u8; 32],
 }
 
-/// То, что реально идёт по проводу (§7.2).
+/// What actually travels on the wire (§7.2).
 ///
 /// `not_after` is carried for STATELESS PoW capabilities (slice 4a): a Public relay stores
 /// no record of a PoW cap, so the client's proof must carry the expiry the relay recomputes
@@ -138,18 +138,18 @@ pub fn pow_cap_secret(issuer_key: &[u8; 32], cap_id: &[u8; 16], not_after: u32, 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityError {
-    /// capability_id не найден в локальной таблице relay.
+    /// The capability_id was not found in the relay's local table.
     UnknownCapability,
-    /// now вне [not_before, not_after].
+    /// `now` is outside [not_before, not_after].
     Expired,
-    /// scope запроса не совпал со scope выданной capability.
+    /// The request's scope does not match the scope the capability was issued for.
     ScopeMismatch,
-    /// MAC не совпал.
+    /// The MAC did not match.
     BadMac,
 }
 
 impl Capability {
-    /// Построить `CapabilityProof` для данного `request_nonce` и эпохи.
+    /// Build a `CapabilityProof` for this `request_nonce` and epoch.
     /// mac = HMAC-SHA256(secret, request_nonce || epoch_id)[:16].
     pub fn prove(&self, request_nonce: &[u8], epoch_id: u32) -> CapabilityProof {
         CapabilityProof {
@@ -161,7 +161,7 @@ impl Capability {
     }
 }
 
-/// Локальная таблица relay: `capability_id → Capability`.
+/// The relay's local table: `capability_id → Capability`.
 ///
 /// Two kinds of capability verify through here. STORED ones (dev/invite) live in `entries`,
 /// looked up by id. STATELESS PoW ones (slice 4a) are NOT stored: when a Public relay sets
@@ -206,10 +206,10 @@ impl CapabilityTable {
         self.pow_issuer = Some(issuer_key);
     }
 
-    /// Верификация предъявленного proof (§7.5, Ступень 4, шаг 1 — самый
-    /// дешёвый крипто-шаг). `request_nonce`/`requested_scope`/`now` — из
-    /// текущего запроса. Возвращает `VerifiedCapability` (не `&Capability`), т.к.
-    /// stateless PoW-cap не имеет хранимой записи для заимствования.
+    /// Verify a presented proof (§7.5, Stage 4, step 1 — the cheapest crypto step).
+    /// `request_nonce`/`requested_scope`/`now` come from the current request. It returns a
+    /// `VerifiedCapability` rather than a `&Capability`, because a stateless PoW capability has no
+    /// stored record to borrow.
     pub fn verify(
         &self,
         proof: &CapabilityProof,
@@ -264,39 +264,39 @@ fn compute_mac(secret: &[u8; 32], request_nonce: &[u8], epoch_id: u32) -> [u8; 1
     truncated
 }
 
-/// Исход учёта квоты для одного запроса capability.
+/// The outcome of quota accounting for one capability request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaDecision {
-    /// В пределах квоты — запрос учтён.
+    /// Within quota — the request was counted.
     Ok,
-    /// Тот же proof уже виден в окне (дословный replay) — не учтён повторно.
+    /// The same proof is already in the window (a verbatim replay) — not counted twice.
     Replay,
-    /// Превышен `max_requests` или `max_bytes` за окно `window_secs`.
+    /// `max_requests` or `max_bytes` exceeded within `window_secs`.
     Exceeded,
 }
 
-/// Учёт расхода квоты по capability_id в скользящем окне `window_secs`.
+/// Accounting of a capability's spend by capability_id over a sliding `window_secs`.
 ///
-/// Закрывает пробел: без него валидный proof переиспользуем по разу в каждой
-/// новой эпохе вплоть до `not_after` (epoch-scoped replay-фильтр §7.5
-/// сбрасывается, а `verify` считает MAC по `proof.epoch_id` и не проверяет
-/// актуальность эпохи — и НЕ должен: capability намеренно многоэпоховая).
-/// Настоящая граница — квота самой capability (§7.2), которую relay обязан
-/// вести локально. Та же sliding-window логика, что у DTN carry-бюджета (§7.7).
+/// It closes a gap: without it a valid proof is reusable once per new epoch all the way to
+/// `not_after` (the epoch-scoped replay filter of §7.5 is cleared, while `verify` computes the MAC
+/// over `proof.epoch_id` and does not check epoch freshness — and MUST NOT: a capability is
+/// deliberately multi-epoch). The real bound is the capability's own quota (§7.2), which the relay
+/// must keep locally. The same sliding-window logic as the DTN carry budget (§7.7).
+/// must keep locally. The same sliding-window logic as the DTN carry budget (§7.7).
 ///
-/// Дословный replay ловится по `proof.mac` (при повторе захваченного proof он
-/// неизменен, в т.ч. через границу эпохи, пока запись в окне). Память
-/// ограничена самим `max_requests` (в окне не больше стольких записей).
-/// Скользящее окно одной capability: очередь (время, байты, тег proof).
+/// A verbatim replay is caught by `proof.mac` (a captured proof repeats unchanged, including
+/// across an epoch boundary, while the entry is in the window). Memory is bounded by
+/// `max_requests` itself (a window holds no more entries than that).
+/// One capability's sliding window: a queue of (time, bytes, proof tag).
 type QuotaWindow = std::collections::VecDeque<(u64, u64, [u8; 16])>;
 
 #[derive(Default)]
 pub struct CapabilityQuotaTracker {
-    /// capability_id → окно расхода.
+    /// capability_id → its spend window.
     windows: std::collections::HashMap<[u8; 16], QuotaWindow>,
-    /// capability_id → ЕГО `window_secs`, запомненный при расходе. `reap` раньше применял ОДНО
-    /// значение по умолчанию ко всем capability, хотя окно — свойство конкретной quota: держатель
-    /// более длинного окна терял записи расхода раньше срока и получал больше своей квоты (A4-6).
+    /// capability_id → ITS `window_secs`, remembered when spending. `reap` used to apply the
+    /// default value to every capability, although the window is a property of the specific one —
+    /// a longer window lost its spend records early and gave back quota it should not have.
     window_of: std::collections::HashMap<[u8; 16], u64>,
 }
 
@@ -316,10 +316,10 @@ impl CapabilityQuotaTracker {
         self.windows.is_empty()
     }
 
-    /// Учесть запрос против квоты. Вызывать ТОЛЬКО после успешной верификации proof
-    /// (иначе плохой MAC жёг бы чужую квоту). `cap_id`/`quota` — из `VerifiedCapability`
-    /// (stored или stateless PoW-cap — квота-учёт одинаков, ключ = `cap_id`);
-    /// `proof_tag` — `proof.mac`; `bytes` — размер запроса.
+    /// Count a request against the quota. Call it ONLY after successful verification (otherwise a
+    /// bad MAC would burn someone else's quota). `cap_id`/`quota` come from `VerifiedCapability`
+    /// (stored or a stateless PoW capability — the accounting is identical, keyed by `cap_id`);
+    /// `proof_tag` is `proof.mac`; `bytes` is the request size.
     pub fn consume(
         &mut self,
         cap_id: [u8; 16],
@@ -332,7 +332,7 @@ impl CapabilityQuotaTracker {
         let horizon = now.saturating_sub(window);
         self.window_of.insert(cap_id, window);
         let dq = self.windows.entry(cap_id).or_default();
-        // Prune: убрать всё старше окна.
+        // Prune: drop everything older than the window.
         while let Some(&(ts, _, _)) = dq.front() {
             if ts <= horizon {
                 dq.pop_front();
@@ -340,11 +340,11 @@ impl CapabilityQuotaTracker {
                 break;
             }
         }
-        // Дословный replay: тот же proof-тег уже в окне.
+        // A verbatim replay: the same proof tag is already in the window.
         if dq.iter().any(|&(_, _, tag)| tag == proof_tag) {
             return QuotaDecision::Replay;
         }
-        // Квота по числу запросов и по байтам за окно.
+        // The quota by request count and by bytes within the window.
         let count = dq.len() as u32;
         let bytes_sum: u64 = dq.iter().map(|&(_, b, _)| b).sum();
         if count + 1 > quota.max_requests || bytes_sum + bytes > quota.max_bytes {
@@ -354,12 +354,12 @@ impl CapabilityQuotaTracker {
         QuotaDecision::Ok
     }
 
-    /// Периодическая уборка: выкинуть capability, чьи окна полностью
-    /// протухли (не трогались дольше своего `window_secs`). `consume` сам не
-    /// освобождает запись капабилити, к которой больше не обращаются, —
-    /// relay вызывает `reap` изредка. Не критично для безопасности (число
-    /// окон ограничено числом выданных capability, не атакующим), а гигиена
-    /// памяти. Возвращает число убранных записей.
+    /// Periodic cleanup: drop capabilities whose windows have fully expired (untouched for longer
+    /// than their own `window_secs`). `consume` does not free the record of a capability nobody
+    /// asks about any more, so the relay calls `reap` occasionally. Not security-critical (the
+    /// number of windows is bounded by the number of issued capabilities, not by an attacker) but
+    /// memory hygiene. Returns the number of records removed.
+
     pub fn reap(&mut self, now: u64, default_window_secs: u64) -> usize {
         let before = self.windows.len();
         let window_of = std::mem::take(&mut self.window_of);

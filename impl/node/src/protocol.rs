@@ -75,11 +75,11 @@ pub fn payload_id(payload: &Payload) -> [u8; 32] {
     h.update(postcard::to_stdvec(payload).expect("Payload serializes"));
     h.finalize().into()
 }
-/// Доказательство владения mailbox для fetch (§7): привязано к общему
-/// static-static DH отправителя-получателя с relay И к `cookie.mac` (свежесть
-/// 30 c). Домен KDF `KARST-fetch-auth-v1` отделён от seal — тот же принцип
-/// разделения доменов, что `KARST-skeleton-seal-v1`. Только держатель приватного
-/// ключа `mailbox` может вычислить DH → только он вычислит proof.
+/// Proof of mailbox ownership for a fetch (§7): bound to the sender-recipient static-static DH
+/// with the relay AND to `cookie.mac` (30-second freshness). The KDF domain `KARST-fetch-auth-v1`
+/// is separated from seal — the same domain-separation principle as `KARST-skeleton-seal-v1`. Only
+/// the holder of the `mailbox` private key can compute the DH, hence the proof.
+
 pub fn fetch_proof(shared_dh: &[u8; 32], cookie_mac: &[u8; 16], mailbox: &[u8; 32]) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(None, shared_dh);
     let mut key = [0u8; 32];
@@ -118,12 +118,12 @@ pub fn mailbox_owner_ok(
     }
     fetch_proof(&shared, cookie_mac, &mailbox).ct_eq(&dh_proof).unwrap_u8() == 1
 }
-/// Сессионный §2.1-конверт (PQXDH + Double Ratchet). Первое сообщение несёт
-/// key-agreement (`Initial`), последующие — только ratchet-груз (`Ratchet`).
-/// Relay хранит непрозрачно — ключа не имеет, различить содержимое не может.
+/// The session §2.1 envelope (PQXDH + Double Ratchet). The first message carries the key agreement
+/// (`Initial`); later ones carry only ratchet payload (`Ratchet`). The relay stores it opaquely —
+/// it holds no key and cannot tell the contents apart.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum SessionEnvelope {
-    /// Продолжение установленной сессии.
+    /// The continuation of an established session.
     ///
     /// The unsealed `Initial` opener that used to sit here is GONE (#232/A3-14). It carried
     /// `KeyAgreement.ik_a_pub` — the sender's long-term identity — in the clear, so any relay
@@ -165,17 +165,17 @@ pub enum SessionEnvelope {
     /// APPENDED LAST: postcard numbers variants positionally.
     Veiled { nonce: [u8; crate::veil::NONCE_LEN], inner: Vec<u8> },
 }
-/// Полезный груз в mailbox. **Стадийная миграция** (не мёртвый код): сессионный
-/// §2.1-путь (`Session`) — новый in-process E2E; скелет (`Skeleton`) ещё несёт
-/// сокет/CLI-путь, пока тому не добавлена персистентность сессий. Relay хранит
-/// любой вариант непрозрачно.
+/// The payload in a mailbox. **A staged migration** (not dead code): the session §2.1 path
+/// (`Session`) is the new in-process E2E; the skeleton (`Skeleton`) still carries the socket and
+/// CLI path until session persistence is added there. The relay stores either variant opaquely.
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Payload {
     Skeleton(SkeletonSeal),
     Session(SessionEnvelope),
 }
 impl Payload {
-    /// Приблизительный размер груза для stage-0 size-gate конвейера допуска.
+    /// The approximate payload size, for the pipeline's stage-0 size gate.
     pub fn approx_len(&self) -> usize {
         match self {
             Payload::Skeleton(s) => s.ciphertext.len(),
@@ -194,12 +194,12 @@ impl Payload {
         }
     }
 }
-/// Доказательство ВЛАДЕНИЯ IK для §12-публикации bundle (write-side зеркало
-/// `fetch_proof`): только держатель приватного IK вычислит `DH(IK, relay)`.
-/// Связывает cookie.mac (свежесть) И СОДЕРЖИМОЕ bundle (ik‖prekey‖kem_ek) — иначе
-/// перехваченный proof переиспользовали бы для подмены bundle другим содержимым.
-/// Останавливает ДРУГИХ клиентов от перезаписи чужого bundle; против ЗЛОГО RELAY
-/// не помогает (тот подменит IK — внешняя стена, OOB-проверка IK).
+/// Proof of IK OWNERSHIP for a §12 bundle publication (the write-side mirror of `fetch_proof`):
+/// only the holder of the private IK can compute `DH(IK, relay)`. It binds cookie.mac (freshness)
+/// AND the bundle CONTENTS (ik‖prekey‖kem_ek) — otherwise an intercepted proof could be reused to
+/// substitute a bundle with different contents. It stops OTHER clients from overwriting someone's
+/// bundle; against a MALICIOUS RELAY it does not help (that one substitutes the IK — the external
+/// wall, an out-of-band IK check).
 pub fn publish_proof(
     shared_dh: &[u8; 32],
     cookie_mac: &[u8; 16],
@@ -218,8 +218,8 @@ pub fn publish_proof(
     out.copy_from_slice(&full[..16]);
     out
 }
-/// Сообщение на проводе: admission-часть (§7) + маршрут + запечатанный полезный
-/// груз. Владеющий тип — транспорт передаёт его целиком.
+/// A message on the wire: the admission part (§7), the route, and the sealed payload. An owning
+/// type — the transport passes it whole.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WireMessage {
     pub client_addr: Vec<u8>,
@@ -227,15 +227,15 @@ pub struct WireMessage {
     pub cookie: Option<Cookie>,
     pub request_nonce: Vec<u8>,
     pub capability_proof: CapabilityProof,
-    /// Публичный ключ получателя = адрес его mailbox (skeleton: static X25519;
-    /// session: долговременный IK получателя).
+    /// The recipient's public key = their mailbox address (skeleton: a static X25519 key;
+    /// session: the recipient's long-term IK).
     pub recipient: [u8; 32],
     pub payload: Payload,
 }
-/// Ответ relay клиенту.
+/// The relay's reply to a client.
 #[derive(Debug)]
 pub enum Response {
-    /// Первый контакт: relay выдал cookie, клиент повторяет с ним.
+    /// First contact: the relay issued a cookie, and the client retries with it.
     NeedCookie(Cookie),
     /// Admitted, and the sealed payload is sitting in the recipient's mailbox. **How much that
     /// is worth depends on the relay** (R2-5, #161): on a `Volatile` relay the message lives only
@@ -248,7 +248,7 @@ pub enum Response {
     /// (`RelayPolicy::mailbox_durability`) and used to CHOOSE the relay, which is where the
     /// decision actually belongs.
     Accepted,
-    /// Отклонено конвейером допуска (текст исхода).
+    /// Rejected by the admission pipeline (the outcome text).
     Rejected(String),
 }
 /// Operator's choice for the §15 blob store's restart behaviour. `Durable` keeps parked blobs
@@ -397,8 +397,8 @@ pub enum BundleOpkResponse {
     Bundle(Option<PreKeyBundle>),
     Rejected(String),
 }
-/// Запрос §12-публикации bundle. `proof` привязывает владение приватным IK
-/// (`bundle.ik_pub`) к cookie.mac и содержимому bundle.
+/// A §12 bundle publication request. `proof` binds ownership of the private IK (`bundle.ik_pub`)
+/// to cookie.mac and to the bundle contents.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublishRequest {
     pub bundle: PreKeyBundle,
@@ -429,18 +429,18 @@ pub struct PublishRequest {
     pub capability_proof: CapabilityProof,
     pub proof: [u8; 16],
 }
-/// Ответ на §12-публикацию.
+/// The reply to a §12 publication.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PublishResponse {
-    /// Нужен (свежий) cookie — клиент перевыдаёт и повторяет.
+    /// A (fresh) cookie is needed — the client re-obtains one and retries.
     NeedCookie(Cookie),
-    /// Опубликовано (bundle сохранён/перезаписан).
+    /// Published (the bundle was stored or overwritten).
     Published,
-    /// Отклонено (провал auth / хранилище полно).
+    /// Rejected (auth failure, or storage full).
     Rejected(String),
 }
-/// Запрос на выборку mailbox. `mailbox` = pubkey получателя (его адрес);
-/// `proof` привязывает владение приватным ключом к `cookie.mac`.
+/// A mailbox fetch request. `mailbox` is the recipient's public key (their address); `proof` binds
+/// ownership of the private key to `cookie.mac`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FetchRequest {
     pub mailbox: [u8; 32],
@@ -472,25 +472,25 @@ pub struct AckRequest {
     /// use the DH `proof`. The right to delete is the same right as to read, proven the same way.
     pub own_proof: Vec<u8>,
 }
-/// Ответ на ACK.
+/// The reply to an ACK.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum AckResponse {
-    /// Нужен (свежий) cookie — клиент перевыдаёт и повторяет (как fetch).
+    /// A (fresh) cookie is needed — the client re-obtains one and retries (as with fetch).
     NeedCookie(Cookie),
     /// Named messages deleted (or already gone — ACK is idempotent).
     Acked,
-    /// Отклонено (в т.ч. провал ownership-proof) — mailbox не тронут.
+    /// Rejected (including a failed ownership proof) — the mailbox is untouched.
     Rejected(String),
 }
-/// Ответ на fetch.
+/// The reply to a fetch.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum FetchResponse {
-    /// Нужен (свежий) cookie — клиент перевыдаёт и повторяет.
+    /// A (fresh) cookie is needed — the client re-obtains one and retries.
     NeedCookie(Cookie),
     /// Authenticated: sealed objects for this poll — at most one fixed-size page
     /// worth (`FETCH_CAP`); any remainder stays queued for the next poll.
     Fetched(Vec<Payload>),
-    /// Отклонено (в т.ч. провал fetch-auth) — mailbox не тронут.
+    /// Rejected (including a failed fetch-auth) — the mailbox is untouched.
     Rejected(String),
 }
 /// §7 slice 4a — a PoW redemption for the PUBLIC door. The client mines a solution for the
@@ -781,8 +781,8 @@ pub enum BlobResponse {
     Chunk(Option<Vec<u8>>),
     Rejected(String),
 }
-/// Транспорт между клиентом и relay. In-memory реализация ниже; сокет-версия —
-/// следующий срез, тот же контракт.
+/// The transport between a client and a relay. The in-memory implementation is below; the socket
+/// version is the next slice, against the same contract.
 pub trait Transport {
     fn send(&self, msg: &WireMessage, now: u64) -> Response;
     fn fetch(&self, req: &FetchRequest, now: u64) -> FetchResponse;
@@ -819,14 +819,14 @@ pub trait Transport {
         self.ack(req, now)
     }
 
-    /// §12 публикация bundle. По умолчанию не поддержано (тест-транспорты без
-    /// discovery); реальные транспорты переопределяют.
+    /// §12 bundle publication. Unsupported by default (test transports have no discovery); real
+    /// transports override it.
     fn publish_bundle(&self, _req: &PublishRequest, _now: u64) -> PublishResponse {
         PublishResponse::Rejected("bundle publish unsupported".into())
     }
 
-    /// §12 fetch bundle (публичный). `Ok(None)` — не опубликован; `Err` — сбой
-    /// транспорта. По умолчанию не поддержано.
+    /// §12 bundle fetch (public). `Ok(None)` means it was never published; `Err` is a transport
+    /// failure. Unsupported by default.
     fn fetch_bundle(&self, _ik: &[u8; 32], _now: u64) -> Result<Option<PreKeyBundle>, String> {
         Err("bundle fetch unsupported".into())
     }

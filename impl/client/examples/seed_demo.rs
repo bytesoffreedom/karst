@@ -1,5 +1,5 @@
-//! Засеять KARST_HOME демо-данными для ВИЗУАЛЬНОЙ проверки GUI (реакции, ответ,
-//! правка, блок). Не часть продукта — инструмент визуального смоука.
+//! Seed KARST_HOME with demo data for VISUAL inspection of the GUI (reactions, a reply, an edit, a
+//! block). Not part of the product — a tool for looking at the interface.
 //!
 //!   KARST_HOME=/tmp/karst-demo KARST_PASSPHRASE=pw cargo run -p client --example seed_demo
 
@@ -16,7 +16,7 @@ fn main() {
     let pass = std::env::var("KARST_PASSPHRASE").unwrap_or_else(|_| "pw".into());
     let vault = Vault::unlock(&home, pass.as_bytes()).expect("vault unlock");
 
-    // Свой аккаунт из фиксированной тест-фразы.
+    // Our own account from a fixed test phrase.
     let phrase = seed::DEMO_PHRASE;
     let entropy = seed::entropy_of(&seed::parse_mnemonic(phrase).unwrap());
     let ik = seed::derive(&entropy).account.identity_public();
@@ -24,33 +24,33 @@ fn main() {
     vault.create_account_dir(&id).unwrap();
     let store = vault.account(&id);
     store.save_seed(&entropy).unwrap();
-    vault.save_registry(&[AccountEntry { id: id.clone(), label: "Демо".into(), ik }]).unwrap();
+    vault.save_registry(&[AccountEntry { id: id.clone(), label: "Demo".into(), ik }]).unwrap();
 
-    // Собеседник «Боб».
+    // The peer, "Bob".
     let bob = seed::derive(&[7u8; seed::ENTROPY_BYTES]).account.identity_public();
-    store.save_contacts(&[ContactRecord { name: "Боб".into(), ik: bob, verified: true }]).unwrap();
+    store.save_contacts(&[ContactRecord { name: "Bob".into(), ik: bob, verified: true }]).unwrap();
 
-    // Переписка.
+    // The conversation.
     let recs = [
-        HistoryRecord { from_me: false, peer_ik: bob, text: b("Привет! как жизнь?"), ts: 1000 },
-        HistoryRecord { from_me: true, peer_ik: bob, text: b("норм, спасибо"), ts: 1001 },
-        HistoryRecord { from_me: false, peer_ik: bob, text: b("покажи скрин когда сможешь"), ts: 1002 },
+        HistoryRecord { from_me: false, peer_ik: bob, text: b("Hey! how are things?"), ts: 1000 },
+        HistoryRecord { from_me: true, peer_ik: bob, text: b("good, thanks"), ts: 1001 },
+        HistoryRecord { from_me: false, peer_ik: bob, text: b("send a screenshot when you can"), ts: 1002 },
     ];
     for r in &recs {
         store.append_history(r).unwrap();
     }
 
-    // Реакции на первое (входящее) сообщение Боба (автор = bob).
-    let m0 = msg_id(&bob, 1000, "Привет! как жизнь?".as_bytes());
+    // Reactions on Bob's first (incoming) message (the author is bob).
+    let m0 = msg_id(&bob, 1000, "Hey! how are things?".as_bytes());
     store.set_reaction(m0, "👍", ik, true).unwrap();
     store.set_reaction(m0, "👍", bob, true).unwrap();
     store.set_reaction(m0, "🔥", ik, true).unwrap();
 
-    // Моё сообщение — ответ на первое Боба.
-    let m1 = msg_id(&ik, 1001, "норм, спасибо".as_bytes());
+    // My message — a reply to Bob's first.
+    let m1 = msg_id(&ik, 1001, "good, thanks".as_bytes());
     store.set_reply(m1, m0).unwrap();
-    // И оно же отредактировано.
-    store.set_edit(m1, 1005, "норм, спасибо большое!".as_bytes()).unwrap();
+    // And the same message, edited.
+    store.set_edit(m1, 1005, "good, thanks a lot!".as_bytes()).unwrap();
 
     // Profiles: own (shown in the side-panel editor) + Bob's received profile
     // (shown as a hint in the chat header, layered over the local label).

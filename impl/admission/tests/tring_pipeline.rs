@@ -1,9 +1,9 @@
-//! Композиция §7.3 ↔ §7.5: настоящая пороговая кольцевая подпись, проходящая
-//! через полный staged-конвейер допуска. Это и есть та проверка, ради которой
-//! реализация вообще затевалась — что примитивы КОМПОНУЮТСЯ на реальной
-//! крипте, а не только по отдельности «звучат согласованно».
+//! The §7.3 ↔ §7.5 composition: a real threshold ring signature driven through the full staged
+//! admission pipeline. This is the check the implementation existed for — that the primitives
+//! COMPOSE against real crypto rather than merely sounding consistent in isolation.
+
 //!
-//! Запуск: cargo test --features unaudited-crypto --test tring_pipeline
+//! Run with: cargo test --features unaudited-crypto --test tring_pipeline
 #![cfg(feature = "unaudited-crypto")]
 
 use admission::capability::{CapabilityTable, Scope};
@@ -36,8 +36,8 @@ fn make_ring(n: usize) -> (Vec<RistrettoPoint>, Vec<Scalar>) {
     (pubs, secs)
 }
 
-/// Построить AdmissionToken с настоящей пороговой кольцевой подписью над
-/// nonce токена.
+/// Build an AdmissionToken with a real threshold ring signature over the token nonce.
+
 fn issue_token(
     token_nonce: [u8; 32],
     epoch: u32,
@@ -68,7 +68,7 @@ fn real_threshold_token_admitted_through_pipeline() {
     let keyring = CookieKeyring::new(EPOCH_DURATION_SECS, now, [0x11; 32], [0x22; 32]);
     let caps = CapabilityTable::new();
     let (ring, secs) = make_ring(5);
-    let iring = issuer_ring(&ring, 2); // политика «2 из 5»
+    let iring = issuer_ring(&ring, 2); // the "2 of 5" policy
     let verifier = RealRingVerifier;
     let pipe = AdmissionPipeline {
         keyring: &keyring,
@@ -81,7 +81,7 @@ fn real_threshold_token_admitted_through_pipeline() {
     let carrier = b"c";
     let cookie = keyring.issue(client, carrier, now as u32);
 
-    // Токен, подписанный настоящими 2 из 5 issuer'ами.
+    // A token signed by a real 2 of 5 issuers.
     let token = issue_token([0x33; 32], 0, &ring, 2, &secs, &[1, 3]);
 
     let mut replay = ReplayFilter::new(0, 1024);
@@ -98,7 +98,7 @@ fn real_threshold_token_admitted_through_pipeline() {
     assert_eq!(
         pipe.process(&req, now, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()),
         Outcome::Admit,
-        "валидный '2 из 5' токен должен пройти весь конвейер"
+        "a valid '2 of 5' token must pass the whole pipeline"
     );
 }
 
@@ -108,7 +108,7 @@ fn real_below_threshold_token_rejected_through_pipeline() {
     let keyring = CookieKeyring::new(EPOCH_DURATION_SECS, now, [0x11; 32], [0x22; 32]);
     let caps = CapabilityTable::new();
     let (ring, secs) = make_ring(5);
-    let iring = issuer_ring(&ring, 2); // политика требует 2
+    let iring = issuer_ring(&ring, 2); // the policy requires 2
     let verifier = RealRingVerifier;
     let pipe = AdmissionPipeline {
         keyring: &keyring,
@@ -121,7 +121,7 @@ fn real_below_threshold_token_rejected_through_pipeline() {
     let carrier = b"c";
     let cookie = keyring.issue(client, carrier, now as u32);
 
-    // Токен, подписанный лишь 1 issuer'ом (t=1) — не удовлетворяет политике 2.
+    // A token signed by only 1 issuer (t=1) — it does not satisfy the policy.
     let token = issue_token([0x44; 32], 0, &ring, 1, &secs, &[2]);
 
     let mut replay = ReplayFilter::new(0, 1024);
@@ -140,6 +140,6 @@ fn real_below_threshold_token_rejected_through_pipeline() {
             pipe.process(&req, now, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()),
             Outcome::Reject(RejectReason::Token(_))
         ),
-        "токен ниже порога должен быть отвергнут конвейером"
+        "a token below the threshold must be rejected by the pipeline"
     );
 }

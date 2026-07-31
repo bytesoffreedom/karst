@@ -1,8 +1,8 @@
-//! Подключаемый транспорт (§15): сессия транспорт-агностична (`dyn Channel`) и
-//! KARST говорит корректный SOCKS5. Заглушка ПРОВЕРЯЕТ CONNECT-handshake и
-//! форвардит к реальному relay — полный Noise-роунд-трип проходит сквозь неё.
-//! Не заявляем «обфусцировано» (обфускация — у внешнего транспорта); проверяем шов.
-//! Плюс: мёртвый прокси → ЖЁСТКАЯ ошибка, НИКОГДА не прямое соединение.
+//! A pluggable transport (§15): the session is transport-agnostic (`dyn Connector`), and KARST
+//! speaks correct SOCKS5. The stub VALIDATES the CONNECT handshake and forwards to a real relay, so
+//! a full Noise round trip passes through it. No claim of "obfuscated" is made (obfuscation belongs
+//! to the external transport).
+//! Plus: a dead proxy is a HARD error, NEVER a direct connection.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -66,8 +66,8 @@ fn splice(mut from: TcpStream, mut to: TcpStream) {
     }
 }
 
-/// SOCKS5-заглушка (CONNECT, no-auth, IPv4). Валидирует протокол клиента,
-/// подключается к запрошенному dest, форвардит. `validated` = handshake прошёл.
+/// A SOCKS5 stub (CONNECT, no auth, IPv4). It validates the client's protocol, connects to the
+/// requested destination and forwards. `validated` means the handshake went through.
 fn spawn_socks5_stub() -> (SocketAddr, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -144,17 +144,17 @@ fn routes_through_socks5_proxy() {
     let bob_kem = bob.kem_ek().to_vec();
 
     assert!(matches!(alice.send(&bob_pub, &bob_kem, b"via socks5", NOW), Response::Accepted));
-    assert!(validated.load(Ordering::SeqCst), "прокси должен был провести SOCKS5-handshake");
+    assert!(validated.load(Ordering::SeqCst), "the proxy must have performed a SOCKS5 handshake");
 
-    let msgs = bob.receive(NOW).expect("fetch через socks5");
+    let msgs = bob.receive(NOW).expect("fetch through socks5");
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].as_deref(), Some(b"via socks5".as_ref()));
 }
 
 #[test]
 fn routes_through_socks5_proxy_ipv6() {
-    // IPv6-relay → адаптер шлёт CONNECT с ATYP=4 (16-байтовый адрес). Тот же путь,
-    // но другая ветка кодирования/разбора — закрываем «достижимо, ноль покрытия».
+    // An IPv6 relay → the adapter sends CONNECT with ATYP=4 (a 16-byte address). The same path but
+    // a different encode/parse branch — closing the "reachable in principle" gap.
     let (relay_addr, npub, fpub) = spawn_relay_on("[::1]:0");
     assert!(relay_addr.is_ipv6());
     let (proxy_addr, validated) = spawn_socks5_stub();
@@ -174,15 +174,15 @@ fn routes_through_socks5_proxy_ipv6() {
     let bob_kem = bob.kem_ek().to_vec();
 
     assert!(matches!(alice.send(&bob_pub, &bob_kem, b"via socks5 v6", NOW), Response::Accepted));
-    assert!(validated.load(Ordering::SeqCst), "IPv6 SOCKS5-handshake должен пройти");
-    let msgs = bob.receive(NOW).expect("fetch через socks5 v6");
+    assert!(validated.load(Ordering::SeqCst), "the IPv6 SOCKS5 handshake must succeed");
+    let msgs = bob.receive(NOW).expect("fetch through socks5 v6");
     assert_eq!(msgs[0].as_deref(), Some(b"via socks5 v6".as_ref()));
 }
 
 #[test]
 fn socks5_dead_proxy_hard_fails_no_direct() {
     let (relay_addr, npub, _fpub) = spawn_relay();
-    // Свободный, но не слушаемый порт → connect refused.
+    // A free but unlistened port → connect refused.
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let a = l.local_addr().unwrap();
@@ -198,11 +198,11 @@ fn socks5_dead_proxy_hard_fails_no_direct() {
     let bob = Identity::generate();
 
     let resp = alice.send(&bob.public, node::seal::SealKemKeys::generate().ek(), b"should not send", NOW);
-    // Прямой fallback вернул бы Accepted (relay доступен). Rejected доказывает,
-    // что тихого прямого соединения НЕ произошло.
+    // A direct fallback would have returned Accepted (the relay is reachable). Rejected proves no
+    // silent direct connection happened.
     assert!(
         matches!(resp, Response::Rejected(_)),
-        "мёртвый прокси → жёсткая ошибка, не прямое соединение; получено: {:?}",
+        "a dead proxy is a hard error, never a direct connection; got: {:?}",
         resp
     );
 }

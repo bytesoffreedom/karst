@@ -1,6 +1,6 @@
-//! Тесты enforcement квоты capability (§7.2) — закрытие пробела, при котором
-//! захваченный proof переиспользовался по разу в каждой новой эпохе до
-//! `not_after`. Несущий тест — `captured_proof_replay_caught_across_epoch`.
+//! Tests for §7.2 capability quota enforcement — closing the gap where a captured proof was
+//! reusable once per new epoch until `not_after`. The load-bearing test is
+//! `captured_proof_replay_caught_across_epoch`.
 
 use admission::capability::{
     pow_cap_id, pow_cap_secret, Capability, CapabilityProof, CapabilityQuotaTracker,
@@ -26,13 +26,13 @@ fn cap_with(max_requests: u32, max_bytes: u64, window_secs: u32) -> Capability {
     }
 }
 
-// ---------- Юнит-уровень трекера ----------
+// ---------- Tracker unit level ----------
 
 #[test]
 fn tracker_enforces_request_count() {
     let cap = cap_with(3, 1 << 20, 600);
     let mut t = CapabilityQuotaTracker::new();
-    // 3 разных proof-тега проходят, 4-й — Exceeded.
+    // Three different proof tags pass, the fourth is Exceeded.
     for i in 0..3u8 {
         assert_eq!(t.consume(cap.capability_id, &cap.quota,[i; 16], 100, NOW), QuotaDecision::Ok);
     }
@@ -44,7 +44,7 @@ fn tracker_enforces_byte_budget() {
     let cap = cap_with(100, 1000, 600);
     let mut t = CapabilityQuotaTracker::new();
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[1; 16], 600, NOW), QuotaDecision::Ok);
-    assert_eq!(t.consume(cap.capability_id, &cap.quota,[2; 16], 400, NOW), QuotaDecision::Ok); // ровно 1000
+    assert_eq!(t.consume(cap.capability_id, &cap.quota,[2; 16], 400, NOW), QuotaDecision::Ok); // exactly 1000
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[3; 16], 1, NOW), QuotaDecision::Exceeded);
 }
 
@@ -53,7 +53,7 @@ fn tracker_detects_verbatim_replay() {
     let cap = cap_with(100, 1 << 20, 600);
     let mut t = CapabilityQuotaTracker::new();
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[7; 16], 100, NOW), QuotaDecision::Ok);
-    // Тот же тег — дословный replay, не учитывается повторно.
+    // The same tag is a verbatim replay and is not counted twice.
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[7; 16], 100, NOW), QuotaDecision::Replay);
 }
 
@@ -62,11 +62,11 @@ fn tracker_reap_drops_stale_windows() {
     let cap = cap_with(100, 1 << 20, 600);
     let mut t = CapabilityQuotaTracker::new();
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[1; 16], 100, NOW), QuotaDecision::Ok);
-    // Пока в окне — не убирается.
+    // While inside the window it is not removed.
     assert_eq!(t.reap(NOW, 600), 0);
-    // Спустя окно запись протухла → capability выметается.
+    // After the window the record has expired → the capability is swept away.
     assert_eq!(t.reap(NOW + 601, 600), 1);
-    // После уборки тот же тег снова свеж (не replay).
+    // After the sweep the same tag is fresh again (not a replay).
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[1; 16], 100, NOW + 601), QuotaDecision::Ok);
 }
 
@@ -76,12 +76,12 @@ fn tracker_window_slides_and_frees_quota() {
     let mut t = CapabilityQuotaTracker::new();
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[1; 16], 100, NOW), QuotaDecision::Ok);
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[2; 16], 100, NOW), QuotaDecision::Exceeded);
-    // Спустя окно старая запись выпадает → снова есть место (и старый тег
-    // больше не считается replay).
+    // After the window the old record falls out → there is room again (and the old tag no longer
+    // counts as a replay).
     assert_eq!(t.consume(cap.capability_id, &cap.quota,[2; 16], 100, NOW + 601), QuotaDecision::Ok);
 }
 
-// ---------- Через конвейер: несущее — закрытие пробела ----------
+// ---------- Through the pipeline: the load-bearing gap closure ----------
 
 fn pipeline_env() -> (CookieKeyring, IssuerRing) {
     (
@@ -111,10 +111,10 @@ fn mk_req<'a>(
 
 #[test]
 fn captured_proof_replay_caught_across_epoch() {
-    // ПРОБЕЛ, который закрываем: раньше захваченный (nonce, proof) проходил
-    // заново в КАЖДОЙ новой эпохе (epoch-scoped replay-фильтр сбрасывался, а
-    // verify не проверяет актуальность эпохи). Теперь per-capability quota-
-    // трекер (НЕ epoch-scoped) ловит дословный replay через границу эпохи.
+    // THE GAP being closed: a captured (nonce, proof) used to pass again in EVERY new epoch (the
+    // epoch-scoped replay filter was cleared, and verify does not check epoch freshness). Now the
+    // per-capability quota tracker (which is NOT epoch-scoped) catches the verbatim replay across
+    // an epoch boundary.
     let cap = cap_with(100, 1 << 20, 600);
     let mut caps = CapabilityTable::new();
     caps.insert(cap.clone());
@@ -130,21 +130,21 @@ fn captured_proof_replay_caught_across_epoch() {
     let carrier = b"c";
     let cookie = kr.issue(client, carrier, NOW as u32);
     let nonce = b"captured-nonce";
-    let proof = cap.prove(nonce, 0); // proof для эпохи 0
+    let proof = cap.prove(nonce, 0); // a proof for epoch 0
 
-    // Общие для узла состояние: replay-фильтр (epoch-scoped) и quota-трекер.
+    // State shared by the node: the replay filter (epoch-scoped) and the quota tracker.
     let mut replay = ReplayFilter::new(0, 1024);
     let mut cq = CapabilityQuotaTracker::new();
 
-    // Эпоха 0: допущен.
+    // Epoch 0: admitted.
     assert_eq!(
         pipe.process(&mk_req(client, carrier, cookie, nonce, proof), NOW, 0, [0; 64], &mut replay, &mut cq),
         Outcome::Admit
     );
 
-    // Эпоха 1: тот же захваченный proof. Stage-3 фильтр сброшен ротацией и
-    // пропускает; но quota-трекер помнит proof.mac → Reject(Replay).
-    // (Без трекера здесь был бы повторный Admit — это и есть закрытый пробел.)
+    // Epoch 1: the same captured proof. The Stage-3 filter was cleared by the rotation and lets it
+    // through; but the quota tracker remembers proof.mac → Reject(Replay).
+    // (Without the tracker this would be a second Admit — that is the gap.)
     assert_eq!(
         pipe.process(&mk_req(client, carrier, cookie, nonce, proof), NOW, 1, [0; 64], &mut replay, &mut cq),
         Outcome::Reject(RejectReason::Replay)
@@ -153,7 +153,7 @@ fn captured_proof_replay_caught_across_epoch() {
 
 #[test]
 fn pipeline_rejects_when_quota_exhausted() {
-    let cap = cap_with(2, 1 << 20, 600); // всего 2 запроса за окно
+    let cap = cap_with(2, 1 << 20, 600); // only 2 requests per window
     let mut caps = CapabilityTable::new();
     caps.insert(cap.clone());
     let (kr, ring) = pipeline_env();
@@ -171,7 +171,7 @@ fn pipeline_rejects_when_quota_exhausted() {
     let mut replay = ReplayFilter::new(0, 1024);
     let mut cq = CapabilityQuotaTracker::new();
 
-    // Два разных запроса (свежие nonce) — допущены.
+    // Two different requests (fresh nonces) — admitted.
     for i in 0..2u8 {
         let nonce = [b'n', i];
         let proof = cap.prove(&nonce, 0);
@@ -180,7 +180,7 @@ fn pipeline_rejects_when_quota_exhausted() {
             Outcome::Admit
         );
     }
-    // Третий свежий запрос — квота исчерпана.
+    // A third fresh request — the quota is exhausted.
     let proof3 = cap.prove(b"n3", 0);
     assert_eq!(
         pipe.process(&mk_req(client, carrier, cookie, b"n3", proof3), NOW, 0, [0; 64], &mut replay, &mut cq),

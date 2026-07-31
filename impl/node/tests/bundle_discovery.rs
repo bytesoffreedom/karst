@@ -1,11 +1,11 @@
-//! §12 discovery E2E: publish/fetch prekey-bundle у relay + `Peer::connect`
-//! через relay. Несущее — граница ДОВЕРИЯ, а не только round-trip:
-//! - **composition**: publish → connect-через-relay → рабочая сессия;
-//! - **fail-closed**: подмена prekey/KEM (при подлинном IK) → никто не
-//!   расшифрует (relay не вычислит root_key) — не тихий частичный успех;
-//! - **честная стена (executable-doc)**: подмена самого IK при OOB-непроверенном
-//!   `peer_ik` → незаметный MITM на этом слое (почему нужна OOB-проверка IK);
-//! - не опубликован → чистая ошибка connect.
+//! §12 discovery E2E: publishing and fetching a prekey bundle at a relay, plus `Peer::connect`
+//! through the relay. The load-bearing part is the TRUST boundary, not merely a round trip:
+//! - **composition**: publish → connect-through-relay → a working session;
+//! - **fail-closed**: substituting the prekey/KEM (with an authentic IK) means nobody decrypts (the
+//!   relay cannot compute the root_key) — never a silent partial success;
+//! - **the honest wall (executable doc)**: substituting the IK itself, when `peer_ik` was never
+//!   verified out of band, is an undetectable MITM at this layer (why the OOB IK check exists);
+//! - not published → a clean connect error.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -52,14 +52,14 @@ fn publish_fetch_connect_roundtrip_session_works() {
     let bob_ik = bob.identity();
     let alice_ik = alice.identity();
 
-    // Bob публикует свой bundle; Alice забирает его у relay и устанавливает сессию.
+    // Bob publishes his bundle; Alice fetches it from the relay and establishes a session.
     assert!(matches!(bob.publish(NOW), PublishResponse::Published));
-    alice.connect(&bob_ik, NOW).expect("connect через relay");
+    alice.connect(&bob_ik, NOW).expect("connect through the relay");
 
     assert!(matches!(alice.send(&bob_ik, b"hi via discovery", NOW), Response::Accepted));
     assert_eq!(plaintexts(bob.receive(NOW).unwrap()), vec![b"hi via discovery".to_vec()]);
 
-    // Разворот — сессия двунаправленна.
+    // A reversal — the session is bidirectional.
     assert!(matches!(bob.send(&alice_ik, b"ack", NOW), Response::Accepted));
     assert_eq!(plaintexts(alice.receive(NOW).unwrap()), vec![b"ack".to_vec()]);
 }
@@ -69,37 +69,37 @@ fn connect_to_unpublished_ik_errors_cleanly() {
     let (t, relay_pub) = shared();
     let mut alice = peer(&t, relay_pub);
     let ghost = Account::generate().identity_public();
-    assert!(alice.connect(&ghost, NOW).is_err(), "нет опубликованного bundle → ошибка, не паника");
+    assert!(alice.connect(&ghost, NOW).is_err(), "no published bundle → an error, not a hang");
 }
 
 #[test]
 fn redundant_connect_does_not_kill_live_session() {
-    // Silent-loss guard: повторный connect к УЖЕ установленному пиру не должен
-    // молча заменить живую сессию новым root_key (иначе разговор тихо умрёт).
+    // Silent-loss guard: a repeated connect to an ALREADY established peer must not silently
+    // replace the live session with a new root_key (that would kill the conversation quietly).
     let (t, relay_pub) = shared();
     let mut alice = peer(&t, relay_pub);
     let mut bob = peer(&t, relay_pub);
     let bob_ik = bob.identity();
 
     bob.publish(NOW);
-    alice.connect(&bob_ik, NOW).expect("первый connect");
+    alice.connect(&bob_ik, NOW).expect("the first connect");
     assert!(matches!(alice.send(&bob_ik, b"one", NOW), Response::Accepted));
 
-    // Повторный connect → Err (не перезапись), сессия жива.
-    assert!(alice.connect(&bob_ik, NOW).is_err(), "повторный connect должен отказать, не перезаписать");
+    // A repeated connect → Err (no overwrite), and the session stays alive.
+    assert!(alice.connect(&bob_ik, NOW).is_err(), "a repeated connect must refuse, not overwrite");
     assert!(matches!(alice.send(&bob_ik, b"two", NOW), Response::Accepted));
     assert_eq!(
         plaintexts(bob.receive(NOW).unwrap()),
         vec![b"one".to_vec(), b"two".to_vec()],
-        "живая сессия переживает повторный connect"
+        "a live session survives a repeated connect"
     );
 }
 
 #[test]
 fn publish_request_fits_request_frame() {
-    // Frame-cap: PublishRequest несёт полный bundle (kem_ek ~1184 Б) — должен
-    // влезать в MAX_REQUEST_FRAME (in-process тесты не кадрируют → регресс размера
-    // проявился бы только по сокету). Проверяем реальную postcard-длину.
+    // Frame cap: a PublishRequest carries the full bundle (kem_ek ~1184 B) and must fit inside
+    // MAX_REQUEST_FRAME (in-process tests do not frame, so a regression would surface only over a
+    // socket). We check the real postcard length.
     use relay::node::PublishRequest;
     use node::wire::{WireRequest, MAX_REQUEST_FRAME};
 
@@ -118,7 +118,7 @@ fn publish_request_fits_request_frame() {
     };
     let wire = WireRequest::PublishBundle(req);
     let len = postcard::to_allocvec(&wire).unwrap().len();
-    assert!(len <= MAX_REQUEST_FRAME, "PublishBundle {len} Б должен влезать в {MAX_REQUEST_FRAME}");
+    assert!(len <= MAX_REQUEST_FRAME, "PublishBundle {len} B must fit inside {MAX_REQUEST_FRAME}");
 }
 
 #[test]
@@ -150,24 +150,24 @@ fn swapped_prekey_bundle_is_rejected_by_the_signature() {
 
 #[test]
 fn ik_swap_is_undetected_mitm_without_oob_verification() {
-    // ЧЕСТНАЯ СТЕНА (executable-doc): если Alice доверилась НЕПРОВЕРЕННОМУ IK
-    // (узнала «Bob = mallory_ik» из недоверенного каталога/relay), она установит
-    // сессию с Mallory, и Mallory прочитает «для Bob». Этот слой этого НЕ ловит —
-    // подлинность IK обязана проверяться вне канала (OOB/TOFU). Пиннит стену.
+    // THE HONEST WALL (executable doc): if Alice trusted an UNVERIFIED IK (learning "Bob =
+    // mallory_ik" from an untrusted directory or relay), she establishes a session with Mallory and
+    // Mallory reads what was meant for Bob. This layer does NOT catch that: IK authenticity must be
+    // verified out of band (OOB/TOFU). Pinned here so nobody mistakes it for a defect.
     let (t, relay_pub) = shared();
     let mut alice = peer(&t, relay_pub);
     let mut mallory = peer(&t, relay_pub);
     let mallory_ik = mallory.identity();
 
     assert!(matches!(mallory.publish(NOW), PublishResponse::Published));
-    // Alice ДУМАЕТ, что это Bob (ей подсунули IK Mallory как «Bob»).
+    // Alice THINKS this is Bob (Mallory's IK was handed to her as "Bob").
     alice.connect(&mallory_ik, NOW).expect("connect");
     assert!(matches!(alice.send(&mallory_ik, b"for bob only", NOW), Response::Accepted));
 
     assert_eq!(
         plaintexts(mallory.receive(NOW).unwrap()),
         vec![b"for bob only".to_vec()],
-        "MITM удаётся, если IK не проверен вне канала — это внешняя стена, не баг слоя"
+        "a MITM succeeds when the IK is not verified out of band — that is the external wall"
     );
 }
 

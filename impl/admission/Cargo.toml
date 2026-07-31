@@ -16,8 +16,8 @@ curve25519-dalek = { version = "4", features = ["serde"] }
 thiserror = "1"
 
 [features]
-# Пороговая кольцевая подпись §7.3 — РЕФЕРЕНС, НЕ ПРОШЕДШИЙ АУДИТ.
-# Выключено по умолчанию; включать только осознанно для тестов/исследования.
+# The §7.3 threshold ring signature — REFERENCE, NOT AUDITED.
+# Off by default; enable deliberately, for tests or research only.
 unaudited-crypto = []
 
 [dev-dependencies]

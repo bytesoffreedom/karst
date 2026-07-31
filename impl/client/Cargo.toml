@@ -12,8 +12,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["use-std"] }
 hex = "0.4"
-# At-rest: Argon2id (парольный KDF) + XChaCha20-Poly1305 (24-байтный nonce →
-# свежий random на запись безопасен без счётчика). Оба RustCrypto, Apache/MIT.
+# At rest: Argon2id (a password KDF) plus XChaCha20-Poly1305 (a 24-byte nonce, so a
+# fresh random one per write is safe without a counter). Both RustCrypto, Apache/MIT.
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"

@@ -1,14 +1,14 @@
-//! §2.1 PQXDH — состязательные тесты СОГЛАСОВАНИЯ КЛЮЧА. Несущие свойства:
-//! - **согласование**: инициатор и получатель выводят ОДИН root_key;
-//! - **аутентификация отправителя**: подмена IK_A → у получателя ДРУГОЙ root_key
-//!   (форжер без приватного IK Alice не согласует тот же ключ);
-//! - **PQ-нога нагружена**: битый ML-KEM-ct → другой pq_shared → другой root_key;
-//! - слой ортогонален: чужой получатель выводит другой root_key.
+//! §2.1 PQXDH — adversarial tests of the KEY AGREEMENT. The load-bearing properties:
+//! - **agreement**: the initiator and the recipient derive ONE root_key;
+//! - **sender authentication**: substituting IK_A gives the recipient a DIFFERENT key (a forger
+//!   without Alice's private IK cannot agree the same one);
+//! - **the PQ leg is load-bearing**: a corrupt ML-KEM ciphertext → a different pq_shared → a
+//!   different root_key;
+//! - the layers are orthogonal: a foreign recipient derives a different root_key.
 //!
-//! Проверяем именно РАЗЛИЧИЕ root_key (а не decrypt-провал): шифрование ушло в
-//! ratchet, pqxdh отвечает только за согласование. Несовпадение root_key →
-//! первое ratchet-сообщение не расшифруется (см. состязательные тесты сессии).
-
+//! What is checked is the DIFFERENCE in root_key (not a decrypt failure): encryption belongs to the
+//! ratchet, and pqxdh is only responsible for agreement. A root_key mismatch means the first
+//! ratchet message will not decrypt (see the adversarial ratchet tests).
 use node::pqxdh::{initiate_key_agreement, Account};
 use node::seal::Identity;
 
@@ -19,62 +19,62 @@ fn initiator_and_recipient_agree_on_root_key() {
     let alice = Identity::generate();
 
     let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
-    let (bob_rk, sender) = bob.accept_key_agreement(&ka).expect("валидная длина KEM-ct");
-    assert_eq!(alice_rk, bob_rk, "инициатор и получатель должны согласовать один root_key");
-    assert_eq!(sender, alice.public.to_bytes(), "Bob узнаёт отправителя по заявленному IK");
+    let (bob_rk, sender) = bob.accept_key_agreement(&ka).expect("a valid KEM ciphertext length");
+    assert_eq!(alice_rk, bob_rk, "the initiator and recipient must agree one key");
+    assert_eq!(sender, alice.public.to_bytes(), "Bob learns the sender from the claimed IK");
 }
 
 #[test]
 fn cannot_impersonate_alice_without_her_identity_key() {
-    // Несущее (sender-auth): Mallory знает pubkey Alice (публичен), но НЕ её
-    // приватный IK. Заявив IK Alice, она НЕ согласует тот же root_key, что
-    // получил бы Bob — DH1 сделан ключом Mallory.
+    // Load-bearing (sender auth): Mallory knows Alice's public key (it is public) but NOT her
+    // private IK. Claiming Alice's IK, she does NOT agree the same root_key Bob would have got —
+    // DH1 was computed with Mallory's key.
     let mut bob = Account::generate();
     let bundle = bob.prekey_bundle();
     let alice = Identity::generate();
     let mallory = Identity::generate();
 
-    // Честная установка от Mallory: обе стороны согласуют ключ, Bob видит Mallory.
+    // An honest establishment from Mallory: both sides agree a key, and Bob sees Mallory.
     let (mallory_rk, honest) =
         initiate_key_agreement(&mallory, &[7u8; 32], &bundle).expect("well-formed bundle");
     let (bob_rk, sender) = bob.accept_key_agreement(&honest).unwrap();
     assert_eq!(mallory_rk, bob_rk);
     assert_eq!(sender, mallory.public.to_bytes());
 
-    // Подделка: заявить IK Alice, не имея её приватного ключа.
+    // The forgery: claim Alice's IK without holding her private key.
     let mut forged = honest.clone();
     forged.ik_a_pub = alice.public.to_bytes();
     let (forged_bob_rk, _) = bob.accept_key_agreement(&forged).unwrap();
     assert_ne!(
         forged_bob_rk, mallory_rk,
-        "нельзя выдать себя за Alice: root_key получателя разойдётся с ключом форжера"
+        "impersonating Alice is impossible: the recipient's root_key diverges"
     );
 }
 
 #[test]
 fn corrupt_kem_ciphertext_breaks_agreement() {
-    // PQ-нога нагружена end-to-end: порча ML-KEM-ct → другой pq_shared у
-    // получателя → root_key не совпадёт с ключом инициатора.
+    // The PQ leg is load-bearing end to end: corrupting the ML-KEM ciphertext gives the recipient a
+    // different pq_shared, so the root_key no longer matches the initiator's.
     let mut bob = Account::generate();
     let bundle = bob.prekey_bundle();
     let alice = Identity::generate();
 
     let (alice_rk, mut ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     ka.kem_ct[0] ^= 0x01;
-    let (bob_rk, _) = bob.accept_key_agreement(&ka).expect("длина сохранена, decaps даёт значение");
-    assert_ne!(alice_rk, bob_rk, "битый KEM-ct должен ломать согласование");
+    let (bob_rk, _) = bob.accept_key_agreement(&ka).expect("the length is intact, decaps yields a value");
+    assert_ne!(alice_rk, bob_rk, "a corrupt KEM ciphertext must break the agreement");
 }
 
 #[test]
 fn malformed_kem_ciphertext_length_rejected() {
-    // Структурная защита: KEM-ct неверной ДЛИНЫ отвергается (None), а не паникует.
+    // Structural protection: a KEM ciphertext of the wrong LENGTH is refused (None), never a panic.
     let mut bob = Account::generate();
     let bundle = bob.prekey_bundle();
     let alice = Identity::generate();
 
     let (_alice_rk, mut ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     ka.kem_ct.truncate(10);
-    assert!(bob.accept_key_agreement(&ka).is_none(), "KEM-ct кривой длины → None");
+    assert!(bob.accept_key_agreement(&ka).is_none(), "a KEM ciphertext of the wrong length → None");
 }
 
 /// CRYPTO-06 — a bundle advertising a small-order prekey must be REFUSED. X25519 against the
@@ -138,8 +138,8 @@ fn a_small_order_ephemeral_is_refused_on_accept() {
 
 #[test]
 fn wrong_recipient_derives_different_key() {
-    // Согласование адресовано bob'у (его bundle); другой аккаунт выведет другой
-    // root_key — ни его prekey/IK, ни его ML-KEM-ключ не подходят.
+    // The agreement is addressed to Bob (his bundle); another account derives a different root_key
+    // — neither his prekey/IK nor his ML-KEM key fit.
     let mut bob = Account::generate();
     let mut eve = Account::generate();
     let bundle = bob.prekey_bundle();
@@ -148,8 +148,8 @@ fn wrong_recipient_derives_different_key() {
     let (alice_rk, ka) = initiate_key_agreement(&alice, &[7u8; 32], &bundle).expect("well-formed bundle");
     let (bob_rk, _) = bob.accept_key_agreement(&ka).unwrap();
     let (eve_rk, _) = eve.accept_key_agreement(&ka).unwrap();
-    assert_eq!(alice_rk, bob_rk, "адресат согласует тот же ключ");
-    assert_ne!(alice_rk, eve_rk, "чужой получатель выводит другой root_key");
+    assert_eq!(alice_rk, bob_rk, "the addressee agrees the same key");
+    assert_ne!(alice_rk, eve_rk, "a foreign recipient derives a different root_key");
 }
 
 /// A one-time prekey adds a fourth DH term to the agreement, both sides derive the same

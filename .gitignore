@@ -1,4 +1,4 @@
-# Rust build artefacts (workspace под impl/)
+# Rust build artefacts (the workspace lives under impl/)
 /impl/target/
 **/target/
 # The local CI script keeps a SEPARATE target dir per (checker x feature set) — clippy and rustc
@@ -8,17 +8,17 @@
 # artefacts. Ignore the whole family, not each name.
 **/target-*/
 
-# Локальное состояние запуска (relay-id, каталоги профилей демо)
+# Local run state (relay-id, demo profile directories)
 /impl/.run/
 .run/
 
-# Агент-инструменты и приватная память (email/личные данные — НЕ публиковать)
+# Agent tooling and private memory (personal data — never published)
 /.claude/
 
-# Сырой лог проектных размышлений — НЕ публиковать
+# Raw project notes — never published
 /mosaic_chat.txt
 
-# Редакторы / ОС
+# Editors / OS
 *.swp
 *~
 .DS_Store

@@ -1,9 +1,9 @@
-//! Тесты RLN quota-слоя §7.4: детекция двойного предъявления + slashing.
+//! Tests for the §7.4 RLN quota layer: double-presentation detection plus slashing.
 //!
-//! Несущий тест — `second_different_message_deanonymizes_violator`: превышение
-//! квоты восстанавливает секрет нарушителя (экономическое наказание, а не
-//! превентивный блок). Границу (слой предполагает zk-верифицированные доли)
-//! несёт документация типа, не тест.
+//! The load-bearing test is `second_different_message_deanonymizes_violator`: exceeding the quota
+//! recovers the violator's secret (an economic penalty, not a preventive block). The boundary (the
+//! layer assumes zk-verified shares) is carried by the type's documentation, not by a test.
+
 
 use admission::rln::{external_nullifier, Field, IdentitySecret, RlnOutcome, RlnQuotaTracker};
 
@@ -26,22 +26,22 @@ fn second_different_message_deanonymizes_violator() {
     let id = identity(42);
     let ext = external_nullifier(7, b"scope");
 
-    // Первое сообщение — в пределах квоты.
+    // The first message — within quota.
     let s1 = id.share(&ext, Field::from(111u64));
     assert_eq!(t.observe(&s1), RlnOutcome::Accepted);
 
-    // Второе РАЗНОЕ сообщение той же личности в ту же эпоху → нарушение квоты,
-    // секрет восстановлен.
+    // A second DIFFERENT message from the same identity in the same epoch → a violation, and the
+    // secret is recovered.
     let s2 = id.share(&ext, Field::from(222u64));
     match t.observe(&s2) {
         RlnOutcome::QuotaViolation { recovered_secret } => {
             assert_eq!(
                 recovered_secret,
                 id.0.to_bytes(),
-                "восстановленный секрет должен совпасть с секретом нарушителя"
+                "the recovered secret must equal the violator's secret"
             );
         }
-        other => panic!("ожидалось QuotaViolation, получено {:?}", other),
+        other => panic!("expected QuotaViolation, got {:?}", other),
     }
 }
 
@@ -53,7 +53,7 @@ fn same_message_replay_is_duplicate_not_violation() {
     let m = Field::from(333u64);
     let share = id.share(&ext, m);
     assert_eq!(t.observe(&share), RlnOutcome::Accepted);
-    // Тот же самый message_hash повторно — это один RLNProof, не нарушение.
+    // The very same message_hash again is one RLNProof, not a violation.
     assert_eq!(t.observe(&share), RlnOutcome::Duplicate);
 }
 
@@ -64,7 +64,7 @@ fn different_identities_do_not_cross_slash() {
     let a = identity(1).share(&ext, Field::from(10u64));
     let b = identity(2).share(&ext, Field::from(20u64));
     assert_eq!(t.observe(&a), RlnOutcome::Accepted);
-    // Другая личность → другой nullifier → отдельный учёт, не slash.
+    // A different identity gives a different nullifier → separate accounting, no slash.
     assert_eq!(t.observe(&b), RlnOutcome::Accepted);
 }
 
@@ -77,7 +77,7 @@ fn epoch_rotation_resets_quota() {
     let s7 = id.share(&ext7, Field::from(1u64));
     assert_eq!(t.observe(&s7), RlnOutcome::Accepted);
 
-    // Новая эпоха → квота обнулилась; та же личность снова может отправить.
+    // A new epoch resets the quota; the same identity may send again.
     t.roll_epoch(8);
     let ext8 = external_nullifier(8, b"scope");
     let s8 = id.share(&ext8, Field::from(1u64));
@@ -86,39 +86,39 @@ fn epoch_rotation_resets_quota() {
 
 #[test]
 fn capacity_triggers_backpressure() {
-    let mut t = RlnQuotaTracker::new(7, b"scope", 2); // ёмкость 2 личности
+    let mut t = RlnQuotaTracker::new(7, b"scope", 2); // capacity: 2 identities
     let ext = external_nullifier(7, b"scope");
     assert_eq!(t.observe(&identity(1).share(&ext, Field::from(1u64))), RlnOutcome::Accepted);
     assert_eq!(t.observe(&identity(2).share(&ext, Field::from(1u64))), RlnOutcome::Accepted);
-    // Третья НОВАЯ личность не влезает → backpressure.
+    // A third NEW identity does not fit → backpressure.
     assert_eq!(t.observe(&identity(3).share(&ext, Field::from(1u64))), RlnOutcome::Backpressure);
 }
 
-// ---------- Несущие: актуальность эпохи (иначе лимит обходится) ----------
+// ---------- Load-bearing: epoch freshness (otherwise the limit is bypassed) ----------
 
 #[test]
 fn stale_or_future_epoch_rejected() {
-    // Трекер на эпохе 7. Доля, собранная для эпохи 5 (external_nullifier(5)),
-    // не совпадает ни с текущей (7), ни с grace-предыдущей (6) → WrongEpoch.
-    // Без этой проверки личность циклила бы epoch_id и слала бы без лимита.
+    // The tracker is on epoch 7. A share built for epoch 5 (external_nullifier(5)) matches neither
+    // the current epoch (7) nor the grace previous one (6) → WrongEpoch. Without this check an
+    // identity would cycle epoch_id and send without limit.
     let mut t = RlnQuotaTracker::new(7, b"scope", 1024);
     let id = identity(1);
     let stale = id.share(&external_nullifier(5, b"scope"), Field::from(1u64));
     assert_eq!(t.observe(&stale), RlnOutcome::WrongEpoch);
-    // И будущая эпоха (9) тоже.
+    // And a future epoch (9) too.
     let future = id.share(&external_nullifier(9, b"scope"), Field::from(1u64));
     assert_eq!(t.observe(&future), RlnOutcome::WrongEpoch);
 }
 
 #[test]
 fn straddle_across_epoch_boundary_still_slashes() {
-    // САМЫЙ важный тест: попытка обойти slashing, «размазав» два разных
-    // сообщения одной эпохи через границу ротации.
-    // 1) На эпохе 7 личность шлёт сообщение A (external_nullifier(7)).
-    // 2) Трекер продвигается в эпоху 8 (grace удерживает состояние эпохи 7).
-    // 3) Личность шлёт ВТОРОЕ разное сообщение B, всё ещё для эпохи 7.
-    // Без grace-удержания шаг 3 прошёл бы как Accepted (обход). С ним —
-    // QuotaViolation: та же личность, та же эпоха, два сообщения → slash.
+    // THE most important test: an attempt to dodge slashing by spreading two different messages of
+    // one epoch across a rotation boundary.
+    // 1) On epoch 7 the identity sends message A (external_nullifier(7)).
+    // 2) The tracker advances to epoch 8 (grace retains the state of epoch 7).
+    // 3) The identity sends a SECOND, different message B, still for epoch 7.
+    // Without the grace retention step 3 would come back Accepted (a bypass). With it, it is a
+    // QuotaViolation: the same identity, the same epoch, two messages → slash.
     let mut t = RlnQuotaTracker::new(7, b"scope", 1024);
     let id = identity(77);
     let ext7 = external_nullifier(7, b"scope");
@@ -126,27 +126,27 @@ fn straddle_across_epoch_boundary_still_slashes() {
     let a = id.share(&ext7, Field::from(1u64));
     assert_eq!(t.observe(&a), RlnOutcome::Accepted);
 
-    t.roll_epoch(8); // граница эпохи
+    t.roll_epoch(8); // the epoch boundary
 
-    let b = id.share(&ext7, Field::from(2u64)); // второе разное сообщение эпохи 7
+    let b = id.share(&ext7, Field::from(2u64)); // a second, different message of epoch 7
     match t.observe(&b) {
         RlnOutcome::QuotaViolation { recovered_secret } => {
             assert_eq!(recovered_secret, id.0.to_bytes());
         }
-        other => panic!("straddle через границу эпохи должен слэшить, получено {:?}", other),
+        other => panic!("straddling an epoch boundary must slash, got {:?}", other),
     }
 }
 
 #[test]
 fn beyond_grace_window_epoch_rejected() {
-    // Скачок эпохи больше grace: состояние прошлого не удерживается, и доли
-    // старой эпохи отвергаются как WrongEpoch.
+    // An epoch jump larger than the grace: the previous state is not retained, and shares of the
+    // old epoch are refused as WrongEpoch.
     let mut t = RlnQuotaTracker::new(7, b"scope", 1024);
     let id = identity(1);
     let ext7 = external_nullifier(7, b"scope");
     assert_eq!(t.observe(&id.share(&ext7, Field::from(1u64))), RlnOutcome::Accepted);
 
-    t.roll_epoch(10); // скачок > grace(1)
-    // Эпоха 7 теперь ни current(10), ни previous(9) → WrongEpoch.
+    t.roll_epoch(10); // a jump larger than grace(1)
+    // Epoch 7 is now neither current(10) nor previous(9) → WrongEpoch.
     assert_eq!(t.observe(&id.share(&ext7, Field::from(2u64))), RlnOutcome::WrongEpoch);
 }

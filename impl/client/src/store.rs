@@ -3817,6 +3817,10 @@ impl Store {
     /// and the id lets a redelivered copy be recognised and skipped.
     pub fn append_history_incoming(&self, rec: &HistoryRecord, msg_id: [u8; 32]) -> io::Result<()> {
         self.append_history_with_id(rec, msg_id)?;
+        // The plaintext is now durable and the dedup ring is not. A crash HERE is the one this
+        // ring exists to absorb, and the claimed cost is one re-appended message — never a lost
+        // one. Checked by a crash test rather than asserted (QA-2, transaction 3).
+        node::fail_point!("store.history.after_append_before_dedup");
         self.note_incoming_id(msg_id);
         Ok(())
     }

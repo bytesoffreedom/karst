@@ -282,6 +282,10 @@ impl BlobStore {
                 return BlobPut::Rejected(format!("store meta io: {e}"));
             }
         }
+        // The claim above — "a crash after the header but before the chunk just leaves an
+        // in-progress blob, and the client resumes" — is checked here rather than believed
+        // (QA-2, transaction 4).
+        crate::fail_point!("blobstore.after_header_before_chunk");
         // Write this chunk to its OWN file, atomically (temp + rename), so a re-send overwrites
         // cleanly and a crash can never leave a torn chunk that corrupts a neighbour.
         if let Err(e) = self.write_chunk_file(&id, index, data) {

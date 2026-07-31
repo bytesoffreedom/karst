@@ -17,6 +17,9 @@
 /// Mailbox deposit/fetch key separation via Ristretto point-blinding — wired into the live
 /// drop-box path for established sessions (reference construction; the Schnorr fetch proof is
 /// unaudited, first-contact openers keep the identity mailbox + DH proof). See the module.
+// Injectable failure points for crash-consistency tests (QA-2). Behind an off-by-default feature;
+// with it off the macro expands to nothing at all. See the module for why `abort` and not `panic`.
+pub mod failpoint;
 pub mod blobstore;
 pub mod discovery;
 // What a helper node may SEE, as a checked invariant rather than a table someone maintains

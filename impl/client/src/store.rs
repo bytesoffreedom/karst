@@ -1,11 +1,11 @@
-//! Хранение секретов клиента на диске под **at-rest шифрованием**.
+//! Client secrets on disk, under **at-rest encryption**.
 //!
-//! Секретные файлы (`identity.key`, `account.key`, `sessions.dat`) шифруются
-//! `MasterKey` (`Argon2id(passphrase)` — см. `secretbox`) и лежат под 0600 (файл
-//! создаётся СРАЗУ под 0600, не write-then-chmod). Защита ХОЛОДНОГО диска, НЕ
-//! hot-процесса (см. `secretbox`). `capability.json` НЕ шифруется (дев-артефакт с
-//! публичным секретом; настоящий провижининг — отдельный слой). Ключи relay
-//! шифрованием НЕ покрыты (сервер рестартует unattended — своя граница доверия).
+//! The secret files (`identity.key`, `account.key`, `sessions.dat`) are encrypted with a
+//! `MasterKey` (`Argon2id(passphrase)` — see `secretbox`) and live under 0600 (created 0600
+//! IMMEDIATELY, never write-then-chmod). This protects a COLD disk, not a live process (see
+//! `secretbox`). `capability.json` is NOT encrypted (a dev artifact with a public secret; real
+//! provisioning is a separate layer). Relay keys are outside this encryption (a server restarts
+//! unattended — its own trust boundary).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::secretbox::{random_salt, MasterKey};
 
-/// Контакт на диске: имя (алиас) + §2.1-IK + был ли сверен код безопасности.
-/// Шифруется at-rest вместе со всем списком. `verified` — доверие подтверждено
-/// пользователем по OOB-каналу (не выводимо из relay, только локальная пометка).
+/// A contact on disk: alias, §2.1 IK, and whether the safety number was verified.
+/// Encrypted at rest with the whole list. `verified` means the user confirmed the contact
+/// out of band — it cannot be derived from the relay, it is a local mark only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactRecord {
     pub name: String,
@@ -75,9 +75,9 @@ pub struct Profile {
     pub photos_ts: u64,
 }
 
-/// Одна запись истории чата (шифруется at-rest как отдельная запечатанная запись).
-/// `peer_ik` — §2.1-IK собеседника (ключ чата, к кому/от кого); `from_me` —
-/// исходящее ли; `text` — plaintext сообщения; `ts` — unix-секунды.
+/// One chat history record (encrypted at rest as its own sealed record).
+/// `peer_ik` is the peer's §2.1 IK (the chat key: to whom / from whom); `from_me` says whether
+/// it was outgoing; `text` is the message plaintext; `ts` is unix seconds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryRecord {
     pub from_me: bool,
@@ -321,8 +321,8 @@ struct ReceivedFileV0 {
     ts: u64,
 }
 
-/// Верхняя граница на длину одной записи истории (защита от абсурдного length-
-/// prefix'а из мусорного хвоста → не аллоцируем гигабайты по битой длине).
+/// Upper bound on one history record (protection against an absurd length prefix out of a
+/// garbage tail — never allocate gigabytes because of a corrupt length).
 const MAX_HISTORY_RECORD: usize = 1 << 20; // 1 MiB — ample for any text
 
 /// The sealed history index is rounded up to a multiple of this before sealing, so its length
@@ -660,11 +660,11 @@ fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-/// Известный plaintext для верификатора пароля (см. `unlock`).
+/// The known plaintext of the password verifier (see `unlock`).
 const VERIFY_CONST: &[u8] = b"KARST-at-rest-verify-v1";
 
-/// Прочитать соль каталога (`salt`, 16 Б plaintext) или создать при первом запуске.
-/// `create_new`: не перезатирать (иначе все существующие шифртексты нечитаемы).
+/// Read the directory salt (`salt`, 16 plaintext bytes) or create it on first run.
+/// `create_new` never overwrites: doing so would make every existing ciphertext unreadable.
 fn read_or_create_salt(dir: &std::path::Path) -> io::Result<Vec<u8>> {
     let salt_path = dir.join("salt");
     match std::fs::read(&salt_path) {
@@ -684,8 +684,8 @@ fn read_or_create_salt(dir: &std::path::Path) -> io::Result<Vec<u8>> {
 /// file read before we know which store/account we are in, so it cannot be scoped by one.
 const VERIFY_LABEL: &str = "verify";
 
-/// Верификатор пароля: при первом разе запечатать известную константу, далее
-/// сверять. Ловит НЕВЕРНЫЙ пароль СРАЗУ (fail-fast), до любой записи секрета.
+/// Password verifier: on the first run seal a known constant, afterwards compare against it.
+/// Catches a WRONG password IMMEDIATELY (fail-fast), before any secret is written.
 fn check_or_seal_verify(dir: &std::path::Path, key: &MasterKey) -> io::Result<()> {
     let verify_path = dir.join("verify");
     match std::fs::read(&verify_path) {
@@ -707,11 +707,11 @@ fn check_or_seal_verify(dir: &std::path::Path, key: &MasterKey) -> io::Result<()
 }
 
 impl Store {
-    /// Открыть каталог и вывести мастер-ключ из `passphrase` (Argon2id, ОДИН раз
-    /// на процесс). Соль (`salt`, 16 Б plaintext) читается или создаётся при
-    /// первом запуске. Одиночный аккаунт (salt/verify В ЭТОМ каталоге) — путь CLI
-    /// и обратной совместимости. Мультиаккаунт GUI использует `Vault` (salt/verify
-    /// на уровне базы, ключ раздаётся всем аккаунтам).
+    /// Open the directory and derive the master key from `passphrase` (Argon2id, ONCE per
+    /// process). The salt (`salt`, 16 plaintext bytes) is read or created on first run. A single
+    /// account (salt/verify IN THIS directory) is the CLI and backwards-compatible path. The
+    /// multi-account GUI uses `Vault` (salt/verify at the base level, one key shared by every
+    /// account).
     pub fn unlock(dir: impl Into<PathBuf>, passphrase: &[u8]) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
@@ -721,9 +721,9 @@ impl Store {
         Ok(Store { dir, key, proxy: None, scope: "store".into() })
     }
 
-    /// Store поверх УЖЕ выведенного vault-ключа (salt/verify проверены на уровне
-    /// базы). Не трогает salt/verify — их у аккаунт-подкаталога нет. Переключение
-    /// аккаунтов = сменить `dir`, переиспользовать тот же `key` (без Argon2).
+    /// A store on top of an ALREADY derived vault key (salt/verify were checked at the base
+    /// level). Does not touch salt/verify — an account subdirectory has none. Switching accounts
+    /// means changing `dir` and reusing the same `key`, with no second Argon2 pass.
     pub fn at(dir: impl Into<PathBuf>, key: MasterKey) -> Self {
         Store { dir: dir.into(), key, proxy: None, scope: "store".into() }
     }
@@ -787,7 +787,7 @@ impl Store {
         }
     }
 
-    /// `$KARST_HOME`, иначе `$XDG_CONFIG_HOME/karst`, иначе `~/.config/karst`.
+    /// `$KARST_HOME`, else `$XDG_CONFIG_HOME/karst`, else `~/.config/karst`.
     pub fn default_dir() -> PathBuf {
         if let Ok(d) = std::env::var("KARST_HOME") {
             return PathBuf::from(d);
@@ -1495,7 +1495,7 @@ impl Store {
     }
 
     pub fn capability_path(&self) -> PathBuf {
-        // .dat, а не .json: на диске зашифрованный blob, не JSON.
+        // .dat rather than .json: what is on disk is an encrypted blob, not JSON.
         //
         // Deliberately `self.dir`, NOT `net_file`: ONE file holds every slot's credentials, keyed
         // `<relay-id>:<slot>` inside (see `CapabilityFile`). The per-proxy separation A8-4 asks
@@ -1505,10 +1505,10 @@ impl Store {
         self.dir.join("capabilities.dat")
     }
 
-    /// **Единый корень личности** — 16 байт энтропии мнемонической фразы (§seed).
-    /// ЕДИНСТВЕННЫЙ секрет-личность на диске: и seal, и account выводятся из него
-    /// (`seed::derive`), поэтому диск и фраза НЕ МОГУТ разойтись. `.key`, но это
-    /// зашифрованный at-rest blob.
+    /// **The single root of the identity** — the 16 bytes of mnemonic entropy (§seed).
+    /// The ONLY identity secret on disk: both the seal key and the account are derived from it
+    /// (`seed::derive`), so the disk and the phrase CANNOT diverge. `.key`, but the contents are
+    /// an at-rest encrypted blob.
     fn seed_path(&self) -> PathBuf {
         self.dir.join("seed.key")
     }
@@ -1523,10 +1523,10 @@ impl Store {
         self.load_capability_for(relay).is_ok()
     }
 
-    /// Записать корень (энтропию фразы). `create_new` → НЕ перезаписывает: смена
-    /// корня сменила бы IK/владение mailbox → осиротила бы всё запечатанное на
-    /// старую личность и все сессии. Права 0600 при СОЗДАНИИ. Provisioning
-    /// (create/restore) кладёт сюда энтропию свежей/введённой фразы.
+    /// Write the root (the phrase entropy). `create_new` refuses to overwrite: changing the root
+    /// would change the IK and mailbox ownership, orphaning everything sealed to the old identity
+    /// along with every session. Mode 0600 at CREATION. Provisioning (create/restore) puts the
+    /// entropy of a fresh or entered phrase here.
     pub fn save_seed(&self, entropy: &[u8; crate::seed::ENTROPY_BYTES]) -> io::Result<()> {
         let blob = self.key.seal(&self.label(&self.seed_path()), entropy);
         let mut f = OpenOptions::new()
@@ -1537,7 +1537,7 @@ impl Store {
         f.write_all(&blob)
     }
 
-    /// Прочитать корень (для показа фразы / provisioning-проверок).
+    /// Read the root (to show the phrase, or for provisioning checks).
     pub fn load_entropy(&self) -> io::Result<[u8; crate::seed::ENTROPY_BYTES]> {
         let blob = std::fs::read(self.seed_path())?;
         let secret = self.key.open(&self.label(&self.seed_path()), &blob).map_err(io_err)?;
@@ -1547,10 +1547,10 @@ impl Store {
             .map_err(|_| io_err("seed: entropy is not 16 bytes"))
     }
 
-    /// seal-ключ (relay-facing). В корневом режиме **выводится** из фразы, не хранится отдельно.
-    /// В proxy-режиме — seal ЭТОГО прокси, выведенный из его собственного случайного секрета
-    /// (`proxy_identity`), НЕ из фразы (#207): если запись прокси сожжена/не существует, это
-    /// ошибка, а не тихий откат на HD-вывод из фразы (см. `proxy_identity`).
+    /// The seal key (relay-facing). In ROOT mode it is **derived** from the phrase, never stored
+    /// separately. In PROXY mode it is THIS proxy's seal key, derived from the proxy's own random
+    /// secret (`proxy_identity`) and NOT from the phrase (#207): if the proxy record is burned or
+    /// missing, that is an error rather than a silent fallback to deriving from the phrase.
     pub fn load_identity(&self) -> io::Result<Identity> {
         Ok(match self.proxy {
             None => crate::seed::derive(&self.load_entropy()?).seal,
@@ -1558,14 +1558,14 @@ impl Store {
         })
     }
 
-    /// §2.1-account (ik‖prekey‖KEM). В корневом режиме **выводится** из фразы, не хранится
-    /// отдельно. В proxy-режиме возвращает личность ПРОКСИ — выведенную из ЕЁ СОБСТВЕННОГО
-    /// секрета в реестре (`proxy_identity`), НЕ из фразы (#207, A6-4) — поэтому весь session-слой
-    /// (mailbox = IK, ownership-proof, ratchet) работает как этот прокси, а не как корень. Это
-    /// единственное место, где сетевой identity подменяется — все сетевые операции идут через
-    /// него. Если запись прокси сожжена (или никогда не создавалась), это `Err`: НИКАКОГО тихого
-    /// отката на вывод из фразы — именно такой откат воссоздал бы "сожжённую" личность и обнулил
-    /// бы весь смысл сжигания.
+    /// The §2.1 account (ik‖prekey‖KEM). In ROOT mode it is **derived** from the phrase and not
+    /// stored separately. In PROXY mode it returns the PROXY's identity — derived from ITS OWN
+    /// secret in the registry (`proxy_identity`), NOT from the phrase (#207, A6-4) — so the whole
+    /// session layer (mailbox = IK, ownership proof, ratchet) runs as that proxy rather than as
+    /// the root. This is the single place where the network identity is substituted, and every
+    /// network operation goes through it. If the proxy record is burned (or never existed) this
+    /// is an `Err`: NO silent fallback to deriving from the phrase — such a fallback would
+    /// recreate the "burned" identity and empty the whole point of burning it.
     pub fn load_account(&self) -> io::Result<Account> {
         Ok(match self.proxy {
             None => crate::seed::derive(&self.load_entropy()?).account,
@@ -1839,13 +1839,13 @@ impl Store {
         Ok(true)
     }
 
-    // ----- Контакты (имена + флаг сверки), шифрованы at-rest -----
+    // ----- Contacts (names + a verified flag), encrypted at rest -----
 
     fn contacts_path(&self) -> PathBuf {
         self.dir.join("contacts.dat")
     }
 
-    /// Загрузить контакты (пусто, если файла нет). Расшифровывается at-rest-ключом.
+    /// Load the contacts (empty when the file is absent). Decrypted with the at-rest key.
     pub fn load_contacts(&self) -> io::Result<Vec<ContactRecord>> {
         match std::fs::read(self.contacts_path()) {
             Ok(blob) => {
@@ -1857,10 +1857,10 @@ impl Store {
         }
     }
 
-    /// АТОМАРНО сохранить список контактов (temp 0600 → fsync → rename). Полная
-    /// перезапись (список маленький, не append-лог). Единственный писатель — GUI-
-    /// процесс, поэтому без flock (в отличие от sessions/history, где гонка ведёт к
-    /// keystream-reuse; тут максимум — потеря последнего переименования контакта).
+    /// ATOMICALLY save the contact list (temp 0600 → fsync → rename). A full rewrite (the list is
+    /// small, not an append log). The only writer is the GUI process, so no flock — unlike
+    /// sessions/history, where a race leads to keystream reuse; here the worst case is losing the
+    /// last contact rename.
     pub fn save_contacts(&self, contacts: &[ContactRecord]) -> io::Result<()> {
         let plain = postcard::to_stdvec(contacts).map_err(io_err)?;
         let bytes = self.key.seal(&self.label(&self.contacts_path()), &plain);
@@ -1878,16 +1878,16 @@ impl Store {
         std::fs::rename(&tmp, self.contacts_path())
     }
 
-    // ----- Блок-лист (IK, от которых НЕ принимаем входящее), шифрован at-rest -----
+    // ----- Block list (IKs whose incoming mail we refuse), encrypted at rest -----
     //
-    // Отдельный sidecar (НЕ поле в `ContactRecord`: тот postcard-позиционен, новое
-    // поле осиротило бы имена/флаги сверки на диске). Whole-file atomic, как contacts.
+    // A separate sidecar, NOT a field in `ContactRecord`: that struct is positional postcard, and
+    // a new field would orphan the stored names and verified flags. Whole-file atomic, like contacts.
 
     fn blocked_path(&self) -> PathBuf {
         self.dir.join("blocked.dat")
     }
 
-    /// Загрузить множество заблокированных IK (пусто, если файла нет).
+    /// Load the set of blocked IKs (empty when the file is absent).
     pub fn load_blocked(&self) -> io::Result<BTreeSet<[u8; 32]>> {
         match std::fs::read(self.blocked_path()) {
             Ok(blob) => {
@@ -1899,8 +1899,8 @@ impl Store {
         }
     }
 
-    /// Заблокировать/разблокировать `ik`. Идемпотентно. Пустой список удаляет файл.
-    /// Атомарно (temp→fsync→rename). Единственный писатель — GUI, поэтому без flock.
+    /// Block or unblock `ik`. Idempotent. An empty list deletes the file.
+    /// Atomic (temp → fsync → rename). The only writer is the GUI, so no flock.
     pub fn set_blocked(&self, ik: [u8; 32], blocked: bool) -> io::Result<()> {
         let mut set = self.load_blocked()?;
         let changed = if blocked { set.insert(ik) } else { set.remove(&ik) };
@@ -3376,24 +3376,24 @@ impl Store {
         rename_durable(&tmp, path)
     }
 
-    // ----- §2.1 персистентные сессии (ratchet-состояние между процессами) -----
+    // ----- §2.1 persistent sessions (ratchet state across processes) -----
 
     fn sessions_path(&self) -> PathBuf {
         self.net_file("sessions.dat")
     }
 
-    /// ВЫДЕЛЕННЫЙ lock-файл: он НИКОГДА не переименовывается и не удаляется, чтобы
-    /// flock держался за стабильный inode. Если лочить `sessions.dat`, который мы
-    /// перезаписываем через temp+rename, замок повис бы на откреплённом inode и
-    /// взаимного исключения не было бы (класс «замок на переименованном файле»).
+    /// A DEDICATED lock file: it is NEVER renamed or deleted, so flock holds a stable inode. If
+    /// the lock lived on `sessions.dat`, which is rewritten through temp+rename, the lock would
+    /// hang on a detached inode and there would be no mutual exclusion at all (the classic
+    /// "lock on a renamed file" bug).
     fn sessions_lock_path(&self) -> PathBuf {
         self.net_file("sessions.lock")
     }
 
-    /// Взять ЭКСКЛЮЗИВНЫЙ замок на всё окно операции (load → мутация → save).
-    /// Блокирующий: второй процесс `karst` ждёт, а не мчится параллельно —
-    /// иначе оба загрузили бы сессию на позиции N и зашифровали РАЗНЫЕ тексты
-    /// одним `mk`+нулевым nonce (keystream-reuse). Замок снимается при `drop`.
+    /// Take an EXCLUSIVE lock for the whole operation window (load → mutate → save).
+    /// Blocking: a second `karst` process waits instead of racing — otherwise both would load the
+    /// session at position N and encrypt DIFFERENT plaintexts under one `mk` and a zero nonce
+    /// (keystream reuse). The lock is released on `drop`.
     pub fn lock_sessions(&self) -> io::Result<SessionLock> {
         let file = OpenOptions::new()
             .read(true)
@@ -3406,8 +3406,8 @@ impl Store {
         Ok(SessionLock { _file: file })
     }
 
-    /// Загрузить персистентное состояние сессий (пусто, если файла нет).
-    /// Держите `lock_sessions` вокруг load→save. Расшифровывается at-rest-ключом.
+    /// Load the persistent session state (empty when the file is absent).
+    /// Hold `lock_sessions` around load→save. Decrypted with the at-rest key.
     fn sessions_anchor_path(&self) -> PathBuf {
         self.net_file("sessions.anchor")
     }
@@ -3536,15 +3536,15 @@ impl Store {
         self.read_session_file().ok().flatten().map(|f| f.generation).unwrap_or(0)
     }
 
-    // ----- Зашифрованный append-лог истории чатов -----
+    // ----- The encrypted append log of chat history -----
     //
-    // Формат файла — последовательность записей `len(u32-LE) ‖ sealed`, где
-    // `sealed` = независимо запечатанная (`secretbox::seal`, СВЕЖИЙ 192-бит nonce
-    // на запись) запись. Независимое запечатывание безопасно без счётчика (при
-    // 192-бит nonce коллизия ~2^-96) — это НЕ ratchet, keystream-reuse тут неоткуда
-    // взяться. Append — O(1) (в отличие от переписывания всего файла O(n) на
-    // сообщение → O(n²)). Конкурентность — ВЫДЕЛЕННЫЙ `history.lock` (никогда не
-    // переименовывается, стабильный inode — как `sessions.lock`).
+    // The file format is a sequence of `len(u32-LE) ‖ sealed` records, where `sealed` is an
+    // independently sealed record (`secretbox::seal`, a FRESH 192-bit nonce per record).
+    // Independent sealing is safe without a counter (at 192 bits a collision is ~2^-96) — this is
+    // NOT a ratchet, so there is no keystream reuse to be had here. Appending is O(1), unlike
+    // rewriting the whole file per message, which would be O(n) per message and O(n²) overall.
+    // Concurrency uses a DEDICATED `history.lock` (never renamed, stable inode — like
+    // `sessions.lock`).
 
     fn outstanding_requests_path(&self) -> PathBuf {
         self.dir.join("outstanding_requests.dat")
@@ -3790,8 +3790,8 @@ impl Store {
         self.dir.join("history.lock")
     }
 
-    /// Эксклюзивный замок на окно append/load истории (сериализует писателей между
-    /// процессами; mid-file interleave был бы НЕвосстановим усечением хвоста).
+    /// Exclusive lock around the append/load window (serialises writers across processes; a
+    /// mid-file interleave would be UNRECOVERABLE by truncating the tail).
     fn lock_history(&self) -> io::Result<SessionLock> {
         let file = OpenOptions::new()
             .read(true)
@@ -3804,10 +3804,10 @@ impl Store {
         Ok(SessionLock { _file: file })
     }
 
-    /// Дописать одну запись истории (append + fsync под замком). Вызывать:
-    /// входящие — БЕЗУСЛОВНО; исходящие — ТОЛЬКО после успешной `send_session`
-    /// (иначе провал отправки стал бы ДОЛГОВЕЧНО залогирован как доставленное —
-    /// та самая оптимистичная граница, но уже на диске).
+    /// Append one history record (append + fsync under the lock). Call it: for incoming messages
+    /// UNCONDITIONALLY; for outgoing ones ONLY after a successful `send_session` — otherwise a
+    /// failed send would be DURABLY logged as delivered, which is the same optimistic boundary as
+    /// before but now on disk.
     pub fn append_history(&self, rec: &HistoryRecord) -> io::Result<()> {
         self.append_history_with_id(rec, [0u8; 32])
     }
@@ -3843,10 +3843,10 @@ impl Store {
         f.sync_all()
     }
 
-    /// Сканировать сырой файл истории до первой битой границы. Возвращает разобранные
-    /// записи и смещение последней ЧИСТОЙ границы (`last_good`) — всё после него
-    /// рваный/мусорный хвост. Чистая функция разбора (без замка/IO) — переиспользуется
-    /// загрузкой (усекает хвост) и перезаписью (дропает хвост, переписав только целое).
+    /// Scan the raw history file up to the first broken boundary. Returns the parsed records and
+    /// the offset of the last CLEAN boundary (`last_good`) — everything after it is a torn or
+    /// garbage tail. A pure parsing function (no lock, no IO), reused by loading (which truncates
+    /// the tail) and by rewriting (which drops it, rewriting only whole records).
     fn scan_history(&self, bytes: &[u8]) -> (Vec<StoredHistory>, usize) {
         let mut records = Vec::new();
         let mut off = 0usize;
@@ -3877,11 +3877,11 @@ impl Store {
         (records, last_good)
     }
 
-    /// Загрузить всю историю. При СТАРТЕ восстанавливает целостность: сканирует до
-    /// последней чисто разобранной границы записи и УСЕКАЕТ файл до неё. Иначе
-    /// рваный хвост (крах на середине append) не просто терял бы последнее
-    /// сообщение — его битый length-prefix рассинхронизировал бы чтение и ОТРАВИЛ
-    /// БЫ все будущие append'ы. Потеря последней записи — liveness, не reuse.
+    /// Load the whole history. At STARTUP it restores integrity: it scans to the last cleanly
+    /// parsed record boundary and TRUNCATES the file there. Otherwise a torn tail (a crash
+    /// mid-append) would not merely lose the last message — its corrupt length prefix would
+    /// desynchronise reading and POISON every future append. Losing the last record is a liveness
+    /// cost, not reuse.
     pub fn load_history(&self) -> io::Result<Vec<HistoryRecord>> {
         let _lock = self.lock_history()?;
         let path = self.history_path();
@@ -3892,7 +3892,7 @@ impl Store {
         };
         let (records, last_good) = self.scan_history(&bytes);
         if last_good < bytes.len() {
-            // Отрезать рваный/мусорный хвост, чтобы будущие append'ы парсились.
+            // Cut the torn or garbage tail so future appends still parse.
             OpenOptions::new().write(true).open(&path)?.set_len(last_good as u64)?;
         }
         Ok(records.into_iter().map(|s| s.rec).collect())
@@ -4131,18 +4131,18 @@ impl Store {
         }
     }
 
-    /// Перезаписать историю, оставив только записи, для которых `keep` вернул `true`
-    /// (удаление сообщений / очистка переписки / истечение исчезающих). Возвращает
-    /// УДАЛЁННЫЕ записи (не только счётчик) — вызывающий считает их `msg_id` и чистит
-    /// метаданные (`prune_meta`), а `rewrite_history` остаётся single-purpose.
+    /// Rewrite the history keeping only the records for which `keep` returned `true` (message
+    /// deletion / clearing a conversation / expiring disappearing messages). Returns the REMOVED
+    /// records rather than a count — the caller reads their `msg_id`s and prunes the metadata
+    /// (`prune_meta`), which keeps `rewrite_history` single-purpose.
     ///
-    /// Атомарно: пишем во временный файл (0600), fsync, `rename` поверх (замена
-    /// inode за одну операцию ФС) — крах на середине не оставит полу-перезаписанной
-    /// истории. Каждая оставленная запись запечатывается ЗАНОВО (свежий 192-бит
-    /// nonce — как append), поэтому переписывание безопасно (это не ratchet). Рваный
-    /// хвост при этом естественно отбрасывается: переписываем лишь целые записи.
-    /// В отличие от append (O(1)) это O(n) — вызывать по действию пользователя/
-    /// подметанию, а не на каждое сообщение.
+    /// Atomic: write a temporary file (0600), fsync, `rename` over the target (an inode swap in
+    /// one filesystem operation) — a crash midway cannot leave a half-rewritten history. Every
+    /// retained record is sealed AGAIN (a fresh 192-bit nonce, as on append), so rewriting is safe
+    /// (this is not a ratchet). A torn tail is dropped naturally in the process: only whole
+    /// records are rewritten. Unlike append (O(1)) this is O(n) — call it on a user action or a
+    /// sweep, never per message.
+
     pub fn rewrite_history(
         &self,
         mut keep: impl FnMut(&HistoryRecord) -> bool,
@@ -4190,7 +4190,7 @@ impl Store {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &path)?;
-        // fsync каталога — чтобы переименование пережило крах (запись деструктивна).
+        // fsync the directory so the rename survives a crash (this write is destructive).
         if let Ok(dir) = File::open(&self.dir) {
             let _ = dir.sync_all();
         }
@@ -4206,15 +4206,15 @@ impl Store {
         Ok(())
     }
 
-    // ----- Метаданные сообщений (реакции; позже reply/edit), шифрованы at-rest -----
+    // ----- Message metadata (reactions; later replies/edits), encrypted at rest -----
     //
-    // Отдельный sidecar `meta.dat` (whole-file atomic, как contacts.dat), НЕ трогает
-    // формат `HistoryRecord` (postcard-позиционный — новое поле сломало бы диск).
-    // Ключ — канонический `msg_id` (см. `content::msg_id`): один и тот же у обеих
-    // сторон, поэтому метаданные джойнятся к истории при рендере без относительных
-    // полей. Метаданные — best-effort: их порча/потеря НИКОГДА не блокирует историю
-    // (расшифровка не удалась → пусто, не ошибка). Отдельный `meta.lock` (не вложен
-    // в history.lock — иначе реакции сериализовались бы против append'ов истории).
+    // A separate `meta.dat` sidecar (whole-file atomic, like contacts.dat) that does NOT touch the
+    // `HistoryRecord` format (positional postcard — a new field would break the on-disk layout).
+    // The key is the canonical `msg_id` (see `content::msg_id`): identical on both sides, so
+    // metadata joins to history at render time without any relative fields. Metadata is
+    // best-effort: its corruption or loss NEVER blocks the history (a failed decrypt yields empty,
+    // not an error). It has its own `meta.lock`, not nested inside history.lock — otherwise
+    // reactions would serialise against history appends.
 
     fn meta_path(&self) -> PathBuf {
         self.dir.join("meta.dat")
@@ -4236,9 +4236,9 @@ impl Store {
         Ok(SessionLock { _file: file })
     }
 
-    /// Загрузить карту реакций (пусто, если файла нет ИЛИ он не расшифровался —
-    /// метаданные best-effort, не блокируют историю). Анти-DoS: усечение сверх
-    /// лимитов при разборе (не аллоцируем безгранично по чужому/битому файлу).
+    /// Load the reaction map (empty when the file is absent OR did not decrypt — metadata is
+    /// best-effort and never blocks the history). Anti-DoS: truncate anything beyond the limits
+    /// while parsing, so a foreign or corrupt file cannot drive unbounded allocation.
     pub fn load_meta(&self) -> io::Result<MetaMap> {
         let _lock = self.lock_meta()?;
         Ok(self.load_meta_unlocked())
@@ -4257,13 +4257,13 @@ impl Store {
             Ok(m) => m,
             Err(_) => return MetaMap::new(),
         };
-        // Оборонительно приводим к лимитам (файл мог прийти из будущего/битым).
+        // Defensively clamp to the limits (the file could come from the future, or be corrupt).
         clamp_meta(&mut map);
         map
     }
 
     fn save_meta_unlocked(&self, map: &MetaMap) -> io::Result<()> {
-        // Пустая карта → удаляем файл (не держим мусор).
+        // An empty map deletes the file (no leftovers kept).
         if map.is_empty() {
             match std::fs::remove_file(self.meta_path()) {
                 Ok(_) => {}
@@ -4288,10 +4288,10 @@ impl Store {
         std::fs::rename(&tmp, self.meta_path())
     }
 
-    /// Поставить/снять реакцию `author_ik` эмодзи `emoji` на сообщение `msg_id`.
-    /// Идемпотентно (повтор `add` не дублирует — `BTreeSet`). Пустые множества/карты
-    /// схлопываются (снятие последней реакции убирает запись). Анти-DoS: отвергаем
-    /// абсурдный emoji / переполнение авторов-на-реакцию / числа сообщений ДО записи.
+    /// Add or remove `author_ik`'s `emoji` reaction on message `msg_id`.
+    /// Idempotent (a repeated `add` does not duplicate — `BTreeSet`). Empty sets and maps collapse
+    /// (removing the last reaction removes the entry). Anti-DoS: an absurd emoji, an overflow of
+    /// authors-per-reaction, or of messages, is refused BEFORE anything is written.
     pub fn set_reaction(
         &self,
         msg_id: [u8; 16],
@@ -4305,7 +4305,7 @@ impl Store {
         let _lock = self.lock_meta()?;
         let mut map = self.load_meta_unlocked();
         if add {
-            // Новый msg_id — только если не переполним карту (анти-память-DoS).
+            // A new msg_id only if it does not overflow the map (anti memory DoS).
             if !map.contains_key(&msg_id) && map.len() >= MAX_META_MESSAGES {
                 return Err(io_err("too many messages carrying metadata"));
             }
@@ -4332,9 +4332,9 @@ impl Store {
         self.save_meta_unlocked(&map)
     }
 
-    /// Пометить сообщение `msg_id` как ОТВЕТ на `reply_to` (overlay в meta). Автор
-    /// самого ответа — обычное сообщение в истории; здесь лишь связь «отвечает на».
-    /// Анти-память-DoS: новый `msg_id` только под лимитом.
+    /// Mark message `msg_id` as a REPLY to `reply_to` (an overlay in meta). The reply itself is an
+    /// ordinary history message; this records only the "replies to" link.
+    /// Anti memory DoS: a new `msg_id` only while under the limit.
     pub fn set_reply(&self, msg_id: [u8; 16], reply_to: [u8; 16]) -> io::Result<()> {
         let _lock = self.lock_meta()?;
         let mut map = self.load_meta_unlocked();
@@ -4345,10 +4345,10 @@ impl Store {
         self.save_meta_unlocked(&map)
     }
 
-    /// Записать ПРАВКУ сообщения `msg_id`: `(edit_ts, new_text)` overlay в meta (сам
-    /// `HistoryRecord` не трогаем — `msg_id` стабилен). Анти-DoS: длина текста и число
-    /// сообщений под лимитом. Авторизацию (только автор цели) проверяет вызывающий
-    /// ДО этого вызова (`incoming_edit_allowed`) — здесь только запись.
+    /// Record an EDIT of message `msg_id`: `(edit_ts, new_text)` as an overlay in meta (the
+    /// `HistoryRecord` itself is untouched — `msg_id` stays stable). Anti-DoS: the text length and
+    /// the message count are bounded. Authorisation (only the target's author) is checked by the
+    /// caller BEFORE this call (`incoming_edit_allowed`); this only writes.
     /// Last-writer-by-`edit_ts` wins, NOT last-received: an edit is applied only if its
     /// `edit_ts` is at least the currently stored one. This makes edit application idempotent
     /// AND order-independent — a redelivered (crash-window) or reordered edit can never
@@ -4374,10 +4374,10 @@ impl Store {
         self.save_meta_unlocked(&map)
     }
 
-    /// Удалить метаданные для набора `msg_id` (когда сами сообщения удалены из
-    /// истории — delete/clear/tombstone/sweep). Best-effort, вызывать ПОСЛЕ
-    /// `rewrite_history`; осиротевшая запись безвредна (ничего не рендерит) — но
-    /// чистим, чтобы призрак не «прилип» к будущему сообщению с тем же `msg_id`.
+    /// Delete the metadata for a set of `msg_id`s (when the messages themselves are gone from the
+    /// history — delete/clear/tombstone/sweep). Best-effort, call it AFTER `rewrite_history`; an
+    /// orphaned entry is harmless (it renders nothing) — but clean it anyway, so a ghost cannot
+    /// attach itself to a future message with the same `msg_id`.
     pub fn prune_meta(&self, ids: &[[u8; 16]]) -> io::Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -4397,43 +4397,43 @@ impl Store {
     }
 }
 
-/// Метаданные ОДНОГО сообщения (sidecar `meta.dat`, ключ — канонический `msg_id`).
-/// Все поля определены СРАЗУ: postcard кодирует поля позиционно, добавить поле
-/// позже нельзя без слома диска (та же дисциплина, что у `HistoryRecord`). `BTree*`
-/// — детерминированный at-rest blob.
+/// The metadata of ONE message (the `meta.dat` sidecar, keyed by the canonical `msg_id`).
+/// Every field is defined UP FRONT: postcard encodes fields positionally, so a field cannot be
+/// added later without breaking the on-disk layout (the same discipline as `HistoryRecord`).
+/// `BTree*` keeps the at-rest blob deterministic.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgMeta {
-    /// Реакции: эмодзи → множество IK-авторов.
+    /// Reactions: emoji → the set of author IKs.
     pub reactions: BTreeMap<String, BTreeSet<[u8; 32]>>,
-    /// Если это ответ/цитата — `msg_id` сообщения, на которое отвечают.
+    /// If this is a reply/quote — the `msg_id` of the message being replied to.
     pub reply_to: Option<[u8; 16]>,
-    /// Правка: `(время правки, новый текст)` — overlay поверх текста истории. Сам
-    /// `HistoryRecord` НЕ переписываем, чтобы `msg_id` (в нём есть текст) оставался
-    /// стабильным — иначе реакции/ответы на это сообщение осиротели бы.
+    /// An edit: `(edit time, new text)` — an overlay on top of the history text. The
+    /// `HistoryRecord` is NOT rewritten, so that `msg_id` (which covers the text) stays stable —
+    /// otherwise reactions and replies to that message would be orphaned.
     pub edited: Option<(u64, Vec<u8>)>,
 }
 
 impl MsgMeta {
-    /// Пусто (ни реакций, ни ответа, ни правки) → запись можно убрать из карты.
+    /// Empty (no reactions, no reply, no edit) → the entry can be dropped from the map.
     pub fn is_empty(&self) -> bool {
         self.reactions.is_empty() && self.reply_to.is_none() && self.edited.is_none()
     }
 }
 
-/// Карта метаданных сообщений: `msg_id → MsgMeta`.
+/// The message metadata map: `msg_id → MsgMeta`.
 pub type MetaMap = BTreeMap<[u8; 16], MsgMeta>;
 
-/// Максимум сообщений с метаданными (анти-память-DoS; осиротевшие реакции/ответы на
-/// ещё-не-пришедшие/удалённые сообщения не должны копиться безгранично).
+/// The maximum number of messages carrying metadata (anti memory DoS; orphaned reactions or
+/// replies to not-yet-arrived or deleted messages must not accumulate without bound).
 const MAX_META_MESSAGES: usize = 100_000;
-/// Максимум РАЗНЫХ эмодзи-реакций на одно сообщение.
+/// The maximum number of DISTINCT emoji reactions on one message.
 const MAX_REACTIONS_PER_MSG: usize = 64;
-/// Максимум авторов одной эмодзи-реакции (в 1:1 практически 2, но с запасом на
-/// будущие группы; главное — конечность против залива при приёме).
+/// The maximum number of authors for one emoji reaction (in a 1:1 chat it is effectively 2, with
+/// headroom for future groups; what matters is that it is finite against a flood on receive).
 const MAX_AUTHORS_PER_REACTION: usize = 1024;
 
-/// Оборонительно усечь карту к лимитам при загрузке (файл мог прийти битым/из
-/// будущего с бóльшими лимитами). Тихо отбрасывает лишнее — не паникует.
+/// Defensively clamp the map to the limits while loading (the file could be corrupt, or come from
+/// a future build with larger limits). Silently drops the excess rather than panicking.
 fn clamp_meta(map: &mut MetaMap) {
     while map.len() > MAX_META_MESSAGES {
         let k = *map.keys().next_back().expect("non-empty");
@@ -4450,21 +4450,21 @@ fn clamp_meta(map: &mut MetaMap) {
                 authors.remove(&a);
             }
         }
-        // Overlay правки из недоверенного файла — усечь абсурдную длину текста.
+        // An edit overlay from an untrusted file — clamp an absurd text length.
         if let Some((_, txt)) = &mut mm.edited {
             txt.truncate(crate::content::MAX_TEXT_BYTES);
         }
     }
 }
 
-/// RAII-замок сессий. Держите его на всё окно load→мутация→save; при `drop`
-/// (в т.ч. при панике) замок снимается ОС.
+/// The RAII session lock. Hold it for the whole load→mutate→save window; on `drop` (including on
+/// a panic) the OS releases it.
 pub struct SessionLock {
     _file: File,
 }
 
-/// Запись реестра аккаунтов (шифруется под vault-ключом). `id` — имя подкаталога
-/// (`accounts/<id>`), `label` — пользовательское имя, `ik` — §2.1-адрес (для показа).
+/// An account registry entry (encrypted under the vault key). `id` is the subdirectory name
+/// (`accounts/<id>`), `label` is the user-facing name, `ik` is the §2.1 address (for display).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountEntry {
     pub id: String,
@@ -4961,13 +4961,13 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> 
     Ok(())
 }
 
-/// **Vault — мультиаккаунтное, мультипарольное хранилище.** Один пароль устройства (Argon2id ОДИН
-/// раз) выводит `MasterKey`, защищающий один КОМПАРТМЕНТ (`base/c/<id>/`) со всеми его аккаунтами;
-/// переключение аккаунтов внутри компартмента бесплатно (тот же ключ, другой подкаталог). Соль — на
-/// уровне базы (`base/salt`, одна на устройство). Разные пароли открывают разные компартменты либо
-/// запускают wipe — маршрутизация в `Vault::open` через `base/slots.dat`. Реестр аккаунтов
-/// (`<compartment>/accounts.dat`) зашифрован. `Clone` дёшев (два PathBuf + 32-байтный ключ).
-#[derive(Clone)]
+/// **Vault — the multi-account, multi-password store.** One device password (Argon2id ONCE)
+/// derives the `MasterKey` that protects one COMPARTMENT (`base/c/<id>/`) with all of its
+/// accounts; switching accounts inside a compartment is free (same key, different subdirectory).
+/// The salt lives at the base level (`base/salt`, one per device). Different passwords open
+/// different compartments or trigger a wipe — routed in `Vault::open` through `base/slots.dat`.
+/// The account registry (`<compartment>/accounts.dat`) is encrypted. `Clone` is cheap (two
+/// PathBufs and a 32-byte key).
 pub struct Vault {
     /// Vault root: holds `salt`, `slots.dat`, and the `c/<id>/` compartments.
     base: PathBuf,
@@ -4988,7 +4988,7 @@ impl Vault {
         format!("vault/{}", parts.join("/"))
     }
 
-    /// Открыть vault под паролем устройства. `salt`/`verify` на уровне базы.
+    /// Open the vault under the device password. `salt`/`verify` live at the base level.
     ///
     /// NO migration of a legacy single-account directory. That path was removed with format v2:
     /// at-rest keys are derived per (account, file), so relocating a file into an account
@@ -5366,19 +5366,19 @@ impl Vault {
         Vault { base: dir.clone(), dir, key }
     }
 
-    /// Store поверх аккаунта `id` (общий vault-ключ). Каталог должен существовать
-    /// для записи (провижининг создаёт его через `create_account_dir`).
+    /// A store on top of account `id` (sharing the vault key). The directory must exist before
+    /// writing (provisioning creates it through `create_account_dir`).
     pub fn account(&self, id: &str) -> Store {
         Store::scoped(self.account_dir(id), self.key.clone(), format!("acct:{id}"))
     }
 
-    /// Создать каталог аккаунта `id` (перед первым `save_seed`).
+    /// Create the directory for account `id` (before the first `save_seed`).
     pub fn create_account_dir(&self, id: &str) -> io::Result<()> {
         std::fs::create_dir_all(self.account_dir(id))
     }
 
-    /// Прочитать реестр аккаунтов (пусто, если файла нет). Расшифровывается
-    /// vault-ключом.
+    /// Read the account registry (empty when the file is absent). Decrypted with the vault key.
+
     pub fn load_registry(&self) -> io::Result<Vec<AccountEntry>> {
         match std::fs::read(self.registry_path()) {
             Ok(blob) => {
@@ -5390,8 +5390,8 @@ impl Vault {
         }
     }
 
-    /// АТОМАРНО сохранить реестр (temp 0600 → fsync → rename), зашифрован. Temp — в том же
-    /// каталоге компартмента, что и цель, чтобы rename был атомарным (одна ФС).
+    /// ATOMICALLY save the registry (temp 0600 → fsync → rename), encrypted. The temp file is in
+    /// the same compartment directory as the target, so the rename is atomic (one filesystem).
     pub fn save_registry(&self, entries: &[AccountEntry]) -> io::Result<()> {
         let plain = postcard::to_stdvec(entries).map_err(io_err)?;
         let bytes = self.key.seal(&self.label(&self.registry_path()), &plain);

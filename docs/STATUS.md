@@ -237,6 +237,10 @@ lookup, `blob_stat`, node list, policy, blob store. The one read-shaped handler 
 so a read signature there would be a lie about what the function does. `RelayServer.relay`'s own doc
 comment said this already — the task could have been closed by reading the line above the field.
 
+Amended 2026-07-31: `GetNodeList` now takes `write()` too, but only to re-sign this relay's OWN entry
+and only when the cached signature has aged out — once per refresh window, not once per request. It
+is checked under the read lock first, so the common path is unchanged. See below for why it had to.
+
 **Running total for this sweep: six tasks whose premise had expired**, two of them mine. Rule applied
 since: grep the whole chain before taking a task, not after.
 
@@ -492,9 +496,12 @@ in QUIC-4 had nothing to race. Five slices closed that:
   time out first — the exact cost QUIC-4 exists to avoid, handed out by the relay. Found while
   wiring it: `add_relay` merged `addrs` for a known relay but silently dropped `quic_addrs`, so a
   gossiped endpoint could never propagate.
-- **QUIC-12** — the client learns the endpoint from the relay's OWN node-list entry (never a third
-  party's claim about it, CRYPTO-23) and builds a path from it. **A proxied relay never gets a
-  QUIC path**, enforced in path construction rather than by convention.
+- **QUIC-12** — the client learns the endpoint from the relay's OWN signed descriptor, fetched with
+  `GetDescriptor` (never a third party's claim about it, CRYPTO-23), and builds a path from it.
+  Deliberately not its entry in the served node-list page: that page is a rotating window, so a
+  relay with a full table can legitimately be absent from the slice received, and reading "no QUIC"
+  out of that absence would be wrong. **A proxied relay never gets a QUIC path**, enforced in path
+  construction rather than by convention.
 - **QUIC-13** — which request classes carry a scope, settled: the two that already do. Public
   reads stay unscoped and are now guarded, because scoping them would attach a channel label to
   requests that have none — creating linkage in the name of pooling.
@@ -4004,7 +4011,12 @@ is worth naming: a descriptor with a ten-year window and a *genuine* signature i
 `expires_at` bounds staleness only if the VERIFIER enforces the maximum. The discovery plane had the
 same hole before its own bound existed.
 
-**NOT done — slice 2:** the node list still serves bare `RelayDescriptor`s, so gossip cannot yet
+**Slice 2 — WAS "not done", and is done (PR #2).** The paragraph below is kept as written because it
+states the reasoning that was acted on; what it describes as missing now exists: the node list serves
+`SignedDescriptor`s, gossip stores what each relay signed rather than merging addresses, and the
+client filters by policy BEFORE dialing. Read it as the design note it became, not as a residual.
+
+**NOT done — slice 2 (as originally written):** the node list still serves bare `RelayDescriptor`s, so gossip cannot yet
 store what each relay signed (which also means replacing address MERGING with "take the newest signed
 statement wholesale"), and the client still learns policy only after dialing. That last one is where
 the countable win is: today `client/src/lib.rs` filters by policy AFTER `verified_self_address`, so
@@ -4016,3 +4028,39 @@ filter moves before the dial: `2k` connections for `k` candidates becomes `m`, t
 STATUS paragraph naming a live gossip residual; the code closed it a day later, and the correction is
 recorded in place above rather than quietly deleted. That is the **eighth** task in this sweep whose
 premise had moved, and the third where the mover was our own change.
+
+### The relay that was missing from its own node list (found 2026-07-31, while re-taking a screenshot)
+
+`node_list()` puts this relay's own entry first, taken from the cached signature in `signed_self`.
+Nothing ever filled that cache except a client asking `GetDescriptor` — there was no signing at boot
+and no cadence. So a relay started with a perfectly good `KARST_RELAY_ADVERTISE` served a node list
+**without itself in it**, to every peer that asked, until some unrelated request happened to warm the
+cache. And because `signed_descriptor` stops handing out a copy at `DESCRIPTOR_REFRESH_SECS` (one
+hour, a sixth of the TTL), a relay whose cache HAD been warmed dropped back out of its own list every
+hour and stayed out until the next `GetDescriptor`.
+
+Gossip converges on peers' node lists, so this is §12 discovery failing silently: the network never
+learns about a relay that is sitting there answering requests and printing a routable address at
+startup. Nothing errors, nothing logs, and the relay looks healthy from every angle an operator has.
+
+**Why it survived the tests that exist.** `relay/tests/signed_descriptor.rs` opens by naming this
+exact failure — "nothing re-signing, so a perfectly healthy relay silently disappears from every node
+list" — and then exercises it entirely through `GetDescriptor`, the one request that hid the bug by
+warming the cache as a side effect. The claim was about node lists; the coverage was about
+descriptors. The demo script missed it for the same reason: `quic_endpoints()` fetches the descriptor
+(deliberately — QUIC-12), so every demo run warmed the cache before anything read a node list.
+
+**Fixed** in the serving path, not in the binary, so it holds for any embedder: `GetNodeList` renews
+this relay's own entry on exactly the terms `GetDescriptor` uses — checked under the read lock, write
+lock taken only when there is something to re-sign, which is once per refresh window and not once per
+request. The binary additionally signs at startup, because a relay that has not signed itself cannot
+COUNT itself, and the startup line was printing `0 relay(s) known` to a correctly configured operator
+— which reads as a failed advertisement. That line now says what is actually in the served page.
+
+Two tests, both RED before the fix: one asks for the node list FIRST with no descriptor request
+before it, the other moves the clock past the refresh boundary and requires a NEW signature. Each
+checks the self entry verifies, so neither can pass on an unverifiable placeholder.
+
+**How it was found:** re-taking the README screenshot of a relay starting up. The banner is program
+output, so refreshing the image meant running the program, and the run disagreed with the picture.
+Documentation that is generated by executing the thing it documents is a test with a low duty cycle.

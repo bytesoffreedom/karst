@@ -111,6 +111,61 @@ fn asking_twice_does_not_make_the_relay_sign_twice() {
     assert_eq!(a.sig, b.sig, "the relay re-signed inside its own refresh window");
 }
 
+/// **A relay is in its OWN node list, from the first request onwards.**
+///
+/// `node_list` puts self first, but only from the cached signature — and the cache was filled by
+/// exactly one thing: somebody asking `GetDescriptor`. Nothing else signed, at boot or ever. So a
+/// freshly started relay with a perfectly good advertised address served a node list WITHOUT ITSELF
+/// to every peer that asked, until an unrelated request happened to warm the cache for it.
+///
+/// That is the whole of §12 discovery failing quietly: gossip converges on peers' node lists, so a
+/// relay missing from its own list is a relay the network never learns about — while it sits there
+/// answering requests and printing a routable address at startup.
+///
+/// The order here is the point: `get_node_list` FIRST, with no `get_descriptor` before it.
+#[test]
+fn a_relay_serves_itself_in_its_node_list_without_being_asked_for_its_descriptor_first() {
+    let (t, _clock, _shared, noise_pub) = spawn(true);
+
+    let list = t.get_node_list().expect("fetch node list");
+    assert!(
+        list.iter().any(|s| s.desc.relay.noise_pub == noise_pub),
+        "the relay left ITSELF out of the node list it serves — nothing signed its own statement \
+         until some other request happened to, so discovery never learns this relay exists"
+    );
+
+    // Not vacuously true through an unverifiable entry: what it serves about itself must verify.
+    let mine = list.iter().find(|s| s.desc.relay.noise_pub == noise_pub).expect("self entry");
+    assert!(mine.verified(NOW).is_some(), "the self entry does not verify against the relay serving it");
+}
+
+/// **…and it is still there an hour later.**
+///
+/// The gap this covers is not only the cold start. `signed_descriptor` stops handing out a copy at
+/// `DESCRIPTOR_REFRESH_SECS`, which is a sixth of the TTL — so even a relay whose cache HAD been
+/// warmed dropped out of its own node list once per hour and stayed out until the next
+/// `GetDescriptor`. A per-hour disappearance from discovery is harder to notice than never
+/// appearing at all, which is why it is asserted separately.
+#[test]
+fn the_relay_does_not_fall_out_of_its_own_node_list_once_an_hour() {
+    let (t, clock, _shared, noise_pub) = spawn(true);
+    let first = t.get_node_list().expect("fetch");
+    let before =
+        first.iter().find(|s| s.desc.relay.noise_pub == noise_pub).expect("self entry").sig.clone();
+
+    // Past the refresh cadence — the cached signature is no longer servable.
+    let later = NOW + DESCRIPTOR_REFRESH_SECS + 1;
+    clock.store(later, Ordering::Relaxed);
+
+    let second = t.get_node_list().expect("fetch");
+    let mine = second.iter().find(|s| s.desc.relay.noise_pub == noise_pub).expect(
+        "the relay vanished from its own node list at the refresh boundary — every hour, a healthy \
+         relay stops being discoverable until something asks it for its descriptor",
+    );
+    assert_ne!(mine.sig, before, "same signature past the refresh window — the fixture did not age");
+    assert!(mine.verified(later).is_some(), "the renewed self entry does not verify");
+}
+
 /// **The relay re-signs before its descriptor lapses.**
 ///
 /// DISCRIMINATING for the failure an expiry introduces if nothing renews it: a running, reachable,

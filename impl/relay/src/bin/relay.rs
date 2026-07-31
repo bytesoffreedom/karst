@@ -763,7 +763,7 @@ fn main() -> io::Result<()> {
     match arg1.as_deref() {
         Some("-h" | "--help") => {
             println!(
-                "karst-relay [ADDR]              start a relay (SKELETON, not for production)\n\
+                "karst-relay [ADDR]              start a relay (REFERENCE, not for production)\n\
                  karst-relay setup | -i          interactive setup, then start (also: bare run at a\n\
                  \x20                              TTY with no addr/env asks the same questions)\n\
                  karst-relay pow status|off|open|on [BITS]   control a RUNNING relay's door\n\
@@ -980,6 +980,12 @@ fn run_relay(addr: String) -> io::Result<()> {
             relay.add_relay_hint(d);
         }
     }
+    // Sign the self-statement now rather than leaving the first caller to trigger it. The serving
+    // path renews it on demand either way, but a relay that has not signed itself yet also cannot
+    // COUNT itself, and the startup line below is the operator's only confirmation that setting
+    // KARST_RELAY_ADVERTISE actually made them discoverable — printing "0 relay(s) known" to a
+    // correctly configured relay reads as a failed advertisement.
+    relay.refresh_signed_descriptor(wall_clock(), &noise_priv);
     let known_relays = relay.node_list(wall_clock()).len();
 
     // relay-id = Noise-pub ‖ fetch-auth-pub (оба узнаются вне канала). СТАБИЛЕН
@@ -1108,7 +1114,13 @@ fn run_relay(addr: String) -> io::Result<()> {
         eprintln!("  PoW rate-limits fresh capabilities; the per-cap quota bounds each — a spam");
         eprintln!("  BOUND, not Sybil resistance. See docs/STATUS.md.");
     }
-    eprintln!("node-list: {known_relays} relay(s) known (served via GetNodeList; clients: karst relays)");
+    // "known" was ambiguous once self counts: an operator reading "1 relay(s) known" cannot tell
+    // whether that one is themselves or somebody else. Say what is actually in the served page.
+    eprintln!(
+        "node-list: serving {known_relays} entr{} via GetNodeList — this relay plus any it verified \
+         (clients: karst relays)",
+        if known_relays == 1 { "y" } else { "ies" }
+    );
 
     // Owner control of a RUNNING relay (turn PoW off/open/on live — early on there may be no
     // spam to gate). Owner-only by fs perms. A crash that skips the socket is not fatal to

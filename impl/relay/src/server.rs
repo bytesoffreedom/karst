@@ -501,10 +501,30 @@ pub(crate) fn serve_channel(
         }
         WireRequest::GetNodeList => {
             // A clock is needed now: every entry carries a validity window, and serving a lapsed
-            // statement is how a relay's stale address outlives the relay itself. Still a READ —
-            // expired entries are skipped in the page, not pruned from storage, so a public read
-            // never takes the write lock.
-            WireResponse::NodeList(relay.read().expect("relay lock").node_list((clock)()))
+            // statement is how a relay's stale address outlives the relay itself. Expired entries
+            // are skipped in the page, not pruned from storage, so serving is a READ.
+            //
+            // The one thing that is NOT read-only is this relay's own entry. `node_list` puts self
+            // first, but only from the cached signature — and until this existed, the sole thing
+            // that ever filled that cache was somebody asking `GetDescriptor`. A relay with a
+            // perfectly good advertised address therefore served a node list WITHOUT ITSELF, from
+            // boot until an unrelated request happened to warm it, and again after every refresh
+            // boundary. Gossip converges on peers' node lists, so that is §12 discovery failing
+            // silently: the network never learns about a relay that is sitting there answering.
+            //
+            // Renewed on exactly the terms `GetDescriptor` uses — checked under the read lock,
+            // and the write lock taken ONLY when there is something to re-sign, which is once per
+            // refresh window and not once per request. A relay that advertises nothing signs
+            // nothing here either; it has no truthful statement to make about itself.
+            let now = (clock)();
+            let must_renew = {
+                let r = relay.read().expect("relay lock");
+                r.self_descriptor().is_some() && r.signed_descriptor(now).is_none()
+            };
+            if must_renew {
+                relay.write().expect("relay lock").refresh_signed_descriptor(now, &noise_priv);
+            }
+            WireResponse::NodeList(relay.read().expect("relay lock").node_list(now))
         }
         WireRequest::GetPolicy => {
             WireResponse::Policy(relay.read().expect("relay lock").policy())

@@ -3524,6 +3524,32 @@ as an explicit not-done item, not a stub.
 
 ## Closed gaps
 
+- **Opening a chat no longer costs the whole account (2026-07-30, PERF-2).** `history()` read and
+  AEAD-opened the ENTIRE history log and filtered it to one peer, so the cost grew with the AGE of
+  the account: the app got slower by being used. `history_index.dat` records where each peer's
+  records sit; `load_history_for_peer` opens those and no others. The index is a CACHE, derived
+  from the log and repaired lazily on read, so the append path is untouched (one sealed record, one
+  `fsync`) and no crash can freeze a disagreement between the two.
+
+  A real defect fell out of testing it, and the first test missed it: truncating the log and
+  re-reading passed even with the recovery branch deleted, because the per-offset bounds check
+  silently covered for stale offsets. The scenario that separates the implementations is
+  truncate-then-GROW — crash mid-append, reopen (torn tail cut), keep chatting. The mark then sits
+  inside a record that did not exist when it was taken, the regrown file is longer than the mark
+  again so no length comparison can see it, and every record written after the truncation is
+  invisible to a peer read while present in a full scan. Detected now by the scan consuming nothing
+  at a non-zero mark, which rebuilds the index rather than trusting it.
+
+  The index is padded to a 4 KiB multiple before sealing: the contents are sealed but the LENGTH is
+  not, and an unpadded index tracks how many people you talk to and how much.
+
+- **A relay that reports failure after committing cannot double the conversation (2026-07-30,
+  QA-1 slice 3).** The mirror of `AcceptedButDiscarded`, and the more dangerous direction: the
+  sender believes it lost a message that arrived, so it resends. A relay manufactures this by
+  committing and dropping the connection; a bad network produces it for free, and the two are
+  indistinguishable from the client's side. `Evil::CommitThenFail` pins that a resend delivers
+  exactly the resent message and drags nothing back with it.
+
 - **Capability quota enforced + anti-replay across the epoch boundary.**
   `CapabilityQuotaTracker` (§7.2) keeps a per-capability sliding `window_secs`
   window: it enforces `max_requests`/`max_bytes` and catches a verbatim replay by

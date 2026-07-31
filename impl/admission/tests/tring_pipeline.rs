@@ -37,7 +37,6 @@ fn make_ring(n: usize) -> (Vec<RistrettoPoint>, Vec<Scalar>) {
 }
 
 /// Build an AdmissionToken with a real threshold ring signature over the token nonce.
-
 fn issue_token(
     token_nonce: [u8; 32],
     epoch: u32,

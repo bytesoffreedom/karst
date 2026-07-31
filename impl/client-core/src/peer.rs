@@ -571,6 +571,137 @@ impl BoxAuth {
     }
 }
 
+/// One fetch, built and authorised but not yet sent.
+///
+/// The split exists so the network phase needs nothing mutable: building this MINTS a handle and
+/// reads a cookie (both `&mut self`), sending it needs only `&self.transport`. Everything the
+/// response handler will need is carried here rather than re-derived, because re-deriving
+/// `client_addr` after the fact would mint a DIFFERENT handle and file the ACK receipt under an
+/// address the relay never saw.
+#[derive(Clone)]
+pub struct PreparedFetch {
+    req: FetchRequest,
+    client_addr: Vec<u8>,
+    scope: Option<String>,
+    /// The cookie the request was signed with — the ACK must re-present this exact one, and by the
+    /// time the response is absorbed the cookie map may already hold a newer one.
+    cookie: Option<Cookie>,
+}
+
+/// Evidence that this relay is reached over the DIRECT carrier, with no proxy in the path.
+///
+/// It exists so the fan-out below cannot be enabled by accident. Fetching many boxes CONCURRENTLY
+/// is the same shape as batching them, and #280 settled that question for batching: under a proxy
+/// it must never happen. Sequential fetches are spread out in time, which is most of what keeps a
+/// relay from reading one client's boxes as one set; N simultaneous circuit opens collapse exactly
+/// that spread, and under Tor they also multiply circuits for a single poll.
+///
+/// The type is the prohibition. There is no `pub` constructor that takes a bare `true` — the only
+/// way to obtain one is [`DirectCarrier::inspect`], which is handed the actual proxy and route
+/// configuration and answers `None` for anything that is not a plain direct connection.
+pub struct DirectCarrier(());
+
+impl DirectCarrier {
+    /// `Some` only when nothing sits between us and the relay: no SOCKS5 proxy, and no route that
+    /// is anything other than a direct dial. Anything unrecognised answers `None` — a new carrier
+    /// added later is refused until someone decides deliberately that it may fan out.
+    pub fn inspect(proxy: Option<&str>, routes: &[String]) -> Option<Self> {
+        if proxy.is_some_and(|p| !p.trim().is_empty()) {
+            return None;
+        }
+        if routes.iter().any(|r| !r.trim().is_empty() && !r.eq_ignore_ascii_case("direct")) {
+            return None;
+        }
+        Some(DirectCarrier(()))
+    }
+}
+
+/// How the box-fetch phase is executed. The phases themselves (`prepare_fetch` → transport →
+/// `absorb_fetch`) do not change; only who runs the middle one, and how many at a time.
+///
+/// It is a trait rather than a flag because the parallel implementation needs `T: Sync`, which
+/// cannot be added to `receive` itself: the in-memory test transports are `Rc`-based and would stop
+/// compiling. With a trait, the bound sits on the implementation, so a caller holding a non-`Sync`
+/// transport simply cannot name the parallel executor.
+pub trait BoxFetcher<T: Transport> {
+    /// Run every prepared request against the transport, returning one response per request **in
+    /// the same order**. Order is not cosmetic: the caller absorbs them in box order, and
+    /// `pending_ack` evicts its oldest entry at the cap.
+    fn run(&self, transport: &T, reqs: &[PreparedFetch], now: u64) -> Vec<FetchResponse>;
+}
+
+/// One box at a time — the behaviour every caller had before the fan-out existed.
+pub struct Sequential;
+
+impl<T: Transport> BoxFetcher<T> for Sequential {
+    fn run(&self, transport: &T, reqs: &[PreparedFetch], now: u64) -> Vec<FetchResponse> {
+        reqs.iter().map(|p| transport.fetch_isolated(&p.req, now, p.scope.as_deref())).collect()
+    }
+}
+
+/// Several boxes at once, on the direct carrier only.
+///
+/// `width` bounds how many requests are in flight; it is not "one thread per box" — a client with a
+/// large session table would otherwise open hundreds of sockets in one poll, which is a burst the
+/// relay sees as one client and the OS may refuse outright.
+pub struct Parallel {
+    _direct: DirectCarrier,
+    width: usize,
+}
+
+impl Parallel {
+    /// Requires the [`DirectCarrier`] witness by value, so the prohibition cannot be satisfied by
+    /// a stale check somewhere else in the caller.
+    pub fn new(direct: DirectCarrier, width: usize) -> Self {
+        Parallel { _direct: direct, width: width.clamp(1, MAX_FETCH_WIDTH) }
+    }
+}
+
+impl<T: Transport + Sync> BoxFetcher<T> for Parallel {
+    fn run(&self, transport: &T, reqs: &[PreparedFetch], now: u64) -> Vec<FetchResponse> {
+        if reqs.len() <= 1 {
+            return Sequential.run(transport, reqs, now);
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<FetchResponse>>> =
+            (0..reqs.len()).map(|_| std::sync::Mutex::new(None)).collect();
+        let workers = self.width.min(reqs.len());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(p) = reqs.get(i) else { return };
+                    let resp = transport.fetch_isolated(&p.req, now, p.scope.as_deref());
+                    // Written into ITS OWN slot, so the result order is the request order however
+                    // the threads interleave.
+                    *slots[i].lock().expect("slot lock") = Some(resp);
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|s| {
+                s.into_inner()
+                    .expect("slot lock")
+                    .unwrap_or_else(|| FetchResponse::Rejected("fetch worker produced no answer".into()))
+            })
+            .collect()
+    }
+}
+
+/// The ceiling on concurrent box fetches. Small deliberately: the win is removing serial latency,
+/// not saturating a link, and a burst that looks like a scan is worse than a slow poll.
+pub const MAX_FETCH_WIDTH: usize = 8;
+
+/// What a fetch response means to the caller, once the `&mut self` bookkeeping is done.
+enum Absorbed {
+    Fetched(Vec<Payload>),
+    /// The relay issued a fresh cookie; it is banked, and the same box should be asked again. The
+    /// caller bounds how many times — one retry, exactly as before the split.
+    Retry,
+    Rejected(String),
+}
+
 /// Send one ACK, best-effort, refreshing the cookie once on a `NeedCookie`. Free (not a
 /// method) so single- and multi-homed receive share exactly one copy of the retry: the
 /// single path acks through the `Peer`'s own transport, the multi path acks a carried-out
@@ -1475,6 +1606,19 @@ impl<T: Transport> Peer<T> {
     /// binds, the fix is a batched multi-mailbox fetch — but note that batching every box
     /// under ONE `client_addr` would relink them and undo the slice.
     pub fn receive(&mut self, now: u64) -> Result<Vec<Option<Received>>, String> {
+        self.receive_with(now, &Sequential)
+    }
+
+    /// `receive`, with the box-fetch phase run by `fetcher`.
+    ///
+    /// [`Sequential`] is what `receive` uses. [`Parallel`] fans the boxes out, and can only be
+    /// constructed from a [`DirectCarrier`] witness — see its documentation for why concurrency is
+    /// a proxy-relevant decision rather than a pure performance knob.
+    pub fn receive_with<F: BoxFetcher<T>>(
+        &mut self,
+        now: u64,
+        fetcher: &F,
+    ) -> Result<Vec<Option<Received>>, String> {
         // Monotonic, and deliberately not `now`: the budget measures how long WE have been in this
         // call, which a wall clock that jumps (or a caller passing a fixed test clock) cannot say.
         let started = Instant::now();
@@ -1599,22 +1743,65 @@ impl<T: Transport> Peer<T> {
         let mut box_err: Option<String> = None;
         let mut skipped = 0usize;
         let total_boxes = boxes.len();
-        for (auth, handle, owner) in boxes {
+        // Walked in chunks so the time budget still means something: with a fan-out the whole pass
+        // would otherwise be dispatched before the first elapsed-check, and R2-12's bound would
+        // apply to nothing. One chunk is at most `MAX_FETCH_WIDTH` boxes in flight.
+        for chunk in boxes.chunks(MAX_FETCH_WIDTH) {
             // R2-12: stop once this pass has spent its budget (see `RECEIVE_BUDGET`). Checked
-            // BEFORE each fetch, not after, so the budget bounds when the last request STARTS —
-            // one in-flight request may still run to its own timeout, which is the tightest bound
-            // available without cancelling a socket mid-flight.
+            // BEFORE dispatch, not after, so the budget bounds when the last request STARTS —
+            // requests already in flight still run to their own timeout, which is the tightest
+            // bound available without cancelling a socket mid-flight.
             if started.elapsed() >= self.receive_budget {
-                skipped += 1;
+                skipped += chunk.len();
                 continue;
             }
-            match self.fetch_mailbox(auth, handle, now) {
-                Ok(payloads) => {
-                    for p in &payloads {
-                        out.push(self.process_for_peer(&owner, p).map(|mut r| { r.msg_id = payload_id(p); r }));
+            // Phase 1 for the whole chunk (needs `&mut self`), then one transport phase, then
+            // phase 3 in BOX ORDER — never completion order, because `pending_ack` evicts its
+            // oldest entry at the cap and `out` is what the caller sees.
+            let mut pending: Vec<(usize, PreparedFetch)> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, (auth, handle, _))| (i, self.prepare_fetch(auth, handle)))
+                .collect();
+            let mut done: Vec<Option<Result<Vec<Payload>, String>>> = vec![None; chunk.len()];
+            // At most two rounds, exactly as one sequential fetch had: a `NeedCookie` banks the
+            // cookie and the SAME box is asked once more. Anything still unanswered after that is
+            // the terminal "persistent cookie challenge".
+            for round in 0..2 {
+                if pending.is_empty() {
+                    break;
+                }
+                let reqs: Vec<PreparedFetch> = pending.iter().map(|(_, p)| p.clone()).collect();
+                let responses = fetcher.run(&self.transport, &reqs, now);
+                let mut retry: Vec<(usize, PreparedFetch)> = Vec::new();
+                for ((i, prepared), resp) in pending.into_iter().zip(responses) {
+                    let (auth, handle, _) = &chunk[i];
+                    match self.absorb_fetch(auth, &prepared, resp) {
+                        Absorbed::Fetched(payloads) => done[i] = Some(Ok(payloads)),
+                        Absorbed::Rejected(r) => done[i] = Some(Err(r)),
+                        Absorbed::Retry => {
+                            if round == 0 {
+                                retry.push((i, self.prepare_fetch(auth, handle)));
+                            } else {
+                                done[i] = Some(Err("persistent cookie challenge".into()));
+                            }
+                        }
                     }
                 }
-                Err(e) => box_err = Some(e),
+                pending = retry;
+            }
+            for (i, (_, _, owner)) in chunk.iter().enumerate() {
+                match done[i].take() {
+                    Some(Ok(payloads)) => {
+                        for p in &payloads {
+                            out.push(self.process_for_peer(owner, p).map(|mut r| { r.msg_id = payload_id(p); r }));
+                        }
+                    }
+                    Some(Err(e)) => box_err = Some(e),
+                    // Not dispatched and not absorbed: count it as unread, so the cursor below
+                    // cannot move past a box nobody looked at.
+                    None => skipped += 1,
+                }
             }
         }
         // Advance the cursor ONLY on a pass that actually walked every box it meant to. A cursor
@@ -1660,84 +1847,125 @@ impl<T: Transport> Peer<T> {
         handle: Handle,
         now: u64,
     ) -> Result<Vec<Payload>, String> {
+        // One box, one round trip at a time — the shape every caller had before the fetch was
+        // split into phases. It is now written in terms of that split (`prepare_fetch` →
+        // transport → `absorb_fetch`) rather than beside it, so there is exactly one description
+        // of how a fetch is built, authorised and remembered. Two implementations of that would
+        // drift, and the half that drifts is the one that records ACK receipts — mail nobody
+        // deletes, or worse, mail deleted twice.
+        for _ in 0..2 {
+            let prepared = self.prepare_fetch(&auth, &handle);
+            let resp = self.transport.fetch_isolated(&prepared.req, now, prepared.scope.as_deref());
+            match self.absorb_fetch(&auth, &prepared, resp) {
+                Absorbed::Fetched(payloads) => return Ok(payloads),
+                Absorbed::Retry => continue,
+                Absorbed::Rejected(r) => return Err(r),
+            }
+        }
+        Err("persistent cookie challenge".into())
+    }
+
+    /// Phase 1 of a fetch: everything that needs `&mut self`, and nothing that touches the network.
+    ///
+    /// Minting the handle and reading the cookie both mutate, so this cannot happen while several
+    /// requests are in flight. Doing it for ALL boxes first is what lets the transport phase take
+    /// only `&self` — see `fetch_boxes` — and it is why this is a separate function rather than a
+    /// block inside the loop.
+    fn prepare_fetch(&mut self, auth: &BoxAuth, handle: &Handle) -> PreparedFetch {
         let mailbox = auth.mailbox();
         let client_addr = self.handle(handle.clone());
-        let scope = self.scope_for(&handle);
+        let scope = self.scope_for(handle);
         let rid = self.relay_id();
-
-        for _ in 0..2 {
-            let cookie = self.cookies.get(&(rid, client_addr.clone())).copied();
-            // Ownership proof for THIS cookie: DH for the identity mailbox, Schnorr (bound to the
-            // cookie MAC) for a blinded drop-box.
-            let (proof, own_proof) = match (&auth, cookie) {
-                (BoxAuth::Identity(id), Some(c)) => {
-                    (fetch_proof(&id.dh(&self.relay_pub), &c.mac, &mailbox), Vec::new())
-                }
-                (BoxAuth::DropBox { fetch_secret, .. }, Some(c)) => {
-                    let own = karst_crypto::blind::FetchOwnershipProof::prove(fetch_secret, &mailbox, &c.mac)
-                        .map(|p| p.to_bytes().to_vec())
-                        .unwrap_or_default();
-                    ([0u8; 16], own)
-                }
-                (_, None) => ([0u8; 16], Vec::new()),
-            };
-            let req = FetchRequest {
+        let cookie = self.cookies.get(&(rid, client_addr.clone())).copied();
+        // Ownership proof for THIS cookie: DH for the identity mailbox, Schnorr (bound to the
+        // cookie MAC) for a blinded drop-box.
+        let (proof, own_proof) = match (&auth, cookie) {
+            (BoxAuth::Identity(id), Some(c)) => {
+                (fetch_proof(&id.dh(&self.relay_pub), &c.mac, &mailbox), Vec::new())
+            }
+            (BoxAuth::DropBox { fetch_secret, .. }, Some(c)) => {
+                let own = karst_crypto::blind::FetchOwnershipProof::prove(fetch_secret, &mailbox, &c.mac)
+                    .map(|p| p.to_bytes().to_vec())
+                    .unwrap_or_default();
+                ([0u8; 16], own)
+            }
+            (_, None) => ([0u8; 16], Vec::new()),
+        };
+        PreparedFetch {
+            req: FetchRequest {
                 mailbox,
                 client_addr: client_addr.clone(),
                 carrier_id: self.carrier_id.clone(),
                 cookie,
                 proof,
                 own_proof,
-            };
-            match self.transport.fetch_isolated(&req, now, scope.as_deref()) {
-                FetchResponse::NeedCookie(c) => {
-                    self.cookies.insert((rid, client_addr.clone()), c);
-                    continue;
-                }
-                FetchResponse::Fetched(payloads) => {
-                    // Under lease, remember what to delete: the messages stay on the relay
-                    // until the ACK runs (after the caller persists the ratchet). The
-                    // receipt captures the cookie that just authorised this fetch, so it can
-                    // be acked later without the Peer. Empty pages leave nothing to ACK.
-                    // ALWAYS record a receipt (#179 follow-up). This used to be gated on an
-                    // `enable_ack` flag, which made sense while the flag ALSO selected the
-                    // relay's behaviour: a non-lease fetch destroyed its messages, so there was
-                    // nothing to remember. Now every fetch leases, so a receive that records
-                    // nothing leaves mail sitting on the relay with no receipt anywhere — it
-                    // redelivers when the lease lapses, silently, and no caller can choose to
-                    // clean it up. Recording costs a Vec entry; the real control is `ack_all`,
-                    // which the caller still only runs once the ratchet is durable.
-                    if !payloads.is_empty() {
-                        // The later ACK re-proves ownership: DH needs `shared`, a drop-box needs
-                        // its fetch secret.
-                        let (shared, own_fetch_secret) = match &auth {
-                            BoxAuth::Identity(id) => (id.dh(&self.relay_pub), None),
-                            BoxAuth::DropBox { fetch_secret, .. } => ([0u8; 32], Some(*fetch_secret)),
-                        };
-                        // A caller that never runs `ack_all` (a probe, a test, an aborted
-                        // receive) must not grow this without bound. Dropping the OLDEST
-                        // receipt is the safe direction: that mail stays on the relay and
-                        // redelivers when its lease lapses, exactly as if the ACK had failed.
-                        if self.pending_ack.len() >= MAX_PENDING_ACKS {
-                            self.pending_ack.remove(0);
-                        }
-                        self.pending_ack.push(AckReceipt {
-                            mailbox,
-                            client_addr: client_addr.clone(),
-                            carrier_id: self.carrier_id.clone(),
-                            shared,
-                            cookie,
-                            scope: scope.clone(),
-                            ids: payloads.iter().map(payload_id).collect(),
-                            own_fetch_secret,
-                        });
-                    }
-                    return Ok(payloads);
-                }
-                FetchResponse::Rejected(r) => return Err(r),
-            }
+            },
+            client_addr,
+            scope,
+            cookie,
         }
-        Err("persistent cookie challenge".into())
+    }
+
+    /// Phase 3 of a fetch: everything that needs `&mut self` again — bank a fresh cookie, or
+    /// record what this box leased so it can be acked once the ratchet is durable.
+    ///
+    /// Takes the response by value and returns what the caller should do next, so the SAME
+    /// function serves one sequential fetch and a whole fanned-out batch. Payload decryption is
+    /// deliberately NOT here: it belongs to the caller, which knows the box's owning peer.
+    fn absorb_fetch(
+        &mut self,
+        auth: &BoxAuth,
+        prepared: &PreparedFetch,
+        resp: FetchResponse,
+    ) -> Absorbed {
+        let rid = self.relay_id();
+        match resp {
+            FetchResponse::NeedCookie(c) => {
+                self.cookies.insert((rid, prepared.client_addr.clone()), c);
+                Absorbed::Retry
+            }
+            FetchResponse::Fetched(payloads) => {
+                // Under lease, remember what to delete: the messages stay on the relay
+                // until the ACK runs (after the caller persists the ratchet). The
+                // receipt captures the cookie that just authorised this fetch, so it can
+                // be acked later without the Peer. Empty pages leave nothing to ACK.
+                // ALWAYS record a receipt (#179 follow-up). This used to be gated on an
+                // `enable_ack` flag, which made sense while the flag ALSO selected the
+                // relay's behaviour: a non-lease fetch destroyed its messages, so there was
+                // nothing to remember. Now every fetch leases, so a receive that records
+                // nothing leaves mail sitting on the relay with no receipt anywhere — it
+                // redelivers when the lease lapses, silently, and no caller can choose to
+                // clean it up. Recording costs a Vec entry; the real control is `ack_all`,
+                // which the caller still only runs once the ratchet is durable.
+                if !payloads.is_empty() {
+                    // The later ACK re-proves ownership: DH needs `shared`, a drop-box needs
+                    // its fetch secret.
+                    let (shared, own_fetch_secret) = match auth {
+                        BoxAuth::Identity(id) => (id.dh(&self.relay_pub), None),
+                        BoxAuth::DropBox { fetch_secret, .. } => ([0u8; 32], Some(*fetch_secret)),
+                    };
+                    // A caller that never runs `ack_all` (a probe, a test, an aborted
+                    // receive) must not grow this without bound. Dropping the OLDEST
+                    // receipt is the safe direction: that mail stays on the relay and
+                    // redelivers when its lease lapses, exactly as if the ACK had failed.
+                    if self.pending_ack.len() >= MAX_PENDING_ACKS {
+                        self.pending_ack.remove(0);
+                    }
+                    self.pending_ack.push(AckReceipt {
+                        mailbox: prepared.req.mailbox,
+                        client_addr: prepared.client_addr.clone(),
+                        carrier_id: self.carrier_id.clone(),
+                        shared,
+                        cookie: prepared.cookie,
+                        scope: prepared.scope.clone(),
+                        ids: payloads.iter().map(payload_id).collect(),
+                        own_fetch_secret,
+                    });
+                }
+                Absorbed::Fetched(payloads)
+            }
+            FetchResponse::Rejected(r) => Absorbed::Rejected(r),
+        }
     }
 
     /// Delete every message leased during this receive. MUST be called only AFTER the
@@ -3621,5 +3849,158 @@ mod a_message_looks_different_at_each_relay {
             ),
             "an opener was veiled; the recipient has no session yet and could never unveil it"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PERF-4b: the box fan-out. Tests for the executor itself, where the property lives.
+// ---------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod fan_out {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A transport that measures CONCURRENCY: it records the high-water mark of requests in flight
+    /// at once. `Mutex`-based rather than `Rc`/`RefCell` on purpose — the parallel executor needs
+    /// `T: Sync`, so the in-memory test transports used elsewhere in this file cannot exercise it.
+    #[derive(Default)]
+    struct ConcurrencyProbe {
+        live: AtomicUsize,
+        high_water: AtomicUsize,
+        served: AtomicUsize,
+    }
+
+    impl Transport for ConcurrencyProbe {
+        fn send(&self, _m: &WireMessage, _now: u64) -> Response {
+            Response::Rejected("probe".into())
+        }
+        fn fetch(&self, req: &FetchRequest, _now: u64) -> FetchResponse {
+            let now_live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.high_water.fetch_max(now_live, Ordering::SeqCst);
+            // Long enough that genuinely concurrent workers overlap, short enough to keep the test
+            // quick. Wall-clock is NOT what is asserted — only the high-water mark is.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            self.served.fetch_add(1, Ordering::SeqCst);
+            // Echo the mailbox back so the caller can check the ORDER of the answers.
+            FetchResponse::Fetched(vec![Payload::Skeleton(karst_crypto::seal::SkeletonSeal {
+                ephemeral_pub: req.mailbox,
+                kem_ct: Vec::new(),
+                nonce: [0u8; 12],
+                ciphertext: req.mailbox.to_vec(),
+            })])
+        }
+    }
+
+    fn prepared(n: usize) -> Vec<PreparedFetch> {
+        (0..n)
+            .map(|i| {
+                let mut mailbox = [0u8; 32];
+                mailbox[0] = i as u8;
+                PreparedFetch {
+                    req: FetchRequest {
+                        mailbox,
+                        client_addr: vec![i as u8],
+                        carrier_id: Vec::new(),
+                        cookie: None,
+                        proof: [0u8; 16],
+                        own_proof: Vec::new(),
+                    },
+                    client_addr: vec![i as u8],
+                    scope: None,
+                    cookie: None,
+                }
+            })
+            .collect()
+    }
+
+    fn echoed_index(r: &FetchResponse) -> u8 {
+        match r {
+            FetchResponse::Fetched(ps) => match &ps[0] {
+                Payload::Skeleton(s) => s.ciphertext[0],
+                _ => panic!("probe returns a skeleton payload"),
+            },
+            _ => panic!("the probe always answers Fetched"),
+        }
+    }
+
+    /// **The property this slice exists for.** With the fan-out, more than one box is in flight at
+    /// once; sequentially, never more than one.
+    ///
+    /// Asserted on a high-water COUNTER, not on wall-clock time: a timing assertion would be flaky
+    /// on a loaded machine and would pass for the wrong reason on a fast one.
+    ///
+    /// Verified discriminating by swapping `Parallel` for `Sequential` here — the high-water mark
+    /// drops to 1 and the assertion reds, which is exactly the mistake being guarded against
+    /// (a "parallel" path that quietly runs one at a time).
+    #[test]
+    fn the_fan_out_really_overlaps_and_the_sequential_path_never_does() {
+        let reqs = prepared(8);
+
+        let probe = ConcurrencyProbe::default();
+        let par = Parallel::new(DirectCarrier::inspect(None, &[]).expect("direct"), 4);
+        let out = par.run(&probe, &reqs, 0);
+        assert_eq!(out.len(), reqs.len(), "one answer per request");
+        assert_eq!(probe.served.load(Ordering::SeqCst), 8, "every box was actually fetched");
+        assert!(
+            probe.high_water.load(Ordering::SeqCst) > 1,
+            "the fan-out never had two requests in flight — it is parallel in name only"
+        );
+
+        let probe2 = ConcurrencyProbe::default();
+        let out2 = Sequential.run(&probe2, &reqs, 0);
+        assert_eq!(out2.len(), reqs.len());
+        assert_eq!(
+            probe2.high_water.load(Ordering::SeqCst),
+            1,
+            "the sequential path must never overlap requests"
+        );
+    }
+
+    /// Answers come back in REQUEST order, whatever order the workers finish in.
+    ///
+    /// Load-bearing rather than cosmetic: the caller absorbs responses in box order and
+    /// `pending_ack` evicts its OLDEST entry at the cap, so completion-order results would change
+    /// which receipt is dropped — that is mail nobody deletes, or mail deleted twice.
+    #[test]
+    fn answers_come_back_in_request_order() {
+        let reqs = prepared(8);
+        let probe = ConcurrencyProbe::default();
+        let par = Parallel::new(DirectCarrier::inspect(None, &[]).expect("direct"), 8);
+        let out = par.run(&probe, &reqs, 0);
+        let order: Vec<u8> = out.iter().map(echoed_index).collect();
+        assert_eq!(order, (0..8).collect::<Vec<u8>>(), "responses are not in request order");
+    }
+
+    /// The #280 prohibition, as a type: the witness cannot be obtained under a proxy or a
+    /// non-direct route, so `Parallel` cannot be constructed there at all.
+    #[test]
+    fn the_witness_refuses_anything_that_is_not_a_plain_direct_dial() {
+        assert!(DirectCarrier::inspect(None, &[]).is_some(), "a plain direct dial fans out");
+        assert!(
+            DirectCarrier::inspect(None, &["direct".into()]).is_some(),
+            "an explicit direct route is still direct"
+        );
+        assert!(DirectCarrier::inspect(Some("127.0.0.1:9050"), &[]).is_none(), "a proxy refuses");
+        assert!(
+            DirectCarrier::inspect(None, &["wss".into()]).is_none(),
+            "a non-direct carrier refuses"
+        );
+        assert!(
+            DirectCarrier::inspect(None, &["mixnet".into(), "direct".into()]).is_none(),
+            "one non-direct route among several is enough to refuse"
+        );
+    }
+
+    /// A single box takes the sequential path even under `Parallel` — spawning a thread scope to
+    /// run one request is pure overhead, and the common case (one session, one epoch) is one box.
+    #[test]
+    fn one_box_does_not_spawn_anything() {
+        let reqs = prepared(1);
+        let probe = ConcurrencyProbe::default();
+        let par = Parallel::new(DirectCarrier::inspect(None, &[]).expect("direct"), 8);
+        let out = par.run(&probe, &reqs, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(probe.high_water.load(Ordering::SeqCst), 1);
     }
 }

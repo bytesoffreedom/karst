@@ -10,12 +10,11 @@
 //! The only crypto here is a symmetric HMAC (as in §7.2) — nothing exotic, so this module lives in
 //! the core without a feature gate.
 //!
-//! **Scope (honestly).** The PRIMITIVES of the DTN class are built here (capability + carry budget
-//! + rolling replay), but they are NOT yet woven into `pipeline.rs`. Per §10 (audit round 3),
-//! Ingress branches on the credential type at Stage 4 — no separate DTN gateway is introduced —
-//! so rolling replay and the DTN capability eventually attach to that branch of `pipeline` rather
-//! than as a parallel gateway. Integration is the next slice.
-//! than as a parallel gateway. Integration is the next slice.
+//! **Scope (honestly).** The PRIMITIVES of the DTN class are built here (the capability, the carry
+//! budget and the rolling replay window), but they are NOT yet woven into `pipeline.rs`. Per §10
+//! (audit round 3) Ingress branches on the credential type at Stage 4 — no separate DTN gateway is
+//! introduced — so rolling replay and the DTN capability eventually attach to that branch of
+//! `pipeline` rather than as a parallel gateway. Integration is the next slice.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -118,7 +117,6 @@ impl DtnCapabilityTable {
     /// Proof verification: expiry (by our own clock), size, then MAC.
     /// `capsule_bytes` is the actual size of the presented capsule, checked against
     /// `quota.max_bytes` (§7.7). Order: the cheap checks (expiry, size) come before the MAC.
-
     pub fn verify(
         &self,
         proof: &DtnCapabilityProof,
@@ -298,7 +296,6 @@ impl CarryBudgetTracker {
     /// The decision on an incoming offer to carry a capsule.
     /// Order: the PoW throttle (which makes the peer spend CPU on every attempt) → per-peer (a
     /// cheap local neighbour) → device-wide (Sybil). Only an Accept is recorded.
-
     pub fn offer(&mut self, offer: &CarryOffer, now: u64) -> CarryDecision {
         // The PoW throttle is bound to this specific capsule, so it cannot be reused.
         // difficulty=0 skips the check.
@@ -349,7 +346,6 @@ impl CarryBudgetTracker {
 /// through the mesh. N daily buckets; an entry lives until its `not_after`; the oldest bucket is
 /// recycled when a new day begins. Its memory is bounded not by a short window but by the low
 /// volume of mesh traffic (§7.7).
-
 pub struct RollingReplayWindow {
     buckets: Vec<std::collections::HashSet<[u8; 16]>>,
     /// Which day (unix_day) each bucket currently holds; None means empty.
@@ -399,14 +395,12 @@ impl RollingReplayWindow {
     /// A cheap read-only scan across all buckets: is the id present (without knowing not_after).
     /// Needed at Stage 3 to reject an obvious replay BEFORE the expensive HMAC — the authoritative
     /// not_after is only available after looking the capability up at Stage 4.
-
     ///
     /// Note: the scan includes buckets that are stale but not yet recycled, so it can return
     /// `true` for an id whose bucket has gone stale without being cleared. That is safe: such a
     /// capsule is certainly past its `not_after` and would be filtered out as `Expired` at Stage 4
     /// (verify) regardless. A false "replay" here lets no attack through; it merely rejects an
     /// already-expired capsule earlier.
-
     pub fn contains_any(&self, id: &[u8; 16]) -> bool {
         self.buckets.iter().any(|b| b.contains(id))
     }

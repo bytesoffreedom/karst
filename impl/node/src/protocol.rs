@@ -79,7 +79,6 @@ pub fn payload_id(payload: &Payload) -> [u8; 32] {
 /// with the relay AND to `cookie.mac` (30-second freshness). The KDF domain `KARST-fetch-auth-v1`
 /// is separated from seal — the same domain-separation principle as `KARST-skeleton-seal-v1`. Only
 /// the holder of the `mailbox` private key can compute the DH, hence the proof.
-
 pub fn fetch_proof(shared_dh: &[u8; 32], cookie_mac: &[u8; 16], mailbox: &[u8; 32]) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(None, shared_dh);
     let mut key = [0u8; 32];

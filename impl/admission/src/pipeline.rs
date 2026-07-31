@@ -131,7 +131,6 @@ pub enum RejectReason {
 /// the quota epoch and cleared when it rotates. What the implementation checks is exactly the
 /// bounded memory plus the backpressure signal on overflow, not any particular probabilistic
 /// structure (choosing one is an optimisation, not a change of behaviour at the boundary).
-
 pub struct ReplayFilter {
     epoch_id: u32,
     seen: std::collections::HashSet<[u8; 16]>,
@@ -233,7 +232,6 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
     /// The live path (§7.5). `replay` is the live-class epoch filter; `cap_quota` accounts for the
     /// capability's spend within its window (§7.2) and is NOT cleared by the epoch (unlike
     /// `replay`) — otherwise a valid proof would be reusable once per epoch until `not_after`.
-
     pub fn process(
         &self,
         req: &Request,
@@ -364,7 +362,6 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
     /// successful HMAC at Stage 4. Otherwise an attacker who glimpsed a capsule id in the mesh
     /// would upload it first with a garbage proof, burn the id at Stage 3, and the genuine capsule
     /// would later be rejected as a "replay".
-
     pub fn process_dtn(
         &self,
         req: &DtnRequest,
@@ -449,7 +446,6 @@ pub fn capsule_hash(ciphertext: &[u8]) -> [u8; 32] {
 /// The tag for the replay filter: for a token it is its `t` (unique per token); for a capability
 /// it is the proof's MAC (unique per (nonce, epoch)). RLN never reaches the filter in this
 /// implementation (the zk gate stops it earlier on the branch — but no tag is handed out anyway).
-
 fn credential_replay_tag(cred: &Credential) -> Option<[u8; 16]> {
     match cred {
         Credential::Capability(p) => Some(p.mac),

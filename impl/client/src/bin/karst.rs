@@ -782,7 +782,6 @@ fn positional_after_flags(args: &[String]) -> Option<String> {
 }
 
 /// `--socks5 HOST:PORT` routes through an external PT (Tor/obfs4/…). Absent means direct TCP.
-
 /// Parse `--socks5` and, as a side effect, announce the §15 carrier that will
 /// actually be used (this is the chokepoint every networked subcommand passes
 /// through). Printed to stderr so a user who set a proxy or `KARST_WSS` can see

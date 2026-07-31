@@ -390,7 +390,6 @@ impl Account {
     /// Not a blanket serde impl: every export of a secret to disk is deliberate, so it cannot leak
     /// into a wire message by accident.
     /// The KEM is stored as a 64-byte seed (FIPS 203 `from_seed`/`to_seed`), not in expanded form.
-
     pub fn to_secret_bytes(&self) -> [u8; 128] {
         let mut out = [0u8; 128];
         out[..32].copy_from_slice(&self.ik.to_secret_bytes());
@@ -517,7 +516,6 @@ impl Account {
     /// Consume the one-time prekey named in this agreement. Call it ONLY after the first ratchet
     /// message decrypts successfully: consuming the OPK is what provides at-most-once dedup for a
     /// redelivered opener, so it must never burn on an unauthenticated message. Idempotent.
-
     pub fn consume_opk(&mut self, ka: &KeyAgreement) {
         if let Some(opk_pub) = ka.opk_pub {
             self.opks.remove(&opk_pub);

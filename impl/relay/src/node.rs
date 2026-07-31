@@ -908,7 +908,6 @@ impl RelayNode {
 
     /// Issue a capability to a client (the relay is the issuer itself, §7.2). Returns the copy the
     /// client keeps for building proofs; the secret record stays at the relay for verification.
-
     pub fn issue_capability(&mut self, cap: Capability) {
         self.capabilities.insert(cap);
     }
@@ -1271,7 +1270,6 @@ impl RelayNode {
     /// key rotation are both derived from `cookie_epoch_id(now)`, so they are coherent by
     /// construction. (Named limitation: a clock regression WITHIN an epoch still shifts the
     /// 30-second cookie freshness; the real fix is a monotonic clock, outside this slice.)
-
     fn advance_epoch(&mut self, now: u64) {
         let e = cookie_epoch_id(now, EPOCH_DURATION_SECS);
         if e > self.epoch {

@@ -104,6 +104,7 @@ fn relay_with_fixed_noise_key_handshakes() {
     });
     // A client with the STORED public key — the handshake must succeed (Fetch without a cookie →
     // challenge).
+    assert!(server_alive(addr, npub), "a handshake with the persistent key must work");
 }
 
 #[test]

@@ -47,3 +47,8 @@ relay = { path = "../relay" }
 # Build capabilities with relay-specific ids/secrets in the tests (CRYPTO-24), instead of the
 # single globally-known dev credential every dev relay accepts.
 admission = { path = "../admission" }
+
+[features]
+# Failure injection for crash-consistency tests (QA-2). Off by default; forwards to `node`, where
+# the mechanism and its guards live. With it off, every `fail_point!` expands to nothing.
+failpoints = ["node/failpoints"]

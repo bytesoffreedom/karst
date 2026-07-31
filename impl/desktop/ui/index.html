@@ -746,7 +746,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
           <span data-i18n="The SOCKS5 above is a mixnet (Nym) client — route through the mixnet">The SOCKS5 above is a mixnet (Nym) client &mdash; route through the mixnet</span></label>
         <p style="margin:2px 0 0 25px;color:var(--faint);font-size:11.5px;line-height:1.5" data-i18n="Adds timing / traffic-analysis resistance on top. Point SOCKS5 at nym-socks5-client (127.0.0.1:1080).">Adds timing / traffic-analysis resistance on top. Point SOCKS5 at <span class="mono">nym-socks5-client</span> (<span class="mono">127.0.0.1:1080</span>).</p>
         <p class="flabel" id="set-relay-msg" style="display:none"></p>
-        <button class="btn primary" id="btn-save-relay" style="margin-top:4px" data-i18n="Save &amp; connect">Save &amp; connect</button>
+        <button class="btn primary" id="btn-save-relay" style="margin-top:14px" data-i18n="Save &amp; connect">Save &amp; connect</button>
       </div>
       <div style="padding-top:16px;margin-top:14px;border-top:1px solid var(--line)">
         <p class="flabel" data-i18n="Backup relays (multi-homing)">Backup relays (multi-homing)</p>
@@ -762,7 +762,7 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
         <p data-i18n="Paste the invite.json the relay operator gave you. A fresh account can publish anywhere but can only send through a private relay once its invite is imported." style="margin:0 0 8px;color:var(--muted);font-size:12.5px;line-height:1.55">Paste the <span class="mono">invite.json</span> the relay operator gave you. A fresh account can publish anywhere but can only <b>send</b> through a private relay once its invite is imported.</p>
         <textarea class="field mono" id="set-invite" rows="3" placeholder='{ "capability_id": […], "scope": "MessageDelivery", … }'></textarea>
         <p class="flabel" id="set-invite-msg" style="display:none"></p>
-        <button class="btn sec" id="btn-import-invite" style="margin-top:4px" data-i18n="Import invite">Import invite</button>
+        <button class="btn sec" id="btn-import-invite" style="margin-top:14px" data-i18n="Import invite">Import invite</button>
       </div>
     </div>
     <div class="setcard"><h2 data-i18n="Privacy &amp; encryption">Privacy &amp; encryption</h2>
@@ -879,8 +879,12 @@ mark{background:var(--accent);color:#04121a;border-radius:3px;padding:0 1px}
     <input class="field" id="nc-name" data-i18n-ph="Blank = show their own name; you can rename later" placeholder="Blank = show their own name; you can rename later">
     <p class="flabel" id="nc-err" style="color:var(--danger);display:none"></p>
     <div style="display:flex;gap:8px;margin-top:6px">
-      <button class="btn ghost" onclick="document.getElementById('modal-contact').style.display='none'" data-i18n="Cancel">Cancel</button>
-      <button class="btn ghost" style="flex:1" id="btn-addcontact" data-i18n="Add to contacts">Add to contacts</button>
+      <!-- Cancel is sized to its label, not stretched: `.btn` is width:100%, so leaving it without
+           a flex basis let it eat over half the row and squeezed "Add to contacts" until the label
+           wrapped onto two lines, leaving the three buttons at different heights. The two buttons
+           that DO something share the remaining width. -->
+      <button class="btn ghost" style="flex:0 0 auto;width:auto;padding:12px 18px" onclick="document.getElementById('modal-contact').style.display='none'" data-i18n="Cancel">Cancel</button>
+      <button class="btn ghost" style="flex:1;white-space:nowrap" id="btn-addcontact" data-i18n="Add to contacts">Add to contacts</button>
       <button class="btn primary" style="flex:1" id="btn-startchat" data-i18n="Message">Message</button>
     </div>
   </div>
@@ -2993,6 +2997,28 @@ if(TA){
       .map(function(n){return '<img src="'+A(n)+'" alt="">';}).join('');
     const bio=document.getElementById('dh-bio');
     if(bio) bio.textContent='Runs a relay in Reykjavík. Ask me about drop-box rotation.';
+    // The safety number is computed by the backend, so in the preview the panel showed an empty
+    // grey slab where the most reassuring element on the screen belongs. Fixed digits of the right
+    // SHAPE (12 groups of 5) — not a real number for a real pair, and it cannot be: it is derived
+    // from two identity keys neither of which exists here.
+    const fp=document.getElementById('dh-fp');
+    if(fp) fp.textContent='43192 59463 94039 77410 26776 22543 59827 77791 03864 51920 68315 44207';
+    const vf=document.getElementById('dh-verified');
+    if(vf) vf.textContent='✓ Safety number verified';
+    // Four dialogs are filled entirely by the backend, so the preview photographed them EMPTY:
+    // a headline-less card with a blank cyan button (ctrpw, duress) and a bare coloured slab where
+    // the warning text belongs (channel, hiddenview). Each is given the copy the backend would
+    // supply for its most representative case, so a screenshot shows the dialog rather than its
+    // skeleton.
+    const put=(id,txt)=>{const e=document.getElementById(id); if(e) e.textContent=txt;};
+    put('ctrpw-title','Change device password');
+    put('ctrpw-sub','The new password protects everything already stored on this device.');
+    put('ctrpw-go','Change password');
+    put('duress-title','Duress password');
+    put('duress-sub','Opens a decoy account. Entering it never unlocks your real one, and nothing on screen says a real one exists.');
+    put('btn-duress-go','Set duress password');
+    put('modal-channel-warn','Channel mode makes this account publicly subscribable. Anyone holding your public code can read what you publish here — it is not a way to be reached privately.');
+    put('hiddenview-text','Rotate the drop-box seed before the trip. The old one stays valid for 48h.');
 
     // Let a screenshot open the feed directly: ?v=feed
   })();
@@ -3006,6 +3032,11 @@ if(TA){
   // The [data-nav] click handler lives in the backend branch, so in the browser preview it is
   // never attached — clicking the rail did nothing. Switch the section directly instead.
   if(q.get('v')==='feed'){try{showSection('feed');}catch(e){}}
+  // ?modal=<id> opens one dialog, for the same reason and in the same place: every modal in this
+  // file is hidden with an inline display:none and revealed by a handler that only exists in the
+  // backend branch, so in the preview there is no way to photograph one at all. Same synchronous
+  // slot as ?v=feed — a timer loses the race with a headless screenshot.
+  const m=q.get('modal'); if(m){try{showModal(m.startsWith('modal-')?m:'modal-'+m);}catch(e){}}
 }
 enhanceAllSelects();applyI18n();
 </script></body></html>

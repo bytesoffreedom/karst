@@ -1,16 +1,16 @@
-//! §7.5 / §7.6 — Полный порядок проверки входящего запроса.
+//! §7.5 / §7.6 — the full checking order for an incoming request.
 //!
-//! Память на каждой ступени растёт только пропорционально уже проверенной
-//! легитимной нагрузке (§7.5). Порядок ступеней = порядок по цене: дешёвые
-//! отказы раньше дорогих (§7.6).
+//! Memory at every stage grows only in proportion to the already-verified legitimate load (§7.5).
+//! The stage order is the cost order: cheap rejections come before expensive ones (§7.6).
+//!
 //!
 //! ```text
-//! Ступень 0  bounded parse         — бюджет на длину, без аллокаций по непроверенной длине
-//! Ступень 1  cookie                — нет валидного → ровно 64 байта, состояние НЕ создаётся
-//! Ступень 2  формат credential     — структура без крипто, reject мусора бесплатно
-//! Ступень 3  replay/freshness      — bounded-фильтр, привязан к quota-эпохе
-//! Ступень 4  дорогая криптография  — по возрастанию цены: capability HMAC → token ring-sig → RLN zk
-//! Ступень 5  bounded session state — LRU, жёсткий потолок → Mix/Mailbox/Egress (§10)
+//! Stage 0  bounded parse         — a length budget, no allocation on an unverified length
+//! Stage 1  cookie                — without a valid one, exactly 64 bytes back and NO state created
+//! Stage 2  credential format     — structure without crypto; rejecting garbage is free
+//! Stage 3  replay/freshness      — a bounded filter, tied to the quota epoch
+//! Stage 4  expensive crypto      — in rising cost order: capability HMAC → token ring sig → RLN zk
+//! Stage 5  bounded session state — LRU with a hard ceiling → Mix/Mailbox/Egress (§10)
 //! ```
 
 use crate::capability::{
@@ -24,20 +24,20 @@ use crate::dtn::{
 use crate::params::COOKIE_CHALLENGE_SIZE;
 use crate::token::{AdmissionToken, AdmissionTokenVerifier, IssuerRing, TokenError};
 
-/// Предъявляемый credential (§7.5, Ступень 4). RLN здесь не отдельный
-/// credential, а квота-слой поверх допуска; его zk-гейт застаблен (см. `rln`),
-/// поэтому в конвейере он представлен явно недоступной ветвью.
+/// The credential being presented (§7.5, Stage 4). RLN is not a separate credential here but a
+/// quota layer on top of admission; its zk gate is stubbed (see `rln`), so it appears in the
+/// pipeline as an explicitly unreachable branch.
 pub enum Credential {
     Capability(CapabilityProof),
     Token(AdmissionToken),
-    /// RLN-квота: zk-обёртка не реализована (§7.4). Ветвь присутствует,
-    /// чтобы конвейер честно показывал «этот путь пока не проходит», а не
-    /// делал вид, что RLN готов.
+    /// RLN quota: the zk wrapper is not implemented (§7.4). The branch exists so the pipeline
+    /// says honestly "this path does not pass yet" rather than pretending RLN is ready.
+
     RlnQuota,
 }
 
 pub struct Request<'a> {
-    /// Длина сырого пакета до разбора (для Ступени 0).
+    /// The raw packet length before parsing (for Stage 0).
     pub raw_len: usize,
     /// Stage-0 ceiling for THIS request's CLASS, supplied by the caller.
     ///
@@ -53,55 +53,55 @@ pub struct Request<'a> {
     pub max_raw_len: usize,
     pub client_addr: &'a [u8],
     pub carrier_id: &'a [u8],
-    /// Cookie, если клиент уже прошёл первый round-trip; None — первый контакт.
+    /// The cookie, if the client already completed the first round trip; None on first contact.
     pub cookie: Option<Cookie>,
     pub request_nonce: &'a [u8],
     pub requested_scope: Scope,
     pub credential: Credential,
 }
 
-/// Запрос DTN-ветки Ingress (§7.7): capsule, вернувшаяся из mesh и заливаемая
-/// в сеть онлайн-носителем.
+/// A request on the Ingress DTN branch (§7.7): a capsule that came back out of the mesh and is
+/// being uploaded to the network by an online carrier.
 ///
-/// **Единственный идентификатор capsule = `H(ciphertext)`** — он же вход MAC
-/// (привязка подписи к содержимому), он же ключ rolling-window. Поэтому:
-/// - наблюдатель в mesh не может прицепить валидный proof к другому контенту
-///   (изменил контент → другой хэш → и MAC, и replay-ключ другие);
-/// - `capsule_bytes` и `capsule_id` берутся С ПРОВОДА (из `ciphertext`), а не
-///   из клиентских полей; `not_after`/`max_bytes` — из авторитетной
-///   capability на Ступени 4.
+/// **The only capsule identifier is `H(ciphertext)`** — it is also the MAC input (binding the
+/// signature to the content) and the rolling-window key. Therefore:
+/// - an observer inside the mesh cannot attach a valid proof to different content (change the
+///   content → a different hash → a different MAC and a different replay key);
+/// - `capsule_bytes` and `capsule_id` are taken FROM THE WIRE (from `ciphertext`), never from
+///   client-supplied fields; `not_after`/`max_bytes` come from the authoritative capability at
+///   Stage 4.
 pub struct DtnRequest<'a> {
     pub raw_len: usize,
     pub client_addr: &'a [u8],
     pub carrier_id: &'a [u8],
     pub cookie: Option<Cookie>,
-    /// Proof DTN-capability; его MAC покрывает `H(ciphertext)`.
+    /// The DTN capability proof; its MAC covers `H(ciphertext)`.
     pub proof: DtnCapabilityProof,
-    /// Сырой шифртекст capsule — источник и id, и размера.
+    /// The raw capsule ciphertext — the source of both the id and the size.
     pub ciphertext: &'a [u8],
 }
 
-/// Исход прохождения конвейера.
+/// The outcome of a pass through the pipeline.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Ступень 0/2: молчаливый reject без ответа (мусор/переразмер).
+    /// Stage 0/2: a silent reject with no reply (garbage or oversized).
     DropNoReply(DropReason),
-    /// Ступень 1: нет валидного cookie — ответ ровно 64 байта, состояние не создаётся.
+    /// Stage 1: no valid cookie — the reply is exactly 64 bytes and no state is created.
     Challenge([u8; COOKIE_CHALLENGE_SIZE]),
-    /// Ступень 3: replay-фильтр переполнен — сигнал поднять adaptive PoW.
-    /// Запрос не принят, но это не «мусор», а перегрузка (§7.5, Ступень 3).
+    /// Stage 3: the replay filter is full — a signal to raise the adaptive PoW. The request is not
+    /// accepted, but this is overload rather than garbage (§7.5, Stage 3).
     BackpressurePow,
-    /// Ступень 3/4: запрос отвергнут по конкретной причине (replay/крипто).
+    /// Stage 3/4: the request was rejected for a specific reason (replay or crypto).
     Reject(RejectReason),
-    /// Ступень 5: допущен, передаётся в session state → Mix/Mailbox/Egress.
+    /// Stage 5: admitted, handed to the session state → Mix/Mailbox/Egress.
     Admit,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DropReason {
-    /// Ступень 0: длина превышает MAX_PACKET_SIZE.
+    /// Stage 0: the length exceeds MAX_PACKET_SIZE.
     Oversize,
-    /// Ступень 2: структура credential не разобралась (пустой nonce и т.п.).
+    /// Stage 2: the credential structure did not parse (an empty nonce and the like).
     MalformedCredential,
 }
 
@@ -111,27 +111,27 @@ pub enum RejectReason {
     Capability(CapabilityError),
     Token(TokenError),
     Replay,
-    /// Capability исчерпала квоту (max_requests/max_bytes за окно, §7.2).
+    /// The capability exhausted its quota (max_requests/max_bytes per window, §7.2).
     CapabilityQuota,
-    /// RLN zk-обёртка не реализована — путь заведомо не проходит (§7.4).
+    /// The RLN zk wrapper is not implemented — this path cannot pass (§7.4).
     RlnNotImplemented,
-    /// DTN-ветка (§7.7): capability не прошла (срок/размер/MAC/неизвестна).
+    /// DTN branch (§7.7): the capability failed (expiry, size, MAC, or unknown).
     Dtn(DtnCapError),
-    /// DTN-ветка: capsule уже видели (rolling-window replay).
+    /// DTN branch: this capsule has been seen before (rolling-window replay).
     DtnReplay,
-    /// DTN-ветка: capsule истекла (now > not_after).
+    /// DTN branch: the capsule expired (now > not_after).
     DtnExpired,
-    /// DTN-ветка: not_after дальше окна rolling-window — гарантий нет.
+    /// DTN branch: not_after lies beyond the rolling window — no guarantee can be offered.
     DtnBeyondWindow,
 }
 
-/// Bounded replay/freshness-фильтр (§7.5, Ступень 3).
+/// The bounded replay/freshness filter (§7.5, Stage 3).
 ///
-/// Спека называет Bloom/cuckoo; здесь — ограниченный по ёмкости `HashSet` с
-/// жёстким потолком, привязанный к quota-эпохе и сбрасываемый при её ротации.
-/// Свойство, которое проверяет реализация, — именно bounded-memory + сигнал
-/// backpressure при переполнении, а не конкретная вероятностная структура
-/// (её выбор — оптимизация, не изменение поведения на границе).
+/// The spec names Bloom/cuckoo; this is a capacity-bounded `HashSet` with a hard ceiling, tied to
+/// the quota epoch and cleared when it rotates. What the implementation checks is exactly the
+/// bounded memory plus the backpressure signal on overflow, not any particular probabilistic
+/// structure (choosing one is an optimisation, not a change of behaviour at the boundary).
+
 pub struct ReplayFilter {
     epoch_id: u32,
     seen: std::collections::HashSet<[u8; 16]>,
@@ -147,7 +147,7 @@ impl ReplayFilter {
         }
     }
 
-    /// Сброс при ротации quota-эпохи (§7.5): весь фильтр обнуляется.
+    /// Cleared when the quota epoch rotates (§7.5): the whole filter is zeroed.
     pub fn roll_epoch(&mut self, new_epoch: u32) {
         if new_epoch != self.epoch_id {
             self.seen.clear();
@@ -155,20 +155,20 @@ impl ReplayFilter {
         }
     }
 
-    /// Дешёвый READ-ONLY-взгляд: видели ли тег. Ничего не занимает — используется на
-    /// Ступени 3, чтобы отбить очевидный replay ДО дорогой крипты, не отдавая
-    /// неаутентифицированному запросу слот в фильтре (R2-1).
+    /// A cheap READ-ONLY look: have we seen this tag. It occupies nothing — used at Stage 3 to
+    /// reject an obvious replay BEFORE the expensive crypto, without giving an unauthenticated
+    /// request a slot in the filter (R2-1).
     fn contains(&self, tag: &[u8; 16]) -> bool {
         self.seen.contains(tag)
     }
 
-    /// Пытается зафиксировать тег. Возвращает:
-    /// - `Ok(true)`  — свежий, принят;
-    /// - `Ok(false)` — уже видели (replay);
-    /// - `Err(())`   — фильтр полон (переполнение → backpressure/PoW).
+    /// Attempts to record the tag. Returns:
+    /// - `Ok(true)`  — fresh, accepted;
+    /// - `Ok(false)` — already seen (replay);
+    /// - `Err(())`   — the filter is full (overflow → backpressure/PoW).
     ///
-    /// Вызывается ТОЛЬКО после успешной верификации credential — иначе мусорный proof
-    /// занимает ёмкость и валит отправку всему relay (R2-1; DTN-ветка так делала всегда).
+    /// Called ONLY after a credential verifies — otherwise a garbage proof occupies capacity and
+    /// breaks sending for the whole relay (R2-1; the DTN branch always did it this way).
     fn commit(&mut self, tag: [u8; 16]) -> Result<bool, ()> {
         if self.seen.contains(&tag) {
             return Ok(false);
@@ -181,7 +181,7 @@ impl ReplayFilter {
     }
 }
 
-/// Оркестратор конвейера. Держит ссылки на состояние relay.
+/// The pipeline orchestrator. Holds references to the relay's state.
 pub struct AdmissionPipeline<'r, V: AdmissionTokenVerifier> {
     pub keyring: &'r CookieKeyring,
     pub capabilities: &'r CapabilityTable,
@@ -190,15 +190,15 @@ pub struct AdmissionPipeline<'r, V: AdmissionTokenVerifier> {
 }
 
 impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
-    /// Ступени 0–1, общие для live- и DTN-веток единого Ingress (§10: одна
-    /// точка входа, ветвление по типу credential — не отдельный gateway).
-    /// `Some(outcome)` = короткое замыкание (drop/challenge); `None` = прошли.
+    /// Stages 0–1, shared by the live and DTN branches of one Ingress (§10: a single entry point,
+    /// branching on the credential type — not a separate gateway).
+    /// `Some(outcome)` means a short circuit (drop/challenge); `None` means we passed.
     ///
-    /// Cookie сохраняется и для DTN: capsule, вернувшуюся из mesh, заливает в
-    /// сеть УЖЕ онлайн-носитель — cookie защищает именно этот онлайн-аплинк от
-    /// амплификации (спуфинг внутри самого mesh невозможен, §7.7).
-    // Аргументы примитивны и различны; бандл в структуру ради линта добавил бы
-    // лишнюю косвенность в приватный хелпер.
+    /// The cookie applies to DTN as well: a capsule returning from the mesh is uploaded by an
+    /// ALREADY online carrier, and the cookie protects that online uplink against amplification
+    /// (spoofing inside the mesh itself is impossible, §7.7).
+    // The arguments are primitive and distinct; bundling them into a struct for the lint's sake
+    // would add indirection to a private helper for nothing.
     #[allow(clippy::too_many_arguments)]
     fn precheck(
         &self,
@@ -210,12 +210,12 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         now_secs: u64,
         challenge_bytes: [u8; COOKIE_CHALLENGE_SIZE],
     ) -> Option<Outcome> {
-        // Ступень 0: bounded parse. Потолок зависит от класса: live-MTU для
-        // live-пути, MB-масштабный DTN-потолок для хранимой mesh-capsule.
+        // Stage 0: bounded parse. The ceiling depends on the class: the live MTU for the live
+        // path, the MB-scale DTN ceiling for a stored mesh capsule.
         if raw_len > max_raw_len {
             return Some(Outcome::DropNoReply(DropReason::Oversize));
         }
-        // Ступень 1: cookie.
+        // Stage 1: cookie.
         let cookie = match cookie {
             Some(c) => c,
             None => return Some(Outcome::Challenge(challenge_bytes)),
@@ -230,10 +230,10 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         None
     }
 
-    /// Live-путь (§7.5). `replay` — epoch-фильтр live-класса; `cap_quota` —
-    /// учёт расхода квоты capability за её окно (§7.2), не сбрасывается по
-    /// эпохе (в отличие от `replay`) — иначе валидный proof переиспользуем
-    /// каждую эпоху до `not_after`.
+    /// The live path (§7.5). `replay` is the live-class epoch filter; `cap_quota` accounts for the
+    /// capability's spend within its window (§7.2) and is NOT cleared by the epoch (unlike
+    /// `replay`) — otherwise a valid proof would be reusable once per epoch until `not_after`.
+
     pub fn process(
         &self,
         req: &Request,
@@ -261,7 +261,7 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         cap_quota: &mut CapabilityQuotaTracker,
         quota_policy: Option<Quota>,
     ) -> Outcome {
-        // --- Ступени 0–1 ---
+        // --- Stages 0–1 ---
         if let Some(out) = self.precheck(
             req.raw_len,
             req.max_raw_len,
@@ -274,18 +274,18 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
             return out;
         }
 
-        // --- Ступень 2: формат credential (без крипто) ---
+        // --- Stage 2: credential format (no crypto) ---
         if req.request_nonce.is_empty() {
             return Outcome::DropNoReply(DropReason::MalformedCredential);
         }
 
-        // --- Ступень 3: replay/freshness — ТОЛЬКО read-only CHECK ---
-        // Порядок здесь критичен и теперь совпадает с DTN-веткой (см. `process_dtn`).
-        // Тег для capability — это `proof.mac`, поле С ПРОВОДА: если фиксировать его ДО
-        // проверки HMAC, любой обладатель обычной cookie заливает фильтр мусорными MAC'ами,
-        // и после переполнения КАЖДЫЙ новый уникальный запрос получает BackpressurePow до
-        // смены эпохи — дешёвый отказ отправки для всего relay (R2-1). Поэтому здесь только
-        // дешёвый взгляд (настоящий replay отбивается сразу), а вставка — после Ступени 4.
+        // --- Stage 3: replay/freshness — a read-only CHECK ONLY ---
+        // The order matters here and now matches the DTN branch (see `process_dtn`).
+        // The capability's tag is `proof.mac`, a field FROM THE WIRE: recording it BEFORE the HMAC
+        // is verified would let anyone holding an ordinary cookie flood the filter with garbage
+        // MACs, and after the overflow EVERY new unique request gets BackpressurePow until the
+        // epoch turns — a cheap denial of sending for the whole relay (R2-1). So only the cheap
+        // look happens here (a real replay is rejected at once); the insert comes after Stage 4.
         replay.roll_epoch(epoch_id);
         let replay_tag = credential_replay_tag(&req.credential);
         if let Some(tag) = replay_tag {
@@ -294,9 +294,9 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
             }
         }
 
-        // --- Ступень 4: дорогая криптография по возрастанию цены ---
+        // --- Stage 4: expensive crypto, in rising cost order ---
         match &req.credential {
-            // Шаг 1: Capability HMAC (дешевле всего).
+            // Step 1: capability HMAC (the cheapest).
             Credential::Capability(proof) => {
                 let cap = match self.capabilities.verify(
                     proof,
@@ -307,10 +307,10 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
                     Ok(c) => c,
                     Err(e) => return Outcome::Reject(RejectReason::Capability(e)),
                 };
-                // Учёт квоты — ТОЛЬКО после успешного MAC (иначе плохой proof
-                // жёг бы чужую квоту). Тег = proof.mac (стабилен при дословном
-                // replay, в т.ч. через границу эпохи). cap_id/quota — из verify
-                // (stored или stateless PoW-cap, учёт одинаков).
+                // Quota accounting happens ONLY after the MAC verifies (otherwise a bad proof
+                // would burn someone else's quota). The tag is proof.mac (stable under a verbatim
+                // replay, including across an epoch boundary). cap_id/quota come from verify
+                // (stored or a stateless PoW capability — the accounting is identical).
                 // The operator's policy (if any) clamps the effective quota — a forgeable dev cap or
                 // a stale over-generous token cannot exceed what the relay currently allows.
                 let effective = match quota_policy {
@@ -325,7 +325,7 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
                     }
                 }
             }
-            // Шаг 2: Admission token ring signature.
+            // Step 2: the admission token ring signature.
             Credential::Token(token) => {
                 match self
                     .token_verifier
@@ -335,15 +335,15 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
                     Err(e) => return Outcome::Reject(RejectReason::Token(e)),
                 }
             }
-            // Шаг 3: RLN zk-proof — не реализован (§7.4), путь честно не проходит.
+            // Step 3: the RLN zk proof — not implemented (§7.4); the path honestly does not pass.
             Credential::RlnQuota => {
                 return Outcome::Reject(RejectReason::RlnNotImplemented)
             }
         }
 
-        // Фиксация replay-тега — ТОЛЬКО теперь, когда credential ВЕРИФИЦИРОВАН (R2-1).
-        // Неаутентифицированный запрос сюда не доходит, поэтому ёмкость фильтра тратят лишь
-        // те, кто реально предъявил валидный credential (а их дополнительно держит квота).
+        // The replay tag is recorded ONLY now, once the credential is VERIFIED (R2-1).
+        // An unauthenticated request never reaches this point, so filter capacity is spent only by
+        // those who really presented a valid credential (and the quota bounds them further).
         if let Some(tag) = replay_tag {
             match replay.commit(tag) {
                 Ok(true) => {}
@@ -352,19 +352,19 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
             }
         }
 
-        // --- Ступень 5: bounded session state → Mix/Mailbox/Egress ---
+        // --- Stage 5: bounded session state → Mix/Mailbox/Egress ---
         Outcome::Admit
     }
 
-    /// DTN-путь (§7.7) того же Ingress. `dtn_caps` — таблица DTN-capability,
-    /// `dtn_replay` — отдельный rolling-window (не epoch-фильтр live-класса).
+    /// The DTN path (§7.7) of the same Ingress. `dtn_caps` is the DTN capability table,
+    /// `dtn_replay` is a separate rolling window (not the live-class epoch filter).
     ///
-    /// Порядок для DTN критичен и ОТЛИЧАЕТСЯ от live (по разбору с advisor):
-    /// Ступень 3 — только read-only CHECK (дёшево отбить настоящий replay), а
-    /// вставка в rolling-window — ТОЛЬКО после успешного HMAC на Ступени 4.
-    /// Иначе атакующий, подсмотревший id capsule в mesh, зальёт её первым с
-    /// мусорным proof, сожжёт id на Ступени 3, а настоящую capsule потом отобьют
-    /// как «replay».
+    /// The order matters for DTN and DIFFERS from live: Stage 3 is a read-only CHECK only (to
+    /// reject a real replay cheaply), and the insert into the rolling window happens ONLY after a
+    /// successful HMAC at Stage 4. Otherwise an attacker who glimpsed a capsule id in the mesh
+    /// would upload it first with a garbage proof, burn the id at Stage 3, and the genuine capsule
+    /// would later be rejected as a "replay".
+
     pub fn process_dtn(
         &self,
         req: &DtnRequest,
@@ -373,9 +373,9 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         now_secs: u64,
         challenge_bytes: [u8; COOKIE_CHALLENGE_SIZE],
     ) -> Outcome {
-        // --- Ступени 0–1 (общие) ---
-        // DTN-потолок (MB-масштаб), НЕ live-MTU: capsule — хранимый объект.
-        // Дешёвый гейт до хеширования ciphertext.
+        // --- Stages 0–1 (shared) ---
+        // The DTN ceiling (MB scale), NOT the live MTU: a capsule is a stored object.
+        // A cheap gate before hashing the ciphertext.
         if let Some(out) = self.precheck(
             req.raw_len,
             MAX_DTN_CAPSULE_SIZE,
@@ -388,28 +388,28 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
             return out;
         }
 
-        // --- Ступень 2: формат (без крипто) ---
+        // --- Stage 2: format (no crypto) ---
         if req.ciphertext.is_empty() {
             return Outcome::DropNoReply(DropReason::MalformedCredential);
         }
 
-        // Единственный идентификатор capsule — с провода, не из клиентских полей.
+        // The only capsule identifier comes from the wire, never from client fields.
         let full_hash = capsule_hash(req.ciphertext);
         let mut replay_key = [0u8; 16];
         replay_key.copy_from_slice(&full_hash[..16]);
         let capsule_bytes = req.ciphertext.len() as u64;
 
-        // --- Ступень 3: дешёвый read-only CHECK (scan, без not_after) ---
-        // Отбивает очевидный replay ДО HMAC, но НЕ сжигает id (insert только
-        // после верификации на Ступени 4).
+        // --- Stage 3: a cheap read-only CHECK (scan, no not_after) ---
+        // Rejects an obvious replay BEFORE the HMAC without burning the id (the insert happens
+        // only after verification at Stage 4).
         if dtn_replay.contains_any(&replay_key) {
             return Outcome::Reject(RejectReason::DtnReplay);
         }
 
-        // --- Ступень 4: верификация DTN-capability ---
-        // MAC над H(ciphertext) (привязка к содержимому), срок, размер против
-        // авторитетной квоты. not_after берём из найденной capability, не из
-        // клиента.
+        // --- Stage 4: verify the DTN capability ---
+        // The MAC over H(ciphertext) (binding it to the content), the expiry, and the size against
+        // the authoritative quota. `not_after` comes from the capability that was found, never
+        // from the client.
         let cap = match dtn_caps.verify(&req.proof, &full_hash, capsule_bytes, now_secs) {
             Ok(c) => c,
             Err(DtnCapError::Expired) => return Outcome::Reject(RejectReason::DtnExpired),
@@ -417,9 +417,9 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         };
         let not_after = cap.not_after;
 
-        // Фиксация в rolling-window — ТОЛЬКО теперь, после успешного HMAC.
-        // (Expired здесь не наступит — verify уже проверил срок; BeyondWindow
-        // осмыслен — зависит от not_after, окна rolling-window.)
+        // Recorded in the rolling window ONLY now, after a successful HMAC.
+        // (Expired cannot occur here — verify already checked the expiry; BeyondWindow is
+        // meaningful, since it depends on not_after and the rolling window.)
         match dtn_replay.insert(replay_key, not_after, now_secs) {
             ReplayCheck::Fresh => {}
             ReplayCheck::Replayed => return Outcome::Reject(RejectReason::DtnReplay), // lost the race
@@ -427,14 +427,14 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
             ReplayCheck::BeyondWindow => return Outcome::Reject(RejectReason::DtnBeyondWindow),
         }
 
-        // --- Ступень 5 ---
+        // --- Stage 5 ---
         Outcome::Admit
     }
 }
 
-/// `H(ciphertext)` — единственный идентификатор capsule (§7.7-интеграция).
-/// Публичный: DTN-отправитель обязан вычислять id тем же способом, чтобы
-/// его proof (MAC над этим значением) совпал с тем, что пересчитает Ingress.
+/// `H(ciphertext)` — the only capsule identifier (§7.7 integration).
+/// Public: a DTN sender must compute the id the same way, so that its proof (a MAC over this
+/// value) matches what Ingress recomputes.
 pub fn capsule_hash(ciphertext: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -446,10 +446,10 @@ pub fn capsule_hash(ciphertext: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Тег для replay-фильтра: для токена — его `t` (уникальный per-token); для
-/// capability — MAC proof'а (уникален per (nonce, epoch)). RLN не доходит до
-/// фильтра в этой реализации (zk застаблен раньше по ветке — но тег на всякий
-/// случай не выдаём).
+/// The tag for the replay filter: for a token it is its `t` (unique per token); for a capability
+/// it is the proof's MAC (unique per (nonce, epoch)). RLN never reaches the filter in this
+/// implementation (the zk gate stops it earlier on the branch — but no tag is handed out anyway).
+
 fn credential_replay_tag(cred: &Credential) -> Option<[u8; 16]> {
     match cred {
         Credential::Capability(p) => Some(p.mac),
@@ -466,10 +466,10 @@ fn credential_replay_tag(cred: &Credential) -> Option<[u8; 16]> {
 mod tests {
     use super::*;
 
-    /// Дискриминирующий тест `roll_epoch`: смена эпохи ОЧИЩАЕТ live replay-фильтр.
-    /// Через полный конвейер это замаскировано quota-трекером (для capability) —
-    /// здесь проверяем сам примитив, где эффект наблюдаем напрямую. Именно на это
-    /// опирается epoch-scoped replay-защита узла.
+    /// A discriminating test for `roll_epoch`: an epoch change CLEARS the live replay filter.
+    /// Through the full pipeline this is masked by the quota tracker (for capabilities), so here
+    /// the primitive is checked where the effect is directly observable. The node's epoch-scoped
+    /// replay protection rests on exactly this.
     #[test]
     fn roll_epoch_clears_replay_filter() {
         let mut f = ReplayFilter::new(0, 16);
@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(f.commit(tag), Ok(false)); // replay inside the same epoch
         f.roll_epoch(1); // epoch change
         assert_eq!(f.commit(tag), Ok(true), "an epoch change must clear the filter");
-        // Тот же номер эпохи повторно — идемпотентно, НЕ очищает.
+        // The same epoch number again is idempotent and does NOT clear it.
         f.roll_epoch(1);
         assert_eq!(f.commit(tag), Ok(false), "the same epoch_id must not reset it");
     }

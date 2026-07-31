@@ -459,3 +459,107 @@ mod an_address_is_specific_to_its_relay {
         assert_ne!(e5, rev, "the two directions of one session collapsed into one box");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// PRIV-7a: the blob read key — turning "knowing the id" into "holding the key" (#294)
+// ---------------------------------------------------------------------------------------------
+
+/// Domain for deriving a blob's read keypair. Separated from every other KDF in the tree, so the
+/// read secret can never coincide with the content key it is derived from, nor with a mailbox
+/// fetch secret.
+const BLOB_READ_DOMAIN: &[u8] = b"KARST-blob-read-v1";
+
+/// Derive a blob's read keypair `(secret, public)` from the content key that already travels to the
+/// recipient inside the `FileRef`.
+///
+/// **Why derive rather than add a field.** The recipient must end up holding the secret and the
+/// relay must end up holding only the public half. The content key is already delivered E2E and
+/// already means "you may read this blob" — deriving from it gives the relay a verifier without
+/// changing the message format at all, and without inventing a second thing a sender could forget
+/// to send.
+///
+/// **What it buys, stated exactly.** Today a blob download is bearer-by-id: the 256-bit `blob_id`
+/// IS the right to fetch, so anyone who learns an id — a relay operator reading its own store, a
+/// backup, a log — can pull the ciphertext. The bytes stay E2E-sealed either way, so this is not
+/// about confidentiality of the content. It is about the RELAY being able to refuse a download to
+/// someone who never held the key, which removes the id from the set of things that must stay
+/// secret, and stops an id leak turning into unmetered traffic.
+///
+/// The secret is a Ristretto scalar and the public half is `secret·G`, so the existing
+/// [`FetchOwnershipProof`] verifies it: the same Schnorr proof the blinded drop-boxes use, bound to
+/// the cookie MAC so a captured proof cannot be replayed by a bystander.
+pub fn blob_read_keypair(content_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let mut h = <Sha512 as sha2::Digest>::new();
+    sha2::Digest::update(&mut h, BLOB_READ_DOMAIN);
+    sha2::Digest::update(&mut h, content_key);
+    let wide: [u8; 64] = sha2::Digest::finalize(h).into();
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    let p = (&s * RISTRETTO_BASEPOINT_TABLE).compress().to_bytes();
+    (s.to_bytes(), p)
+}
+
+/// The context a blob read proof is bound to: the cookie MAC (freshness), the blob id and the
+/// chunk index. Included in full so a proof captured for one chunk cannot be replayed for another.
+pub fn blob_read_context(cookie_mac: &[u8; 16], blob_id: &[u8; 32], index: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16 + 32 + 4);
+    v.extend_from_slice(cookie_mac);
+    v.extend_from_slice(blob_id);
+    v.extend_from_slice(&index.to_be_bytes());
+    v
+}
+
+#[cfg(test)]
+mod blob_read {
+    use super::*;
+
+    /// The same content key gives the same keypair on both sides — the recipient derives what the
+    /// uploader registered, without any extra field on the wire.
+    #[test]
+    fn both_sides_derive_the_same_keypair_from_the_content_key() {
+        let key = [7u8; 32];
+        let (s1, p1) = blob_read_keypair(&key);
+        let (s2, p2) = blob_read_keypair(&key);
+        assert_eq!((s1, p1), (s2, p2), "the derivation is not deterministic");
+        let (_, other) = blob_read_keypair(&[8u8; 32]);
+        assert_ne!(p1, other, "different content keys must give different read keys");
+    }
+
+    /// The derived secret really opens the derived public half through the EXISTING proof, and a
+    /// holder of a different key cannot.
+    ///
+    /// This is the property the whole slice rests on: the relay stores only the public half and
+    /// runs the same verification the drop-boxes use.
+    #[test]
+    fn only_the_content_key_holder_can_prove_the_read_right() {
+        let (sec, public) = blob_read_keypair(&[7u8; 32]);
+        let ctx = blob_read_context(&[3u8; 16], &[9u8; 32], 4);
+        let proof = FetchOwnershipProof::prove(&sec, &public, &ctx).expect("prove");
+        assert!(proof.verify(&public, &ctx), "the real holder must be admitted");
+
+        let (other_sec, _) = blob_read_keypair(&[8u8; 32]);
+        let forged = FetchOwnershipProof::prove(&other_sec, &public, &ctx).expect("prove");
+        assert!(
+            !forged.verify(&public, &ctx),
+            "a different content key must NOT open the blob — the id alone would be the right again"
+        );
+    }
+
+    /// The proof is bound to the cookie AND to the chunk: a proof captured on the wire cannot be
+    /// replayed for the next chunk, nor by a bystander holding a different cookie.
+    #[test]
+    fn a_captured_proof_does_not_travel_to_another_chunk_or_cookie() {
+        let (sec, public) = blob_read_keypair(&[7u8; 32]);
+        let ctx0 = blob_read_context(&[3u8; 16], &[9u8; 32], 0);
+        let proof = FetchOwnershipProof::prove(&sec, &public, &ctx0).expect("prove");
+        assert!(proof.verify(&public, &ctx0));
+
+        let next_chunk = blob_read_context(&[3u8; 16], &[9u8; 32], 1);
+        assert!(!proof.verify(&public, &next_chunk), "replayed onto another chunk");
+
+        let other_cookie = blob_read_context(&[4u8; 16], &[9u8; 32], 0);
+        assert!(!proof.verify(&public, &other_cookie), "replayed under another cookie");
+
+        let other_blob = blob_read_context(&[3u8; 16], &[1u8; 32], 0);
+        assert!(!proof.verify(&public, &other_blob), "replayed onto another blob");
+    }
+}

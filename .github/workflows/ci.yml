@@ -86,6 +86,17 @@ jobs:
       # coverage — scope it to the one crate the feature actually changes.
       - name: test (unaudited-crypto, admission only)
         run: cargo test -p admission --features unaudited-crypto
+      # Crash-consistency tests are `#![cfg(feature = "failpoints")]`, so the default run above
+      # COMPILES them and never executes one. Without this step they would be dead the moment
+      # someone broke them — the same way two seeding examples sat broken for weeks because
+      # `cargo test` builds examples without running them. Scoped to the crates that define the
+      # feature, for the reason the step above gives.
+      - name: test (failpoints — crash consistency)
+        run: |
+          cargo test -p node --lib --features failpoints failpoint
+          cargo test -p client --features failpoints --test crash_sessions
+        env:
+          KARST_INSECURE_FAST_KDF: "1"
 
   # Release build in its own job so it runs concurrently with the tests instead of
   # tailing them on the critical path (same gate, shorter wall clock).

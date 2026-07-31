@@ -1,7 +1,7 @@
-//! End-to-end сценарии полного admission-пути через несколько модулей вместе.
-//! В отличие от per-module тестов, здесь проверяются связки: cookie ↔ конвейер
-//! ↔ credential, и особенно DTN carrier-budget ↔ ingress-return, которые
-//! раньше тестировались порознь.
+//! End-to-end scenarios of the full admission path across several modules at once.
+//! Unlike the per-module tests, these check the seams: cookie ↔ pipeline ↔ credential, and
+//! especially the DTN carrier budget ↔ ingress return, which used to be tested separately.
+
 
 use admission::capability::{Capability, CapabilityTable, Quota, Scope};
 use admission::cookie::CookieKeyring;
@@ -28,8 +28,8 @@ fn dummy_ring() -> IssuerRing {
 }
 
 // ============================================================================
-// Live «сессия»: первый контакт → challenge → cookie → capability → Admit →
-// within-epoch replay reject → свежий запрос снова Admit.
+// A live "session": first contact → challenge → cookie → capability → Admit → a within-epoch
+// replay reject → a fresh request admitted again.
 // ============================================================================
 
 #[test]
@@ -58,7 +58,7 @@ fn live_session_journey() {
     let client = b"203.0.113.10:7000";
     let carrier = b"c";
 
-    // 1. Первый контакт без cookie → Challenge.
+    // 1. First contact without a cookie → Challenge.
     let first = Request {
         raw_len: 200,
         max_raw_len: admission::params::MAX_PACKET_SIZE,
@@ -74,7 +74,7 @@ fn live_session_journey() {
         Outcome::Challenge(_)
     ));
 
-    // 2. Клиент берёт cookie и повторяет с capability → Admit.
+    // 2. The client takes the cookie and retries with the capability → Admit.
     let cookie = kr.issue(client, carrier, NOW as u32);
     let proof1 = cap.prove(b"nonce-1", 0);
     let admitted = Request {
@@ -89,13 +89,13 @@ fn live_session_journey() {
     };
     assert_eq!(pipe.process(&admitted, NOW, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()), Outcome::Admit);
 
-    // 3. Тот же proof в ту же эпоху → replay.
+    // 3. The same proof in the same epoch → replay.
     assert_eq!(
         pipe.process(&admitted, NOW, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()),
         Outcome::Reject(RejectReason::Replay)
     );
 
-    // 4. Свежий запрос (новый nonce) → снова Admit.
+    // 4. A fresh request (a new nonce) → Admit again.
     let proof2 = cap.prove(b"nonce-2", 0);
     let admitted2 = Request {
         raw_len: 200,
@@ -111,9 +111,9 @@ fn live_session_journey() {
 }
 
 // ============================================================================
-// DTN полный жизненный цикл: carrier-budget (нести?) → ingress-return
-// (process_dtn) → replay → подмена содержимого. Связывает CarryBudgetTracker
-// и process_dtn через ОДИН capsule-id.
+// The full DTN life cycle: the carrier budget (carry it?) → the ingress return (process_dtn) →
+// replay → content substitution. It ties CarryBudgetTracker and process_dtn together through ONE
+// capsule id.
 // ============================================================================
 
 fn dtn_cap() -> DtnCapability {
@@ -143,13 +143,13 @@ fn dtn_full_lifecycle_carrier_then_ingress() {
     };
 
     let ciphertext = b"encrypted-emergency-message-carried-through-mesh";
-    // Один идентификатор capsule связывает обе стадии.
+    // A single capsule identifier ties both stages together.
     let full_hash = capsule_hash(ciphertext);
     let mut capsule_tag = [0u8; 16];
     capsule_tag.copy_from_slice(&full_hash[..16]);
 
-    // --- Стадия carrier: сосед предлагает нести capsule; устройство решает по
-    //     бюджету (+ PoW, привязанный к capsule) ---
+    // --- The carrier stage: a neighbour offers a capsule; the device decides by its budget
+    //     (plus the PoW bound to the capsule) ---
     let limits = BudgetLimits {
         window_secs: 24 * 60 * 60,
         per_peer_max_messages: 10,
@@ -167,14 +167,14 @@ fn dtn_full_lifecycle_carrier_then_ingress() {
         bytes: ciphertext.len() as u64,
         pow_nonce: pow,
     };
-    assert_eq!(carrier.offer(&offer, NOW), CarryDecision::Accept, "носитель принимает capsule");
+    assert_eq!(carrier.offer(&offer, NOW), CarryDecision::Accept, "the carrier accepts the capsule");
 
-    // --- Стадия ingress-return: онлайн-носитель заливает capsule в сеть ---
+    // --- The ingress-return stage: the online carrier uploads the capsule to the network ---
     let mut dtn_replay = RollingReplayWindow::new(8);
     let client = b"203.0.113.11:7001";
     let carrier_id = b"c";
     let cookie = kr.issue(client, carrier_id, NOW as u32);
-    let proof = cap.prove(&full_hash); // MAC над H(ciphertext)
+    let proof = cap.prove(&full_hash); // a MAC over H(ciphertext)
     let mk_req = |ct: &'static [u8]| DtnRequest {
         raw_len: ct.len(),
         client_addr: client,
@@ -186,23 +186,23 @@ fn dtn_full_lifecycle_carrier_then_ingress() {
     assert_eq!(
         pipe.process_dtn(&mk_req(ciphertext), &caps, &mut dtn_replay, NOW, [0; 64]),
         Outcome::Admit,
-        "пронесённая capsule принята ingress'ом"
+        "the carried capsule is accepted by ingress"
     );
 
-    // Replay той же capsule (другой mesh-путь принёс копию) → DtnReplay.
+    // A replay of the same capsule (another mesh path brought a copy) → DtnReplay.
     assert_eq!(
         pipe.process_dtn(&mk_req(ciphertext), &caps, &mut dtn_replay, NOW, [0; 64]),
         Outcome::Reject(RejectReason::DtnReplay)
     );
 
-    // Подмена содержимого при том же proof → Reject(Dtn).
+    // Substituted content with the same proof → Reject(Dtn).
     let other = b"attacker-substituted-different-content";
     let sub = DtnRequest {
         raw_len: other.len(),
         client_addr: client,
         carrier_id,
         cookie: Some(cookie),
-        proof, // proof для исходного ciphertext
+        proof, // the proof for the original ciphertext
         ciphertext: other,
     };
     assert!(matches!(
@@ -213,8 +213,8 @@ fn dtn_full_lifecycle_carrier_then_ingress() {
 
 #[test]
 fn dtn_carrier_sybil_capped_before_ingress() {
-    // Sybil из многих дешёвых identity упирается в device-бюджет ещё на стадии
-    // carrier — до всякого ingress. (e2e-подтверждение §7.7-аргумента в связке.)
+    // A Sybil of many cheap identities hits the device budget already at the carrier stage —
+    // before any ingress. (An e2e confirmation of the §7.7 argument in the seam.)
     let limits = BudgetLimits {
         window_secs: 24 * 60 * 60,
         per_peer_max_messages: 5,
@@ -235,17 +235,17 @@ fn dtn_carrier_sybil_capped_before_ingress() {
             }
         }
     }
-    assert_eq!(accepted, 20, "device-бюджет ограничивает Sybil на carrier-стадии");
+    assert_eq!(accepted, 20, "the device budget bounds a Sybil at the carrier stage");
 }
 
 // ============================================================================
-// RLN — обе стороны честной границы одним тестом: quota-слой РАБОТАЕТ, но
-// ветка конвейера остаётся RlnNotImplemented (нет zk-обёртки).
+// RLN — both sides of the honest boundary in one test: the quota layer WORKS, while the pipeline
+// branch stays RlnNotImplemented (there is no zk wrapper).
 // ============================================================================
 
 #[test]
 fn rln_layer_works_but_pipeline_branch_not_implemented() {
-    // (a) Слой наказания работает: второе разное сообщение → деанон.
+    // (a) The penalty layer works: a second, different message deanonymises.
     let mut tracker = RlnQuotaTracker::new(7, b"relay-scope", 1024);
     let id = IdentitySecret(Field::from(0xABCDu64));
     let ext = external_nullifier(7, b"relay-scope");
@@ -254,10 +254,10 @@ fn rln_layer_works_but_pipeline_branch_not_implemented() {
         RlnOutcome::QuotaViolation { recovered_secret } => {
             assert_eq!(recovered_secret, id.0.to_bytes());
         }
-        other => panic!("ожидался slash, получено {:?}", other),
+        other => panic!("expected a slash, got {:?}", other),
     }
 
-    // (b) Но в конвейере RLN-ветка не проходит (zk-обёртка застаблена).
+    // (b) But in the pipeline the RLN branch does not pass (the zk wrapper is stubbed).
     let kr = keyring();
     let caps = CapabilityTable::new();
     let ring = dummy_ring();
@@ -289,8 +289,8 @@ fn rln_layer_works_but_pipeline_branch_not_implemented() {
 }
 
 // ============================================================================
-// Live с настоящей пороговой кольцевой подписью (feature-gated).
-// Связывает tring::sign ↔ token::RealRingVerifier ↔ pipeline в одном сценарии.
+// Live with a real threshold ring signature (feature-gated).
+// It ties tring::sign ↔ token::RealRingVerifier ↔ pipeline together in one scenario.
 // ============================================================================
 
 #[cfg(feature = "unaudited-crypto")]
@@ -314,7 +314,7 @@ fn live_real_ring_token_journey() {
     let kps: Vec<IssuerKeypair> = (0u8..5).map(|i| kp(&[i])).collect();
     let ring_pts: Vec<RistrettoPoint> = kps.iter().map(|k| k.public).collect();
     let token_nonce = [0x9C; 32];
-    // 2 из 5 issuer'ов подписывают nonce токена.
+    // Two of five issuers sign the token nonce.
     let signers = vec![(1usize, kps[1].secret), (3usize, kps[3].secret)];
     let sig = sign(&token_nonce, &ring_pts, 2, &signers).unwrap();
 
@@ -349,7 +349,7 @@ fn live_real_ring_token_journey() {
     };
     assert_eq!(pipe.process(&req, NOW, 0, [0; 64], &mut replay, &mut admission::capability::CapabilityQuotaTracker::new()), Outcome::Admit);
 
-    // Искажение подписи → reject через тот же конвейер.
+    // Distorting the signature → a reject through the same pipeline.
     let mut bad_bytes = sig.to_bytes();
     let n = bad_bytes.len();
     bad_bytes[n - 1] ^= 0x01;

@@ -1,10 +1,10 @@
-//! Интеграция DTN-класса (§7.7) в Ingress-конвейер (§7.5/§10).
+//! Integration of the DTN class (§7.7) into the Ingress pipeline (§7.5/§10).
 //!
-//! Вес несут два теста по блокерам, которые happy-path не показал бы (оба —
-//! из-за того, что DTN-proof едет через недоверенных наблюдающих mesh-
-//! носителей): (1) proof привязан к содержимому — нельзя прицепить к другому
-//! контенту; (2) вставка в rolling-window только ПОСЛЕ верификации — мусорный
-//! proof не блокирует настоящую capsule.
+//! The weight is carried by two tests for the blockers a happy path would not show (both arise
+//! because a DTN proof travels through untrusted, observing mesh carriers): (1) the proof is bound
+//! to the content, so it cannot be attached to different content; (2) the insert into the rolling
+//! window happens only AFTER verification, so a garbage proof cannot block the real capsule.
+
 
 use admission::capability::CapabilityTable;
 use admission::cookie::CookieKeyring;
@@ -34,13 +34,13 @@ fn dtn_cap(max_bytes: u64) -> DtnCapability {
     }
 }
 
-/// Собрать валидный DTN-proof для конкретного ciphertext (как это делает
-/// добросовестный отправитель: MAC над H(ciphertext)).
+/// Build a valid DTN proof for a specific ciphertext (as an honest sender does: a MAC over
+/// H(ciphertext)).
 fn proof_for(cap: &DtnCapability, ciphertext: &[u8]) -> DtnCapabilityProof {
     cap.prove(&capsule_hash(ciphertext))
 }
 
-/// Обёртка над pipeline с пустыми live-зависимостями (DTN их не использует).
+/// A wrapper over the pipeline with empty live dependencies (DTN does not use them).
 fn run_dtn(
     caps: &DtnCapabilityTable,
     replay: &mut RollingReplayWindow,
@@ -92,12 +92,12 @@ fn valid_dtn_capsule_admitted() {
     assert_eq!(run_dtn(&caps, &mut replay, &req), Outcome::Admit);
 }
 
-// ---------- Блокер 1: привязка proof к содержимому ----------
+// ---------- Blocker 1: the proof is bound to the content ----------
 
 #[test]
 fn proof_cannot_be_reattached_to_other_content() {
-    // Наблюдатель в mesh видит валидный (proof, ct_A). Пытается прицепить его к
-    // другому контенту ct_B. H(ct_B) ≠ H(ct_A) → MAC не сойдётся → отказ.
+    // An observer in the mesh sees a valid (proof, ct_A) and tries to attach it to different
+    // content ct_B. H(ct_B) ≠ H(ct_A) → the MAC does not match → refused.
     let cap = dtn_cap(1 << 20);
     let mut caps = DtnCapabilityTable::new();
     caps.insert(cap.clone());
@@ -106,21 +106,21 @@ fn proof_cannot_be_reattached_to_other_content() {
 
     let ct_a = b"original-capsule";
     let ct_b = b"attacker-substituted-content";
-    let stolen_proof = proof_for(&cap, ct_a); // валиден для ct_a
-    let req = cookied_request(&kr, stolen_proof, ct_b); // прицеплен к ct_b
+    let stolen_proof = proof_for(&cap, ct_a); // valid for ct_a
+    let req = cookied_request(&kr, stolen_proof, ct_b); // attached to ct_b
     assert!(
         matches!(run_dtn(&caps, &mut replay, &req), Outcome::Reject(RejectReason::Dtn(_))),
-        "proof, украденный из mesh, не должен подойти к другому содержимому"
+        "a proof stolen from the mesh must not fit different content"
     );
 }
 
-// ---------- Блокер 2: мусорный proof не блокирует настоящую capsule ----------
+// ---------- Blocker 2: a garbage proof does not block the real capsule ----------
 
 #[test]
 fn garbage_proof_does_not_burn_capsule_id() {
-    // Атакующий, подсмотревший ct в mesh, заливает его ПЕРВЫМ с мусорным proof.
-    // Ступень 3 (read-only CHECK) не сжигает id, Ступень 4 отвергает мусор без
-    // insert. Значит настоящая capsule с валидным proof потом проходит.
+    // An attacker who glimpsed the ct in the mesh uploads it FIRST with a garbage proof. Stage 3
+    // (a read-only CHECK) does not burn the id, and Stage 4 refuses the garbage before the insert.
+    // So the real capsule with a valid proof passes afterwards.
     let cap = dtn_cap(1 << 20);
     let mut caps = DtnCapabilityTable::new();
     caps.insert(cap.clone());
@@ -129,24 +129,24 @@ fn garbage_proof_does_not_burn_capsule_id() {
 
     let ct = b"capsule-visible-in-mesh";
 
-    // (1) Атакующий: тот же ct, но мусорный MAC.
+    // (1) The attacker: the same ct but a garbage MAC.
     let garbage = DtnCapabilityProof { capability_id: cap.capability_id, mac: [0xFF; 16] };
     let atk_req = cookied_request(&kr, garbage, ct);
     assert!(
         matches!(run_dtn(&caps, &mut replay, &atk_req), Outcome::Reject(RejectReason::Dtn(_))),
-        "мусорный proof должен быть отвергнут"
+        "a garbage proof must be rejected"
     );
 
-    // (2) Настоящая capsule с валидным proof — id НЕ был сожжён → Admit.
+    // (2) The real capsule with a valid proof — the id was NOT burned → Admit.
     let real_req = cookied_request(&kr, proof_for(&cap, ct), ct);
     assert_eq!(
         run_dtn(&caps, &mut replay, &real_req),
         Outcome::Admit,
-        "настоящая capsule не должна быть заблокирована предшествующим мусором"
+        "the real capsule must not be blocked by a preceding garbage upload"
     );
 }
 
-// ---------- Replay настоящей capsule ----------
+// ---------- Replay of the real capsule ----------
 
 #[test]
 fn genuine_replay_rejected() {
@@ -159,16 +159,16 @@ fn genuine_replay_rejected() {
 
     let req1 = cookied_request(&kr, proof_for(&cap, ct), ct);
     assert_eq!(run_dtn(&caps, &mut replay, &req1), Outcome::Admit);
-    // Тот же ct во второй раз (напр. другой mesh-путь принёс копию) → replay.
+    // The same ct a second time (another mesh path brought a copy) → DtnReplay.
     let req2 = cookied_request(&kr, proof_for(&cap, ct), ct);
     assert_eq!(run_dtn(&caps, &mut replay, &req2), Outcome::Reject(RejectReason::DtnReplay));
 }
 
-// ---------- max_bytes и срок ----------
+// ---------- max_bytes and expiry ----------
 
 #[test]
 fn oversize_capsule_rejected_by_quota() {
-    let cap = dtn_cap(8); // очень маленькая квота
+    let cap = dtn_cap(8); // a very small quota
     let mut caps = DtnCapabilityTable::new();
     caps.insert(cap.clone());
     let mut replay = RollingReplayWindow::new(8);
@@ -181,13 +181,13 @@ fn oversize_capsule_rejected_by_quota() {
     ));
 }
 
-// ---------- Размер: DTN-капсула НЕ ограничена live-MTU ----------
+// ---------- Size: a DTN capsule is NOT bounded by the live MTU ----------
 
 #[test]
 fn realistic_large_capsule_admitted_not_mtu_capped() {
-    // 50 КБ — далеко за live-MTU (1400), но в пределах DTN-потолка и квоты.
-    // Этот тест — доказательство, что общий precheck не навязывает DTN
-    // live-MTU (иначе почти любая настоящая capsule дропалась бы на Ступени 0).
+    // 50 KB — far beyond the live MTU (1400) but within the DTN ceiling and the quota.
+    // This test proves the shared precheck does not impose the live MTU on DTN (otherwise almost
+    // every real capsule would be dropped at Stage 0).
     let cap = dtn_cap(1 << 20);
     let mut caps = DtnCapabilityTable::new();
     caps.insert(cap.clone());
@@ -196,21 +196,21 @@ fn realistic_large_capsule_admitted_not_mtu_capped() {
 
     let ct = vec![0xAB_u8; 50 * 1024];
     let mut req = cookied_request(&kr, proof_for(&cap, &ct), &ct);
-    req.raw_len = ct.len(); // реальный размер загрузки
+    req.raw_len = ct.len(); // the real upload size
     assert_eq!(run_dtn(&caps, &mut replay, &req), Outcome::Admit);
 }
 
 #[test]
 fn capsule_over_dtn_ceiling_dropped_before_hashing() {
-    // Свыше глобального DTN-потолка → Drop на Ступени 0 (до хеширования),
-    // защита от заведомо огромной загрузки.
-    let cap = dtn_cap(u64::MAX); // квота не ограничивает — сработать должен потолок
+    // Above the global DTN ceiling → a Drop at Stage 0 (before hashing) — protection against an
+    // obviously huge upload.
+    let cap = dtn_cap(u64::MAX); // the quota does not bind — the ceiling must fire
     let mut caps = DtnCapabilityTable::new();
     caps.insert(cap.clone());
     let mut replay = RollingReplayWindow::new(8);
     let kr = keyring();
 
-    let ct = vec![0u8; 8]; // содержимое неважно — raw_len заявлен огромным
+    let ct = vec![0u8; 8]; // the contents do not matter — raw_len is declared huge
     let mut req = cookied_request(&kr, proof_for(&cap, &ct), &ct);
     req.raw_len = MAX_DTN_CAPSULE_SIZE + 1;
     assert!(matches!(
@@ -219,7 +219,7 @@ fn capsule_over_dtn_ceiling_dropped_before_hashing() {
     ));
 }
 
-// ---------- Cookie сохраняется для DTN-ветки ----------
+// ---------- The cookie is kept for the DTN branch ----------
 
 #[test]
 fn dtn_without_cookie_gets_challenge() {
@@ -232,7 +232,7 @@ fn dtn_without_cookie_gets_challenge() {
         raw_len: 400,
         client_addr: b"203.0.113.9:6000",
         carrier_id: b"c",
-        cookie: None, // онлайн-аплинк без cookie
+        cookie: None, // an online uplink without a cookie
         proof: proof_for(&cap, ct),
         ciphertext: ct,
     };

@@ -1,5 +1,5 @@
-//! Тесты DTN-класса допуска §7.7. Вес несут состязательные: Sybil из многих
-//! дешёвых mesh-identity должен упираться в device-бюджет, а не в per-peer.
+//! Tests for the §7.7 DTN admission class. The weight is carried by the adversarial ones: a Sybil
+//! of many cheap mesh identities must hit the device budget, not the per-peer one.
 
 use admission::dtn::{
     solve_pow, BudgetLimits, CarryBudgetTracker, CarryDecision, CarryOffer, DtnCapability,
@@ -7,7 +7,7 @@ use admission::dtn::{
     SECS_PER_DAY,
 };
 
-/// Предложение без PoW (для тестов с pow_difficulty_bits = 0).
+/// An offer without PoW (for tests with pow_difficulty_bits = 0).
 fn plain_offer(peer: [u8; 16], bytes: u64) -> CarryOffer<'static> {
     CarryOffer {
         peer,
@@ -42,7 +42,7 @@ fn dtn_capability_proof_verifies() {
 
     let nonce = b"capsule-nonce";
     let proof = cap.prove(nonce);
-    // Валиден сразу и спустя дни (нет epoch-квантования).
+    // Valid immediately and days later (there is no epoch quantisation).
     assert!(table.verify(&proof, nonce, 500, now).is_ok());
     assert!(table.verify(&proof, nonce, 500, now + 3 * SECS_PER_DAY).is_ok());
 }
@@ -56,7 +56,7 @@ fn dtn_capability_enforces_max_bytes() {
     table.insert(cap.clone());
     let nonce = b"n";
     let proof = cap.prove(nonce);
-    // В пределах квоты — ок; сверх — QuotaExceeded.
+    // Within quota — fine; beyond it — QuotaExceeded.
     assert!(table.verify(&proof, nonce, 1_000, now).is_ok());
     assert!(table.verify(&proof, nonce, 1_001, now).is_err());
 }
@@ -69,7 +69,7 @@ fn dtn_capability_expires_by_not_after() {
     table.insert(cap.clone());
     let nonce = b"n";
     let proof = cap.prove(nonce);
-    // За not_after — Expired.
+    // Past not_after — Expired.
     assert!(table.verify(&proof, nonce, 500, cap.not_after + 1).is_err());
 }
 
@@ -80,7 +80,7 @@ fn dtn_capability_bad_mac_rejected() {
     let mut table = DtnCapabilityTable::new();
     table.insert(cap.clone());
     let proof = cap.prove(b"nonce-A");
-    // Другой nonce → MAC не совпал.
+    // A different nonce → the MAC does not match.
     assert!(table.verify(&proof, b"nonce-B", 500, now).is_err());
 }
 
@@ -88,7 +88,7 @@ fn dtn_capability_bad_mac_rejected() {
 fn dtn_capability_ttl_too_long_rejected() {
     let now = 1_000_000u64;
     let mut cap = sample_cap(now);
-    cap.not_after = now + MAX_DTN_TRANSIT_TTL_SECS + 1; // за пределом
+    cap.not_after = now + MAX_DTN_TRANSIT_TTL_SECS + 1; // beyond the limit
     assert!(cap.validate_issue().is_err());
 }
 
@@ -101,7 +101,7 @@ fn limits() -> BudgetLimits {
         per_peer_max_bytes: 5_000,
         device_max_messages: 20,
         device_max_bytes: 100_000,
-        pow_difficulty_bits: 0, // PoW отдельно тестируется ниже
+        pow_difficulty_bits: 0, // PoW is tested separately below
     }
 }
 
@@ -110,7 +110,7 @@ fn per_peer_limit_caps_single_noisy_neighbor() {
     let mut t = CarryBudgetTracker::new(limits());
     let peer = [0xAA; 16];
     let now = 1_000u64;
-    // 5 сообщений проходят, 6-е — RejectPerPeer (device-бюджет ещё есть).
+    // Five messages pass, the sixth is RejectPerPeer (the device budget still has room).
     for _ in 0..5 {
         assert_eq!(t.offer(&plain_offer(peer, 100), now), CarryDecision::Accept);
     }
@@ -120,7 +120,7 @@ fn per_peer_limit_caps_single_noisy_neighbor() {
 #[test]
 fn pow_throttle_rejects_insufficient_and_accepts_solved() {
     use admission::dtn::pow_leading_zero_bits;
-    let difficulty = 12u32; // низкая, быстро решается в тесте
+    let difficulty = 12u32; // low, so the test solves it quickly
     let mut lim = limits();
     lim.pow_difficulty_bits = difficulty;
     let mut t = CarryBudgetTracker::new(lim);
@@ -128,14 +128,14 @@ fn pow_throttle_rejects_insufficient_and_accepts_solved() {
     let tag = b"capsule-xyz";
     let now = 1_000u64;
 
-    // Решённый PoW проходит throttle (и далее бюджет) → Accept.
+    // A solved PoW passes the throttle (and then the budget) → Accept.
     let solved = solve_pow(&peer, tag, difficulty);
     assert!(pow_leading_zero_bits(&peer, tag, solved) >= difficulty);
     let good = CarryOffer { peer, capsule_tag: tag, bytes: 100, pow_nonce: solved };
     assert_eq!(t.offer(&good, now), CarryDecision::Accept);
 
-    // Заведомо недостаточный nonce (первый, дающий < difficulty бит) → RejectPow,
-    // причём PoW проверяется ДО бюджета.
+    // A deliberately insufficient nonce (the first one giving fewer than `difficulty` bits) →
+    // Reject, and the PoW is checked BEFORE the budget.
     let mut bad_nonce = 0u64;
     while pow_leading_zero_bits(&peer, tag, bad_nonce) >= difficulty {
         bad_nonce += 1;
@@ -143,22 +143,22 @@ fn pow_throttle_rejects_insufficient_and_accepts_solved() {
     let bad = CarryOffer { peer, capsule_tag: tag, bytes: 100, pow_nonce: bad_nonce };
     assert_eq!(t.offer(&bad, now), CarryDecision::RejectPow);
 
-    // PoW привязан к capsule_tag: тот же nonce под другой tag не годится.
+    // The PoW is bound to capsule_tag: the same nonce under a different tag does not do.
     let other = CarryOffer { peer, capsule_tag: b"other-capsule", bytes: 100, pow_nonce: solved };
-    // (почти наверняка недостаточен — иначе тест ложно прошёл бы; проверяем явно)
+    // (Almost certainly insufficient — otherwise the test would pass falsely.)
     if pow_leading_zero_bits(&peer, b"other-capsule", solved) < difficulty {
         assert_eq!(t.offer(&other, now), CarryDecision::RejectPow);
     }
 }
 
-// ---------- Carry budget: Sybil (несущий тест §7.7) ----------
+// ---------- Carry budget: Sybil (the load-bearing §7.7 test) ----------
 
 #[test]
 fn device_budget_caps_sybil_of_many_cheap_identities() {
-    // Атакующий: 100 РАЗНЫХ эфемерных identity, каждая шлёт лишь 3 сообщения —
-    // строго под per_peer_max=5. Без device-бюджета это забило бы устройство
-    // (300 сообщений). С device_max=20 — принимается ровно 20, остальное
-    // RejectDevice, независимо от числа «новых» пиров.
+    // The attacker: 100 DIFFERENT ephemeral identities, each sending only 3 messages, strictly
+    // under per_peer_max=5. Without a device budget that would bury the device (300 messages).
+    // With device_max=20, exactly 20 are accepted and the rest are RejectDevice, whatever the
+    // number of "new" peers.
     let mut t = CarryBudgetTracker::new(limits());
     let now = 1_000u64;
     let mut accepted = 0;
@@ -170,18 +170,18 @@ fn device_budget_caps_sybil_of_many_cheap_identities() {
             match t.offer(&plain_offer(peer, 100), now) {
                 CarryDecision::Accept => accepted += 1,
                 CarryDecision::RejectDevice => rejected_device += 1,
-                other => panic!("не ожидалось: {:?} (3 < per_peer 5, PoW выкл)", other),
+                other => panic!("unexpected: {:?} (3 < per_peer 5, PoW off)", other),
             }
         }
     }
-    assert_eq!(accepted, 20, "device-бюджет должен принять ровно device_max_messages");
+    assert_eq!(accepted, 20, "the device budget must accept exactly device_max_messages");
     assert_eq!(rejected_device, 300 - 20);
 }
 
 #[test]
 fn device_byte_budget_caps_aggregate() {
-    // Тот же принцип по байтам: много пиров под per_peer_max_bytes, но суммарно
-    // за device_max_bytes.
+    // The same principle by bytes: many peers under per_peer_max_bytes, but the total is beyond
+    // device_max_bytes.
     let lim = BudgetLimits {
         window_secs: SECS_PER_DAY,
         per_peer_max_messages: 100,
@@ -200,7 +200,7 @@ fn device_byte_budget_caps_aggregate() {
             accepted_bytes += 1_000;
         }
     }
-    assert_eq!(accepted_bytes, 50_000, "суммарные байты не должны превысить device_max_bytes");
+    assert_eq!(accepted_bytes, 50_000, "the total bytes must not exceed device_max_bytes");
 }
 
 #[test]
@@ -208,15 +208,15 @@ fn sliding_window_frees_capacity_over_time() {
     let mut t = CarryBudgetTracker::new(limits());
     let peer = [0xBB; 16];
     let start = 1_000u64;
-    // Забить per-peer лимит.
+    // Fill the per-peer limit.
     for _ in 0..5 {
         assert_eq!(t.offer(&plain_offer(peer, 100), start), CarryDecision::Accept);
     }
     assert_eq!(t.offer(&plain_offer(peer, 100), start), CarryDecision::RejectPerPeer);
-    // Спустя окно+1 старые события выпали → снова есть место.
+    // After window+1 the old events fall out → there is room again.
     let later = start + SECS_PER_DAY + 1;
     assert_eq!(t.offer(&plain_offer(peer, 100), later), CarryDecision::Accept);
-    assert_eq!(t.device_message_count(), 1, "старые события должны быть вычищены");
+    assert_eq!(t.device_message_count(), 1, "old events must be pruned");
 }
 
 // ---------- Rolling replay window ----------
@@ -236,7 +236,7 @@ fn rolling_replay_expired_not_stored() {
     let mut w = RollingReplayWindow::new(8);
     let now = 100 * SECS_PER_DAY;
     let id = [0x22; 16];
-    // not_after в прошлом → Expired.
+    // not_after in the past → Expired.
     assert_eq!(w.check_and_insert(id, now - 1, now), ReplayCheck::Expired);
 }
 
@@ -245,25 +245,25 @@ fn rolling_replay_beyond_window_rejected() {
     let mut w = RollingReplayWindow::new(8);
     let now = 100 * SECS_PER_DAY;
     let id = [0x33; 16];
-    // not_after дальше 8 дней вперёд → BeyondWindow.
+    // not_after more than 8 days ahead → BeyondWindow.
     let far = now + 8 * SECS_PER_DAY;
     assert_eq!(w.check_and_insert(id, far, now), ReplayCheck::BeyondWindow);
 }
 
 #[test]
 fn rolling_replay_bucket_recycled_frees_old() {
-    // Запись в день D; спустя N дней тот же слот-корзину переиспользует день
-    // D+N, старая запись вычищается → та же id снова Fresh (и так истекла).
+    // A record on day D; N days later the same slot bucket is recycled for D+N, the old record is
+    // cleared, and the same id is Fresh again (it had expired anyway).
     let mut w = RollingReplayWindow::new(8);
     let day0 = 100 * SECS_PER_DAY;
     let id = [0x44; 16];
-    let na0 = day0 + SECS_PER_DAY; // истекает на следующий день
+    let na0 = day0 + SECS_PER_DAY; // expires the next day
     assert_eq!(w.check_and_insert(id, na0, day0), ReplayCheck::Fresh);
     assert_eq!(w.check_and_insert(id, na0, day0), ReplayCheck::Replayed);
 
-    // Спустя 8 дней тот же слот займёт новый день → старая запись ушла.
+    // Eight days later the same slot holds a new day → the old record is gone.
     let day8 = day0 + 8 * SECS_PER_DAY;
     let na8 = day8 + SECS_PER_DAY;
-    // (та же id, но теперь корзина переиспользована — считается свежей)
+    // (The same id, but the bucket has been recycled — it counts as fresh.)
     assert_eq!(w.check_and_insert(id, na8, day8), ReplayCheck::Fresh);
 }

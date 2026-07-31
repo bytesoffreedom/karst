@@ -162,7 +162,7 @@ fn derive_key(
 ) -> Key {
     let mut ikm = Vec::with_capacity(32 + pq_shared.len());
     ikm.extend_from_slice(classical_dh);
-    ikm.extend_from_slice(pq_shared); // пусто сейчас; слот под ML-KEM
+    ikm.extend_from_slice(pq_shared); // empty for now; the slot reserved for ML-KEM
     let hk = Hkdf::<Sha256>::new(None, &ikm);
     let mut info = Vec::new();
     info.extend_from_slice(b"KARST-skeleton-seal-v1");

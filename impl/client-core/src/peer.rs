@@ -523,7 +523,7 @@ pub struct Peer<T: Transport> {
     /// persisted (like `lease`/`pending_ack`) — this is a live "something is flooding you"
     /// signal for the caller, not session state that has to survive a restart. Existing
     /// signalling paths hand back only `None` for a payload that could not be delivered
-    /// (indistinguishable from ordinary cover traffic / a miss); this is what makes a capacity
+    /// (the same shape as a padded miss); this is what makes a capacity
     /// refusal LOUD instead.
     sessions_refused: u64,
     /// Count of real `Session::decrypt` attempts made while routing an inbound `Ratchet`
@@ -1051,7 +1051,7 @@ impl<T: Transport> Peer<T> {
         // unpadded send site would restore the size signal for that message class alone — and it
         // would be the class nobody thought about.
         let padded = crate::pad::pad(plaintext)?;
-        let rmsg = st.session.encrypt(&padded); // продвигает сохранённую сессию
+        let rmsg = st.session.encrypt(&padded); // advances the stored session
         Ok(match &st.pending_initial {
             // Seal the opener to the RECIPIENT's identity key. The KeyAgreement carries
             // our long-term IK, and an unsealed opener hands the relay the social-graph

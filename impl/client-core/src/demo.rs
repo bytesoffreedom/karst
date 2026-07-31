@@ -23,7 +23,7 @@ use karst_crypto::seal::{Identity, SkeletonSeal};
 /// (§7) с реальным cookie round-trip и шлёт через транспорт.
 pub struct Client<T: Transport> {
     transport: T,
-    capability: Capability, // выдана relay; клиент хранит для proof'ов
+    capability: Capability, // issued by the relay; the client keeps it for proofs
     client_addr: Vec<u8>,
     carrier_id: Vec<u8>,
     cookie: Option<Cookie>,
@@ -162,7 +162,7 @@ impl<T: Transport> Recipient<T> {
         for _ in 0..2 {
             let proof = match self.cookie {
                 Some(c) => fetch_proof(&shared, &c.mac, &mailbox),
-                None => [0u8; 16], // cookie ещё нет → сервер сделает challenge
+                None => [0u8; 16], // no cookie yet → the server will challenge
             };
             let req = FetchRequest {
                 mailbox,

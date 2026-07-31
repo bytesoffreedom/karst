@@ -38,7 +38,7 @@ pub fn safety_number(ik_a: &[u8; 32], ik_b: &[u8; 32]) -> String {
     h.update([VERSION]);
     h.update(lo);
     h.update(hi);
-    let digest = h.finalize(); // 64 байта ≥ GROUPS*5
+    let digest = h.finalize(); // 64 bytes ≥ GROUPS*5
 
     let mut out = String::with_capacity(GROUPS * 6);
     for i in 0..GROUPS {
@@ -99,10 +99,10 @@ mod tests {
     fn format_is_twelve_groups_of_five_digits() {
         let sn = safety_number(&[1u8; 32], &[2u8; 32]);
         let groups: Vec<&str> = sn.split(' ').collect();
-        assert_eq!(groups.len(), 12, "12 групп");
+        assert_eq!(groups.len(), 12, "12 groups");
         for g in groups {
-            assert_eq!(g.len(), 5, "5 цифр в группе (zero-pad)");
-            assert!(g.chars().all(|c| c.is_ascii_digit()), "только цифры");
+            assert_eq!(g.len(), 5, "5 digits per group (zero-padded)");
+            assert!(g.chars().all(|c| c.is_ascii_digit()), "digits only");
         }
     }
 }

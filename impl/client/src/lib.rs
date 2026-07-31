@@ -54,9 +54,9 @@ use store::Store;
 /// файл есть, но не расшифровался (неверный `KARST_PASSPHRASE`/повреждение).
 fn secret_load_err(what: &str, e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
-        format!("нет {what} (karst init)")
+        format!("no {what} (run karst init)")
     } else {
-        format!("не удалось прочитать {what} (неверный KARST_PASSPHRASE или повреждение): {e}")
+        format!("could not read {what} (wrong KARST_PASSPHRASE or corruption): {e}")
     }
 }
 
@@ -1383,9 +1383,9 @@ pub struct RelayId {
 impl RelayId {
     /// Разобрать 128-hex (64 байта: noise ‖ fetch).
     pub fn parse(hex_str: &str) -> Result<Self, String> {
-        let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("relay-id не hex: {e}"))?;
+        let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("relay-id is not hex: {e}"))?;
         if bytes.len() != 64 {
-            return Err(format!("relay-id должен быть 64 байта (128 hex), дано {}", bytes.len()));
+            return Err(format!("relay-id must be 64 bytes (128 hex), got {}", bytes.len()));
         }
         let mut noise_pub = [0u8; 32];
         let mut fetch_pub = [0u8; 32];
@@ -1922,8 +1922,8 @@ pub fn send_session(
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
 
-    let _lock = store.lock_sessions().map_err(|e| format!("замок сессий: {e}"))?;
-    peer.import_state(store.load_sessions().map_err(|e| format!("чтение сессий: {e}"))?);
+    let _lock = store.lock_sessions().map_err(|e| format!("session lock: {e}"))?;
+    peer.import_state(store.load_sessions().map_err(|e| format!("reading sessions: {e}"))?);
     if !peer.has_session(to_ik) {
         // The return value is the FORWARD-SECRECY strength of this first contact, and it is not
         // allowed to be dropped: a relay that withholds every one-time prekey downgrades the
@@ -1953,7 +1953,7 @@ pub fn send_session(
     // because only a batch can make its own manifest the collateral damage of its own chunks).
     let mut ledger = load_ledger_or_empty(store);
     let (id, victim) = queue_and_note(&mut peer, &ledger, to_ik, plaintext, now)?;
-    store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (pre): {e}"))?;
+    store.save_sessions(&peer.export_state()).map_err(|e| format!("writing sessions (pre): {e}"))?;
     // The eviction (if any) is now real — record its victim before it is forgotten everywhere.
     if let Some(v) = victim {
         ledger.retain(|e| e.id != v.id);
@@ -1964,7 +1964,7 @@ pub fn send_session(
     // transport failure left behind) — exact retransmit, never a re-encrypt.
     let delivered = peer.flush_outbox(now);
     // Post-save persists the removals (delivered) and any cleared `pending_initial`.
-    store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (post): {e}"))?;
+    store.save_sessions(&peer.export_state()).map_err(|e| format!("writing sessions (post): {e}"))?;
     let ledger = reconcile_ledger(store, &peer, ledger, &delivered, now);
     save_ledger_best_effort(store, &ledger);
     // `true` = this message reached the relay this call; `false` = the relay was down and it
@@ -2066,8 +2066,8 @@ pub fn send_session_batch(
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
     let mut peer = Peer::new(transport, account, cap, fetch_pub);
 
-    let _lock = store.lock_sessions().map_err(|e| format!("замок сессий: {e}"))?;
-    peer.import_state(store.load_sessions().map_err(|e| format!("чтение сессий: {e}"))?);
+    let _lock = store.lock_sessions().map_err(|e| format!("session lock: {e}"))?;
+    peer.import_state(store.load_sessions().map_err(|e| format!("reading sessions: {e}"))?);
     if !peer.has_session(to_ik) && peer.connect(to_ik, now)? == ForwardSecrecy::NoOneTimePrekey {
         store.mark_reduced_fs(*to_ik).map_err(|e| format!("reduced-FS record: {e}"))?;
     }
@@ -2094,7 +2094,7 @@ pub fn send_session_batch(
     // The whole batch fits: commit the advanced state ONCE — same crash-consistency as
     // `send_session` (envelope N queued ⟺ ratchet ≥ N+1), but for the whole batch in one atomic
     // save.
-    store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (pre): {e}"))?;
+    store.save_sessions(&peer.export_state()).map_err(|e| format!("writing sessions (pre): {e}"))?;
     // Track every payload this call durably queued, so a LATER loss (cap eviction from some
     // future send, or TTL expiry) can still be attributed to what it was (R2-6). None of THESE
     // ids could have just been evicted — the loop above refused rather than let that happen.
@@ -2102,7 +2102,7 @@ pub fn send_session_batch(
         ledger.push(store::PendingSend { id: *id, peer_ik: *to_ik, plaintext: p.clone(), queued_at: now });
     }
     let delivered = peer.flush_outbox(now);
-    store.save_sessions(&peer.export_state()).map_err(|e| format!("запись сессий (post): {e}"))?;
+    store.save_sessions(&peer.export_state()).map_err(|e| format!("writing sessions (post): {e}"))?;
     let ledger = reconcile_ledger(store, &peer, ledger, &delivered, now);
     save_ledger_best_effort(store, &ledger);
     Ok(())
@@ -3700,8 +3700,8 @@ pub fn recv_session(
     // the exact ciphertext; the ratchet's transactional decrypt fails closed on the
     // already-consumed duplicate, so redelivery is effectively-once with no dedup store.
 
-    let _lock = store.lock_sessions().map_err(|e| format!("замок сессий: {e}"))?;
-    peer.import_state(store.load_sessions().map_err(|e| format!("чтение сессий: {e}"))?);
+    let _lock = store.lock_sessions().map_err(|e| format!("session lock: {e}"))?;
+    peer.import_state(store.load_sessions().map_err(|e| format!("reading sessions: {e}"))?);
     // Load one-time prekey secrets so an opener that consumed one can be accepted; receive
     // deletes the used ones, and we persist the remainder so they are never reused.
     peer.load_opks(&store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?);

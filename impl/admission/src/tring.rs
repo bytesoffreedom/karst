@@ -154,7 +154,7 @@ pub enum TRingError {
 fn hash_to_scalar(parts: &[&[u8]]) -> Scalar {
     let mut h = Sha512::new();
     for p in parts {
-        h.update((p.len() as u64).to_be_bytes()); // домен-разделение по длине
+        h.update((p.len() as u64).to_be_bytes()); // length-prefixed domain separation
         h.update(p);
     }
     let mut wide = [0u8; 64];
@@ -246,8 +246,8 @@ pub fn sign(
         }
         is_signer[*idx] = true;
     }
-    let s = signers.len(); // фактическое число подписантов (≥ t)
-    let degree = n - s; // степень полинома
+    let s = signers.len(); // the actual number of signers (≥ t)
+    let degree = n - s; // polynomial degree
 
     // --- 1. Симуляция для НЕ-подписантов: свободные (c_i, s_i) ---
     // Детерминированная симуляционная случайность, чтобы sign был

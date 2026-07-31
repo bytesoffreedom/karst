@@ -1729,7 +1729,7 @@ impl Transport for InMemoryTransport {
         self.relay.borrow_mut().handle_publish(req, now)
     }
     fn fetch_bundle(&self, ik: &[u8; 32], now: u64) -> Result<Option<PreKeyBundle>, String> {
-        let _ = now; // публичный read, время не нужно
+        let _ = now; // a public read; the clock is not needed
         Ok(self.relay.borrow().get_bundle(ik))
     }
     fn fetch_bundle_opk(
@@ -2013,7 +2013,7 @@ mod tests {
         // relay сверяет через DH(relay, bob_ik) → не сойдётся → отказ.
         let mallory = Account::generate();
         let mut forged = mallory.prekey_bundle();
-        forged.ik_pub = bundle.ik_pub; // притворяемся Bob
+        forged.ik_pub = bundle.ik_pub; // impersonate Bob
         let bad = publish_proof(&mallory.ik().dh(&relay_pub), &cookie.mac, &forged);
         let n2 = b"publish-nonce-2".to_vec();
         let attack = PublishRequest {
@@ -2029,7 +2029,7 @@ mod tests {
         };
         assert!(
             matches!(relay.handle_publish(&attack, NOW), PublishResponse::Rejected(_)),
-            "чужой не должен перезаписать bundle под IK Bob"
+            "a stranger must not overwrite the bundle under Bob's IK"
         );
         // bundle Bob не тронут (тот же prekey, что опубликовал он).
         assert_eq!(relay.get_bundle(&bundle.ik_pub).unwrap().prekey_pub, bundle.prekey_pub);
@@ -2113,7 +2113,7 @@ mod tests {
             proof: [0u8; 16],
         };
         assert!(matches!(relay.handle_publish(&req, NOW), PublishResponse::NeedCookie(_)));
-        assert!(relay.get_bundle(&bob.identity_public()).is_none(), "без cookie ничего не сохранено");
+        assert!(relay.get_bundle(&bob.identity_public()).is_none(), "nothing is stored without a cookie");
     }
 
     // ---- lease / ACK (at-most-once → effectively-once receive) ----

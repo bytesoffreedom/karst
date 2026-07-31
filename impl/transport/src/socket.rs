@@ -668,7 +668,7 @@ impl Transport for SocketTransport {
             Ok(WireResponse::NeedCookie(c)) => Response::NeedCookie(c),
             Ok(WireResponse::Accepted) => Response::Accepted,
             Ok(WireResponse::Rejected(s)) => Response::Rejected(s),
-            Ok(_) => Response::Rejected("protocol: unexpected на Send".into()),
+            Ok(_) => Response::Rejected("protocol: unexpected response to Send".into()),
             Err(e) => Response::Rejected(format!("transport: {e}")),
         }
     }
@@ -681,10 +681,10 @@ impl Transport for SocketTransport {
                 Err(_) => FetchResponse::Rejected("protocol: malformed fetch page".into()),
             },
             Ok(WireResponse::Rejected(s)) => FetchResponse::Rejected(s),
-            Ok(WireResponse::Accepted) => FetchResponse::Rejected("protocol: Accepted на Fetch".into()),
+            Ok(WireResponse::Accepted) => FetchResponse::Rejected("protocol: Accepted in response to Fetch".into()),
             // Ошибку транспорта НЕ выдаём за пустой mailbox — recv их различает.
             Err(e) => FetchResponse::Rejected(format!("transport: {e}")),
-            Ok(_) => FetchResponse::Rejected("protocol: unexpected на Fetch".into()),
+            Ok(_) => FetchResponse::Rejected("protocol: unexpected response to Fetch".into()),
         }
     }
 
@@ -697,7 +697,7 @@ impl Transport for SocketTransport {
             Ok(WireResponse::NeedCookie(c)) => AckResponse::NeedCookie(c),
             Ok(WireResponse::Acked) => AckResponse::Acked,
             Ok(WireResponse::Rejected(s)) => AckResponse::Rejected(s),
-            Ok(_) => AckResponse::Rejected("protocol: unexpected на Ack".into()),
+            Ok(_) => AckResponse::Rejected("protocol: unexpected response to Ack".into()),
             Err(e) => AckResponse::Rejected(format!("transport: {e}")),
         }
     }
@@ -717,7 +717,7 @@ impl Transport for SocketTransport {
             Ok(WireResponse::NeedCookie(c)) => PublishResponse::NeedCookie(c),
             Ok(WireResponse::BundlePublished) => PublishResponse::Published,
             Ok(WireResponse::Rejected(s)) => PublishResponse::Rejected(s),
-            Ok(_) => PublishResponse::Rejected("protocol: unexpected на Publish".into()),
+            Ok(_) => PublishResponse::Rejected("protocol: unexpected response to Publish".into()),
             Err(e) => PublishResponse::Rejected(format!("transport: {e}")),
         }
     }
@@ -731,7 +731,7 @@ impl Transport for SocketTransport {
             Ok(WireResponse::NeedCookie(c)) => Ok(BundleOpkResponse::NeedCookie(c)),
             Ok(WireResponse::Bundle(b)) => Ok(BundleOpkResponse::Bundle(b)),
             Ok(WireResponse::Rejected(e)) => Ok(BundleOpkResponse::Rejected(e)),
-            Ok(_) => Err("protocol: unexpected на FetchBundleOpk".into()),
+            Ok(_) => Err("protocol: unexpected response to FetchBundleOpk".into()),
             Err(e) => Err(format!("transport: {e}")),
         }
     }
@@ -740,7 +740,7 @@ impl Transport for SocketTransport {
         match self.round_trip(&WireRequest::FetchBundle(*ik)) {
             Ok(WireResponse::Bundle(b)) => Ok(b),
             Ok(WireResponse::Rejected(s)) => Err(s),
-            Ok(_) => Err("protocol: unexpected на FetchBundle".into()),
+            Ok(_) => Err("protocol: unexpected response to FetchBundle".into()),
             Err(e) => Err(format!("transport: {e}")),
         }
     }

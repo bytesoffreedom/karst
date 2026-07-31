@@ -347,7 +347,7 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         if let Some(tag) = replay_tag {
             match replay.commit(tag) {
                 Ok(true) => {}
-                Ok(false) => return Outcome::Reject(RejectReason::Replay), // гонка
+                Ok(false) => return Outcome::Reject(RejectReason::Replay), // lost the race
                 Err(()) => return Outcome::BackpressurePow,
             }
         }
@@ -422,7 +422,7 @@ impl<'r, V: AdmissionTokenVerifier> AdmissionPipeline<'r, V> {
         // осмыслен — зависит от not_after, окна rolling-window.)
         match dtn_replay.insert(replay_key, not_after, now_secs) {
             ReplayCheck::Fresh => {}
-            ReplayCheck::Replayed => return Outcome::Reject(RejectReason::DtnReplay), // гонка
+            ReplayCheck::Replayed => return Outcome::Reject(RejectReason::DtnReplay), // lost the race
             ReplayCheck::Expired => return Outcome::Reject(RejectReason::DtnExpired),
             ReplayCheck::BeyondWindow => return Outcome::Reject(RejectReason::DtnBeyondWindow),
         }
@@ -474,12 +474,12 @@ mod tests {
     fn roll_epoch_clears_replay_filter() {
         let mut f = ReplayFilter::new(0, 16);
         let tag = [7u8; 16];
-        assert_eq!(f.commit(tag), Ok(true)); // свежий
-        assert_eq!(f.commit(tag), Ok(false)); // replay в той же эпохе
-        f.roll_epoch(1); // смена эпохи
-        assert_eq!(f.commit(tag), Ok(true), "смена эпохи должна очистить фильтр");
+        assert_eq!(f.commit(tag), Ok(true)); // fresh
+        assert_eq!(f.commit(tag), Ok(false)); // replay inside the same epoch
+        f.roll_epoch(1); // epoch change
+        assert_eq!(f.commit(tag), Ok(true), "an epoch change must clear the filter");
         // Тот же номер эпохи повторно — идемпотентно, НЕ очищает.
         f.roll_epoch(1);
-        assert_eq!(f.commit(tag), Ok(false), "тот же epoch_id не должен сбрасывать");
+        assert_eq!(f.commit(tag), Ok(false), "the same epoch_id must not reset it");
     }
 }

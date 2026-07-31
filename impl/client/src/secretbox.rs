@@ -218,7 +218,7 @@ impl MasterKey {
     pub fn seal(&self, label: &str, plaintext: &[u8]) -> Vec<u8> {
         let key = self.subkey(label);
         let cipher = XChaCha20Poly1305::new((&key).into());
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng); // 192-бит, свежий
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng); // 192-bit, fresh
         let aad = Self::context_aad(label, STATE_VERSION);
         let ct = cipher
             .encrypt(&nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad: &aad })
@@ -269,7 +269,7 @@ impl MasterKey {
     /// бинарник, а не «дочитаем с дефолтами»); неверный пароль / порча / файл не отсюда.
     pub fn open(&self, label: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
         if blob.len() < HEADER_LEN || &blob[..4] != MAGIC {
-            return Err("не KARST-шифр at-rest (несовместимый формат — нужен re-init?)".into());
+            return Err("not a KARST at-rest ciphertext (incompatible format — re-init needed?)".into());
         }
         let version = u16::from_le_bytes([blob[4], blob[5]]);
         if version != STATE_VERSION {
@@ -287,7 +287,7 @@ impl MasterKey {
         let aad = Self::context_aad(label, version);
         cipher
             .decrypt(nonce, chacha20poly1305::aead::Payload { msg: &blob[HEADER_LEN..], aad: &aad })
-            .map_err(|_| "неверный пароль, повреждённый файл или файл не из этого места".to_string())
+            .map_err(|_| "wrong password, corrupt file, or a file from another location".to_string())
     }
 }
 
@@ -352,7 +352,7 @@ mod tests {
         let good = MasterKey::derive(b"correct horse", SALT).unwrap();
         let bad = MasterKey::derive(b"wrong horse", SALT).unwrap();
         let blob = good.seal(L, b"secret key material");
-        assert!(bad.open(L, &blob).is_err(), "неверный пароль должен ОТКАЗАТЬ, не вернуть мусор");
+        assert!(bad.open(L, &blob).is_err(), "a wrong password must FAIL rather than return garbage");
     }
 
     /// Несущее (не no-op): на диске нет открытых байтов секрета. Та же форма, что
@@ -364,7 +364,7 @@ mod tests {
         let blob = k.seal(L, secret);
         assert!(
             !blob.windows(secret.len()).any(|w| w == secret),
-            "открытый секрет не должен присутствовать в blob"
+            "the plaintext secret must not appear in the blob"
         );
     }
 
@@ -375,7 +375,7 @@ mod tests {
         let k = MasterKey::derive(b"pw", SALT).unwrap();
         let plaintext_era = b"raw pre-at-rest secret bytes with no MSC1 header";
         let err = k.open(L, plaintext_era).unwrap_err();
-        assert!(err.contains("re-init"), "чужой формат → явная ошибка re-init, дано: {err}");
+        assert!(err.contains("re-init"), "a foreign format must name re-init explicitly, got: {err}");
     }
 
     /// Несущее: два seal ОДИНАКОВОГО текста → РАЗНЫЕ nonce/ciphertext. Пиннит
@@ -385,8 +385,8 @@ mod tests {
         let k = MasterKey::derive(b"pw", SALT).unwrap();
         let a = k.seal(L, b"same session state");
         let b = k.seal(L, b"same session state");
-        assert_ne!(&a[4..HEADER_LEN], &b[4..HEADER_LEN], "nonce должен быть свежим на каждую запись");
-        assert_ne!(a, b, "шифртекст не должен повторяться при одинаковом plaintext");
+        assert_ne!(&a[4..HEADER_LEN], &b[4..HEADER_LEN], "the nonce must be fresh on every write");
+        assert_ne!(a, b, "ciphertext must not repeat for identical plaintext");
     }
 }
 

@@ -111,7 +111,7 @@ pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, String> {
     let normalized =
         phrase.split_whitespace().map(|w| w.to_lowercase()).collect::<Vec<_>>().join(" ");
     let m = Mnemonic::parse_in(Language::English, &normalized)
-        .map_err(|e| format!("неверная фраза восстановления: {e}"))?;
+        .map_err(|e| format!("invalid recovery phrase: {e}"))?;
     if m.word_count() != PHRASE_WORDS {
         return Err(format!("expected {PHRASE_WORDS} words, not {}", m.word_count()));
     }
@@ -122,7 +122,7 @@ pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, String> {
 pub fn entropy_of(m: &Mnemonic) -> [u8; ENTROPY_BYTES] {
     let (arr, len) = m.to_entropy_array();
     debug_assert_eq!(len, ENTROPY_BYTES, "24 words → 32 bytes of entropy");
-    arr[..ENTROPY_BYTES].try_into().expect("16 байт")
+    arr[..ENTROPY_BYTES].try_into().expect("16 bytes")
 }
 
 /// Восстановить фразу из энтропии (для экрана «показать фразу восстановления»).
@@ -229,7 +229,7 @@ mod tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
                       abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
                       abandon abandon art";
-        let m = parse_mnemonic(phrase).expect("валидная тест-фраза");
+        let m = parse_mnemonic(phrase).expect("a valid test phrase");
         // Independent of the hex below: the phrase must REALLY carry all-zero entropy of the
         // current width. Regenerating the vector by copying the code's own output would make the
         // hex circular — this arm is what keeps it evidence. A wrong checksum word or a
@@ -246,11 +246,11 @@ mod tests {
         let seal_pub = hex::encode(d.seal.public.to_bytes());
         assert_eq!(
             ik, "3d1b5e4595d2999a3aa4497ec42f26516f29eb92adc96f98d590df9610707e57",
-            "IK-вектор изменился — восстановление сломано для существующих фраз"
+            "the IK vector changed — restore is broken for existing phrases"
         );
         assert_eq!(
             seal_pub, "c4007067a2a65902f9070746433dacf0d4a5365d33f0f8cb04affefea52f0b67",
-            "seal-вектор изменился — владение mailbox сломано"
+            "the seal vector changed — mailbox ownership is broken"
         );
     }
 
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(
             a1.account.identity_public(),
             a2.account.identity_public(),
-            "тот же секрет → та же личность (иначе прокси нельзя было бы переоткрыть)"
+            "the same secret yields the same identity (otherwise a proxy could not be reopened)"
         );
         assert_eq!(a1.seal.public.to_bytes(), a2.seal.public.to_bytes());
 
@@ -277,7 +277,7 @@ mod tests {
         assert_ne!(
             a1.account.identity_public(),
             b.account.identity_public(),
-            "разные секреты → разные личности"
+            "different secrets yield different identities"
         );
 
         // Корень, выведенный из фразы (ЛЮБОЙ фразы), никогда не совпадает с прокси: секрет
@@ -286,7 +286,7 @@ mod tests {
         assert_ne!(
             a1.account.identity_public(),
             root.account.identity_public(),
-            "прокси != корень, даже случайно"
+            "a proxy is never the root, not even by accident"
         );
     }
 
@@ -294,7 +294,7 @@ mod tests {
     fn same_phrase_same_identity_different_phrase_different() {
         let a = generate_mnemonic();
         let b = generate_mnemonic();
-        assert_ne!(entropy_of(&a), entropy_of(&b), "две генерации различны");
+        assert_ne!(entropy_of(&a), entropy_of(&b), "two generations differ");
 
         // Восстановление: та же энтропия → тот же IK и тот же seal.
         let d1 = derive(&entropy_of(&a));
@@ -315,9 +315,9 @@ mod tests {
         let bad = "abandon abandon abandon abandon abandon abandon abandon abandon \
                    abandon abandon abandon abandon abandon abandon abandon abandon \
                    abandon abandon abandon abandon abandon abandon art abandon";
-        assert!(parse_mnemonic(bad).is_err(), "битая контрольная сумма должна отвергаться");
+        assert!(parse_mnemonic(bad).is_err(), "a broken checksum must be refused");
         // Мусор — тоже.
-        assert!(parse_mnemonic("не мнемоника вовсе").is_err());
+        assert!(parse_mnemonic("not a mnemonic at all").is_err());
         // Правильная — принимается.
         let good = "abandon abandon abandon abandon abandon abandon abandon abandon \
                     abandon abandon abandon abandon abandon abandon abandon abandon \
@@ -335,9 +335,9 @@ mod tests {
         let messy = "ABANDON abandon abandon ABANDON abandon abandon ABANDON abandon \
                      abandon ABANDON abandon abandon ABANDON abandon abandon ABANDON \
                      abandon abandon ABANDON abandon abandon ABANDON abandon art";
-        let a = entropy_of(&parse_mnemonic(canon).expect("канон"));
-        let b = entropy_of(&parse_mnemonic(messy).expect("грязная валидная фраза принимается"));
-        assert_eq!(a, b, "регистр/пробелы/переносы нормализованы к той же личности");
+        let a = entropy_of(&parse_mnemonic(canon).expect("canonical"));
+        let b = entropy_of(&parse_mnemonic(messy).expect("a messy but valid phrase is accepted"));
+        assert_eq!(a, b, "case, spaces and newlines normalise to the same identity");
     }
 
     /// CRYPTO-32 (#193): the phrase must not be weaker than the strongest thing derived from it.
@@ -380,6 +380,6 @@ mod tests {
         let m = generate_mnemonic();
         let e = entropy_of(&m);
         let m2 = mnemonic_of_entropy(&e);
-        assert_eq!(m.to_string(), m2.to_string(), "энтропия ↔ фраза обратимы");
+        assert_eq!(m.to_string(), m2.to_string(), "entropy and phrase round-trip");
     }
 }

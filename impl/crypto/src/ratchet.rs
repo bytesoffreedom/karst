@@ -129,15 +129,15 @@ pub struct Session {
     // `x25519_dalek::StaticSecret` inside `Identity` is already `ZeroizeOnDrop`, so scrubbing it
     // again here would be a second pass over bytes dalek has cleared — skipped, not forgotten.
     #[zeroize(skip)]
-    dhs: Identity,           // наша ratchet-пара
-    dhr: Option<[u8; 32]>,   // ratchet-pubkey собеседника
+    dhs: Identity,           // our ratchet pair
+    dhr: Option<[u8; 32]>,   // the peer's ratchet public key
     rk: [u8; 32],            // root key
     cks: Option<[u8; 32]>,   // sending chain key
     ckr: Option<[u8; 32]>,   // receiving chain key
-    ns: u32,                 // номер отправки
-    nr: u32,                 // номер приёма
-    pn: u32,                 // длина предыдущей sending-цепочки
-    skipped: Vec<SkippedKey>, // пропущенные ключи (out-of-order), FIFO-огранич.
+    ns: u32,                 // send counter
+    nr: u32,                 // receive counter
+    pn: u32,                 // length of the previous sending chain
+    skipped: Vec<SkippedKey>, // skipped (out-of-order) keys, FIFO-bounded
     /// Counts DH-ratchet steps, so a skipped key can be aged out by protocol progress rather than
     /// by an unauthenticated wall clock (A6-9).
     dh_gen: u64,
@@ -278,7 +278,7 @@ impl Session {
     /// plaintexts) plus a reused Poly1305 key. Rollback cannot be *prevented* by a program that
     /// keeps its state in files the attacker can restore, so it is made harmless instead.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> RatchetMessage {
-        let ck = self.cks.expect("sending chain (получатель должен принять до отправки)");
+        let ck = self.cks.expect("sending chain (the recipient must receive before we send)");
         let (ck_next, mk) = kdf_ck(&ck);
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
@@ -518,7 +518,7 @@ mod tests {
         let rk = [5u8; 32];
         let (rk_a, _) = kdf_rk(&rk, &[1u8; 32]);
         let (rk_b, _) = kdf_rk(&rk, &[2u8; 32]);
-        assert_ne!(rk_a, rk_b, "новый root_key должен зависеть от свежего DH (PCS)");
+        assert_ne!(rk_a, rk_b, "a new root_key must depend on a fresh DH (PCS)");
     }
 
     /// Forward secrecy как NON-RETENTION: после расшифровки сессия НЕ хранит
@@ -544,7 +544,7 @@ mod tests {
         let dump = dump_key_material(&bob);
         assert!(
             !dump.windows(32).any(|w| w == mk),
-            "ключ израсходованного сообщения не должен оставаться в состоянии (FS)"
+            "a consumed message key must not stay in the state (FS)"
         );
     }
 
@@ -655,10 +655,10 @@ mod tests {
         let m2 = alice.encrypt(b"two");
 
         assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
-        assert_eq!(bob.decrypt(&m2).unwrap(), b"two", "пропуск m1 → m1-ключ сохранён");
-        assert_eq!(bob.skipped.len(), 1, "ровно один пропущенный ключ (m1)");
-        assert_eq!(bob.decrypt(&m1).unwrap(), b"one", "догнавший m1 — из store");
-        assert!(bob.skipped.is_empty(), "потреблённый пропущенный ключ удалён (FS)");
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two", "skipping m1 stores the m1 key");
+        assert_eq!(bob.skipped.len(), 1, "exactly one skipped key (m1)");
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"one", "the late m1 is opened from the store");
+        assert!(bob.skipped.is_empty(), "a consumed skipped key is deleted (FS)");
     }
 
     /// Out-of-order ЧЕРЕЗ границу цепочек: хвост старой цепочки (m1) сохраняется
@@ -666,18 +666,18 @@ mod tests {
     #[test]
     fn out_of_order_across_ratchet_boundary() {
         let (mut alice, mut bob) = pair();
-        let a0 = alice.encrypt(b"a0"); // цепочка A, n0
-        let a1 = alice.encrypt(b"a1"); // цепочка A, n1 (будет задержан)
+        let a0 = alice.encrypt(b"a0"); // chain A, n0
+        let a1 = alice.encrypt(b"a1"); // chain A, n1 (will be delayed)
         assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
 
         // Bob отвечает → Alice делает DH-шаг → новая цепочка Alice.
         let r0 = bob.encrypt(b"r0");
         assert_eq!(alice.decrypt(&r0).unwrap(), b"r0");
-        let b0 = alice.encrypt(b"b0"); // НОВАЯ цепочка Alice, pn=2
+        let b0 = alice.encrypt(b"b0"); // a NEW chain from Alice, pn=2
 
         // Bob принимает b0 (новая цепочка): хвост старой (a1) сохраняется, DH-шаг.
         assert_eq!(bob.decrypt(&b0).unwrap(), b"b0");
-        assert_eq!(bob.skipped.len(), 1, "хвост старой цепочки (a1) сохранён");
+        assert_eq!(bob.skipped.len(), 1, "the tail of the old chain (a1) is stored");
         // Догнавший a1 из СТАРОЙ цепочки — из store.
         assert_eq!(bob.decrypt(&a1).unwrap(), b"a1");
         assert!(bob.skipped.is_empty());
@@ -693,11 +693,11 @@ mod tests {
         let m1 = alice.encrypt(b"one");
         let m2 = alice.encrypt(b"two");
         assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
-        assert_eq!(bob.decrypt(&m2).unwrap(), b"two"); // m1 сохранён
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two"); // m1 is stored
 
         // Круг через персистентную форму.
         let mut bob2 = Session::restore(bob.snapshot());
-        assert_eq!(bob2.decrypt(&m1).unwrap(), b"one", "gap-filler из ВОССТАНОВЛЕННОГО store");
+        assert_eq!(bob2.decrypt(&m1).unwrap(), b"one", "the gap filler comes from the RESTORED store");
     }
 
     /// Анти-DoS СВЕРХ спеки: forged-сообщение с большим `n` (валидный header, но
@@ -716,8 +716,8 @@ mod tests {
             ciphertext: vec![0u8; 48],
         };
         assert_eq!(bob.decrypt(&forged), Err(RatchetError::Decrypt));
-        assert!(bob.skipped.is_empty(), "forged не наполнил store (откат staged)");
-        assert_eq!(bob.nr, 1, "forged не сдвинул nr");
+        assert!(bob.skipped.is_empty(), "a forged message did not fill the store (staged changes rolled back)");
+        assert_eq!(bob.nr, 1, "a forged message did not advance nr");
 
         // Сессия цела: следующее легитимное in-order сообщение проходит.
         let m1 = alice.encrypt(b"one");
@@ -738,8 +738,8 @@ mod tests {
             ciphertext: vec![0u8; 48],
         };
         assert_eq!(bob.decrypt(&too_far), Err(RatchetError::OutOfOrder));
-        assert!(bob.skipped.is_empty(), "ключи не выведены");
-        assert_eq!(bob.nr, 1, "nr не тронут");
+        assert!(bob.skipped.is_empty(), "no keys were derived");
+        assert_eq!(bob.nr, 1, "nr untouched");
         // И сессия продолжает работать в пределах допустимого.
         let m1 = alice.encrypt(b"one");
         assert_eq!(bob.decrypt(&m1).unwrap(), b"one");

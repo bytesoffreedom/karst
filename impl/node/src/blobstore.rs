@@ -741,7 +741,7 @@ mod tests {
         // expiry check in `parse_meta_header` — `recover`'s early `continue` on a `None` header
         // skips the `blobs` insert AND the `senders` update together, so this sender should look
         // exactly as absent as if it never existed.
-        assert_eq!(s.sender_blob_count(&sender(1)), 0, "an expired-at-recovery blob leaves no trace in the aggregate");
+        assert_eq!(s.sender_blob_count(&sender(1)), 0, "an expired-at-recovery blob is not counted in the aggregate");
     }
 
     #[test]

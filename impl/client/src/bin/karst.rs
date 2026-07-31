@@ -553,7 +553,7 @@ fn cmd_send(args: &[String]) -> Result<(), String> {
     let msg = positional_after_flags(args).ok_or("need message text")?;
 
     let r = relay_arg(args)?;
-    let to = parse_pubkey(&to_hex)?; // §2.1-IK получателя
+    let to = parse_pubkey(&to_hex)?; // the recipient's §2.1 IK
 
     let s = store()?;
     client::send_text(&s, &r, &to, msg.as_bytes(), wall_clock(), wall_clock())?;
@@ -678,7 +678,7 @@ fn cmd_recv(args: &[String]) -> Result<(), String> {
                                 println!("[{from}…] gallery received ({n} photos)");
                                 shown += 1;
                             }
-                            Ok(None) => {} // чанк накоплен, файл ещё не полон
+                            Ok(None) => {} // chunk accepted, the file is not complete yet
                             Err(e) => eprintln!("[{from}…] file rejected: {e}"),
                         }
                     }
@@ -772,7 +772,7 @@ fn positional_after_flags(args: &[String]) -> Option<String> {
             continue;
         }
         if a.starts_with("--") {
-            skip_next = true; // это флаг → следующий его значение
+            skip_next = true; // this is a flag, so the next argument is its value
             continue;
         }
         return Some(a.clone());

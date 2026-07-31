@@ -102,8 +102,8 @@
   <text class="item mono" x="64" y="619">SOCKS5 → Tor · I2P · mixnet</text>
   <text class="note" x="300" y="553">fastest, reveals your address</text>
   <text class="note" x="300" y="575">raced beside TCP; never under a proxy</text>
-  <text class="note" x="300" y="597">looks like ordinary web traffic</text>
-  <text class="note" x="300" y="619">hides the address, costs latency</text>
+  <text class="note" x="300" y="597">a standards-compliant wss:// endpoint</text>
+  <text class="note" x="300" y="619">adds network-level indirection, costs latency</text>
   <text class="note" x="64" y="649">A path that is down is skipped; the next one carries it.</text>
 
   <!-- ─────────── Multi-homing ─────────── -->

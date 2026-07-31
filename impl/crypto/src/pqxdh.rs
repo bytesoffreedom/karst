@@ -395,7 +395,7 @@ impl Account {
         let mut out = [0u8; 128];
         out[..32].copy_from_slice(&self.ik.to_secret_bytes());
         out[32..64].copy_from_slice(&self.prekey.to_secret_bytes());
-        let seed = self.kem_dk.to_seed().expect("KEM dk сгенерирован из seed → Some");
+        let seed = self.kem_dk.to_seed().expect("the KEM dk was generated from a seed → Some");
         out[64..].copy_from_slice(seed.as_slice());
         out
     }
@@ -404,7 +404,7 @@ impl Account {
     pub fn from_secret_bytes(bytes: &[u8; 128]) -> Self {
         let ik = Identity::from_secret_bytes(bytes[..32].try_into().expect("32"));
         let prekey = Identity::from_secret_bytes(bytes[32..64].try_into().expect("32"));
-        let seed = Array::try_from(&bytes[64..]).expect("64-байтный ML-KEM seed");
+        let seed = Array::try_from(&bytes[64..]).expect("a 64-byte ML-KEM seed");
         let kem_dk = DecapsulationKey::<MlKem768>::from_seed(seed);
         // OPKs are not in `account.key` (see the `opks` field) — a restored account starts
         // with an empty batch. The account.key format is therefore UNCHANGED: no migration
@@ -546,7 +546,7 @@ impl Account {
         // Зеркало DH отправителя (симметрия static-static X25519).
         // Every DH must be CONTRIBUTORY: a small-order peer point yields an all-zero shared
         // secret that the attacker also knows, so reject rather than fold it in (CRYPTO-06).
-        let dh1 = self.prekey.dh_checked(&ik_a)?; // PK_B × IK_A  (аутентификация отправителя)
+        let dh1 = self.prekey.dh_checked(&ik_a)?; // PK_B × IK_A (authenticates the sender)
         let dh2 = self.ik.dh_checked(&ek_a)?; //     IK_B × EK_A
         let dh3 = self.prekey.dh_checked(&ek_a)?; //  PK_B × EK_A
 
@@ -640,7 +640,7 @@ pub fn initiate_key_agreement(
 
     let ik_b = PublicKey::from(bundle.ik_pub);
     let prekey_b = PublicKey::from(bundle.prekey_pub);
-    let ek_a = Identity::generate(); // эфемер отправителя
+    let ek_a = Identity::generate(); // the sender's ephemeral
 
     // Every DH must be CONTRIBUTORY. A malicious contact can publish a small-order prekey / OPK
     // (the signature covers it, but "signed" says nothing about order): the shared secret would
@@ -885,7 +885,7 @@ mod tests {
         let t = b"transcript";
         let k_real = derive_root_key(&dh1, &dh2, &dh3, None, &[9u8; 32], t);
         let k_zero = derive_root_key(&dh1, &dh2, &dh3, None, &[0u8; 32], t);
-        assert_ne!(k_real, k_zero, "pq_shared должен влиять на root_key");
+        assert_ne!(k_real, k_zero, "pq_shared must affect root_key");
     }
 
     /// Дискриминирующий для АУТЕНТИФИКАЦИИ ОТПРАВИТЕЛЯ: DH1 (единственный член,
@@ -898,7 +898,7 @@ mod tests {
         let t = b"transcript";
         let with = derive_root_key(&[7u8; 32], &[2u8; 32], &[3u8; 32], None, &[9u8; 32], t);
         let without = derive_root_key(&[8u8; 32], &[2u8; 32], &[3u8; 32], None, &[9u8; 32], t);
-        assert_ne!(with, without, "DH1 (sender-auth) должен влиять на root_key");
+        assert_ne!(with, without, "DH1 (sender auth) must affect root_key");
     }
 
     /// The one-time-prekey DH SECRET (not just its public key via the transcript) is mixed
@@ -927,9 +927,9 @@ mod tests {
 
         let mut restored = Account::from_secret_bytes(&acct.to_secret_bytes());
         let rb = restored.prekey_bundle();
-        assert_eq!(rb.ik_pub, bundle.ik_pub, "IK стабилен");
-        assert_eq!(rb.prekey_pub, bundle.prekey_pub, "prekey стабилен");
-        assert_eq!(rb.kem_ek, bundle.kem_ek, "KEM ek стабилен (seed восстановлен)");
+        assert_eq!(rb.ik_pub, bundle.ik_pub, "the IK is stable");
+        assert_eq!(rb.prekey_pub, bundle.prekey_pub, "the prekey is stable");
+        assert_eq!(rb.kem_ek, bundle.kem_ek, "the KEM ek is stable (the seed was restored)");
 
         // Согласование к восстановленному account работает (decap на seed'е).
         let alice = Identity::generate();
@@ -937,7 +937,7 @@ mod tests {
         let (alice_rk, ka) = initiate_key_agreement(&alice, &alice_m, &rb).expect("well-formed bundle");
         assert_eq!(ka.mailbox_a_pub, alice_m, "the KA carries the sender's mailbox point");
         let (bob_rk, sender) = restored.accept_key_agreement(&ka).expect("decap");
-        assert_eq!(alice_rk, bob_rk, "восстановленный account согласует ключ");
+        assert_eq!(alice_rk, bob_rk, "a restored account still agrees on the key");
         assert_eq!(sender, alice.public.to_bytes());
     }
 

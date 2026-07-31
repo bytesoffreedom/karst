@@ -390,7 +390,7 @@ pub(crate) fn serve_channel(
         let credentialed = requires_admission(&req);
         let resp = match req {
         WireRequest::Send(msg) => {
-            let now = (clock)(); // время СЕРВЕРА
+            let now = (clock)(); // the SERVER's clock
             // #142, same shape as the blob path: ADMISSION under the relay lock, the mail work
             // after it is released. Admission is in-memory arithmetic; a deposit touches a queue
             // and, on a durable relay, an fsync. Under one mutex every client's admission queued

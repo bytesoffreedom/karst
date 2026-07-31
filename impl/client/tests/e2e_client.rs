@@ -3831,7 +3831,7 @@ fn a_crash_before_the_session_commit_leaves_the_prekey_to_reopen_the_contact() {
 /// (`RelayNode::handle_publish`, CRYPTO-18) — so the account never becomes reachable on its
 /// backup at all, which is receive-side multi-homing, not just send failover. The second is the
 /// filed one: a queued ciphertext flushed to a secondary presents a proof minted for the primary
-/// and is refused, so the failover that censorship-resilience rests on silently does nothing.
+/// and is refused, so the failover that reachability under a degraded network rests on silently does nothing.
 #[test]
 fn multi_homing_presents_each_relay_the_credential_that_relay_issued() {
     let cap1 = own_capability(0x11, 0xA1);

@@ -2730,7 +2730,7 @@ actually costs:
    it), no user action, and it pre-seeds alternates before a block lands. **But an
    endpoint list is only safe if admission genuinely gates WHO may ask — and today it
    does not.** The dev-capability secret is public and forgeable by anyone
-   (`dev_capability`, "кто угодно может его подделать"), and cookies are issued to any
+   (`dev_capability` — anyone can forge one), and cookies are issued to any
    (client_addr, carrier_id) — they are anti-spoofing, not authorization. So an adversary
    would connect once and enumerate every IP to blackhole: the feature would hand the
    adversary its own blocklist. **Blocked behind the same wall as blob DoS attribution:

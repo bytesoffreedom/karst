@@ -323,7 +323,7 @@ struct ReceivedFileV0 {
 
 /// Верхняя граница на длину одной записи истории (защита от абсурдного length-
 /// prefix'а из мусорного хвоста → не аллоцируем гигабайты по битой длине).
-const MAX_HISTORY_RECORD: usize = 1 << 20; // 1 MiB — с запасом на любой текст
+const MAX_HISTORY_RECORD: usize = 1 << 20; // 1 MiB — ample for any text
 
 /// The sealed history index is rounded up to a multiple of this before sealing, so its length
 /// stops tracking how many people you talk to and how much.
@@ -692,7 +692,7 @@ fn check_or_seal_verify(dir: &std::path::Path, key: &MasterKey) -> io::Result<()
         Ok(blob) => {
             let ok = key.open(VERIFY_LABEL, &blob).map(|p| p == VERIFY_CONST).unwrap_or(false);
             if !ok {
-                return Err(io_err("неверный пароль"));
+                return Err(io_err("wrong password"));
             }
             Ok(())
         }
@@ -1544,7 +1544,7 @@ impl Store {
         secret
             .as_slice()
             .try_into()
-            .map_err(|_| io_err("seed: не 16 байт энтропии"))
+            .map_err(|_| io_err("seed: entropy is not 16 bytes"))
     }
 
     /// seal-ключ (relay-facing). В корневом режиме **выводится** из фразы, не хранится отдельно.
@@ -3402,7 +3402,7 @@ impl Store {
             .truncate(false)
             .mode(0o600)
             .open(self.sessions_lock_path())?;
-        file.lock()?; // блокирующий эксклюзив; снятие — на drop файла
+        file.lock()?; // blocking exclusive lock; released when the file drops
         Ok(SessionLock { _file: file })
     }
 
@@ -3473,7 +3473,7 @@ impl Store {
                 .mode(0o600)
                 .open(&tmp)?;
             f.write_all(&bytes)?;
-            f.sync_all()?; // durability до rename
+            f.sync_all()?; // durable before the rename
         }
         rename_durable(&tmp, &self.sessions_path())?;
         // The anchor goes LAST, deliberately. A crash between the two leaves the state AHEAD of
@@ -3829,7 +3829,7 @@ impl Store {
         let plain = postcard::to_stdvec(&StoredHistory { rec: rec.clone(), msg_id }).map_err(io_err)?;
         let blob = self.key.seal(&self.label(&self.history_path()), &plain);
         let len: u32 =
-            blob.len().try_into().map_err(|_| io_err("запись истории слишком велика"))?;
+            blob.len().try_into().map_err(|_| io_err("history record too large"))?;
         let _lock = self.lock_history()?;
         let mut f = OpenOptions::new()
             .append(true)
@@ -3839,7 +3839,7 @@ impl Store {
         let mut framed = Vec::with_capacity(4 + blob.len());
         framed.extend_from_slice(&len.to_le_bytes());
         framed.extend_from_slice(&blob);
-        f.write_all(&framed)?; // одна запись под O_APPEND + замок
+        f.write_all(&framed)?; // one record under O_APPEND + the lock
         f.sync_all()
     }
 
@@ -3854,16 +3854,16 @@ impl Store {
         while off + 4 <= bytes.len() {
             let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
             if len == 0 || len > MAX_HISTORY_RECORD {
-                break; // абсурдная длина → граница мусора
+                break; // absurd length → the boundary of garbage
             }
             let start = off + 4;
             let end = match start.checked_add(len) {
                 Some(e) if e <= bytes.len() => e,
-                _ => break, // запись не помещается → рваный хвост
+                _ => break, // the record does not fit → a torn tail
             };
             let plain = match self.key.open(&self.label(&self.history_path()), &bytes[start..end]) {
                 Ok(p) => p,
-                Err(_) => break, // не расшифровалась → граница
+                Err(_) => break, // did not decrypt → boundary
             };
             // Try the current layout (with `msg_id`) first; fall back to a pre-`msg_id` bare
             // `HistoryRecord` (postcard errors on the missing trailing field, and try-new-first
@@ -4165,7 +4165,7 @@ impl Store {
             }
         }
         if removed.is_empty() {
-            return Ok(removed); // нечего менять — не трогаем файл
+            return Ok(removed); // nothing to change — leave the file alone
         }
         let mut out = Vec::new();
         for stored in kept {
@@ -4174,7 +4174,7 @@ impl Store {
             let plain = postcard::to_stdvec(stored).map_err(io_err)?;
             let blob = self.key.seal(&self.label(&self.history_path()), &plain);
             let len: u32 =
-                blob.len().try_into().map_err(|_| io_err("запись истории слишком велика"))?;
+                blob.len().try_into().map_err(|_| io_err("history record too large"))?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(&blob);
         }
@@ -4251,7 +4251,7 @@ impl Store {
         };
         let plain = match self.key.open(&self.label(&self.meta_path()), &blob) {
             Ok(p) => p,
-            Err(_) => return MetaMap::new(), // не наш/битый → пусто, не паника
+            Err(_) => return MetaMap::new(), // not ours or corrupt → empty, never a panic
         };
         let mut map: MetaMap = match postcard::from_bytes(&plain) {
             Ok(m) => m,
@@ -4300,22 +4300,22 @@ impl Store {
         add: bool,
     ) -> io::Result<()> {
         if emoji.is_empty() || emoji.len() > crate::content::MAX_EMOJI_BYTES {
-            return Err(io_err("эмодзи реакции вне лимита длины"));
+            return Err(io_err("reaction emoji exceeds the length limit"));
         }
         let _lock = self.lock_meta()?;
         let mut map = self.load_meta_unlocked();
         if add {
             // Новый msg_id — только если не переполним карту (анти-память-DoS).
             if !map.contains_key(&msg_id) && map.len() >= MAX_META_MESSAGES {
-                return Err(io_err("слишком много сообщений с метаданными"));
+                return Err(io_err("too many messages carrying metadata"));
             }
             let mm = map.entry(msg_id).or_default();
             if !mm.reactions.contains_key(emoji) && mm.reactions.len() >= MAX_REACTIONS_PER_MSG {
-                return Err(io_err("слишком много разных реакций на сообщение"));
+                return Err(io_err("too many distinct reactions on one message"));
             }
             let authors = mm.reactions.entry(emoji.to_string()).or_default();
             if !authors.contains(&author_ik) && authors.len() >= MAX_AUTHORS_PER_REACTION {
-                return Err(io_err("слишком много авторов одной реакции"));
+                return Err(io_err("too many authors for one reaction"));
             }
             authors.insert(author_ik);
         } else if let Some(mm) = map.get_mut(&msg_id) {
@@ -4339,7 +4339,7 @@ impl Store {
         let _lock = self.lock_meta()?;
         let mut map = self.load_meta_unlocked();
         if !map.contains_key(&msg_id) && map.len() >= MAX_META_MESSAGES {
-            return Err(io_err("слишком много сообщений с метаданными"));
+            return Err(io_err("too many messages carrying metadata"));
         }
         map.entry(msg_id).or_default().reply_to = Some(reply_to);
         self.save_meta_unlocked(&map)
@@ -4356,7 +4356,7 @@ impl Store {
     /// sender stamps `edit_ts` monotonically, so ties (same author re-sending) keep the text.
     pub fn set_edit(&self, msg_id: [u8; 16], edit_ts: u64, new_text: &[u8]) -> io::Result<()> {
         if new_text.len() > crate::content::MAX_TEXT_BYTES {
-            return Err(io_err("текст правки вне лимита длины"));
+            return Err(io_err("edit text exceeds the length limit"));
         }
         let _lock = self.lock_meta()?;
         let mut map = self.load_meta_unlocked();
@@ -4368,7 +4368,7 @@ impl Store {
             }
         }
         if !map.contains_key(&msg_id) && map.len() >= MAX_META_MESSAGES {
-            return Err(io_err("слишком много сообщений с метаданными"));
+            return Err(io_err("too many messages carrying metadata"));
         }
         map.entry(msg_id).or_default().edited = Some((edit_ts, new_text.to_vec()));
         self.save_meta_unlocked(&map)
@@ -4436,17 +4436,17 @@ const MAX_AUTHORS_PER_REACTION: usize = 1024;
 /// будущего с бóльшими лимитами). Тихо отбрасывает лишнее — не паникует.
 fn clamp_meta(map: &mut MetaMap) {
     while map.len() > MAX_META_MESSAGES {
-        let k = *map.keys().next_back().expect("непусто");
+        let k = *map.keys().next_back().expect("non-empty");
         map.remove(&k);
     }
     for mm in map.values_mut() {
         while mm.reactions.len() > MAX_REACTIONS_PER_MSG {
-            let k = mm.reactions.keys().next_back().expect("непусто").clone();
+            let k = mm.reactions.keys().next_back().expect("non-empty").clone();
             mm.reactions.remove(&k);
         }
         for authors in mm.reactions.values_mut() {
             while authors.len() > MAX_AUTHORS_PER_REACTION {
-                let a = *authors.iter().next_back().expect("непусто");
+                let a = *authors.iter().next_back().expect("non-empty");
                 authors.remove(&a);
             }
         }
@@ -5071,7 +5071,7 @@ impl Vault {
         // password opens it (extras can't exist yet — adding one needs a logged-in real session).
         if base.join("accounts.dat").exists() {
             if root.load_registry().is_err() {
-                return Err(io_err("неверный пароль или повреждённый файл"));
+                return Err(io_err("wrong password or corrupt file"));
             }
             let id = Self::migrate_to_compartment(&base, &key)?;
             return Ok(Opened::Real(Vault { base: base.clone(), dir: compartment_dir(&base, &id), key }));
@@ -5089,7 +5089,7 @@ impl Vault {
                 crypto_erase(&base)?;
                 Ok(Opened::Wipe)
             }
-            None => Err(io_err("неверный пароль или повреждённый файл")),
+            None => Err(io_err("wrong password or corrupt file")),
         }
     }
 
@@ -5633,7 +5633,7 @@ mod tests {
 
         let err = s.load_unconfirmed().unwrap_err().to_string();
         assert!(
-            err.contains("не из этого места") || err.contains("повреждённый"),
+            err.contains("another location") || err.contains("corrupt"),
             "a sealed blob opened under another file's name — the label must be part of the \
              derivation, not decoration; got: {err}"
         );

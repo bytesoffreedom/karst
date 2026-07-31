@@ -387,7 +387,7 @@ pub fn encode(c: &Content) -> Vec<u8> {
 
 /// Разобрать plaintext-байты в конверт. Чужой/битый груз → ошибка (не паника).
 pub fn decode(bytes: &[u8]) -> Result<Content, String> {
-    postcard::from_bytes(bytes).map_err(|e| format!("контент не разобран: {e}"))
+    postcard::from_bytes(bytes).map_err(|e| format!("content did not decode: {e}"))
 }
 
 /// The transfer id a MANIFEST variant would start in a `Reassembler` (`None` for a chunk or any
@@ -452,15 +452,15 @@ pub enum Assembled {
 /// Разбить файл на (манифест, чанки). Отвергает слишком длинное имя / большой файл.
 pub fn chunk_file(name: &str, bytes: &[u8]) -> Result<(Content, Vec<Content>), String> {
     if name.is_empty() || name.len() > MAX_FILENAME {
-        return Err(format!("имя файла 1..{MAX_FILENAME} байт"));
+        return Err(format!("file name must be 1..{MAX_FILENAME} bytes"));
     }
     if bytes.is_empty() {
         // Пустой файл дал бы манифест с chunks=0, который получатель отвергает —
         // асимметрия (отправитель «успех», получатель «мимо»). Отсекаем у источника.
-        return Err("пустой файл (0 байт)".into());
+        return Err("empty file (0 bytes)".into());
     }
     if bytes.len() as u64 > MAX_FILE_SIZE {
-        return Err(format!("файл > {} Б (лимит первого среза)", MAX_FILE_SIZE));
+        return Err(format!("file larger than {} B (the inline ceiling)", MAX_FILE_SIZE));
     }
     let mut id = [0u8; 16];
     OsRng.fill_bytes(&mut id);
@@ -754,10 +754,10 @@ impl Reassembler {
             Content::FileManifest { id, name, size, chunks, hash } => {
                 // Анти-DoS: отвергаем абсурд ДО аллокации.
                 if chunks == 0 || chunks > MAX_FILE_CHUNKS || size > MAX_FILE_SIZE {
-                    return Err("манифест вне лимитов (чанки/размер)".into());
+                    return Err("manifest outside its limits (chunks/size)".into());
                 }
                 if name.len() > MAX_FILENAME {
-                    return Err("имя файла слишком длинное".into());
+                    return Err("file name too long".into());
                 }
                 self.start_transfer(id, TransferKind::File { name }, size, chunks, hash, now)
             }
@@ -799,13 +799,13 @@ impl Reassembler {
                     // in-order в пределах цепочки. Если это сломать (напр.
                     // распараллелить отправку чанков), передача будет молча гибнуть
                     // здесь — НЕ оптимизировать порядок, не сняв это ограничение.
-                    return Err("чанк без манифеста".into());
+                    return Err("chunk without a manifest".into());
                 };
                 if index >= p.total {
-                    return Err("индекс чанка вне диапазона".into());
+                    return Err("chunk index out of range".into());
                 }
                 if data.len() > MAX_CHUNK_PAYLOAD {
-                    return Err("чанк больше лимита".into());
+                    return Err("chunk exceeds the limit".into());
                 }
                 p.last_seen = now; // keep an actively-arriving transfer fresh (never reaped)
                 p.received.insert(index, data);
@@ -897,16 +897,16 @@ impl Reassembler {
         let p = self.transfers.remove(&id).expect("id present");
         let mut bytes = Vec::with_capacity(p.size as usize);
         for i in 0..p.total {
-            let chunk = p.received.get(&i).expect("все чанки на месте (done)");
+            let chunk = p.received.get(&i).expect("every chunk present (done)");
             bytes.extend_from_slice(chunk);
         }
         if bytes.len() as u64 != p.size {
-            return Err("собранный размер не совпал с манифестом".into());
+            return Err("reassembled size does not match the manifest".into());
         }
         let got: [u8; 32] = Sha256::digest(&bytes).into();
         if got != p.hash {
             // ОБНАРУЖЕННАЯ порча — не тихо принять.
-            return Err("SHA-256 собранного файла не совпал (порча/подмена)".into());
+            return Err("SHA-256 of the reassembled file does not match (corruption or substitution)".into());
         }
         Ok(Some(match p.kind {
             TransferKind::File { name } => Assembled::File(CompletedFile { id, name, bytes }),
@@ -949,12 +949,12 @@ mod tests {
         // Несколько чанков (2.5 KiB → 3 чанка по 1024).
         let data: Vec<u8> = (0..2560u32).map(|i| (i * 31) as u8).collect();
         let (m, ch) = chunk_file("photo.jpg", &data).unwrap();
-        assert!(ch.len() >= 3, "должно быть >1 чанка");
+        assert!(ch.len() >= 3, "expected more than one chunk");
         let mut r = Reassembler::new();
         let f = as_file(feed_all(&mut r, m, ch));
         assert_eq!(f.name, "photo.jpg");
-        assert_eq!(f.bytes, data, "байт-в-байт");
-        assert_eq!(r.pending(), 0, "передача очищена после сборки");
+        assert_eq!(f.bytes, data, "byte for byte");
+        assert_eq!(r.pending(), 0, "the transfer is cleared after reassembly");
     }
 
     #[test]
@@ -1099,7 +1099,7 @@ mod tests {
                 err = Some(e);
             }
         }
-        assert!(err.is_some(), "порча чанка должна быть ОБНАРУЖЕНА (хэш не сошёлся)");
+        assert!(err.is_some(), "a corrupted chunk must be DETECTED (hash mismatch)");
     }
 
     #[test]
@@ -1111,9 +1111,9 @@ mod tests {
         // Подаём все, КРОМЕ последнего.
         let n = ch.len();
         for c in ch.into_iter().take(n - 1) {
-            assert_eq!(r.offer(c, 0).unwrap(), None, "неполная передача не завершается");
+            assert_eq!(r.offer(c, 0).unwrap(), None, "an incomplete transfer does not complete");
         }
-        assert_eq!(r.pending(), 1, "передача осталась незавершённой");
+        assert_eq!(r.pending(), 1, "the transfer stays incomplete");
     }
 
     #[test]
@@ -1126,7 +1126,7 @@ mod tests {
             chunks: u32::MAX,
             hash: [0; 32],
         };
-        assert!(r.offer(m, 0).is_err(), "абсурдный манифест отвергнут");
+        assert!(r.offer(m, 0).is_err(), "an absurd manifest is refused");
         assert_eq!(r.pending(), 0);
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
     #[test]
     fn empty_file_rejected_at_source() {
         // Иначе манифест chunks=0 → получатель отвергает, а отправитель «успех».
-        assert!(chunk_file("empty.bin", b"").is_err(), "пустой файл отсекается у источника");
+        assert!(chunk_file("empty.bin", b"").is_err(), "an empty file is refused at the source");
     }
 
     #[test]
@@ -1177,7 +1177,7 @@ mod tests {
         // вариант ПОЗИЦИОННЫМ индексом. Text должен остаться индексом 0 — первый
         // байт закодированного `Text` = 0 (иначе старые сообщения раскодируются
         // как чужой вариант).
-        assert_eq!(encode(&Content::Text(b"x".to_vec()))[0], 0, "Text — вариант 0");
+        assert_eq!(encode(&Content::Text(b"x".to_vec()))[0], 0, "Text is variant 0");
         // И Text по-прежнему декодируется в Text, не в TextExpiring.
         assert!(matches!(decode(&encode(&Content::Text(b"x".to_vec()))).unwrap(), Content::Text(_)));
     }
@@ -1195,12 +1195,12 @@ mod tests {
     fn reaction_variant_appended_last_keeps_old_indices() {
         // Дискриминирующий против перестановки: Reaction — ПОСЛЕДНИЙ вариант (индекс
         // 6, после DeleteForEveryone=5). Text по-прежнему 0, DFE по-прежнему 5.
-        assert_eq!(encode(&Content::Text(b"x".to_vec()))[0], 0, "Text — вариант 0");
+        assert_eq!(encode(&Content::Text(b"x".to_vec()))[0], 0, "Text is variant 0");
         assert_eq!(encode(&Content::DeleteForEveryone { ts: 1, text: vec![] })[0], 5, "DFE — 5");
         assert_eq!(
             encode(&Content::Reaction { msg_id: [0; 16], emoji: "x".into(), add: true })[0],
             6,
-            "Reaction — вариант 6 (в конце)"
+            "Reaction is variant 6 (last)"
         );
     }
 
@@ -1208,18 +1208,18 @@ mod tests {
     fn text_reply_roundtrips_is_not_a_file_and_is_variant_7() {
         let c = Content::TextReply { text: b"re".to_vec(), ts: 9, reply_to: [4u8; 16] };
         assert_eq!(decode(&encode(&c)).unwrap(), c);
-        assert_eq!(encode(&c)[0], 7, "TextReply — вариант 7 (после Reaction=6)");
+        assert_eq!(encode(&c)[0], 7, "TextReply is variant 7 (after Reaction=6)");
         let mut r = Reassembler::new();
-        assert_eq!(r.offer(c, 0).unwrap(), None, "ответ — не файл");
+        assert_eq!(r.offer(c, 0).unwrap(), None, "a reply is not a file");
     }
 
     #[test]
     fn edit_message_roundtrips_is_not_a_file_and_is_variant_8() {
         let c = Content::EditMessage { target_msg_id: [3u8; 16], new_text: b"fixed".to_vec(), edit_ts: 5 };
         assert_eq!(decode(&encode(&c)).unwrap(), c);
-        assert_eq!(encode(&c)[0], 8, "EditMessage — вариант 8 (после TextReply=7)");
+        assert_eq!(encode(&c)[0], 8, "EditMessage is variant 8 (after TextReply=7)");
         let mut r = Reassembler::new();
-        assert_eq!(r.offer(c, 0).unwrap(), None, "правка — не файл");
+        assert_eq!(r.offer(c, 0).unwrap(), None, "an edit is not a file");
     }
 
     #[test]
@@ -1273,9 +1273,9 @@ mod tests {
         // Детерминизм: те же входы → тот же id (обе стороны сойдутся).
         assert_eq!(base, msg_id(&a, 100, b"hello"));
         // Чувствительность к КАЖДОМУ входу (иначе реакция сядет не на то сообщение):
-        assert_ne!(base, msg_id(&[2u8; 32], 100, b"hello"), "автор влияет");
-        assert_ne!(base, msg_id(&a, 101, b"hello"), "ts влияет");
-        assert_ne!(base, msg_id(&a, 100, b"hell0"), "текст влияет (снимает ts-коллизию)");
+        assert_ne!(base, msg_id(&[2u8; 32], 100, b"hello"), "the author changes the id");
+        assert_ne!(base, msg_id(&a, 101, b"hello"), "the timestamp changes the id");
+        assert_ne!(base, msg_id(&a, 100, b"hell0"), "the text changes the id (breaks a same-timestamp collision)");
     }
 
     #[test]
@@ -1307,7 +1307,7 @@ mod tests {
             chunks: 1,
             hash: [0; 32],
         };
-        assert!(r.offer(over, 0).is_err(), "сверх лимита одновременных передач");
+        assert!(r.offer(over, 0).is_err(), "beyond the concurrent-transfer limit");
     }
 
     #[test]

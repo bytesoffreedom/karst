@@ -44,7 +44,7 @@ pub type Field = Scalar;
 fn hash_to_field(parts: &[&[u8]]) -> Field {
     let mut h = Sha512::new();
     for p in parts {
-        h.update((p.len() as u64).to_be_bytes()); // домен-разделение по длине
+        h.update((p.len() as u64).to_be_bytes()); // length-prefixed domain separation
         h.update(p);
     }
     let out = h.finalize();
@@ -305,7 +305,7 @@ impl RlnQuotaTracker {
                     // Ключ карты — сам nullifier, значит nullifier'ы равны;
                     // slash не может вернуть «разные». Если инвариант сломан —
                     // это баг, а не тихий Duplicate.
-                    debug_assert!(false, "равный nullifier дал DifferentNullifier");
+                    debug_assert!(false, "equal nullifiers reported DifferentNullifier");
                     RlnOutcome::Duplicate
                 }
             }

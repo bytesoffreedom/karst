@@ -57,8 +57,8 @@ pub struct DtnQuota {
 #[derive(Debug, Clone)]
 pub struct DtnCapability {
     pub capability_id: [u8; 16],
-    pub issued_at: u64, // unix seconds, без квантования
-    pub not_after: u64, // issued_at + до MAX_DTN_TRANSIT_TTL
+    pub issued_at: u64, // unix seconds, unquantised
+    pub not_after: u64, // issued_at plus at most MAX_DTN_TRANSIT_TTL
     pub quota: DtnQuota,
     pub secret: [u8; 32],
 }
@@ -247,7 +247,7 @@ type Event = (u64, u64);
 pub struct CarryBudgetTracker {
     limits: BudgetLimits,
     per_peer: HashMap<PeerId, VecDeque<Event>>,
-    device: VecDeque<(PeerId, u64, u64)>, // (peer, ts, bytes) для агрегата и prune
+    device: VecDeque<(PeerId, u64, u64)>, // (peer, ts, bytes) for the aggregate and for pruning
     device_bytes: u64,
 }
 

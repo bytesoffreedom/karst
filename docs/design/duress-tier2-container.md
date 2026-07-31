@@ -105,8 +105,8 @@ cost real privacy for a benefit it was never actually providing. **Fix (shipped 
 `container.rs`): P1 and P3 now get the IDENTICAL write ceiling, unconditionally.**
 Net effect, stated plainly because it is a real capability loss and not a free
 lunch: a Blind write can no longer overwrite the hidden tail through an ordinary
-save — "повезёт — жив, нет — хуй с ним" no longer applies, because there is no path
-left that reaches the hidden tail at all. This also makes a Blind save crash-atomic
+save: there is no path left that reaches the hidden tail at all, so the outcome no
+longer depends on luck. This also makes a Blind save crash-atomic
 for the first time (CRYPTO-13's non-atomic spill path is now unreachable from any
 password). Corruption‑avoidance without leaking the hidden extent is still provably
 impossible on one key in the general case (unchanged reasoning: anything the main

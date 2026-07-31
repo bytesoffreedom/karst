@@ -1,14 +1,14 @@
-//! §7.0 — Параметры протокола.
+//! §7.0 — protocol parameters.
 
-/// Длительность quota-эпохи (anonymous rate limiting, §7.4).
+/// The quota epoch duration (anonymous rate limiting, §7.4).
 pub const EPOCH_DURATION_SECS: u64 = 10 * 60;
-/// Время жизни stateless cookie (§7.1).
+/// The lifetime of a stateless cookie (§7.1).
 pub const COOKIE_TTL_SECS: u64 = 30;
-/// Число эпох, в течение которых предыдущий cookie-ключ ещё принимается (§7.1).
+/// How many epochs a previous cookie key is still accepted for.
 pub const GRACE_EPOCHS: u64 = 1;
-/// Максимальный размер пакета на входе (§7.0) — потолок bounded-parse на ступени 0,
-/// НЕ MTU канала: live-путь идёт TCP внутри Noise-сессии, которая сама кадрирует и
-/// пересобирает.
+/// The maximum packet size at the entrance (§7.0) — the bounded-parse ceiling at stage 0.
+/// NOT the link MTU: the live path runs over TCP inside a Noise session, which frames and
+/// reassembles on its own.
 ///
 /// Was 1400 and contradicted Principle 6: an ML-KEM-768 key agreement is ~1.1 KB by
 /// itself, so a post-quantum opener carrying a first message longer than ~120 B was
@@ -37,10 +37,10 @@ pub const GRACE_EPOCHS: u64 = 1;
 /// That is the price of a uniform size class (PRIV-1), and it is paid to hide message length rather
 /// than to carry the opener's PQ ciphertext — ordinary messages do not contain one.
 pub const MAX_PACKET_SIZE: usize = 3840;
-/// Фиксированный размер challenge-ответа непроверенному адресу (§7.1).
+/// The fixed size of the challenge reply to an unverified address (§7.1).
 pub const COOKIE_CHALLENGE_SIZE: usize = 64;
 
-/// cookie-эпоха — локальный секрет relay, ротируется независимо от quota-эпохи.
+/// The cookie epoch is a relay-local secret, rotated independently of the quota epoch.
 pub fn cookie_epoch_id(unix_secs: u64, epoch_duration_secs: u64) -> u32 {
     (unix_secs / epoch_duration_secs) as u32
 }

@@ -1,9 +1,9 @@
 //! §7.1 — Stateless Cookie.
 //!
-//! Первый ответ на непроверенный адрес — всегда фиксированный 64-байтовый
-//! challenge (§7.5, Ступень 1), независимо от содержимого запроса. Relay
-//! хранит только два `relay_epoch_key` (текущий и предыдущий) — O(1) по
-//! числу клиентов, никакого per-client состояния.
+//! The first reply to an unverified address is always a fixed 64-byte challenge (§7.5, Stage 1),
+//! whatever the request contained. The relay keeps only two `relay_epoch_key`s (current and
+//! previous) — O(1) in the number of clients, with no per-client state.
+//! previous) — O(1) in the number of clients, with no per-client state.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -14,23 +14,23 @@ use crate::params::{cookie_epoch_id, COOKIE_TTL_SECS, GRACE_EPOCHS};
 type HmacSha256 = Hmac<Sha256>;
 
 pub const COOKIE_VERSION: u8 = 1;
-/// Сериализованный размер cookie на проводе: 1 + 4 + 16 + 4 + 16.
+/// The serialised size of a cookie on the wire: 1 + 4 + 16 + 4 + 16.
 pub const COOKIE_WIRE_SIZE: usize = 41;
 
-/// Причина отказа при верификации cookie. Никогда не логирует адрес клиента.
+/// The reason a cookie failed verification. It never logs the client's address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CookieError {
     BadLength,
     BadVersion,
-    /// epoch_id вне окна [current-GRACE_EPOCHS, current].
+    /// epoch_id is outside the window [current-GRACE_EPOCHS, current].
     StaleEpoch,
-    /// issued_at выходит за пределы COOKIE_TTL относительно now.
+    /// issued_at is outside COOKIE_TTL relative to now.
     Expired,
-    /// MAC не совпал (спуфинг адреса / carrier_id, либо чужой ключ).
+    /// The MAC did not match (a spoofed address or carrier_id, or a foreign key).
     BadMac,
 }
 
-/// Cookie в том виде, как он уходит на провод (§7.1).
+/// The cookie as it goes on the wire (§7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Cookie {
     pub version: u8,
@@ -69,8 +69,8 @@ impl Cookie {
     }
 }
 
-/// Держатель эпоховых ключей relay. Хранит ровно 2 ключа: текущий и
-/// предыдущий, чтобы cookie на границе ротации не отбрасывались (§7.1).
+/// The holder of the relay's epoch keys. It stores exactly two: the current and the previous, so
+/// that cookies on a rotation boundary are not discarded (§7.1).
 pub struct CookieKeyring {
     epoch_duration_secs: u64,
     current_epoch: u32,
@@ -79,8 +79,8 @@ pub struct CookieKeyring {
 }
 
 impl CookieKeyring {
-    /// `seed_now` — время инициализации; ключи задаются извне (детерминизм
-    /// для тест-векторов), в бою генерируются из CSPRNG.
+    /// `seed_now` is the initialisation time; the keys are supplied from outside (determinism for
+    /// test vectors) and generated from a CSPRNG in production.
     pub fn new(
         epoch_duration_secs: u64,
         now_secs: u64,
@@ -95,10 +95,10 @@ impl CookieKeyring {
         }
     }
 
-    /// Ротация при переходе в новую cookie-эпоху: текущий → предыдущий,
-    /// новый ключ → текущий. Relay вызывает это, передавая текущее время;
-    /// эпоха выводится из `epoch_duration_secs`, чтобы вся арифметика эпох
-    /// жила в одном месте. No-op, если эпоха ещё не сменилась.
+    /// Rotation when a new cookie epoch begins: current → previous, and a new key becomes current.
+    /// The relay calls this with the current time; the epoch is derived from
+    /// `epoch_duration_secs` so that all epoch arithmetic lives in one place. A no-op if the epoch
+    /// has not turned yet.
     pub fn rotate_if_needed(&mut self, now_secs: u64, new_key: [u8; 32]) -> bool {
         let new_epoch = cookie_epoch_id(now_secs, self.epoch_duration_secs);
         if new_epoch <= self.current_epoch {
@@ -122,7 +122,7 @@ impl CookieKeyring {
         }
     }
 
-    /// Выдать cookie для (client_addr, carrier_id) на текущую эпоху.
+    /// Issue a cookie for (client_addr, carrier_id) in the current epoch.
     pub fn issue(
         &self,
         client_addr: &[u8],
@@ -144,11 +144,11 @@ impl CookieKeyring {
         }
     }
 
-    /// Верификация предъявленного cookie (§7.5, Ступень 1).
+    /// Verify a presented cookie (§7.5, Stage 1).
     ///
-    /// `now_secs` нужен для TTL-проверки. Проверки идут от дешёвых к
-    /// дорогим: версия → эпоха → TTL → MAC (последний — единственный крипто-
-    /// шаг), в духе §7.6.
+    /// `now_secs` is needed for the TTL check. The checks run cheapest first: version → epoch →
+    /// TTL → MAC (the last being the only crypto step), in the spirit of §7.6.
+    /// TTL → MAC (the last being the only crypto step), in the spirit of §7.6.
     pub fn verify(
         &self,
         cookie: &Cookie,
@@ -163,8 +163,8 @@ impl CookieKeyring {
             .key_for_epoch(cookie.epoch_id)
             .ok_or(CookieError::StaleEpoch)?;
 
-        // TTL: issued_at не в будущем более чем на допуск, и не старше TTL.
-        // Небольшой допуск на рассинхрон часов — один COOKIE_TTL вперёд.
+        // TTL: issued_at is not in the future beyond the tolerance, and not older than the TTL.
+        // A small tolerance for clock skew — one COOKIE_TTL forward.
         let issued = cookie.issued_at as u64;
         if issued > now_secs.saturating_add(COOKIE_TTL_SECS)
             || now_secs.saturating_sub(issued) > COOKIE_TTL_SECS
@@ -173,7 +173,7 @@ impl CookieKeyring {
         }
 
         let expected = compute_mac(key, client_addr, carrier_id, cookie.issued_at);
-        // Постоянное время: не даём таймингу выдать, сколько байт совпало.
+        // Constant time: do not let timing reveal how many bytes matched.
         if expected.ct_eq(&cookie.mac).into() {
             Ok(())
         } else {
@@ -212,9 +212,9 @@ fn compute_mac(
     truncated
 }
 
-/// client_addr_hash в cookie — это не сам адрес, а его отпечаток (не для
-/// безопасности MAC, а чтобы relay мог грубо сопоставить без хранения).
-/// Полная привязка адреса обеспечивается MAC над сырым client_addr.
+/// The client_addr_hash inside a cookie is not the address itself but its fingerprint (not for the
+/// MAC's security, but so the relay can match roughly without storing anything). The full address
+/// binding comes from the MAC over the raw client_addr.
 fn addr_hash(client_addr: &[u8]) -> [u8; 16] {
     use sha2::Digest;
     let digest = Sha256::digest(client_addr);

@@ -1,4 +1,4 @@
-//! Клиентский транспорт поверх Noise-сессии (§15): `SocketTransport`.
+//! The client transport over a Noise session (§15): `SocketTransport`.
 //!
 //! Split out of the old `socket` module (#143): that file held BOTH the relay's listener and the
 //! client's dialer, which is the crate-level coupling in miniature — the side that accepts
@@ -75,9 +75,9 @@ const POOL_MAX_IDLE: Duration = Duration::from_secs(20);
 /// otherwise hold one file descriptor per scope indefinitely.
 const POOL_MAX_SESSIONS: usize = 32;
 
-/// Клиентский транспорт поверх Noise-сессии. Один запрос = одно соединение +
-/// один handshake (скелет). Держит Noise-pubkey relay (аутентификация при
-/// handshake) и адаптер транспорта (§15): direct-TCP или SOCKS5-к-внешнему-PT.
+/// The client transport over a Noise session. One request is one connection and one handshake
+/// (skeleton). It holds the relay's Noise public key (authentication during the handshake) and the
+/// transport adapter (§15): direct TCP or SOCKS5 to an external PT.
 #[derive(Clone)]
 pub struct SocketTransport {
     /// Routes to the relay in priority order (§15 Path Manager). More than one = the
@@ -113,12 +113,12 @@ struct Pooled {
 }
 
 impl SocketTransport {
-    /// Прямой TCP (без обфускации транспорта).
+    /// Direct TCP (no transport obfuscation).
     pub fn new(addr: impl Into<Dest>, relay_noise_pub: [u8; 32]) -> Self {
         Self::with_adapter(addr.into(), relay_noise_pub, Arc::new(DirectTcpAdapter::default()))
     }
 
-    /// Через заданный адаптер (напр. `Socks5Adapter` на локальный PT-порт).
+    /// Through a given adapter (for example `Socks5Adapter` to a local PT port).
     pub fn with_adapter(
         addr: impl Into<Dest>,
         relay_noise_pub: [u8; 32],
@@ -654,7 +654,7 @@ impl BlobSession {
 }
 
 impl Transport for SocketTransport {
-    /// `now` — часы вызывающего, на провод НЕ уходят (сервер ставит своё).
+    /// `now` is the caller's clock and does NOT go on the wire (the server supplies its own).
     fn send(&self, msg: &WireMessage, now: u64) -> Response {
         self.send_isolated(msg, now, None)
     }
@@ -682,7 +682,7 @@ impl Transport for SocketTransport {
             },
             Ok(WireResponse::Rejected(s)) => FetchResponse::Rejected(s),
             Ok(WireResponse::Accepted) => FetchResponse::Rejected("protocol: Accepted in response to Fetch".into()),
-            // Ошибку транспорта НЕ выдаём за пустой mailbox — recv их различает.
+            // A transport error is never passed off as an empty mailbox — recv distinguishes them.
             Err(e) => FetchResponse::Rejected(format!("transport: {e}")),
             Ok(_) => FetchResponse::Rejected("protocol: unexpected response to Fetch".into()),
         }

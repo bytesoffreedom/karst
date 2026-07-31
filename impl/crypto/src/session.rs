@@ -1,21 +1,21 @@
-//! Независимый защищённый сеанс (§15) — Noise_NK поверх произвольного
-//! `Read + Write` потока (сейчас TCP; позже тот же слой над QUIC/Tor — сеанс
-//! ЖИВЁТ НАД транспортом, как в спеке).
+//! An independent protected session (§15) — Noise_NK over an arbitrary `Read + Write` stream
+//! (TCP today; later the same layer over QUIC or Tor — the session LIVES ABOVE the transport, as
+//! in the spec).
 //!
-//! **Noise_NK:** responder(relay) static известен инициатору (клиент знает
-//! `relay_pub` вне канала, как адрес) → relay аутентифицирован клиенту
-//! (анти-MITM); клиент АНОНИМЕН на транспорте (авторизация — cookie/capability/
-//! fetch-auth ВНУТРИ туннеля, §15 требует сохранять admission поверх тоннеля);
-//! per-session эфемеры → forward secrecy и закрытие on-path replay.
+//! **Noise_NK:** the responder (relay) static key is known to the initiator (the client learns
+//! `relay_pub` out of band, as an address) → the relay is authenticated to the client (anti-MITM);
+//! the client is ANONYMOUS at the transport level (authorisation is cookie/capability/fetch-auth
+//! INSIDE the tunnel, as §15 requires admission to survive above the tunnel); per-session
+//! ephemerals give forward secrecy and close on-path replay.
 //!
-//! **Крипта — snow (де-факто Rust-Noise, Apache-2.0/MIT), НЕ самодельная.**
-//! Pure-Rust resolver (curve25519-dalek/chacha20poly1305/blake2 — наш стек, без
-//! `ring` → кросс-компиляция под Android).
+//! **The crypto is snow (the de facto Rust Noise, Apache-2.0/MIT), NOT homemade.**
+//! A pure-Rust resolver (curve25519-dalek/chacha20poly1305/blake2 — our stack, no `ring`, so
+//! cross-compiling to Android works).
 //!
-//! **Это конфиденциальность + анти-MITM, НЕ обфускация транспорта.** Noise-handshake
-//! опознаваем анализом трафика (msg1 — высокоэнтропийный эфемер без TLS-структуры), блокировка
-//! по IP:port работает поверх шифрования. Обфускацию транспорта даёт внешний PT
-//! (look-like-HTTPS, ECH) — следующий срез §15.
+//! **This is confidentiality plus anti-MITM, NOT transport obfuscation.** A Noise handshake is
+//! recognisable to traffic analysis (msg1 is a high-entropy ephemeral without a TLS header), and
+//! addressing by IP:port works above the encryption. Transport shaping comes from the outer layer
+//! (wss, ECH) — the next §15 slice.
 //!
 //! **What IS now applied here: length-hiding padding.** The payload is padded to
 //! fixed size buckets before encryption (see `pad_to_bucket`), so an on-path observer
@@ -23,24 +23,24 @@
 //! — it does NOT make the handshake look like HTTPS and does NOT defeat IP/port
 //! blocking; that remains the future carrier / look-like-TLS work.
 //!
-//! **Внешняя граница доверия сместилась сюда:** непроверенные байты теперь —
-//! handshake- и Noise-кадры. Bounded-read (сверка длины ДО аллокации, чистая
-//! ошибка вместо паники/зависания) сохранён на ОБОИХ.
+//! **The external trust boundary moved here:** unverified bytes now arrive as handshake and Noise
+//! frames. The bounded read (checking the length BEFORE allocating, a clean error rather than a
+//! panic or a hang) is preserved on BOTH.
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use snow::{Builder, TransportState};
 
-/// Noise-паттерн. NK: known responder static, anonymous initiator.
+/// The Noise pattern. NK: known responder static, anonymous initiator.
 pub const NOISE_PARAMS: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
 
-/// Жёсткий предел Noise-сообщения (спека Noise). Payload на чанк — минус тег.
+/// The hard limit on a Noise message (the Noise spec). The per-chunk payload is that minus the tag.
 const MAX_NOISE_MSG: usize = 65535;
 const MAX_NOISE_PAYLOAD: usize = MAX_NOISE_MSG - 16;
 
-/// Потолок handshake-кадра. NK-сообщения крошечные (~48 Б); строгий кап на
-/// внешней границе. Больше — отказ ДО аллокации.
+/// The ceiling on a handshake frame. NK messages are tiny (~48 B); this is a strict cap at the
+/// external boundary. Anything larger is refused BEFORE allocation.
 const MAX_HANDSHAKE_MSG: usize = 1024;
 
 /// A10-2: wall-clock ceiling on completing the Noise handshake, counted from entry
@@ -168,7 +168,7 @@ fn unpad(padded: &[u8], max: usize) -> io::Result<Vec<u8>> {
     Ok(padded[PAD_HEADER..PAD_HEADER + real_len].to_vec())
 }
 
-/// Записать handshake-кадр: `u16` длина + байты.
+/// Write a handshake frame: a `u16` length plus the bytes.
 fn write_handshake<S: Write>(s: &mut S, msg: &[u8]) -> io::Result<()> {
     let len = u16::try_from(msg.len()).map_err(|_| noise_io("handshake too large"))?;
     s.write_all(&len.to_le_bytes())?;
@@ -176,7 +176,7 @@ fn write_handshake<S: Write>(s: &mut S, msg: &[u8]) -> io::Result<()> {
     s.flush()
 }
 
-/// Прочитать handshake-кадр c bounded-read (кап `MAX_HANDSHAKE_MSG` до аллокации).
+/// Read a handshake frame with a bounded read (capped at `MAX_HANDSHAKE_MSG` before allocation).
 fn read_handshake<S: Read>(s: &mut S) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 2];
     s.read_exact(&mut len_buf)?;
@@ -189,14 +189,14 @@ fn read_handshake<S: Read>(s: &mut S) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Зашифрованный сеанс над потоком `S`.
+/// An encrypted session over the stream `S`.
 pub struct Session<S> {
     stream: S,
     noise: TransportState,
 }
 
 impl<S: Read + Write> Session<S> {
-    /// Клиент (initiator): relay static известен → `-> e, es` / `<- e, ee`.
+    /// The client (initiator): the relay static is known → `-> e, es` / `<- e, ee`.
     pub fn connect(mut stream: S, relay_pub: &[u8; 32]) -> io::Result<Self> {
         let mut noise = Builder::new(NOISE_PARAMS.parse().map_err(noise_io)?)
             .remote_public_key(relay_pub)
@@ -212,7 +212,7 @@ impl<S: Read + Write> Session<S> {
         Ok(Session { stream, noise })
     }
 
-    /// Relay (responder): свой static private key. Bounded by `HANDSHAKE_DEADLINE`
+    /// The relay (responder): its own static private key. Bounded by `HANDSHAKE_DEADLINE`.
     /// (A10-2) — see `accept_with_deadline`, which does the real work.
     pub fn accept(stream: S, relay_priv: &[u8; 32]) -> io::Result<Self> {
         Self::accept_with_deadline(stream, relay_priv, Instant::now() + HANDSHAKE_DEADLINE)
@@ -237,10 +237,10 @@ impl<S: Read + Write> Session<S> {
         Ok(Session { stream, noise })
     }
 
-    /// Зашифровать и отправить `plaintext`. Кадр: `u32` полная длина + чанки
-    /// `[u32 ct_len][ct]` (payload дробится по `MAX_NOISE_PAYLOAD`, т.к. одно
-    /// Noise-сообщение ≤ 64 КБ, а ответ mailbox бывает больше). `max` — потолок
-    /// полной длины (симметрично чтению).
+    /// Encrypt and send `plaintext`. The frame is a `u32` total length plus chunks of
+    /// `[u32 ct_len][ct]` (the payload is split by `MAX_NOISE_PAYLOAD`, because one Noise message
+    /// is ≤ 64 KB while a mailbox reply can be larger). `max` is the ceiling on the total length
+    /// (symmetric with reading).
     pub fn write_msg(&mut self, plaintext: &[u8], max: usize) -> io::Result<()> {
         if plaintext.len() > max {
             return Err(noise_io("outgoing message exceeds max"));
@@ -260,9 +260,9 @@ impl<S: Read + Write> Session<S> {
         self.stream.flush()
     }
 
-    /// Прочитать и расшифровать сообщение. Bounded на ТРЁХ уровнях: полная
-    /// длина сверяется с `max` ДО аллокации, каждый ct-чанк — с `MAX_NOISE_MSG`,
-    /// и (A10-3) the NUMBER of chunks is bounded too — see `max_chunks` below.
+    /// Read and decrypt a message. Bounded at THREE levels: the total length is checked against
+    /// `max` BEFORE allocation, each ciphertext chunk against `MAX_NOISE_MSG`, and (A10-3) the
+    /// NUMBER of chunks is bounded too — see `max_chunks` below.
     pub fn read_msg(&mut self, max: usize) -> io::Result<Vec<u8>> {
         // Wire cap derived from the TRUSTED plaintext `max`, not from the wire length:
         // the padded frame can be up to the bucket that fits `max`. This keeps the
@@ -305,7 +305,7 @@ impl<S: Read + Write> Session<S> {
             self.stream.read_exact(&mut ct)?;
             let n = self.noise.read_message(&ct, &mut pt).map_err(noise_io)?;
             if n == 0 || padded.len() + n > total {
-                // нет прогресса или перебор заявленной длины → злонамеренный ввод.
+                // No progress, or more than the declared length → a malicious peer.
                 return Err(noise_io("malformed chunk stream"));
             }
             padded.extend_from_slice(&pt[..n]);

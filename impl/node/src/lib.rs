@@ -1,18 +1,18 @@
-//! KARST — рабочий скелет узла: первый раз, когда куски §7 (admission)
-//! становятся ПУТЁМ СООБЩЕНИЯ, а не изолированными механизмами.
+//! KARST — a working node skeleton: the first time the pieces of §7 (admission) become a MESSAGE
+//! PATH rather than isolated mechanisms.
 //!
-//! Скелет проводит одно зашифрованное сообщение Alice → relay → Bob
-//! in-process, с реальным admission-handshake (§7) и реальным (но classical-
-//! only, см. `seal`) E2E-конвертом. Relay гейтит по credential и НЕ видит
-//! содержимое. Сессионный §2.1 (`peer`: PQXDH `pqxdh` + Double Ratchet `ratchet`)
-//! — реальный E2E in-process пути сообщения; `seal` ещё несёт сокет/CLI-путь, пока
-//! §12 discovery (`peer::publish`/`connect`) и персистентность сессий
+//! The skeleton carries one encrypted message Alice → relay → Bob in process, with a real
+//! admission handshake (§7) and a real (though classical-only, see `seal`) E2E envelope. The relay
+//! gates on the credential and does NOT see the contents. The session §2.1 path (`peer`: PQXDH
+//! `pqxdh` plus the Double Ratchet `ratchet`) is the real in-process E2E of the message path;
+//! `seal` still carries the socket and CLI path, while §12 discovery (`peer::publish`/`connect`)
+//! and session persistence are implemented — the `karst` CLI runs entirely on §2.1. `seal` remains
 //! (`Session::snapshot`/`restore`, `Peer::export_state`/`import_state`)
-//! реализованы — CLI `karst` целиком на §2.1. `seal` остаётся лишь как
-//! demo-путь `Client`/`Recipient` (тесты). Android-клиент — следующий срез.
+//! only as the demo path for `Client`/`Recipient` (tests). An Android client is the next slice.
 //!
-//! Границы честно: `seal::SkeletonSeal` — НЕ §2.1 (нет FS/ratchet/PQ), это
-//! отложено по выбору, не внешняя стена. Подробности — в doc модуля `seal`.
+//!
+//! The boundaries, honestly: `seal::SkeletonSeal` is NOT §2.1 (no forward secrecy, no ratchet, no
+//! PQ) — deferred by choice, not an external wall. Details in the `seal` module docs.
 
 /// Mailbox deposit/fetch key separation via Ristretto point-blinding — wired into the live
 /// drop-box path for established sessions (reference construction; the Schnorr fetch proof is

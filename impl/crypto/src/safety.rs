@@ -1,36 +1,36 @@
-//! Safety number (отпечаток безопасности) — человекочитаемая сверка подлинности
-//! §2.1-IK по ВНЕПОЛОСНОМУ каналу (голос/личная встреча/видео). Закрывает
-//! единственную крипто-НЕобеспечиваемую стену модели: relay — НЕ якорь личности,
-//! подлинность IK устанавливается OOB, иначе IK-swap = MITM.
+//! The safety number — a human-readable verification of a §2.1 IK's authenticity over an
+//! OUT-OF-BAND channel (voice, an in-person meeting, video). It closes the one wall the model
+//! cannot close cryptographically: the relay is NOT an identity anchor, so IK authenticity is
+//! established out of band, otherwise an IK swap is a MITM.
 //!
-//! **Что именно верифицируется:** ПОДЛИННОСТЬ IK, и только её. Это полно, потому
-//! что IK-подлинность ⟹ подлинность сессии: `root_key` PQXDH нагружает
-//! `DH1 = IK_A × PK_B` и связывает оба IK в транскрипт (см. `pqxdh`) — сторона
-//! без секрета IK не согласует тот же ключ (fail-closed). Подмена prekey/KEM у
-//! relay сессию НЕ образует (не нужно отдельно детектить). Поэтому хэшируем
-//! ровно `identity_public()`.
+//! **What exactly is verified:** the AUTHENTICITY OF THE IK, and only that. It is sufficient
+//! because IK authenticity implies session authenticity: the PQXDH `root_key` is load-bearing on
+//! `DH1 = IK_A × PK_B` and binds both IKs into the transcript (see `pqxdh`) — a party without the
+//! IK secret cannot agree the same key (fail-closed). A prekey or KEM substitution at the relay
+//! forms no session at all (so it needs no separate detection). That is why exactly
+//! `identity_public()` is hashed.
 //!
-//! **Конструкция.** Симметрична: обе стороны сортируют пару IK и получают ОДНО
-//! число. `SHA-512(DOMAIN ‖ VERSION ‖ lo ‖ hi)` → первые 60 байт → 12 групп по
-//! 5 байт (big-endian) `mod 100000` → 12×5 = **60 десятичных цифр** (формат в духе
-//! Signal). Итерированный KDF (Signal 5200×) НЕ нужен: при полной 60-значной
-//! ширине (~199 бит) MITM, ищущий совпадающее число `SN(A,M_a)==SN(B,M_b)`,
-//! упирается в двухсписочную коллизию ~2^100 — итерация ничего не добавляет,
-//! когда показана вся ширина. Ширина несёт стойкость.
+//! **The construction.** It is symmetric: both sides sort the IK pair and obtain the same number.
+//! `SHA-512(DOMAIN ‖ VERSION ‖ lo ‖ hi)` → the first 60 bytes → 12 groups of 5 bytes (big-endian)
+//! `mod 100000` → 12×5 = **60 decimal digits** (in the spirit of Signal). An iterated KDF (Signal's
+//! 5200 rounds) is not needed: at the full 60-digit width (~199 bits) a MITM looking for a matching
+//! number `SN(A,M_a)==SN(B,M_b)` runs into a two-list collision at ~2^100 — iteration adds nothing
+//! once the full width is displayed. The width carries the strength.
+//! once the full width is displayed. The width carries the strength.
 
 use sha2::{Digest, Sha512};
 
 const DOMAIN: &[u8] = b"KARST-safety-number";
-/// Версия формата — смена ломает совместимость отпечатков осознанно.
+/// The format version — changing it breaks fingerprint compatibility deliberately.
 const VERSION: u8 = 1;
-/// Групп по 5 цифр (как Signal: 60 цифр всего). Нужно `GROUPS*5` байт дайджеста.
+/// Groups of 5 digits (as in Signal: 60 digits in total). It needs `GROUPS*5` bytes of digest.
 const GROUPS: usize = 12;
 
-/// 60-значный отпечаток пары §2.1-IK, сгруппированный по 5 цифр через пробел
-/// (`"01234 56789 …"`, 12 групп). Симметричен: `safety_number(a,b) ==
-/// safety_number(b,a)`. Для OOB-сверки читается вслух/сравнивается визуально.
+/// The 60-digit fingerprint of a §2.1 IK pair, grouped in fives with spaces (`"01234 56789 …"`, 12
+/// groups). Symmetric: `safety_number(a,b) == safety_number(b,a)`. Read aloud or compared visually
+/// for the out-of-band check.
 pub fn safety_number(ik_a: &[u8; 32], ik_b: &[u8; 32]) -> String {
-    // Симметрия: канонический порядок пары (меньший IK первым).
+    // Symmetry: a canonical order for the pair (the smaller IK first).
     let (lo, hi) = if ik_a <= ik_b { (ik_a, ik_b) } else { (ik_b, ik_a) };
 
     let mut h = Sha512::new();
@@ -43,7 +43,7 @@ pub fn safety_number(ik_a: &[u8; 32], ik_b: &[u8; 32]) -> String {
     let mut out = String::with_capacity(GROUPS * 6);
     for i in 0..GROUPS {
         let start = i * 5;
-        // 5 байт big-endian → u64 → 5 десятичных цифр.
+        // 5 bytes big-endian → u64 → 5 decimal digits.
         let mut v: u64 = 0;
         for &b in &digest[start..start + 5] {
             v = (v << 8) | b as u64;
@@ -52,8 +52,8 @@ pub fn safety_number(ik_a: &[u8; 32], ik_b: &[u8; 32]) -> String {
         if i > 0 {
             out.push(' ');
         }
-        // ОБЯЗАТЕЛЬНО zero-pad до 5 цифр: иначе группы разъезжаются и визуальная
-        // OOB-сверка (ради чего фича и существует) молча ломается.
+        // Zero-padding to 5 digits is MANDATORY: without it the groups drift apart and the visual
+        // out-of-band comparison — the whole point of the feature — silently breaks.
         out.push_str(&format!("{chunk:05}"));
     }
     out
@@ -63,9 +63,9 @@ pub fn safety_number(ik_a: &[u8; 32], ik_b: &[u8; 32]) -> String {
 mod tests {
     use super::*;
 
-    /// Замороженный known-answer: пиннит DOMAIN, VERSION, порядок сортировки,
-    /// endianness, chunk-математику И zero-pad против тихого дрейфа (как
-    /// conformance-вектора). Значение получено из самой реализации и заморожено.
+    /// A frozen known-answer test: it pins DOMAIN, VERSION, the sort order, the endianness, the
+    /// chunk arithmetic AND the zero-padding against silent drift (like the conformance vectors).
+    /// The value came from the implementation itself and is frozen.
     #[test]
     fn frozen_known_answer_vector() {
         let a = [0u8; 32];
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(sn, "17189 06467 41496 60988 88669 01686 91612 33462 95102 33841 50843 30572");
     }
 
-    /// Симметрия: порядок аргументов не влияет (обе стороны видят одно число).
+    /// Symmetry: the argument order does not matter (both sides see the same number).
     #[test]
     fn symmetric_in_arguments() {
         let a = [7u8; 32];
@@ -83,8 +83,8 @@ mod tests {
         assert_eq!(safety_number(&a, &b), safety_number(&b, &a));
     }
 
-    /// Чувствительность: флип ОДНОГО бита одного IK → другое число (иначе подмена
-    /// IK не детектилась бы — суть фичи).
+    /// Sensitivity: flipping ONE bit of one IK gives a different number (otherwise an IK swap
+    /// would go undetected — the whole point of the feature).
     #[test]
     fn one_bit_flip_changes_number() {
         let a = [0u8; 32];
@@ -94,7 +94,7 @@ mod tests {
         assert_ne!(safety_number(&a, &b), safety_number(&a, &b2));
     }
 
-    /// Формат: ровно 60 цифр в 12 группах по 5, разделённых пробелом.
+    /// The format: exactly 60 digits in 12 groups of 5, separated by spaces.
     #[test]
     fn format_is_twelve_groups_of_five_digits() {
         let sn = safety_number(&[1u8; 32], &[2u8; 32]);

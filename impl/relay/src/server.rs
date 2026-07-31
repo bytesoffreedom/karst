@@ -1,14 +1,14 @@
-//! TCP-сервер вокруг `RelayNode`, **поверх Noise-сессии (§15)**.
+//! A TCP server around `RelayNode`, **over a Noise session (§15)**.
 //!
-//! **СКЕЛЕТ.** Блокирующий, поток-на-соединение, std-only. Каждое соединение сначала проходит
-//! Noise_NK-handshake (`node::session`), потом обменивается запрос-ответом внутри зашифрованного
-//! сеанса.
+//! **SKELETON.** Blocking, thread per connection, std only. Every connection performs a Noise_NK
+//! handshake (`node::session`) and then exchanges request/response inside the protected session.
+
 //!
-//! **Обязательный туннель — без тихого fallback на plaintext.** Провалившийся/отсутствующий
-//! handshake = жёсткая ошибка, соединение закрывается; активный противник не может «раздеть»
-//! сессию до старого открытого протокола.
+//! **The tunnel is mandatory — no silent fallback to plaintext.** A failed handshake is a hard
+//! error and the connection closes; an active adversary cannot downgrade a session to the old
+//! cleartext protocol.
 //!
-//! **Сервер ставит СВОЁ время** (см. `node::protocol`): `now` не едет по проводу.
+//! **The server supplies its OWN time** (see `node::protocol`): `now` never travels on the wire.
 
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -27,12 +27,12 @@ use node::wire::{
     decode, encode, WireRequest, WireResponse, MAX_BLOB_FRAME, MAX_RESPONSE_FRAME,
 };
 
-/// Часы сервера: возвращают текущее время в секундах.
+/// The server clock: returns the current time in seconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// Сгенерировать Noise-static-пару `(private, public)` тем же resolver'ом, что
-/// использует `RelayServer`. Бинарь зовёт на ПЕРВОМ запуске и персистит пару,
-/// затем на рестартах поднимает через `with_noise_keypair` (стабильный relay-id).
+/// Generate a Noise static pair `(private, public)` with the same resolver `RelayServer` uses. The
+/// binary calls this on the FIRST run and persists the pair; on later restarts it loads it through
+/// `with_noise_keypair` (a stable relay-id).
 pub fn generate_noise_keypair() -> ([u8; 32], [u8; 32]) {
     let kp = Builder::new(NOISE_PARAMS.parse().expect("valid noise params"))
         .generate_keypair()
@@ -153,9 +153,9 @@ impl ConnLimiter {
     }
 }
 
-/// TCP-сервер. `RelayNode` под `Mutex` (admission сериализуется). Держит СВОЙ
-/// Noise-static (транспортный ключ, отдельный от fetch-auth relay_identity —
-/// переиспользование Noise-static вне Noise ломает его анализ безопасности).
+/// The TCP server. `RelayNode` sits behind a `Mutex` (admission is serialised). It holds its OWN
+/// Noise static key (a transport key, separate from the fetch-auth relay_identity — reusing a
+/// Noise static outside Noise breaks its security analysis).
 pub struct RelayServer {
     /// `RwLock`, not `Mutex` (#142): the read-only handlers — bundle lookup, node list, policy,
     /// blob stat — are pure reads of relay state, and a bundle lookup happens on every first
@@ -184,10 +184,10 @@ impl RelayServer {
         Self::with_noise_keypair(relay, clock, noise_private, noise_public)
     }
 
-    /// Как `new`, но с ЗАДАННОЙ Noise-static-парой — для персистентности ключа
-    /// relay (стабильный Noise-pub в relay-id между перезапусками). Персистится
-    /// пара (priv+pub) целиком, чтобы не полагаться на совпадение деривации pub
-    /// из priv у разных реализаций 25519.
+    /// Like `new`, but with a GIVEN Noise static pair — for relay key persistence (a stable Noise
+    /// public key inside the relay-id across restarts). The whole pair (private + public) is
+    /// persisted so nothing depends on different 25519 implementations deriving the public key
+    /// from the private one identically.
     pub fn with_noise_keypair(
         relay: RelayNode,
         clock: Clock,
@@ -211,8 +211,8 @@ impl RelayServer {
         self
     }
 
-    /// Публичный Noise-ключ узла — клиент узнаёт его вне канала (аутентифицирует
-    /// relay при handshake). Бинарь печатает его.
+    /// The node's public Noise key — a client learns it out of band (it authenticates the relay
+    /// during the handshake). The binary prints it.
     pub fn noise_public(&self) -> [u8; 32] {
         self.noise_public
     }
@@ -224,7 +224,7 @@ impl RelayServer {
         Arc::clone(&self.relay)
     }
 
-    /// Bind и обслуживать вечно (для бинаря).
+    /// Bind and serve forever (for the binary).
     pub fn serve<A: ToSocketAddrs>(self, addr: A) -> io::Result<()> {
         let listener = TcpListener::bind(addr)?;
         self.serve_listener(listener)
@@ -444,8 +444,8 @@ pub(crate) fn serve_channel(
             }
         }
         WireRequest::FetchBundle(ik) => {
-            // Публичный read; время серверу не нужно — этот путь НИКОГДА не выдаёт one-time
-            // prekey, поэтому у него нет разрушающего побочного эффекта (R2-3).
+            // A public read; the server needs no clock here — this path NEVER touches a one-time
+            // prekey, so it has no destructive side effect (R2-3).
             let bundle = relay.read().expect("relay lock").get_bundle(&ik);
             WireResponse::Bundle(bundle)
         }

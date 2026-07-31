@@ -19,8 +19,8 @@ use node::protocol::{
 };
 use karst_crypto::seal::{Identity, SkeletonSeal};
 
-/// Тонкий клиент: запечатывает сообщение (§2.1-скелет), проходит admission
-/// (§7) с реальным cookie round-trip и шлёт через транспорт.
+/// A thin client: it seals a message (the §2.1 skeleton), passes admission (§7) with a real cookie
+/// round trip, and sends it over the transport.
 pub struct Client<T: Transport> {
     transport: T,
     capability: Capability, // issued by the relay; the client keeps it for proofs
@@ -42,18 +42,18 @@ impl<T: Transport> Client<T> {
         }
     }
 
-    /// Отправить `plaintext` получателю с публичным ключом `recipient_pub`.
+    /// Send `plaintext` to the recipient with public key `recipient_pub`.
     ///
-    /// Cookie-refresh: сервер отвечает `NeedCookie` и на первый контакт (cookie
-    /// нет), и на ПРОТУХШИЙ/сменивший эпоху cookie (§7.1, `COOKIE_TTL_SECS`=30 —
-    /// долгоживущий клиент неизбежно упрётся). Поэтому обрабатываем `NeedCookie`
-    /// на КАЖДОЙ отправке и повторяем РОВНО раз с новым cookie; всё остальное
-    /// (`Accepted`, реальный `Rejected` по capability) возвращаем сразу —
-    /// «протух cookie → повтор» строго отделено от «плохой credential → сдаться».
+    /// Cookie refresh: the server answers `NeedCookie` both on first contact (no cookie yet) and
+    /// on a STALE or epoch-changed cookie (§7.1, `COOKIE_TTL_SECS`=30 — a long-lived client will
+    /// inevitably hit it). So the challenge is handled on EVERY send and retried EXACTLY once with
+    /// the new cookie; everything else (`Accepted`, a genuine `Rejected` on the capability) is
+    /// returned immediately — "the cookie expired, retry" is kept strictly separate from "the
+    /// credential is bad, give up".
     ///
-    /// Тот же nonce+proof на повторе безопасен: challenge отдаётся на Ступени 1
-    /// (cookie) ДО Ступени 3 (replay) и Ступени 4 (quota), т.е. первая попытка
-    /// НИЧЕГО не записала — ни в replay-фильтр, ни в учёт квоты.
+    /// Reusing the same nonce and proof on the retry is safe: the challenge is issued at Stage 1
+    /// (cookie), BEFORE Stage 3 (replay) and Stage 4 (quota), so the first attempt recorded
+    /// NOTHING — neither in the replay filter nor in the quota accounting.
     pub fn send(
         &mut self,
         recipient_pub: &x25519_dalek::PublicKey,
@@ -83,7 +83,7 @@ impl<T: Transport> Client<T> {
             payload: Payload::Skeleton(sealed),
         };
 
-        // До двух попыток: один challenge → refresh → один повтор.
+        // Up to two attempts: one challenge → refresh → one retry.
         for _ in 0..2 {
             match self.transport.send(&msg, now) {
                 Response::NeedCookie(c) => {
@@ -94,14 +94,14 @@ impl<T: Transport> Client<T> {
                 other => return other,
             }
         }
-        // Два challenge подряд — свежий cookie сразу отвергнут (аномалия, не
-        // штатный протух). Не зацикливаемся и не маскируем: честная ошибка.
+        // Two challenges in a row means a fresh cookie was refused immediately (an anomaly, not
+        // ordinary expiry). Do not loop and do not mask it: return an honest error.
         Response::Rejected("persistent cookie challenge".into())
     }
 }
 
-/// Получатель: своя identity + транспорт + публичный ключ relay (для fetch-auth
-/// DH). Забирает ТОЛЬКО свой mailbox (`mailbox` = собственный pubkey).
+/// The recipient: its own identity, the transport, and the relay's public key (for the fetch-auth
+/// DH). It collects ONLY its own mailbox (`mailbox` = its own public key).
 pub struct Recipient<T: Transport> {
     transport: T,
     identity: Identity,
@@ -151,14 +151,14 @@ impl<T: Transport> Recipient<T> {
         self.identity.public
     }
 
-    /// Забрать входящие: cookie-handshake (как send) + доказательство владения
-    /// mailbox, затем расшифровать. `Ok(vec)` — выборка (может быть пустой,
-    /// `None`-элементы = не расшифровались); `Err` — провал (недоступен/протокол/
-    /// отказ auth), отделено от «пусто», чтобы `recv` не путал их.
+    /// Collect incoming mail: the cookie handshake (as in send) plus a mailbox ownership proof,
+    /// then decrypt. `Ok(vec)` is the batch (possibly empty; `None` elements did not decrypt);
+    /// `Err` is a failure (unreachable, protocol, auth refusal), kept separate from "empty" so
+    /// that `recv` never confuses the two.
     pub fn receive(&mut self, now: u64) -> Result<Vec<Option<Vec<u8>>>, String> {
         let mailbox = self.identity.public.to_bytes();
         let shared = self.identity.dh(&self.relay_pub);
-        // До двух попыток: один challenge → refresh → повтор с proof.
+        // Up to two attempts: one challenge → refresh → retry with the proof.
         for _ in 0..2 {
             let proof = match self.cookie {
                 Some(c) => fetch_proof(&shared, &c.mac, &mailbox),
@@ -178,9 +178,9 @@ impl<T: Transport> Recipient<T> {
                     continue;
                 }
                 FetchResponse::Fetched(payloads) => {
-                    // Скелет-получатель открывает только `Skeleton`; сессионные
-                    // §2.1-конверты ему не адресованы (их обрабатывает `Peer`) —
-                    // `None`, а не паника.
+                    // A skeleton recipient opens only `Skeleton` envelopes; session §2.1 ones are
+                    // not addressed to it (they are handled by `Peer`) — so `None`, not a panic.
+
                     let opened: Vec<Option<Vec<u8>>> = payloads
                         .iter()
                         .map(|p| match p {

@@ -4968,6 +4968,7 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> 
 /// different compartments or trigger a wipe — routed in `Vault::open` through `base/slots.dat`.
 /// The account registry (`<compartment>/accounts.dat`) is encrypted. `Clone` is cheap (two
 /// PathBufs and a 32-byte key).
+#[derive(Clone)]
 pub struct Vault {
     /// Vault root: holds `salt`, `slots.dat`, and the `c/<id>/` compartments.
     base: PathBuf,

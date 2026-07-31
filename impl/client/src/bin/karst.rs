@@ -1,11 +1,11 @@
-//! `karst` — десктоп-клиент (Linux), CLI-ядро. **НЕ production** (см.
-//! docs/STATUS.md): §2.1 E2E (PQXDH+ratchet) есть, но дев-capability с публичным
-//! секретом, доверие к IK — вне канала, нет обфускации транспорта, крипта не аудирована.
+//! `karst` — the desktop client (Linux), the CLI core. **NOT production** (see docs/STATUS.md):
+//! the §2.1 E2E path (PQXDH + ratchet) exists, but the dev capability has a public secret, IK
+//! trust is out of band, there is no transport obfuscation, and the crypto is unaudited.
 //!
 //! On-disk secrets are under **at-rest encryption** — the password is prompted for on the
 //! terminal with echo off, with `KARST_PASSPHRASE` as the non-interactive fallback (protects a
 //! COLD disk, not a live process). Directory: `$KARST_HOME`.
-//! Команды: init/id/account/dev-cap/import-cap/publish/send/recv (см. `--help`).
+//! Commands: init/id/account/dev-cap/import-cap/publish/send/recv (see `--help`).
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -188,9 +188,9 @@ impl Drop for EchoOff {
     }
 }
 
-/// Создать аккаунт: свежая 12-словная фраза → корень на диск. Фраза печатается
-/// ОДИН раз — её надо записать (единственный способ восстановления). Идемпотентно
-/// НЕ перезаписывает существующий корень (иначе сменил бы IK и осиротил сессии).
+/// Create an account: a fresh phrase, its root written to disk. The phrase is shown ONCE — it must
+/// be written down (the only way to restore). It does NOT overwrite an existing root (that would
+/// change the IK and orphan everything sealed to the old identity).
 fn cmd_init() -> Result<(), String> {
     let s = store()?;
     if s.has_seed() {
@@ -209,7 +209,8 @@ fn cmd_init() -> Result<(), String> {
     Ok(())
 }
 
-/// Восстановить аккаунт по фразе в ПУСТОЙ `$KARST_HOME`. Та же фраза → тот же IK.
+/// Restore an account from a phrase into an EMPTY `$KARST_HOME`. The same phrase gives the same
+/// identity.
 fn cmd_restore(args: &[String]) -> Result<(), String> {
     let phrase = match flag(args, "--phrase") {
         Some(p) => p,
@@ -229,7 +230,7 @@ fn cmd_restore(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Показать свою фразу восстановления (расшифровав корень паролем).
+/// Show one's own recovery phrase (decrypting the root with the password).
 fn cmd_show_phrase() -> Result<(), String> {
     let s = store()?;
     let e = s.load_entropy().map_err(|_| "no account (karst init)".to_string())?;
@@ -244,7 +245,7 @@ fn cmd_id() -> Result<(), String> {
     Ok(())
 }
 
-/// §2.1-адрес (IK account) — его дают отправителям для discovery/инициации.
+/// The §2.1 address (the account IK) — handed to senders for discovery and initiation.
 fn cmd_account() -> Result<(), String> {
     let s = store()?;
     let acct = s.load_account().map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "no account (karst init)".to_string() } else { format!("account not decrypted (wrong KARST_PASSPHRASE?): {e}") })?;
@@ -528,7 +529,7 @@ fn cmd_import_cap(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// §12: опубликовать свой §2.1-bundle у relay (чтобы другие могли писать нам).
+/// §12: publish one's own §2.1 bundle at the relay (so others can write to us).
 fn cmd_publish(args: &[String]) -> Result<(), String> {
     let r = relay_arg(args)?;
 
@@ -561,9 +562,9 @@ fn cmd_send(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Отправить файл: `--file PATH`. Мелкие идут инлайном (padded mailbox); файлы больше
-/// `MAX_FILE_SIZE` стримятся E2E-blob'ом + маленьким `FileRef` — заливка ВОЗОБНОВЛЯЕМАЯ
-/// (повтор той же команды после обрыва продолжает с watermark релея).
+/// Send a file: `--file PATH`. Small ones go inline (a padded mailbox); files larger than
+/// `MAX_FILE_SIZE` are streamed as an E2E blob plus a small `FileRef` — that upload is RESUMABLE
+/// (repeating the same command after a break continues from the relay's watermark).
 fn cmd_send_file(args: &[String]) -> Result<(), String> {
     let to_hex = flag(args, "--to").ok_or("need --to <§2.1-IK-hex>")?;
     let path = flag(args, "--file").ok_or("need --file <path>")?;
@@ -572,7 +573,7 @@ fn cmd_send_file(args: &[String]) -> Result<(), String> {
     let to = parse_pubkey(&to_hex)?;
 
     let bytes = std::fs::read(&path).map_err(|e| format!("reading {path}: {e}"))?;
-    // Имя — только базовое (без каталогов): получателю не даём path-traversal.
+    // The name only (no directories): the recipient is never handed a path traversal.
     let name = Path::new(&path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -592,7 +593,7 @@ fn cmd_recv(args: &[String]) -> Result<(), String> {
     // Send-side retry on the recv cadence: retransmit (verbatim) anything a prior transport
     // failure left queued. Best-effort — a failure here must not block reading incoming mail.
     let _ = client::flush_outbox(&s, &r, wall_clock());
-    // Err (недоступен/протокол/отказ auth) отделён от Ok(пусто).
+    // Err (unreachable / protocol / auth refusal) is kept separate from Ok(empty).
     let msgs = client::recv_session(&s, &r, wall_clock())?;
     // Drive any pending large-file downloads (a FileRef received this poll, or one left by a
     // crash): recv persisted each before acking, so this fetches them crash-safely and
@@ -610,8 +611,8 @@ fn cmd_recv(args: &[String]) -> Result<(), String> {
         println!("(empty)");
         return Ok(());
     }
-    // Пересборка файлов — по ОТПРАВИТЕЛЮ (чанки одного отправителя не смешиваются
-    // с чужими). Одноразовый recv: файл должен уместиться в один mailbox.
+    // File reassembly is per SENDER (one sender's chunks never mix with another's). For a one-shot
+    // recv the file must fit into a single mailbox.
     let mut reasm: HashMap<[u8; 32], Reassembler> = HashMap::new();
     let mut shown = 0;
     for m in &msgs {
@@ -756,14 +757,14 @@ fn cmd_export_file(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- мелкий разбор аргументов (без внешних крейтов) ----------
+// ---------- small argument parsing (no external crates) ----------
 
-/// Значение флага `--name <value>`.
+/// The value of a `--name <value>` flag.
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
-/// Первый аргумент, не являющийся флагом и не значением флага.
+/// The first argument that is neither a flag nor a flag's value.
 fn positional_after_flags(args: &[String]) -> Option<String> {
     let mut skip_next = false;
     for a in args {
@@ -780,8 +781,8 @@ fn positional_after_flags(args: &[String]) -> Option<String> {
     None
 }
 
-/// `--socks5 HOST:PORT` → маршрут через внешний PT (Tor/obfs4/…). Отсутствует =
-/// прямой TCP.
+/// `--socks5 HOST:PORT` routes through an external PT (Tor/obfs4/…). Absent means direct TCP.
+
 /// Parse `--socks5` and, as a side effect, announce the §15 carrier that will
 /// actually be used (this is the chokepoint every networked subcommand passes
 /// through). Printed to stderr so a user who set a proxy or `KARST_WSS` can see

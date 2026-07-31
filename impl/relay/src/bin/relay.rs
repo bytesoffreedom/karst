@@ -25,8 +25,8 @@ use relay::node::{BlobPersistence, MailboxDurability, RelayDescriptor, RelayNode
 use node::seal::Identity;
 use relay::server::{generate_noise_keypair, RelayServer};
 
-/// Дев-capability: секрет ЗАШИТ и публичен — только для локального теста руками,
-/// НЕ для production. В реальной системе провижининг capability — отдельный слой.
+/// The dev capability: the secret is HARD-CODED and public — for local testing only, NOT for
+/// production. In a real system capability provisioning is a separate slice.
 const DEV_CAP_SECRET: [u8; 32] = [0x33; 32];
 const DEV_CAP_ID: [u8; 16] = [0xCA; 16];
 
@@ -322,10 +322,10 @@ fn key_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("karst-relay")
 }
 
-/// Загрузить (или создать при первом запуске) ключ узла: fetch-auth-секрет(32) ‖
-/// Noise-priv(32) ‖ Noise-pub(32). Возвращает (fetch-identity, noise_priv,
-/// noise_pub). Пара Noise персистится ЦЕЛИКОМ (priv+pub), чтобы не полагаться на
-/// совпадение деривации pub из priv. Файл 0600, `create_new` (не перезаписывает).
+/// Load (or create on first run) the node key: the fetch-auth secret plus Noise-priv(32) ‖
+/// Noise-pub(32). Returns (fetch identity, noise_priv, noise_pub). The Noise pair is persisted
+/// WHOLE (private + public) so nothing depends on deriving the public key from the private one
+/// identically. The file is 0600 and `create_new` (never overwritten).
 fn load_or_create_keys() -> io::Result<(Identity, [u8; 32], [u8; 32])> {
     let dir = key_dir();
     std::fs::create_dir_all(&dir)?;
@@ -988,8 +988,8 @@ fn run_relay(addr: String) -> io::Result<()> {
     relay.refresh_signed_descriptor(wall_clock(), &noise_priv);
     let known_relays = relay.node_list(wall_clock()).len();
 
-    // relay-id = Noise-pub ‖ fetch-auth-pub (оба узнаются вне канала). СТАБИЛЕН
-    // между перезапусками, т.к. ключ персистентен. Клиент подаёт как `--relay-id`.
+    // relay-id = Noise-pub ‖ fetch-auth-pub (both learned out of band). STABLE across restarts,
+    // because the key is persistent. A client passes it as `--relay-id`.
     let mut server =
         RelayServer::with_noise_keypair(relay, Arc::new(wall_clock), noise_priv, noise_pub);
     let relay_id = format!("{}{}", hex::encode(noise_pub), hex::encode(fetch_pub));

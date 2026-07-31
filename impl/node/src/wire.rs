@@ -1,11 +1,11 @@
-//! Framing/кодек — **внешняя граница доверия** узла: сюда приходят непроверенные
-//! байты из сети ДО того, как §7-конвейер увидит структурированный `Request`.
-//! §7 не защищает от 4-ГБ длины, обрезанного кадра или мусора — это делает
-//! ЭТОТ модуль: bounded-read до аллокации, чистая ошибка вместо паники/зависания.
+//! Framing and codec — the node's **external trust boundary**: unverified bytes arrive here from
+//! the network BEFORE the §7 pipeline ever sees a structured `Request`. §7 does not protect
+//! against a 4 GB length, a truncated frame or garbage — THIS module does: a bounded read before
+//! any allocation, and a clean error instead of a panic or a hang.
 //!
-//! Кодек — postcard (компактный; у библиотечного парсера меньше hostile-surface,
-//! чем у ручного). Формат СКЕЛЕТНЫЙ: §15-транспорт перепишет провод целиком и
-//! тогда заморозит байт-векторы для второй реализации; сейчас не замораживаем.
+//! The codec is postcard (compact; a library parser has less hostile surface than a hand-rolled
+//! one). The format is SKELETON: the §15 transport will rewrite the wire wholesale and freeze byte
+//! vectors for a second implementation then; nothing is frozen now.
 
 use std::io::{self, Read, Write};
 
@@ -19,13 +19,13 @@ use crate::discovery::DiscoveryRecord;
 use crate::protocol::{AckRequest, BlobGetRequest, BlobPutRequest, BlobResponse, BlobStatRequest, FetchRequest, JoinRequest, Payload, PublishRequest, RelayPolicy, SignedDescriptor, WireMessage};
 use crate::pqxdh::PreKeyBundle;
 
-/// Потолок кадра ЗАПРОСА (client→server) — самый враждебный вход. Полезная нагрузка §7 всё равно
-/// режется Ступенью 0 по `MAX_PACKET_SIZE`; здесь — потолок аллокации ДО запуска конвейера, с
-/// запасом на обёртку (proof/cookie/адреса/postcard-теги).
+/// The ceiling on a REQUEST frame (client→server) — the most hostile input. The payload is cut by
+/// Stage 0 against `MAX_PACKET_SIZE`; this is the allocation ceiling BEFORE parsing, with headroom
+/// for the wrapper (proof, cookie, addresses, postcard tags).
 ///
-/// Числа тут не повторяются намеренно: этот комментарий говорил «= 1400» ещё две ревизии потолка
-/// спустя (1400 → 2560 → 3840). Константа ВЫВЕДЕНА, поэтому она ехала правильно всё это время —
-/// врал только текст рядом с ней.
+/// The numbers here are deliberately not repeated: this comment used to say "= 1400" three
+/// changes later (1400 → 2560 → 3840). The constant is DERIVED, so it moved correctly — only the
+/// prose beside it lied.
 pub const MAX_REQUEST_FRAME: usize = MAX_PACKET_SIZE + 512;
 
 
@@ -169,24 +169,24 @@ impl FetchPage {
     }
 }
 
-/// Запрос на проводе. `Send` заметно больше `Fetch`, но enum транзиентный
-/// (сериализуется и сразу потребляется, не хранится массово) — боксирование
-/// лишь перенесло бы аллокацию, не сэкономив.
+/// A request on the wire. `Send` is noticeably larger than `Fetch`, but the enum is transient
+/// (serialised and consumed immediately, never stored in bulk) — boxing would only move the
+/// allocation without saving anything.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 pub enum WireRequest {
-    /// Доставить запечатанное сообщение (проходит admission §7).
+    /// Deliver a sealed message (it goes through admission §7).
     Send(WireMessage),
-    /// Забрать свой mailbox — с cookie + доказательством владения (§7-fetch-auth).
+    /// Collect one's own mailbox — with a cookie plus an ownership proof (§7 fetch-auth).
     Fetch(FetchRequest),
     /// Delete leased messages after durable persistence (same ownership proof as fetch).
     Ack(AckRequest),
-    /// §12: опубликовать свой prekey-bundle (cookie + ownership-proof владения IK).
+    /// §12: publish one's own prekey bundle (cookie plus an IK ownership proof).
     PublishBundle(PublishRequest),
-    /// §12: забрать bundle по IK (публичный read). NEVER carries a one-time prekey — see
+    /// §12: fetch a bundle by IK (a public read). NEVER carries a one-time prekey — see
     /// `FetchBundleOpk`.
     FetchBundle([u8; 32]),
-    /// §12: забрать bundle ВМЕСТЕ с one-time prekey. Admission-gated like a send, because
+    /// §12: fetch a bundle TOGETHER with a one-time prekey. Admission-gated like a send, because
     /// handing out an OPK destroys a scarce resource the recipient cannot replace until its next
     /// publish (R2-3). See `node::BundleOpkRequest`.
     FetchBundleOpk(crate::protocol::BundleOpkRequest),
@@ -231,7 +231,7 @@ pub enum WireRequest {
     LookupDiscovery([u8; 32]),
 }
 
-/// Ответ на проводе.
+/// A response on the wire.
 /// What a progress query yields. `NeedCookie` exists because the query is admitted now (PRIV-7):
 /// the first attempt from an unproven address is answered with a challenge, exactly as a chunk
 /// download is, and the client retries once.
@@ -251,9 +251,9 @@ pub enum WireResponse {
     Fetched(FetchPage),
     /// Leased messages deleted (or already gone — ACK is idempotent).
     Acked,
-    /// §12: bundle опубликован.
+    /// §12: the bundle was published.
     BundlePublished,
-    /// §12: ответ на fetch bundle (`None` — не опубликован).
+    /// §12: the reply to a bundle fetch (`None` = never published).
     Bundle(Option<PreKeyBundle>),
     /// §15: blob upload/download outcome (wraps the store's own reply variants).
     Blob(BlobResponse),
@@ -288,7 +288,7 @@ pub enum WireResponse {
     Discovery(Option<DiscoveryRecord>),
 }
 
-/// Ошибка кадрирования/декодирования. `FrameTooLarge` возвращается ДО аллокации.
+/// A framing or decoding error. `FrameTooLarge` is returned BEFORE any allocation.
 #[derive(Debug)]
 pub enum WireError {
     Io(io::Error),
@@ -351,15 +351,15 @@ struct Envelope {
     payload: Vec<u8>,
 }
 
-/// postcard-сериализация без кадрирования (длину/bounded держит слой сессии
-/// поверх Noise). Используется, когда байты уходят в зашифрованный сеанс.
+/// postcard serialisation without framing (length and bounds are handled by the session layer
+/// above Noise). Used when the bytes go into an encrypted session.
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, WireError> {
     let payload = postcard::to_stdvec(msg).map_err(|_| WireError::Decode)?;
     postcard::to_stdvec(&Envelope { protocol_version: PROTOCOL_VERSION, feature_bits: 0, payload })
         .map_err(|_| WireError::Decode)
 }
 
-/// postcard-десериализация — through the versioned envelope (#144).
+/// postcard deserialisation — through the versioned envelope (#144).
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
     let env: Envelope = postcard::from_bytes(bytes).map_err(|_| WireError::Decode)?;
     if env.protocol_version != PROTOCOL_VERSION {
@@ -376,8 +376,8 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
     postcard::from_bytes(&env.payload).map_err(|_| WireError::Decode)
 }
 
-/// Записать один кадр: `u32` LE длина + postcard-тело. Отказ, если тело больше
-/// `max` (симметрично проверке чтения — не шлём того, что вторая сторона отвергнет).
+/// Write one frame: a `u32` LE length plus the postcard body. Refused if the body exceeds `max`
+/// (symmetric with the read check — we do not send what the other side would refuse).
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T, max: usize) -> Result<(), WireError> {
     let body = postcard::to_stdvec(msg).map_err(|_| WireError::Decode)?;
     if body.len() > max {
@@ -390,12 +390,12 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T, max: usize) -> Re
     Ok(())
 }
 
-/// Прочитать один кадр. Порядок КРИТИЧЕН для безопасности:
-/// 1. читаем ровно 4 байта длины (`read_exact`; обрезка → `Io(UnexpectedEof)`);
-/// 2. сверяем длину с `max` **до** любой аллокации (враждебная 4-ГБ длина
-///    отвергается без выделения памяти);
-/// 3. `read_exact` ровно `len` байт (TCP — поток, один `read` ≠ один кадр);
-/// 4. декодируем postcard (мусор → `Decode`, не паника).
+/// Read one frame. The order is SECURITY-CRITICAL:
+/// 1. read exactly 4 length bytes (`read_exact`; truncation → `Io(UnexpectedEof)`);
+/// 2. compare the length against `max` **before** any allocation (a hostile 4 GB length is
+///    refused without allocating memory);
+/// 3. `read_exact` exactly `len` bytes (TCP is a stream: one `read` is not one frame);
+/// 4. decode postcard (garbage → `Decode`, never a panic).
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R, max: usize) -> Result<T, WireError> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;

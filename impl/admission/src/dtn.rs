@@ -1,21 +1,21 @@
-//! §7.7 — DTN-класс допуска (store-and-forward mesh: Bluetooth/Wi-Fi Direct).
+//! §7.7 — the DTN admission class (store-and-forward mesh: Bluetooth / Wi-Fi Direct).
 //!
-//! Отдельный от live-класса (§7.1–7.5) класс допуска. Модель угроз иная: в
-//! mesh соединение физическое, спуфинг адреса третьей стороны невозможен;
-//! защищается не сервер, а устройство-носитель — от соседа по эфиру, который
-//! заваливает его мусором, разряжая батарею и забивая память. Поэтому — не
-//! epoch-based cookie/RLN, а два независимых механизма + отдельный
-//! replay-фильтр на возврате в сеть.
+//! An admission class separate from the live one (§7.1–7.5). The threat model differs: in a mesh
+//! the connection is physical and a third party cannot spoof an address; what is protected is not
+//! a server but the carrying device — against a neighbour on the air who buries it in garbage,
+//! draining the battery and filling the memory. Hence no epoch-based cookie or RLN, but two
+//! independent mechanisms plus a separate replay filter on the way back into the network.
 //!
-//! Крипто здесь только симметричный HMAC (как §7.2) — никакой экзотики,
-//! поэтому модуль в ядре, без feature-гейта.
 //!
-//! **Область (честно).** Здесь построены ПРИМИТИВЫ DTN-класса
-//! (capability + carry-бюджет + rolling-replay), но они ещё НЕ вплетены в
-//! конвейер `pipeline.rs`. По §10 (аудит-раунд 3) Ingress ветвится по типу
-//! credential на Ступени 4 — отдельный DTN-gateway не заводится, — значит
-//! rolling-replay и DTN-capability со временем подключаются в эту ветку
-//! `pipeline`, а не как параллельный шлюз. Интеграция — следующий срез.
+//! The only crypto here is a symmetric HMAC (as in §7.2) — nothing exotic, so this module lives in
+//! the core without a feature gate.
+//!
+//! **Scope (honestly).** The PRIMITIVES of the DTN class are built here (capability + carry budget
+//! + rolling replay), but they are NOT yet woven into `pipeline.rs`. Per §10 (audit round 3),
+//! Ingress branches on the credential type at Stage 4 — no separate DTN gateway is introduced —
+//! so rolling replay and the DTN capability eventually attach to that branch of `pipeline` rather
+//! than as a parallel gateway. Integration is the next slice.
+//! than as a parallel gateway. Integration is the next slice.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -24,36 +24,36 @@ use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Placeholder-параметр (§7.7): верхняя граница TTL транзита mesh. Требует
-/// калибровки по реальным замерам задержки — 7 дней как отправная точка.
+/// A placeholder parameter (§7.7): the upper bound on mesh transit TTL. It needs calibration
+/// against real latency measurements — seven days is a starting point.
 pub const MAX_DTN_TRANSIT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 pub const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// Глобальный потолок размера DTN-capsule (§7.7/§21.1). В отличие от
-/// live-класса, DTN-capsule — хранимый объект (до ~1 МБ size-bucket'а §21.1),
-/// заливаемый потоком, а НЕ UDP-датаграмма под live-MTU `MAX_PACKET_SIZE`.
-/// Это дешёвый pre-verification гейт: отбить заведомо огромную загрузку ДО
-/// хеширования. Авторитетную квоту на конкретную capsule задаёт
-/// `DtnQuota.max_bytes` (проверяется после верификации capability).
+/// The global ceiling on a DTN capsule (§7.7/§21.1). Unlike the live class, a DTN capsule is a
+/// stored object (up to the ~1 MB size bucket of §21.1) uploaded as a stream, NOT a UDP datagram
+/// under the live MTU `MAX_PACKET_SIZE`. This is a cheap pre-verification gate: reject an
+/// obviously huge upload BEFORE hashing it. The authoritative quota for a specific capsule comes
+/// from `DtnQuota.max_bytes` (checked after the capability verifies).
+/// `DtnQuota.max_bytes` (checked after the capability verifies).
 pub const MAX_DTN_CAPSULE_SIZE: usize = 1 << 20; // 1 MiB
 
 // ============================================================================
-// 1. DTN Capability — отдельный тип, без квантования по epoch (§7.7 п.1)
+// 1. The DTN capability — a separate type, without epoch quantisation (§7.7 item 1)
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtnQuota {
     pub max_bytes: u64,
-    /// **Рекомендательное поле, НЕ криптографически обеспеченное (§7.7).**
-    /// Ничто не привязывает декремент к реальному числу передач: носитель
-    /// физически владеет всем состоянием capsule и может не декрементировать.
-    /// Настоящая защита — `CarryBudgetTracker` ниже, распоряжающийся
-    /// собственным ресурсом устройства. Оставлено как advisory-метаданные
-    /// для добросовестных клиентов.
+    /// **An advisory field, NOT cryptographically enforced (§7.7).**
+    /// Nothing binds the decrement to the real number of hops: the carrier physically owns all of
+    /// the capsule's state and may simply not decrement it. The real protection is
+    /// `CarryBudgetTracker` below, which governs the device's own resource. This is kept as
+    /// advisory metadata for well-behaved clients.
+    /// advisory metadata for well-behaved clients.
     pub max_hops: u32,
 }
 
-/// Секретная запись у выдавшего relay. По проводу идёт только proof.
+/// The secret record held by the issuing relay. Only the proof travels on the wire.
 #[derive(Debug, Clone)]
 pub struct DtnCapability {
     pub capability_id: [u8; 16],
@@ -63,7 +63,7 @@ pub struct DtnCapability {
     pub secret: [u8; 32],
 }
 
-/// То, что идёт по проводу вместе с capsule.
+/// What travels on the wire alongside the capsule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtnCapabilityProof {
     pub capability_id: [u8; 16],
@@ -73,17 +73,17 @@ pub struct DtnCapabilityProof {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DtnCapError {
     UnknownCapability,
-    /// now > not_after — транзитное окно истекло.
+    /// now > not_after — the transit window has expired.
     Expired,
-    /// not_after выходит за пределы issued_at + MAX_DTN_TRANSIT_TTL.
+    /// not_after lies beyond issued_at + MAX_DTN_TRANSIT_TTL.
     TtlTooLong,
-    /// Размер capsule превышает `quota.max_bytes` этой capability.
+    /// The capsule size exceeds this capability's `quota.max_bytes`.
     QuotaExceeded,
     BadMac,
 }
 
 impl DtnCapability {
-    /// Проверить корректность самой выданной capability (инвариант TTL).
+    /// Check the issued capability itself for correctness (the TTL invariant).
     pub fn validate_issue(&self) -> Result<(), DtnCapError> {
         if self.not_after > self.issued_at.saturating_add(MAX_DTN_TRANSIT_TTL_SECS) {
             return Err(DtnCapError::TtlTooLong);
@@ -91,8 +91,8 @@ impl DtnCapability {
         Ok(())
     }
 
-    /// Построить proof: mac = HMAC(secret, request_nonce).
-    /// Без epoch (в отличие от live-класса §7.2) — mesh-доставка занимает дни.
+    /// Build the proof: mac = HMAC(secret, request_nonce).
+    /// Without an epoch (unlike the live class, §7.2) — mesh delivery takes days.
     pub fn prove(&self, request_nonce: &[u8]) -> DtnCapabilityProof {
         DtnCapabilityProof {
             capability_id: self.capability_id,
@@ -101,7 +101,7 @@ impl DtnCapability {
     }
 }
 
-/// Локальная таблица выдавшего relay: `capability_id → DtnCapability`.
+/// The issuing relay's local table: `capability_id → DtnCapability`.
 #[derive(Default)]
 pub struct DtnCapabilityTable {
     entries: HashMap<[u8; 16], DtnCapability>,
@@ -115,10 +115,10 @@ impl DtnCapabilityTable {
         self.entries.insert(cap.capability_id, cap);
     }
 
-    /// Верификация proof: срок (по своим часам) + размер + MAC.
-    /// `capsule_bytes` — фактический размер предъявленной capsule; проверяется
-    /// против `quota.max_bytes` (§7.7). Порядок: дешёвые проверки (срок,
-    /// размер) до MAC.
+    /// Proof verification: expiry (by our own clock), size, then MAC.
+    /// `capsule_bytes` is the actual size of the presented capsule, checked against
+    /// `quota.max_bytes` (§7.7). Order: the cheap checks (expiry, size) come before the MAC.
+
     pub fn verify(
         &self,
         proof: &DtnCapabilityProof,
@@ -155,56 +155,56 @@ fn compute_mac(secret: &[u8; 32], request_nonce: &[u8]) -> [u8; 16] {
 }
 
 // ============================================================================
-// 2. Локальный бюджет носителя: per-peer + device-wide (§7.7 п.2)
+// 2. The carrier's local budget: per-peer and device-wide (§7.7 item 2)
 // ============================================================================
 
-/// Эфемерная mesh-identity соседа (Bluetooth/Wi-Fi Direct) — отпечаток.
+/// A neighbour's ephemeral mesh identity (Bluetooth / Wi-Fi Direct) — a fingerprint.
 pub type PeerId = [u8; 16];
 
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetLimits {
-    /// Скользящее окно (§7.7): напр. 24 ч.
+    /// The sliding window (§7.7): 24 hours, for example.
     pub window_secs: u64,
-    /// Ограничивает ОДНОГО навязчивого соседа.
+    /// Bounds ONE insistent neighbour.
     pub per_peer_max_messages: u32,
     pub per_peer_max_bytes: u64,
-    /// Ограничивает Sybil из многих дешёвых личностей — агрегатно по ВСЕМ
-    /// пирам, независимо от числа identity (§7.7: обязательный второй потолок).
+    /// Bounds a Sybil built from many cheap identities — in aggregate across ALL peers, whatever
+    /// the number of identities (§7.7: the mandatory second ceiling).
     pub device_max_messages: u32,
     pub device_max_bytes: u64,
-    /// Локальный PoW-throttle (§7.7): сколько ведущих нулевых бит обязан
-    /// предъявить пир на КАЖДУЮ capsule. Не защита от спуфинга (в mesh его
-    /// нет), а чистый rate-throttle: как быстро незнакомый пир может залить
-    /// тебя за одну сессию контакта. В бою подстраивается под батарею/память
-    /// устройства; здесь конфигурируемая константа. 0 = PoW выключен.
+    /// A local PoW throttle (§7.7): how many leading zero bits a peer must present for EVERY
+    /// capsule. Not protection against spoofing (there is none in a mesh) but a pure rate
+    /// throttle: how fast an unknown peer can flood you within one contact session. In production
+    /// it adapts to the device's battery and memory; here it is a configurable constant. 0
+    /// disables the PoW.
     pub pow_difficulty_bits: u32,
 }
 
-/// Предложение соседа принять его capsule. PoW привязан к `capsule_tag`,
-/// поэтому не переиспользуется между разными capsule.
+/// A neighbour's offer to have its capsule carried. The PoW is bound to `capsule_tag`, so it
+/// cannot be reused across different capsules.
 #[derive(Debug, Clone, Copy)]
 pub struct CarryOffer<'a> {
     pub peer: PeerId,
-    /// Уникальный тег capsule (напр. её хэш) — к нему привязан PoW.
+    /// The capsule's unique tag (its hash, for example) — what the PoW is bound to.
     pub capsule_tag: &'a [u8],
     pub bytes: u64,
-    /// Найденный пиром PoW-nonce (см. `solve_pow`).
+    /// The PoW nonce the peer found (see `solve_pow`).
     pub pow_nonce: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CarryDecision {
     Accept,
-    /// PoW недостаточной сложности — throttle до бюджетных проверок.
+    /// The PoW is of insufficient difficulty — throttled before any budget check.
     RejectPow,
-    /// Один пир превысил свой per-peer лимит (device-бюджет ещё есть).
+    /// One peer exceeded its per-peer limit (the device budget still has room).
     RejectPerPeer,
-    /// Исчерпан агрегатный device-бюджет — независимо от числа identity.
-    /// Именно этот отказ ловит Sybil из многих эфемерных пиров.
+    /// The aggregate device budget is exhausted — regardless of the number of identities.
+    /// This is the rejection that catches a Sybil built from many ephemeral peers.
     RejectDevice,
 }
 
-/// Число ведущих нулевых бит в PoW-хэше связки (peer ‖ capsule_tag ‖ nonce).
+/// The number of leading zero bits in the PoW hash of (peer ‖ capsule_tag ‖ nonce).
 pub fn pow_leading_zero_bits(peer: &PeerId, capsule_tag: &[u8], nonce: u64) -> u32 {
     use sha2::Digest;
     let mut h = Sha256::new();
@@ -226,8 +226,8 @@ pub fn pow_leading_zero_bits(peer: &PeerId, capsule_tag: &[u8], nonce: u64) -> u
     bits
 }
 
-/// Найти PoW-nonce нужной сложности для (peer, capsule_tag) — работа пира,
-/// не носителя. Возвращает первый подходящий nonce.
+/// Find a PoW nonce of the required difficulty for (peer, capsule_tag) — the peer's work, not the
+/// carrier's. Returns the first suitable nonce.
 pub fn solve_pow(peer: &PeerId, capsule_tag: &[u8], difficulty_bits: u32) -> u64 {
     let mut nonce = 0u64;
     loop {
@@ -238,12 +238,12 @@ pub fn solve_pow(peer: &PeerId, capsule_tag: &[u8], difficulty_bits: u32) -> u64
     }
 }
 
-/// Событие в скользящем окне: (время, размер).
+/// An event in the sliding window: (time, size).
 type Event = (u64, u64);
 
-/// Локальная политика устройства-носителя. Не часть сетевого протокола, не
-/// требует согласования. Память ограничена самим device-бюджетом: мы храним
-/// только события внутри окна, а их число не превышает device_max_messages.
+/// The carrying device's local policy. Not part of the network protocol and requiring no
+/// negotiation. Memory is bounded by the device budget itself: only events inside the window are
+/// stored, and their number cannot exceed device_max_messages.
 pub struct CarryBudgetTracker {
     limits: BudgetLimits,
     per_peer: HashMap<PeerId, VecDeque<Event>>,
@@ -261,8 +261,8 @@ impl CarryBudgetTracker {
         }
     }
 
-    /// Убрать из окна всё старше `now - window`. Обновляет device-агрегат и
-    /// вычищает опустевшие per-peer записи (иначе Sybil раздул бы карту).
+    /// Drop everything older than `now - window` from the window. Updates the device aggregate and
+    /// clears emptied per-peer entries (otherwise a Sybil would inflate the map).
     fn prune(&mut self, now: u64) {
         let horizon = now.saturating_sub(self.limits.window_secs);
         while let Some(&(peer, ts, bytes)) = self.device.front() {
@@ -270,7 +270,7 @@ impl CarryBudgetTracker {
                 self.device.pop_front();
                 self.device_bytes -= bytes;
                 if let Some(q) = self.per_peer.get_mut(&peer) {
-                    // Снять соответствующее самое старое событие пира.
+                    // Remove the corresponding oldest event of that peer.
                     while let Some(&(pts, _)) = q.front() {
                         if pts <= horizon {
                             q.pop_front();
@@ -295,13 +295,13 @@ impl CarryBudgetTracker {
         }
     }
 
-    /// Решение по входящему предложению нести capsule.
-    /// Порядок: PoW-throttle (заставляет пира тратить CPU на каждую попытку) →
-    /// per-peer (дешёвый локальный сосед) → device-wide (Sybil). Записываем
-    /// только при Accept.
+    /// The decision on an incoming offer to carry a capsule.
+    /// Order: the PoW throttle (which makes the peer spend CPU on every attempt) → per-peer (a
+    /// cheap local neighbour) → device-wide (Sybil). Only an Accept is recorded.
+
     pub fn offer(&mut self, offer: &CarryOffer, now: u64) -> CarryDecision {
-        // PoW-throttle: связан с конкретной capsule, поэтому не
-        // переиспользуется. difficulty=0 → проверка пропускается.
+        // The PoW throttle is bound to this specific capsule, so it cannot be reused.
+        // difficulty=0 skips the check.
         if self.limits.pow_difficulty_bits > 0
             && pow_leading_zero_bits(&offer.peer, offer.capsule_tag, offer.pow_nonce)
                 < self.limits.pow_difficulty_bits
@@ -325,7 +325,7 @@ impl CarryBudgetTracker {
             return CarryDecision::RejectDevice;
         }
 
-        // Accept: записать в оба окна.
+        // Accept: record it in both windows.
         self.per_peer
             .entry(offer.peer)
             .or_default()
@@ -335,42 +335,42 @@ impl CarryBudgetTracker {
         CarryDecision::Accept
     }
 
-    /// Текущее число событий в окне (для тестов/интроспекции).
+    /// The current number of events in the window (for tests and introspection).
     pub fn device_message_count(&self) -> usize {
         self.device.len()
     }
 }
 
 // ============================================================================
-// 3. Rolling-window replay на возврате в сеть (§7.7 п.3)
+// 3. The rolling-window replay filter on the way back into the network (§7.7 item 3)
 // ============================================================================
 
-/// Отдельная от live-класса (epoch-swap) таблица replay-защиты для capsule,
-/// пронесённых через mesh. N дневных корзин; запись живёт до своего
-/// `not_after`; самая старая корзина переиспользуется при переходе на новый
-/// день. Ограничена по памяти не короткостью окна, а низким объёмом
-/// mesh-трафика (§7.7).
+/// A replay table separate from the live class (which swaps by epoch), for capsules carried
+/// through the mesh. N daily buckets; an entry lives until its `not_after`; the oldest bucket is
+/// recycled when a new day begins. Its memory is bounded not by a short window but by the low
+/// volume of mesh traffic (§7.7).
+
 pub struct RollingReplayWindow {
     buckets: Vec<std::collections::HashSet<[u8; 16]>>,
-    /// Какой день (unix_day) сейчас лежит в каждой корзине; None — пусто.
+    /// Which day (unix_day) each bucket currently holds; None means empty.
     bucket_day: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayCheck {
-    /// Свежая capsule — принята и зафиксирована.
+    /// A fresh capsule — accepted and recorded.
     Fresh,
-    /// Уже видели в окне — replay.
+    /// Already seen within the window — a replay.
     Replayed,
-    /// now > not_after — истекла, не хранится (и так отбрасывается как истёкшая).
+    /// now > not_after — expired, not stored (it is discarded as expired anyway).
     Expired,
-    /// not_after дальше, чем окно из N дней от now — не можем гарантировать
-    /// replay-защиту так далеко вперёд (за границей окна), отвергаем.
+    /// not_after is further out than the N-day window from now — replay protection cannot be
+    /// guaranteed that far ahead (beyond the window), so it is refused.
     BeyondWindow,
 }
 
 impl RollingReplayWindow {
-    /// `days` — размер окна в дневных корзинах (напр. 8 для 7-дневного TTL с запасом).
+    /// `days` is the window size in daily buckets (8, say, for a 7-day TTL with headroom).
     pub fn new(days: usize) -> Self {
         RollingReplayWindow {
             buckets: vec![std::collections::HashSet::new(); days],
@@ -382,8 +382,8 @@ impl RollingReplayWindow {
         (unix_day % self.buckets.len() as u64) as usize
     }
 
-    /// Классифицировать `not_after`/`now` без учёта присутствия id (общая
-    /// проверка окна для check и insert).
+    /// Classify `not_after`/`now` without regard to whether the id is present (the shared window
+    /// check used by both check and insert).
     fn classify(&self, not_after: u64, now: u64) -> Result<(u64, usize), ReplayCheck> {
         if now > not_after {
             return Err(ReplayCheck::Expired);
@@ -396,29 +396,29 @@ impl RollingReplayWindow {
         Ok((target_day, self.slot(target_day)))
     }
 
-    /// Дешёвый read-only scan по всем корзинам: присутствует ли id (без
-    /// знания not_after). Нужен на Ступени 3, чтобы отбить очевидный replay
-    /// ДО дорогого HMAC — авторитетный not_after доступен только после
-    /// look up capability на Ступени 4.
+    /// A cheap read-only scan across all buckets: is the id present (without knowing not_after).
+    /// Needed at Stage 3 to reject an obvious replay BEFORE the expensive HMAC — the authoritative
+    /// not_after is only available after looking the capability up at Stage 4.
+
     ///
-    /// Замечание: скан включает и ещё-не-переиспользованные (устаревшие)
-    /// корзины, поэтому может вернуть `true` для id, чья корзина протухла, но
-    /// не очищена. Это безопасно: такая capsule заведомо за своим `not_after` и
-    /// всё равно отсеивается как `Expired` на Ступени 4 (verify). Ложный
-    /// «replay» здесь не пропускает атаку, а лишь раньше отклоняет и так
-    /// истёкшую capsule.
+    /// Note: the scan includes buckets that are stale but not yet recycled, so it can return
+    /// `true` for an id whose bucket has gone stale without being cleared. That is safe: such a
+    /// capsule is certainly past its `not_after` and would be filtered out as `Expired` at Stage 4
+    /// (verify) regardless. A false "replay" here lets no attack through; it merely rejects an
+    /// already-expired capsule earlier.
+
     pub fn contains_any(&self, id: &[u8; 16]) -> bool {
         self.buckets.iter().any(|b| b.contains(id))
     }
 
-    /// Зафиксировать capsule (Ступень 4, только ПОСЛЕ успешной верификации).
-    /// Возвращает `Replayed`, если id уже был (гонка/двойная вставка).
+    /// Record a capsule (Stage 4, only AFTER successful verification).
+    /// Returns `Replayed` if the id was already present (a race or a double insert).
     pub fn insert(&mut self, id: [u8; 16], not_after: u64, now: u64) -> ReplayCheck {
         let (target_day, idx) = match self.classify(not_after, now) {
             Ok(v) => v,
             Err(c) => return c,
         };
-        // Recycle: если корзина держит другой (старый) день — очистить.
+        // Recycle: if the bucket holds a different (older) day, clear it.
         if self.bucket_day[idx] != Some(target_day) {
             self.buckets[idx].clear();
             self.bucket_day[idx] = Some(target_day);
@@ -431,8 +431,8 @@ impl RollingReplayWindow {
         }
     }
 
-    /// Удобный check-then-insert (для standalone-использования/тестов).
-    /// В конвейере НЕ используется — там check на Ступени 3, insert на 4.
+    /// A convenient check-then-insert (for standalone use and tests).
+    /// NOT used in the pipeline — there, check happens at Stage 3 and insert at Stage 4.
     pub fn check_and_insert(&mut self, id: [u8; 16], not_after: u64, now: u64) -> ReplayCheck {
         self.insert(id, not_after, now)
     }

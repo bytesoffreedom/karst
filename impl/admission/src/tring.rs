@@ -1,59 +1,59 @@
-//! §7.3 — Пороговая кольцевая подпись (t-of-N), curve-friendly замена BSS.
+//! §7.3 — a threshold ring signature (t-of-N), a curve-friendly replacement for BSS.
 //!
-//! # СТАТУС: РЕФЕРЕНС, НЕ ПРОШЁЛ АУДИТ. НЕ ДЛЯ PRODUCTION.
+//! # STATUS: REFERENCE, NOT AUDITED. NOT FOR PRODUCTION.
 //!
-//! Модуль за feature-флагом `unaudited-crypto` (по умолчанию выключен).
-//! «Надёжнее» для security-критичного примитива в пределе означает
-//! независимый аудит — до него этот код нельзя считать доверенным. Вес несут
-//! состязательные тесты (см. низ файла): t−1 подписантов → отказ, подделка →
-//! отказ, привязка к кольцу/сообщению. Happy-path сам по себе тут ничего не
-//! доказывает.
+//! The module sits behind the `unaudited-crypto` feature flag (off by default). For a
+//! security-critical primitive, "more trustworthy" ultimately means an independent audit — until
+//! then this code cannot be treated as trusted. The weight is carried by the adversarial tests
+//! (see the bottom of the file): t−1 signers must fail, a forgery must fail, and the signature
+//! must bind to the ring and the message. A happy path proves nothing here by itself.
 //!
-//! # Конструкция (пиннится к теореме, не ad-hoc)
+//!
+//! # The construction (pinned to a theorem, not ad hoc)
 //!
 //! Cramer–Damgård–Schoenmakers, «Proofs of Partial Knowledge and Simplified
-//! Design of Witness Hiding Protocols», CRYPTO 1994 — пороговая σ-композиция
-//! Schnorr-доказательств, сделанная неинтерактивной через Fiat–Shamir.
-//! Discrete-log над Ristretto255 (`curve25519-dalek`), совместимо с
-//! Ed25519-стеком KARST (в отличие от RSA-based Bresson–Stern–Szydlo).
-//! Ориентир на discrete-log ETRS: Aranha, Hall-Andersen, Nitulescu, Pagnin,
+//! Design of Witness Hiding Protocols", CRYPTO 1994 — a threshold σ-composition of Schnorr proofs,
+//! made non-interactive through Fiat–Shamir. Discrete log over Ristretto255
+//! (`curve25519-dalek`), compatible with KARST's Ed25519 stack (unlike the RSA-based
+//! Bresson–Stern–Szydlo). Guided by the discrete-log ETRS work: Aranha, Hall-Andersen, Nitulescu,
+//! Pagnin,
 //! Yakoubov, «Count Me In! Extendability for Threshold Ring Signatures»,
 //! PKC 2022.
 //!
-//! ## Идея
+//! ## The idea
 //!
-//! N issuer-ключей `P_i = x_i·G`. Подписывают ≥ t из них, не раскрывая, кто.
-//! Каждому issuer сопоставлена точка поля `i+1` (1-индексация; 0 зарезервован
-//! под мастер-challenge). Вызовы Schnorr для всех N членов кольца связаны
-//! требованием: их challenge'и `c_i` лежат на полиноме `p` степени `N−t` с
-//! `p(0) = c`, где `c` — Fiat–Shamir мастер-challenge над (t ‖ кольцо ‖
-//! сообщение ‖ все commitments). Подписант, знающий t секретов, может
-//! свободно выбрать `N−t` challenge'ей симулируемых членов; вместе с `(0,c)`
-//! это фиксирует `p` (степень `N−t`), а challenge'и настоящих подписантов
-//! оказываются `p(индекс)` — под них он строит честный Schnorr-ответ.
+//! N issuer keys `P_i = x_i·G`. At least t of them sign, without revealing which. Each issuer is
+//! assigned the field point `i+1` (1-indexed; 0 is reserved for the master challenge). The Schnorr
+//! challenges of all N ring members are tied together by one requirement: the challenges `c_i` lie
+//! on a polynomial `p` of degree `N−t` with `p(0) = c`, where `c` is the Fiat–Shamir master
+//! challenge over (t ‖ ring ‖ message ‖ all commitments). A signer who knows t secrets may pick
+//! the `N−t` challenges of the simulated members freely; together with `(0,c)` that fixes `p`
+//! (degree `N−t`), and the real signers' challenges then come out as `p(index)` — for which an
+//! honest Schnorr response can be built.
+
 //!
-//! ## Проверка неравенства (≥ t, не = t)
+//! ## The inequality check (≥ t, not = t)
 //!
-//! Подпись с бóльшим числом подписантов `s > t` даёт полином степени
-//! `N−s < N−t` — он тоже степени `≤ N−t`, поэтому проходит проверку политики
-//! `t`. Verify проверяет «степень ≤ N−t» (= «подписали не менее t»), не
+//! A signature with more signers, `s > t`, yields a polynomial of degree `N−s < N−t` — which is
+//! also of degree `≤ N−t` and therefore satisfies a policy of `t`. Verify checks "degree ≤ N−t"
+//! (that is, "at least t signed"), not equality.
 //! «= N−t».
 //!
-//! # Что тесты НЕ доказывают (границы честно)
+//! # What the tests do NOT prove (the boundaries, honestly)
 //!
-//! - **Неподделываемость** держится на теореме soundness CDS + Fiat–Shamir в
-//!   ROM (forking lemma), а НЕ на unit-тесте. `fewer_than_t_signers_fails...`
-//!   проверяет лишь enforcement политики на ЧЕСТНО построенной подписи — он
-//!   не моделирует злонамеренного sub-threshold-подписанта и не может: это
-//!   доказательное обязательство, не assertEq. Тот же класс дисциплины, что
-//!   у анонимности ниже.
-//! - **Анонимность/несвязываемость** держится на симуляционном (HVZK)
-//!   аргументе — тоже доказательство, не тест. Тесты проверяют лишь
-//!   необходимые признаки.
-//! - **Раскрывается ЧИСЛО подписантов `s`** (по степени интерполируемого
-//!   полинома `N−s`), хотя НЕ раскрывается, кто именно. Для нашего
-//!   применения не важно — issuer'ы подписывают ровно `t`, — но это свойство
-//!   нужно называть, а не принимать за скрытое.
+//! - **Unforgeability** rests on the CDS soundness theorem plus Fiat–Shamir in the ROM (the
+//!   forking lemma), NOT on a unit test. `fewer_than_t_signers_fails...` only checks policy
+//!   enforcement on an HONESTLY built signature — it does not model a malicious sub-threshold
+//!   signer and cannot: that is a proof obligation, not an assertEq. The same discipline applies
+//!   to anonymity below.
+//!
+//! - **Anonymity / unlinkability** rests on a simulation (HVZK) argument — also a proof, not a
+//!   test. The tests only check the necessary symptoms.
+//!
+//! - **The NUMBER of signers `s` is revealed** (through the degree `N−s` of the interpolated
+//!   polynomial), although WHO signed is not. It does not matter for our use — issuers sign
+//!   exactly `t` — but the property must be named rather than assumed hidden.
+//!
 
 #![cfg(feature = "unaudited-crypto")]
 
@@ -65,7 +65,7 @@ use sha2::{Digest, Sha512};
 
 const G: &RistrettoPoint = &RISTRETTO_BASEPOINT_POINT;
 
-/// Ключевая пара одного issuer.
+/// One issuer's key pair.
 #[derive(Clone)]
 pub struct IssuerKeypair {
     pub secret: Scalar,
@@ -81,10 +81,10 @@ impl IssuerKeypair {
     }
 }
 
-/// Подпись на проводе: только challenge'и и ответы. `R_i` НЕ передаются —
-/// verifier восстанавливает их как `R_i = s_i·G − c_i·P_i` (иначе `c_i` из
-/// подписи не извлечь, это дискретный лог). Все `c_i` равномерны, поэтому их
-/// публикация ничего не говорит о наборе подписантов.
+/// The signature on the wire: challenges and responses only. The `R_i` are NOT transmitted — the
+/// verifier reconstructs them as `R_i = s_i·G − c_i·P_i` (otherwise `c_i` could not be extracted
+/// from the signature; that is a discrete log). All `c_i` are uniform, so publishing them says
+/// nothing about the set of signers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThresholdRingSig {
     pub challenges: Vec<Scalar>, // c_1..c_N
@@ -92,7 +92,7 @@ pub struct ThresholdRingSig {
 }
 
 impl ThresholdRingSig {
-    /// Формат провода: [N: u32 BE][c_1..c_N: 32B каждый][s_1..s_N: 32B каждый].
+    /// Wire format: [N: u32 BE][c_1..c_N: 32B each][s_1..s_N: 32B each].
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.challenges.len();
         let mut out = Vec::with_capacity(4 + n * 64);
@@ -106,8 +106,8 @@ impl ThresholdRingSig {
         out
     }
 
-    /// Разбор с проверкой каноничности скаляров. `None` при любой
-    /// структурной ошибке или неканоническом скаляре.
+    /// Parsing with a canonicity check on the scalars. `None` on any structural error or any
+    /// non-canonical scalar.
     pub fn from_bytes(buf: &[u8]) -> Option<ThresholdRingSig> {
         if buf.len() < 4 {
             return None;
@@ -136,18 +136,18 @@ impl ThresholdRingSig {
     }
 }
 
-/// Разобрать сжатую Ristretto-точку из 32 байт (для issuer-ключей на проводе).
+/// Parse a compressed Ristretto point from 32 bytes (for issuer keys on the wire).
 pub fn point_from_bytes(b: &[u8; 32]) -> Option<RistrettoPoint> {
     CompressedRistretto::from_slice(b).ok()?.decompress()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TRingError {
-    /// t вне [1, N] или пустое кольцо.
+    /// t outside [1, N], or an empty ring.
     BadThreshold,
-    /// Подписантов меньше порога t.
+    /// Fewer signers than the threshold t.
     NotEnoughSigners,
-    /// Индекс подписанта вне кольца или дубликат.
+    /// A signer index outside the ring, or a duplicate.
     BadSignerIndex,
 }
 
@@ -166,9 +166,9 @@ fn point_bytes(p: &RistrettoPoint) -> [u8; 32] {
     p.compress().to_bytes()
 }
 
-/// Мастер-challenge `c = H(DOMAIN ‖ t ‖ P_1..P_N ‖ msg ‖ R_1..R_N)`.
-/// Привязывает порог, УПОРЯДОЧЕННОЕ кольцо, сообщение и все commitments —
-/// это и есть сильный Fiat–Shamir (пропуск любого из них = дыра подделки).
+/// The master challenge `c = H(DOMAIN ‖ t ‖ P_1..P_N ‖ msg ‖ R_1..R_N)`.
+/// It binds the threshold, the ORDERED ring, the message and every commitment — that is what makes
+/// this a strong Fiat–Shamir (omitting any one of them opens a forgery hole).
 fn master_challenge(
     t: usize,
     ring: &[RistrettoPoint],
@@ -190,15 +190,15 @@ fn master_challenge(
     hash_to_scalar(&refs)
 }
 
-/// Точка поля, сопоставленная issuer с индексом `i` (0-based): `i+1`.
-/// 1-индексация — 0 зарезервирован под мастер-challenge; точки различны и
-/// ненулевые (иначе интерполяция вырождается / течёт).
+/// The field point assigned to the issuer with index `i` (0-based): `i+1`.
+/// 1-indexed because 0 is reserved for the master challenge; the points are distinct and non-zero
+/// (otherwise the interpolation degenerates or leaks).
 fn eval_point(i: usize) -> Scalar {
     Scalar::from((i as u64) + 1)
 }
 
-/// Лагранжева интерполяция: значение в `x_target` полинома через `points`.
-/// Точки должны иметь различныеx-координаты.
+/// Lagrange interpolation: the value at `x_target` of the polynomial through `points`.
+/// The points must have distinct x coordinates.
 fn lagrange_eval(points: &[(Scalar, Scalar)], x_target: Scalar) -> Scalar {
     let mut acc = Scalar::ZERO;
     for (k, (xk, yk)) in points.iter().enumerate() {
@@ -216,15 +216,15 @@ fn lagrange_eval(points: &[(Scalar, Scalar)], x_target: Scalar) -> Scalar {
     acc
 }
 
-/// Подписать `msg` от лица кольца `ring` порогом `t`, набором подписантов
-/// `signers` = список `(индекс_в_кольце, секрет)`. |signers| должно быть ≥ t.
+/// Sign `msg` on behalf of the ring `ring` with threshold `t`, using `signers` — a list of
+/// `(index_in_ring, secret)`. |signers| must be ≥ t.
 ///
-/// Nonce подписантов выводится детерминированно из ПОЛНОГО пред-challenge
-/// контекста (секрет ‖ msg ‖ кольцо ‖ вся симуляционная случайность). Это
-/// строго сильнее, чем `H(secret‖msg)`: если тот же подписант подпишет то же
-/// сообщение в другом составе/симуляции, изменится и nonce — иначе при том же
-/// `k` и другом `c_j` утёк бы секрет через `s=k+c·x` (тот же класс утечки,
-/// что two-shares в RLN §7.4).
+/// The signers' nonces are derived deterministically from the FULL pre-challenge context (secret ‖
+/// msg ‖ ring ‖ all of the simulation randomness). That is strictly stronger than `H(secret‖msg)`:
+/// if the same signer signs the same message in a different composition or simulation, the nonce
+/// changes too — otherwise, with the same `k` and a different `c_j`, the secret would leak through
+/// `s = k + c·x` (the same class of leak as two shares in RLN §7.4).
+
 pub fn sign(
     msg: &[u8],
     ring: &[RistrettoPoint],
@@ -238,7 +238,7 @@ pub fn sign(
     if signers.len() < t {
         return Err(TRingError::NotEnoughSigners);
     }
-    // Валидация индексов подписантов: в диапазоне, без дубликатов.
+    // Validate the signer indices: in range, no duplicates.
     let mut is_signer = vec![false; n];
     for (idx, _) in signers {
         if *idx >= n || is_signer[*idx] {
@@ -249,11 +249,11 @@ pub fn sign(
     let s = signers.len(); // the actual number of signers (≥ t)
     let degree = n - s; // polynomial degree
 
-    // --- 1. Симуляция для НЕ-подписантов: свободные (c_i, s_i) ---
-    // Детерминированная симуляционная случайность, чтобы sign был
-    // воспроизводим в тест-векторах: выводим из (msg, кольцо, секреты, индекс).
-    // В бою заменяется на CSPRNG; здесь важно, что она фиксируется ДО nonce
-    // подписантов и хешируется в них.
+    // --- 1. Simulation for the NON-signers: free (c_i, s_i) ---
+    // The simulation randomness is deterministic so that sign is reproducible in test vectors: it
+    // is derived from (msg, ring, secrets, index). In production it is replaced by a CSPRNG; what
+    // matters here is that it is fixed BEFORE the signers' nonces and hashed into them.
+
     let mut challenges = vec![Scalar::ZERO; n];
     let mut responses = vec![Scalar::ZERO; n];
     let mut sim_seed = Vec::new();
@@ -277,9 +277,9 @@ pub fn sign(
         responses[i] = si;
     }
 
-    // --- 2. Commitments всех членов ---
-    // Для подписантов: R_j = k_j·G, k_j выводится с привязкой ПОЛНОГО контекста
-    // (включая всю симуляционную случайность выше).
+    // --- 2. Commitments of all members ---
+    // For the signers: R_j = k_j·G, with k_j derived from the FULL context (including all of the
+    // simulation randomness above).
     let mut ctx = sim_seed.clone();
     for i in 0..n {
         if !is_signer[i] {
@@ -297,15 +297,15 @@ pub fn sign(
             nonces[i] = kj;
             commitments[i] = kj * G;
         } else {
-            // R_i = s_i·G − c_i·P_i (симуляция).
+            // R_i = s_i·G − c_i·P_i (simulated).
             commitments[i] = responses[i] * G - challenges[i] * ring[i];
         }
     }
 
-    // --- 3. Мастер-challenge ---
+    // --- 3. The master challenge ---
     let c = master_challenge(t, ring, msg, &commitments);
 
-    // --- 4. Полином через (0, c) и (idx+1, c_i) не-подписантов → degree = n−s ---
+    // --- 4. The polynomial through (0, c) and the non-signers' (idx+1, c_i) → degree = n−s ---
     let mut poly_points: Vec<(Scalar, Scalar)> = Vec::with_capacity(degree + 1);
     poly_points.push((Scalar::ZERO, c));
     for i in 0..n {
@@ -315,7 +315,7 @@ pub fn sign(
     }
     debug_assert_eq!(poly_points.len(), degree + 1);
 
-    // --- 5. Challenge'и подписантов = p(idx+1); честный Schnorr-ответ ---
+    // --- 5. The signers' challenges are p(idx+1); an honest Schnorr response follows ---
     for (idx, sk) in signers {
         let cj = lagrange_eval(&poly_points, eval_point(*idx));
         challenges[*idx] = cj;
@@ -328,8 +328,8 @@ pub fn sign(
     })
 }
 
-/// Проверить подпись против кольца `ring` и политики порога `t`.
-/// `t` и `ring` — доверенные параметры (из политики §7.3), НЕ из подписи.
+/// Verify a signature against the ring `ring` and the threshold policy `t`.
+/// `t` and `ring` are trusted parameters (from the §7.3 policy), NOT taken from the signature.
 pub fn verify(msg: &[u8], ring: &[RistrettoPoint], t: usize, sig: &ThresholdRingSig) -> bool {
     let n = ring.len();
     if n == 0 || t == 0 || t > n {
@@ -339,32 +339,32 @@ pub fn verify(msg: &[u8], ring: &[RistrettoPoint], t: usize, sig: &ThresholdRing
         return false;
     }
 
-    // 1. Восстановить commitments: R_i = s_i·G − c_i·P_i.
+    // 1. Reconstruct the commitments: R_i = s_i·G − c_i·P_i.
     let mut commitments = vec![RistrettoPoint::identity(); n];
     for i in 0..n {
         commitments[i] = sig.responses[i] * G - sig.challenges[i] * ring[i];
     }
 
-    // 2. Мастер-challenge над теми же входами.
+    // 2. The master challenge over the same inputs.
     let c = master_challenge(t, ring, msg, &commitments);
 
-    // 3. Проверить: все N challenge-точек + (0,c) лежат на полиноме степени
-    //    ≤ n−t. Интерполируем через (0,c) и первые (n−t) challenge-точек,
-    //    затем сверяем остальные t challenge-точки.
+    // 3. Check that all N challenge points plus (0,c) lie on a polynomial of degree ≤ n−t.
+    //    Interpolate through (0,c) and the first (n−t) challenge points, then verify the remaining
+    //    t challenge points against it.
     let degree = n - t;
     let mut basis: Vec<(Scalar, Scalar)> = Vec::with_capacity(degree + 1);
     basis.push((Scalar::ZERO, c));
     for i in 0..degree {
         basis.push((eval_point(i), sig.challenges[i]));
     }
-    // basis.len() == degree + 1 == n − t + 1 точек → однозначный полином ≤ n−t.
+    // basis.len() == degree + 1 == n − t + 1 points → a unique polynomial of degree ≤ n−t.
     for i in degree..n {
         let expected = lagrange_eval(&basis, eval_point(i));
         if expected != sig.challenges[i] {
             return false;
         }
     }
-    // (Schnorr-уравнения соблюдены по построению: R_i выведены из (c_i,s_i),
-    // и те же R_i вошли в c; несоответствие сломало бы шаг 3.)
+    // (The Schnorr equations hold by construction: each R_i was derived from (c_i,s_i) and the same
+    // R_i went into c; a mismatch would break step 3.)
     true
 }

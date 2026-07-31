@@ -1,30 +1,30 @@
-//! §2.1 — PQXDH: аутентифицированное постквантовое СОГЛАСОВАНИЕ КЛЮЧА.
+//! §2.1 — PQXDH: authenticated post-quantum KEY AGREEMENT.
 //!
-//! Гибрид X3DH + ML-KEM (спека §2.1): `root_key = KDF(classical_DH‖pq_shared)`.
-//! Даёт: **аутентификацию отправителя** (долговременный IK_A участвует в DH →
-//! только держатель IK_A построит тот же root_key) и **постквантовую защиту**
-//! (ML-KEM-768 против harvest-now-decrypt-later). Взломать надо ОБА (гибрид).
+//! A hybrid of X3DH and ML-KEM (spec §2.1): `root_key = KDF(classical_DH‖pq_shared)`.
+//! It provides **sender authentication** (the long-term IK_A takes part in the DH, so only the
+//! holder of IK_A can build the same root_key) and **post-quantum protection** (ML-KEM-768
+//! against harvest-now-decrypt-later). BOTH must be broken (that is the hybrid).
 //!
-//! Этот модуль — ТОЛЬКО согласование ключа: выдаёт `root_key`, которым
-//! засевается Double Ratchet (`crate::ratchet`). Шифрованием сообщений
-//! занимается ratchet, не этот слой (никакого one-shot AEAD здесь).
+//! This module is key agreement ONLY: it produces the `root_key` that seeds the Double Ratchet
+//! (`crate::ratchet`). Message encryption belongs to the ratchet, not to this layer (there is no
+//! one-shot AEAD here).
 //!
-//! # Границы среза (явно):
-//! - **направленная аутентификация:** Alice→Bob ПРИ подлинном IK_B (вне
-//!   канала / §12). НЕ взаимная. Prekey ПОДПИСАН ключом IK (XEdDSA) — подмена
-//!   prekey/KEM relay'ем отклоняется явно (`verify_prekey_sig`), а не только fail-closed;
-//! - **bundle in-memory** — публикация/фетч prekey у relay (§12) — отдельный срез;
-//! - **replay initial-KA** не предотвращается тут (нет one-time-prekey) — но
-//!   ratchet поверх сделает повторную установку сессии видимой (см. `ratchet`);
-//! - **нет low-order-проверки** трёх X25519-DH — audit-item (для sender-auth не
-//!   эксплуатируемо: форжер привязан к подлинному pubkey Alice);
-//! - **только 1:1.**
+//! # The slice boundaries, explicitly:
+//! - **directional authentication:** Alice→Bob GIVEN an authentic IK_B (out of band, or §12). NOT
+//!   mutual. The prekey is SIGNED by the IK (XEdDSA) — a prekey/KEM substitution by the relay is
+//!   rejected explicitly (`verify_prekey_sig`), not merely fail-closed;
+//! - **the bundle is in memory** — publishing and fetching a prekey at a relay (§12) is its own slice;
+//! - **replaying the initial KA** is not prevented here (there is no one-time prekey) — but the
+//!   ratchet above makes a repeated session establishment visible (see `ratchet`);
+//! - **no low-order check** on the three X25519 DHs — an audit item (not exploitable for
+//!   sender auth: a forger is bound to Alice's authentic public key);
+//! - **1:1 only.**
 //!
-//! # Дисциплина крипты.
-//! Примитивы — вендорные (`ml-kem` FIPS 203, `x25519-dalek`, `hkdf`). X3DH-
-//! композиция — REFERENCE-код (точная публичная спека, как admission),
-//! **НЕ аудирован независимо**. Состязательно протестировано (sender-auth,
-//! PQ-нагруженность через различие root_key).
+//! # Crypto discipline.
+//! The primitives are vendored (`ml-kem` FIPS 203, `x25519-dalek`, `hkdf`). The X3DH composition
+//! is REFERENCE code (an exact public spec, like admission) and is **NOT independently audited**.
+//! It is tested adversarially (sender auth, and PQ load-bearing through a root_key difference).
+//!
 
 use hkdf::Hkdf;
 use ml_kem::array::Array;
@@ -35,19 +35,19 @@ use x25519_dalek::PublicKey;
 
 use crate::seal::Identity;
 
-/// Домен KDF — отделён от seal (`KARST-skeleton-seal-v1`), ratchet и fetch-auth.
+/// The KDF domain — separated from seal (`KARST-skeleton-seal-v1`), the ratchet and fetch-auth.
 const DOMAIN: &[u8] = b"KARST-pqxdh-v1";
 
-/// Публичный prekey-bundle получателя — то, что нужно отправителю. Публичный
-/// материал (сериализуем для §12 publish/fetch у relay).
+/// The recipient's public prekey bundle — what a sender needs. Public material (serialisable for
+/// §12 publish/fetch at a relay).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreKeyBundle {
-    /// Долговременный identity-ключ (X25519). Он же адрес mailbox.
+    /// The long-term identity key (X25519). Also the mailbox address.
     pub ik_pub: [u8; 32],
-    /// Prekey (X25519), ПОДПИСАН ключом IK (см. `prekey_sig`). Он же начальный
-    /// ratchet-ключ получателя.
+    /// The prekey (X25519), SIGNED by the IK (see `prekey_sig`). Also the recipient's initial
+    /// ratchet key.
     pub prekey_pub: [u8; 32],
-    /// ML-KEM-768 encapsulation key (~1184 Б).
+    /// The ML-KEM-768 encapsulation key (~1184 B).
     pub kem_ek: Vec<u8>,
     /// Optional ONE-TIME prekey for this contact, WITH its owner's signature. When present it
     /// adds a fourth DH term `EK_A × OPK_B` to the root key and is CONSUMED by the recipient,
@@ -254,7 +254,7 @@ impl PreKeyBundle {
     }
 }
 
-/// Секреты получателя. `accept_key_agreement` восстанавливает root_key.
+/// The recipient's secrets. `accept_key_agreement` recovers the root_key from them.
 // Clone lets one logical identity back a per-relay `Peer` each, for multi-homed receive
 // (`client::receive_threaded`); every clone carries the same secrets, as a rebuilt-from-seed
 // account would.
@@ -384,13 +384,13 @@ impl Account {
         PreKeyBundle { opk: self.signed_opk(&opk_pub), ..self.prekey_bundle() }
     }
 
-    /// Сериализовать секреты для персистентности (§2.1-личность стабильна между
-    /// запусками). **ВНИМАНИЕ:** это ПРИВАТНЫЕ ключи в открытом виде — ik(32) ‖
-    /// prekey(32) ‖ ML-KEM-seed(64). Вызывающий обязан писать под 0600; at-rest
-    /// шифрование (парольный KDF) — отложено. НЕ blanket-serde: каждый вынос
-    /// секрета на диск умышленен (не утечёт случайно в wire-сообщение).
-    /// KEM хранится как 64-байтный seed (FIPS 203 `from_seed`/`to_seed`), не
-    /// расширенная форма.
+    /// Serialise the secrets for persistence (a §2.1 identity is stable across runs).
+    /// **CAUTION:** these are PRIVATE keys in the clear — ik(32) ‖ prekey(32) ‖ ML-KEM seed(64).
+    /// The caller must write them under 0600; at-rest encryption (a password KDF) is deferred.
+    /// Not a blanket serde impl: every export of a secret to disk is deliberate, so it cannot leak
+    /// into a wire message by accident.
+    /// The KEM is stored as a 64-byte seed (FIPS 203 `from_seed`/`to_seed`), not in expanded form.
+
     pub fn to_secret_bytes(&self) -> [u8; 128] {
         let mut out = [0u8; 128];
         out[..32].copy_from_slice(&self.ik.to_secret_bytes());
@@ -400,7 +400,7 @@ impl Account {
         out
     }
 
-    /// Восстановить account из сохранённых секретов (см. `to_secret_bytes`).
+    /// Restore an account from stored secrets (see `to_secret_bytes`).
     pub fn from_secret_bytes(bytes: &[u8; 128]) -> Self {
         let ik = Identity::from_secret_bytes(bytes[..32].try_into().expect("32"));
         let prekey = Identity::from_secret_bytes(bytes[32..64].try_into().expect("32"));
@@ -415,7 +415,7 @@ impl Account {
         Account { ik, prekey, kem_dk, opks: std::collections::HashMap::new(), mailbox_secret }
     }
 
-    /// Долговременный identity-pubkey (адрес/личность получателя).
+    /// The long-term identity public key (the recipient's address/identity).
     pub fn identity_public(&self) -> [u8; 32] {
         self.ik.public.to_bytes()
     }
@@ -441,8 +441,8 @@ impl Account {
         sig.to_vec()
     }
 
-    /// Долговременный identity-ключ (для отправки: sender_ik) — внутри крейта,
-    /// сессионный слой берёт приватный ключ отсюда.
+    /// The long-term identity key (for sending: sender_ik) — crate-internal; the session layer
+    /// takes the private key from here.
     /// The account's LONG-LIVED ML-KEM decapsulation key, for opening a sealed opener (PRIV-3).
     ///
     /// Exposed by reference and never cloned out: the sealed opener has to be opened with the
@@ -464,7 +464,7 @@ impl Account {
         &self.ik
     }
 
-    /// Prekey-ключ (для приёма: начальный ratchet-ключ получателя).
+    /// The prekey (for receiving: the recipient's initial ratchet key).
     /// Open the RECEIVING half of a ratchet from an agreed root key, using this account's signed
     /// prekey.
     ///
@@ -480,7 +480,7 @@ impl Account {
         &self.prekey
     }
 
-    /// Публичный bundle для отправителя — с XEdDSA-подписью prekey-материала ключом IK.
+    /// The public bundle for a sender — with an XEdDSA signature by the IK over the prekey material.
     pub fn prekey_bundle(&self) -> PreKeyBundle {
         use xeddsa::Sign;
         let prekey_pub = self.prekey.public.to_bytes();
@@ -502,37 +502,37 @@ impl Account {
         }
     }
 
-    /// Принять initial key-agreement: восстановить `root_key` и опознать
-    /// отправителя, СРАЗУ потребив one-time prekey.
+    /// Accept an initial key agreement: recover the `root_key` and identify the sender, consuming
+    /// the one-time prekey IMMEDIATELY.
     ///
-    /// Предпочитайте [`Account::prepare_key_agreement`] + [`Account::consume_opk`] на путях,
-    /// где результат ещё может быть отвергнут: здесь OPK сгорает ДО проверки первого AEAD,
-    /// поэтому подделанный opener сжигал бы чужой one-time prekey (CRYPTO-03).
+    /// Prefer [`Account::prepare_key_agreement`] + [`Account::consume_opk`] on paths where the
+    /// result can still be rejected: here the OPK burns BEFORE the first AEAD is checked, so a
+    /// forged opener would burn someone else's one-time prekey (CRYPTO-03).
     pub fn accept_key_agreement(&mut self, ka: &KeyAgreement) -> Option<([u8; 32], [u8; 32])> {
         let accepted = self.prepare_key_agreement(ka)?;
         self.consume_opk(ka);
         Some(accepted)
     }
 
-    /// Потребить one-time prekey, названный в этом agreement. Вызывать ТОЛЬКО после того,
-    /// как первое ratchet-сообщение успешно расшифровано: именно потребление OPK служит
-    /// at-most-once дедупом для повторной доставки opener'а, поэтому сжигать его на
-    /// неаутентифицированном сообщении нельзя. Идемпотентно.
+    /// Consume the one-time prekey named in this agreement. Call it ONLY after the first ratchet
+    /// message decrypts successfully: consuming the OPK is what provides at-most-once dedup for a
+    /// redelivered opener, so it must never burn on an unauthenticated message. Idempotent.
+
     pub fn consume_opk(&mut self, ka: &KeyAgreement) {
         if let Some(opk_pub) = ka.opk_pub {
             self.opks.remove(&opk_pub);
         }
     }
 
-    /// PREPARE-шаг: восстановить `root_key` и опознать заявленного отправителя, НИЧЕГО не
-    /// меняя в аккаунте. `None` — структурная ошибка (кривая длина KEM-ct, неизвестный или
-    /// уже потреблённый OPK, non-contributory DH).
+    /// The PREPARE step: recover the `root_key` and identify the claimed sender while changing
+    /// NOTHING in the account. `None` means a structural error (a malformed KEM ciphertext, an
+    /// unknown or already-consumed OPK, a non-contributory DH).
     ///
-    /// Аутентификация отправителя проверяется НЕ здесь: неверный IK_A даёт ДРУГОЙ root_key →
-    /// первое ratchet-сообщение не расшифруется (AEAD). Поэтому вызывающий обязан проверить
-    /// этот AEAD ПРЕЖДЕ, чем фиксировать что-либо (сессию, потребление OPK) — иначе кто угодно,
-    /// взяв публичный bundle, заставит получателя сохранить мёртвую сессию под чужим IK.
-    /// Возвращает (root_key, заявленный identity отправителя).
+    /// Sender authentication is NOT checked here: a wrong IK_A yields a DIFFERENT root_key, so the
+    /// first ratchet message fails to decrypt (AEAD). The caller must therefore verify that AEAD
+    /// BEFORE committing anything (a session, an OPK consumption) — otherwise anyone holding the
+    /// public bundle could make the recipient store a dead session under someone else's IK.
+    /// Returns (root_key, the sender's claimed identity).
     pub fn prepare_key_agreement(&self, ka: &KeyAgreement) -> Option<([u8; 32], [u8; 32])> {
         // The sender's mailbox point becomes where we deposit our replies, so a degenerate one
         // must never enter a session: the all-zero encoding is the Ristretto IDENTITY, and
@@ -543,7 +543,7 @@ impl Account {
         }
         let ik_a = PublicKey::from(ka.ik_a_pub);
         let ek_a = PublicKey::from(ka.ek_a_pub);
-        // Зеркало DH отправителя (симметрия static-static X25519).
+        // The mirror of the sender's DH (static-static X25519 symmetry).
         // Every DH must be CONTRIBUTORY: a small-order peer point yields an all-zero shared
         // secret that the attacker also knows, so reject rather than fold it in (CRYPTO-06).
         let dh1 = self.prekey.dh_checked(&ik_a)?; // PK_B × IK_A (authenticates the sender)
@@ -590,15 +590,15 @@ impl Account {
     }
 }
 
-/// Initial key-agreement на проводе (§2.1). Несёт ТОЛЬКО материал согласования
-/// (без груза — груз идёт в ratchet-сообщении, приложенном рядом).
+/// The initial key agreement on the wire (§2.1). It carries ONLY agreement material (no payload —
+/// the payload travels in the ratchet message attached beside it).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct KeyAgreement {
-    /// Долговременный identity отправителя (заявленный — аутентифицируется DH1).
+    /// The sender's long-term identity (claimed — authenticated by DH1).
     pub ik_a_pub: [u8; 32],
-    /// Эфемерный ключ отправителя.
+    /// The sender's ephemeral key.
     pub ek_a_pub: [u8; 32],
-    /// ML-KEM-768 ciphertext (~1088 Б).
+    /// The ML-KEM-768 ciphertext (~1088 B).
     pub kem_ct: Vec<u8>,
     /// Which one-time prekey the sender used (its public key), so the recipient knows
     /// which OPK secret to mix in and consume. `None` = no OPK was used. Appended last.
@@ -612,10 +612,10 @@ pub struct KeyAgreement {
     pub mailbox_a_pub: [u8; 32],
 }
 
-/// Отправитель Alice: согласовать `root_key` с получателем по его bundle.
-/// `sender_ik` — долговременный identity Alice (её аутентификатор).
-/// Возвращает (root_key, KA-на-провод), либо `Err` — если bundle структурно невалиден
-/// (malformed KEM key). Никакой wire-вход не доходит до `expect`/паники.
+/// Alice, the sender: agree a `root_key` with the recipient from their bundle.
+/// `sender_ik` is Alice's long-term identity (her authenticator).
+/// Returns (root_key, the KA for the wire), or `Err` if the bundle is structurally invalid (a
+/// malformed KEM key). No wire input ever reaches an `expect` or a panic.
 pub fn initiate_key_agreement(
     sender_ik: &Identity,
     sender_mailbox_pub: &[u8; 32],
@@ -683,9 +683,9 @@ pub fn initiate_key_agreement(
     ))
 }
 
-/// Транскрипт: связывает ОБА долговременных ключа (IK_A, IK_B), эфемер, prekey и
-/// **KEM-ciphertext** — без последнего возможна атака подстановки инкапсуляции.
-/// Идёт в KDF-`info`.
+/// The transcript: it binds BOTH long-term keys (IK_A, IK_B), the ephemeral, the prekey and the
+/// **KEM ciphertext** — without the last one an encapsulation-substitution attack is possible.
+/// It goes into the KDF `info`.
 fn transcript(
     ik_a: &[u8; 32],
     ik_b: &[u8; 32],
@@ -718,7 +718,7 @@ fn transcript(
 }
 
 /// root_key = HKDF-SHA256(ikm = DH1‖DH2‖DH3‖pq_shared, info = transcript).
-/// pq_shared входит В IKM — постквантовая нога НАГРУЖЕНА (тест это пиннит).
+/// pq_shared is part of the IKM — the post-quantum leg is LOAD-BEARING (a test pins this).
 fn derive_root_key(
     dh1: &[u8; 32],
     dh2: &[u8; 32],
@@ -876,9 +876,9 @@ mod tests {
         assert!(addr.is_some(), "the published M is a valid Ristretto point");
     }
 
-    /// Дискриминирующий: pq_shared РЕАЛЬНО входит в root_key. Если бы ML-KEM был
-    /// декоративным, ключи совпали бы. Нельзя протестировать «квантово-стойко»
-    /// напрямую — тестируем, что PQ-вклад ПРОВОДЁН в ключ.
+    /// Discriminating: pq_shared REALLY enters the root_key. If ML-KEM were decorative, the keys
+    /// would match. "Quantum resistant" cannot be tested directly — what is tested is that the PQ
+    /// contribution is WIRED into the key.
     #[test]
     fn pq_shared_is_load_bearing_in_root_key() {
         let (dh1, dh2, dh3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
@@ -888,11 +888,11 @@ mod tests {
         assert_ne!(k_real, k_zero, "pq_shared must affect root_key");
     }
 
-    /// Дискриминирующий для АУТЕНТИФИКАЦИИ ОТПРАВИТЕЛЯ: DH1 (единственный член,
-    /// зависящий от приватного ключа отправителя) реально входит в root_key.
-    /// Без этого root_key = HKDF(DH2‖DH3‖pq) вычислил бы кто угодно из публичного
-    /// bundle — подделка удалась бы. Этот тест пиннит, что подделка невозможна
-    /// по КЛЮЧУ.
+    /// Discriminating for SENDER AUTHENTICATION: DH1 (the only term that depends on the sender's
+    /// private key) really enters the root_key. Without it, root_key = HKDF(DH2‖DH3‖pq) would be
+    /// computable by anyone from the public bundle and forgery would succeed. This test pins that
+    /// forgery is impossible BY KEY.
+
     #[test]
     fn dh1_is_load_bearing_in_root_key() {
         let t = b"transcript";
@@ -916,10 +916,10 @@ mod tests {
         assert_ne!(with_a, without, "OPK presence must affect the root key");
     }
 
-    /// Персистентность §2.1-личности: восстановленный из байтов account даёт ТОТ
-    /// ЖЕ публичный bundle (стабильный адрес/discovery) И согласует тот же
-    /// root_key (KEM-seed восстановлен корректно). Не «round-trip не паникует» —
-    /// именно неизменность bundle + рабочая decap.
+    /// Persistence of the §2.1 identity: an account restored from bytes yields THE SAME public
+    /// bundle (a stable address for discovery) AND agrees the same root_key (the KEM seed was
+    /// restored correctly). Not "the round trip does not panic" — precisely the invariance of the
+    /// bundle plus a working decapsulation.
     #[test]
     fn account_persists_identity_bundle_and_decap() {
         let acct = Account::generate();
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(rb.prekey_pub, bundle.prekey_pub, "the prekey is stable");
         assert_eq!(rb.kem_ek, bundle.kem_ek, "the KEM ek is stable (the seed was restored)");
 
-        // Согласование к восстановленному account работает (decap на seed'е).
+        // Agreement against the restored account works (decapsulation on the seed).
         let alice = Identity::generate();
         let alice_m = crate::blind::MailboxSecret::generate().public();
         let (alice_rk, ka) = initiate_key_agreement(&alice, &alice_m, &rb).expect("well-formed bundle");

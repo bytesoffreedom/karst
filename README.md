@@ -28,9 +28,22 @@ The desktop client — no phone number, no signup; your identity is a 24-word ph
 
 <p align="center"><img src="docs/assets/screenshot-desktop.png" alt="KARST desktop client" width="620"></p>
 
-A conversation. The safety number in the right-hand panel is what you read aloud to confirm nobody swapped your contact's keys; an arriving file is hash-checked before it is offered to you.
+Those 24 words *are* the account. Nothing is registered anywhere, so nothing can be recovered for you — the next screen asks for three of them back before it will go on:
 
-<p align="center"><img src="docs/assets/screenshot-app.png" alt="A KARST conversation, with the contact panel and safety number" width="820"></p>
+<p align="center"><img src="docs/assets/screenshot-phrase.png" alt="The 24-word recovery phrase shown once, at account creation" width="620"></p>
+
+A conversation. The safety number in the right-hand panel is what you read aloud to confirm nobody swapped your contact's keys; an arriving file is hash-checked before it is offered to you. Both themes are first-class:
+
+<table>
+<tr>
+<td width="50%"><img src="docs/assets/screenshot-app.png" alt="A KARST conversation in the dark theme, with the contact panel and safety number" width="100%"></td>
+<td width="50%"><img src="docs/assets/screenshot-app-light.png" alt="The same conversation in the light theme" width="100%"></td>
+</tr>
+</table>
+
+Posts reach your subscribers the same way a message reaches a contact — sealed per recipient and fanned out from your own device, so there is no server-side feed for anyone to read or take down. The honest limit, since it is a real one: a subscriber currently fetches from the author, so the **author** can tell who read a post (the relay cannot — that half is closed by padding). Batched delivery, to close that remaining half, is open work:
+
+<p align="center"><img src="docs/assets/screenshot-feed.png" alt="The KARST feed: posts from accounts you follow" width="720"></p>
 
 Your identity itself has no address. What you hand out is a disposable channel, and burning one touches neither your identity nor your other channels — Settings is where you make them, and where a relay, Tor, i2p or a mixnet is configured:
 

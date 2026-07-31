@@ -1,33 +1,33 @@
-//! §2.1 сессионный peer: PQXDH-согласование + Double Ratchet поверх реального
-//! пути сообщения (admission §7 → mailbox → fetch-auth). Первое, когда §2.1
-//! перестаёт быть островом и становится E2E in-process пути.
+//! The §2.1 session peer: PQXDH agreement plus a Double Ratchet over the real message path
+//! (admission §7 → mailbox → fetch-auth). This is where §2.1 stops being an island and becomes
+//! in-process E2E over the path.
 //!
-//! Peer одновременно ОТПРАВИТЕЛЬ и ПОЛУЧАТЕЛЬ (ratchet-сессия двунаправленна):
-//! `connect` устанавливает сессию к получателю по его bundle; `send` шлёт по ней;
-//! `receive` забирает свой mailbox и продвигает сессии. Одна сессия на пир-пару
-//! (ключ — долговременный IK пира), обслуживает оба направления.
+//! A Peer is SENDER and RECIPIENT at once (a ratchet session is bidirectional): `connect`
+//! establishes a session to a recipient from their bundle; `send` sends over it; `receive`
+//! collects its own mailbox and advances the sessions. One session per peer pair (keyed by the
+//! peer's long-term IK), serving both directions.
 //!
-//! # Границы среза (названы, не тихие):
-//! - **сокет/CLI НЕ используют этот путь** — там процесс-на-вызов, ratchet
-//!   требует персистентности `Session` между запусками (serde + Store) — отдельный
-//!   срез. Здесь сессия живёт в памяти между вызовами;
-//! - **§12 bundle publish/fetch** реализован (`publish`/`connect`): relay хранит
-//!   и отдаёт bundle. Но relay — НЕ якорь личности: подлинность `peer_ik`
-//!   проверяется вне канала (OOB/TOFU) — внешняя стена. `connect` сверяет, что
-//!   отданный bundle заявляет запрошенный IK; подмена только prekey/KEM →
-//!   fail-closed; подмена самого IK при OOB-непроверенном `peer_ik` → MITM;
-//! - **надёжность первой доставки предполагается**: цепочка продвигается
-//!   безусловно (см. `send` — иначе keystream-reuse), поэтому недоставленное
-//!   сообщение = gap. Установить сессию может лишь `Initial` c n=0; если он не
-//!   прошёл, сессия мертва до `connect` заново (first-delivery-must-succeed).
-//!   Retransmit-без-gap (дослать те же байты) и prologue-повтор (Signal) —
-//!   отдельный reliability-срез;
-//! - **повторный `Initial`** от уже известного пира НЕ переустанавливает живую
-//!   сессию (защита от отбрасывания состояния) — расшифровка идёт на существующей;
-//! - **маршрутизация `Ratchet` — trial-decryption** по всем сессиям (безопасно:
-//!   `decrypt` транзакционен, промах не двигает чужую сессию). Sealed-sender/
-//!   session-id для явной адресации без утечки метаданных — отдельный срез;
-//! - **только 1:1.**
+//! # The slice boundaries, named rather than silent:
+//! - **the socket and the CLI do NOT use this path** — there it is a process per invocation, and
+//!   the ratchet needs `Session` to persist across runs (serde + Store), which is its own slice.
+//!   Here a session lives in memory between calls;
+//! - **§12 bundle publish/fetch** is implemented (`publish`/`connect`): the relay stores and
+//!   serves bundles. But the relay is NOT an identity anchor: the authenticity of `peer_ik` is
+//!   checked out of band (OOB/TOFU) — an external wall. `connect` verifies that the bundle handed
+//!   over claims the requested IK; substituting only the prekey/KEM fails closed; substituting the
+//!   IK itself, when `peer_ik` was never verified out of band, is a MITM;
+//! - **first-delivery reliability is assumed**: the chain advances unconditionally (see `send` —
+//!   otherwise keystream reuse), so an undelivered message leaves a gap. Only an `Initial` with
+//!   n=0 can establish a session; if that one did not land, the session is dead until `connect`
+//!   runs again (first-delivery-must-succeed). Gap-free retransmission (resending the same bytes)
+//!   and the Signal prologue repeat are a separate reliability slice;
+//!
+//! - **a repeated `Initial`** from an already-known peer does NOT re-establish a live session
+//!   (protection against state reset) — decryption continues on the existing one;
+//! - **routing a `Ratchet` is trial decryption** across all sessions (safe: `decrypt` is
+//!   transactional, so a miss does not advance anyone else's session). Sealed sender or a session
+//!   id for explicit addressing without leaking metadata is a separate slice;
+//! - **1:1 only.**
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -75,10 +75,10 @@ fn random32() -> [u8; 32] {
     b
 }
 
-/// Расшифрованное входящее сообщение с АТРИБУЦИЕЙ отправителя. `sender` = его
-/// долговременный IK (PQXDH-аутентифицированный: только держатель приватного IK
-/// согласовал бы root_key этой сессии). Позволяет UI/CLI разложить входящие по
-/// чатам — это НЕ новая крипта, а проброс наружу того, что сессия уже знает.
+/// A decrypted incoming message WITH sender attribution. `sender` is their long-term IK
+/// (PQXDH-authenticated: only the holder of the matching private key could have agreed this
+/// session's root_key). It lets the UI or CLI sort incoming messages into chats — this is not new
+/// crypto but an exposure of what the session already knows.
 #[derive(Clone)]
 pub struct Received {
     pub sender: [u8; 32],
@@ -92,8 +92,8 @@ pub struct Received {
     pub msg_id: [u8; 32],
 }
 
-/// Состояние сессии к одному пиру. `pending_initial` = `Some`, пока первый
-/// `Initial`-конверт не доставлен (сторона-инициатор); затем `None` → шлём `Ratchet`.
+/// The state of a session to one peer. `pending_initial` is `Some` until the first `Initial`
+/// envelope is delivered (on the initiating side); then `None`, and we send `Ratchet`s.
 struct SessionState {
     session: Session,
     pending_initial: Option<KeyAgreement>,
@@ -207,11 +207,11 @@ struct OutboxEntry {
     peer_mailbox_pub: [u8; 32],
 }
 
-/// Персистентное состояние peer'а (для CLI: процесс-на-вызов возобновляет сессии
-/// с диска). Содержит ratchet-снимки, cookie и счётчик nonce. **Секретный
-/// материал** (ratchet-ключи в снимках) — писать под 0600, atomic + под flock
-/// (иначе гонка процессов → keystream-reuse). Account НЕ здесь — он персистится
-/// отдельно (`account.key`).
+/// The peer's persistent state (for the CLI: a process per invocation resumes sessions from disk).
+/// It holds ratchet snapshots, cookies and the nonce counter. **Secret material** (the ratchet
+/// keys inside the snapshots) must be written under 0600, atomically and under flock (otherwise a
+/// race between processes leads to keystream reuse). The Account is NOT here — it persists
+/// separately (`account.key`).
 /// **Format note.** postcard encodes fields positionally, so this struct's layout IS its format,
 /// and there is no compatibility path: a state file from any other layout fails to decode. The
 /// version that governs that is `client::secretbox::STATE_VERSION`, which must be bumped whenever
@@ -313,7 +313,7 @@ struct PersistedSession {
 }
 
 impl PeerState {
-    /// Пустое стартовое состояние (первый запуск — сессий нет).
+    /// The empty starting state (first run — no sessions).
     pub fn empty() -> Self {
         PeerState {
             sessions: Vec::new(),
@@ -448,8 +448,8 @@ enum Handle {
     LoopRecv(u64),
 }
 
-/// Сессионный peer над транспортом. Держит долговременный `Account` (личность +
-/// prekey + KEM), admission-capability и сессии по пирам.
+/// A session peer over a transport. Holds the long-term `Account` (identity + prekey + KEM), the
+/// admission capability, and the per-peer sessions.
 pub struct Peer<T: Transport> {
     account: Account,
     transport: T,
@@ -734,8 +734,8 @@ impl<T: Transport> Peer<T> {
             .retain(|(relay, addr), _| !dropped.iter().any(|(dr, da)| dr == relay && da.as_slice() == addr.as_slice()));
     }
 
-    /// Снять персистентное состояние (сессии + cookie + nonce). Для сохранения
-    /// на диск между процесс-вызовами CLI.
+    /// Take the persistent state (sessions + cookies + nonce), to save to disk between CLI process
+    /// invocations.
     pub fn export_state(&self) -> PeerState {
         let persist = |map: &HashMap<[u8; 32], SessionState>| -> Vec<PersistedSession> {
             map.iter()
@@ -798,7 +798,7 @@ impl<T: Transport> Peer<T> {
         self.inbound_sessions = restore(state.inbound_sessions);
     }
 
-    /// Долговременный IK этого peer = адрес его mailbox и ключ сессии у пиров.
+    /// This peer's long-term IK — its mailbox address, and the session key its peers use.
     pub fn identity(&self) -> [u8; 32] {
         self.account.identity_public()
     }
@@ -828,12 +828,12 @@ impl<T: Transport> Peer<T> {
         self.account.opk_count()
     }
 
-    /// Установлена ли сессия к пиру (чтобы не вызывать `connect` повторно).
+    /// Whether a session to the peer exists (so `connect` is not called twice).
     pub fn has_session(&self, peer_ik: &[u8; 32]) -> bool {
         self.sessions.contains_key(peer_ik)
     }
 
-    /// Публичный prekey-bundle этого peer.
+    /// This peer's public prekey bundle.
     pub fn bundle(&self) -> PreKeyBundle {
         self.account.prekey_bundle()
     }
@@ -845,8 +845,8 @@ impl<T: Transport> Peer<T> {
         self.account.prekey_bundle_with_opk(opk_pub)
     }
 
-    /// §12: опубликовать СВОЙ bundle у relay, чтобы другие могли инициировать к
-    /// нам. Cookie-refresh + ownership-proof (владение приватным IK).
+    /// §12: publish OUR bundle at the relay so others can initiate towards us.
+    /// Cookie refresh plus an ownership proof (possession of the private IK).
     pub fn publish(&mut self, now: u64) -> PublishResponse {
         // Advertise the account's currently-held one-time prekeys. Fine for a ONE-SHOT publish
         // (a fresh account with no OPKs publishes an empty batch). For a PERSISTENT batch that is
@@ -921,10 +921,10 @@ impl<T: Transport> Peer<T> {
         PublishResponse::Rejected("persistent cookie challenge".into())
     }
 
-    /// §12: установить сессию к пиру `peer_ik`, ЗАБРАВ его bundle у relay.
-    /// Проверяет, что отданный bundle заявляет ЗАПРОШЕННЫЙ IK — relay не может
-    /// подсунуть bundle под другим IK незаметно (подмена самого IK — внешняя
-    /// стена: подлинность `peer_ik` проверяется вне канала, см. STATUS).
+    /// §12: establish a session to `peer_ik` by FETCHING their bundle from the relay.
+    /// Verifies that the bundle handed over claims the REQUESTED IK — the relay cannot slip in a
+    /// bundle under a different IK unnoticed (substituting the IK itself is the external wall: the
+    /// authenticity of `peer_ik` is checked out of band, see STATUS).
     pub fn connect(&mut self, peer_ik: &[u8; 32], now: u64) -> Result<ForwardSecrecy, String> {
         let bundle = self.fetch_bundle_with_opk(peer_ik, now)?;
         if bundle.ik_pub != *peer_ik {
@@ -968,11 +968,11 @@ impl<T: Transport> Peer<T> {
         Err("persistent cookie challenge on bundle fetch".into())
     }
 
-    /// Установить исходящую сессию по УЖЕ имеющемуся bundle (OOB-доставка / тесты).
-    /// **Подлинность `bundle.ik_pub` — ответственность вызывающего** (relay не
-    /// доверенный якорь личности). НЕ перезатирает живую сессию: повторный
-    /// `connect` к известному пиру → `Err` (иначе новый root_key молча убил бы
-    /// работающую сессию в обе стороны — тот же класс silent-loss).
+    /// Establish an outgoing session from a bundle already in hand (OOB delivery, or tests).
+    /// **The authenticity of `bundle.ik_pub` is the caller's responsibility** (the relay is not a
+    /// trusted identity anchor). It does NOT overwrite a live session: a repeated `connect` to a
+    /// known peer returns `Err` (otherwise a new root_key would silently kill a working session in
+    /// both directions — the same class of silent loss).
     pub fn connect_with_bundle(&mut self, bundle: &PreKeyBundle) -> Result<ForwardSecrecy, String> {
         if self.sessions.contains_key(&bundle.ik_pub) {
             return Err("session already established with this peer".into());
@@ -1018,17 +1018,17 @@ impl<T: Transport> Peer<T> {
         Ok(fs)
     }
 
-    /// Отправить `plaintext` пиру `peer_ik` по установленной сессии.
+    /// Send `plaintext` to `peer_ik` over an established session.
     ///
-    /// **Цепочка продвигается БЕЗУСЛОВНО** на `encrypt`: каждый `mk` шифрует ровно
-    /// один plaintext → нулевой nonce безопасен (предусловие `ratchet`). Недоставка
-    /// (`Rejected`) оставляет **gap** — получатель отвергнет по in-order/`pn` до
-    /// переустановки. Это liveness-издержка, НЕ переиспользование ключа: НИКОГДА не
-    /// менять nonce-уникальность на liveness на слое крипты. (Если бы коммитили
-    /// продвижение лишь при `Accepted`, следующий ДРУГОЙ plaintext занял бы ту же
-    /// позицию цепочки → тот же `mk` + нулевой nonce → keystream-reuse, а relay
-    /// untrusted и первый шифртекст уже ушёл.) Retransmit-без-gap = дослать те же
-    /// БАЙТЫ конверта дословно (не пере-шифровать) — отдельный reliability-срез.
+    /// **The chain advances UNCONDITIONALLY** on `encrypt`: each `mk` encrypts exactly one
+    /// plaintext, which is what makes the zero nonce safe (the `ratchet` precondition). A
+    /// non-delivery (`Rejected`) leaves a **gap** — the recipient rejects it on in-order/`pn`
+    /// grounds until the session is re-established. That is a liveness cost, NOT key reuse: NEVER
+    /// trade nonce uniqueness for liveness at the crypto layer. (If the advance were committed only
+    /// on `Accepted`, the next DIFFERENT plaintext would take the same chain position → the same
+    /// `mk` with a zero nonce → keystream reuse, while the relay is untrusted and the first
+    /// ciphertext has already left.) Gap-free retransmission means resending the same envelope
+    /// BYTES verbatim (never re-encrypting) — a separate reliability slice.
     pub fn send(&mut self, peer_ik: &[u8; 32], plaintext: &[u8], now: u64) -> Response {
         let envelope = match self.encrypt_next(peer_ik, plaintext) {
             Ok(e) => e,
@@ -1037,12 +1037,12 @@ impl<T: Transport> Peer<T> {
         self.transmit_envelope(peer_ik, envelope, now)
     }
 
-    /// Зашифровать следующее сообщение (продвигает цепочку БЕЗУСЛОВНО), вернуть
-    /// конверт — но НЕ передавать. Для crash-consistent отправки: вызывающий
-    /// обязан ПЕРСИСТИТЬ состояние ДО передачи. Иначе краш между transmit и save
-    /// → следующий send перешифрует ту же позицию цепочки другим текстом → тот же
-    /// `mk`+нулевой nonce = keystream-reuse (шифртекст-N уже у relay). Durable-
-    /// запись «позиция N израсходована» обязана лечь до появления ct_N на проводе.
+    /// Encrypt the next message (advancing the chain UNCONDITIONALLY) and return the envelope
+    /// WITHOUT transmitting it. For crash-consistent sending: the caller must PERSIST the state
+    /// BEFORE transmitting. Otherwise a crash between transmit and save means the next send
+    /// re-encrypts the same chain position with different text → the same `mk` plus a zero nonce =
+    /// keystream reuse (ciphertext N is already at the relay). The durable record "position N is
+    /// spent" must land before ct_N appears on the wire.
     pub fn encrypt_next(&mut self, peer_ik: &[u8; 32], plaintext: &[u8]) -> Result<SessionEnvelope, String> {
         let st = self.sessions.get_mut(peer_ik).ok_or("no session (call connect first)")?;
         // THE one place a ratchet plaintext is produced, and therefore the one place it is padded
@@ -1074,9 +1074,9 @@ impl<T: Transport> Peer<T> {
         })
     }
 
-    /// Передать уже зашифрованный конверт (cookie-retry). На `Accepted` снимает
-    /// `pending_initial` (дальше только Ratchet). Отдельно от `encrypt_next`,
-    /// чтобы вызывающий вставил durable-save между ними (см. `encrypt_next`).
+    /// Transmit an already-encrypted envelope (with cookie retry). On `Accepted` it clears
+    /// `pending_initial` (only Ratchets from then on). Kept separate from `encrypt_next` so the
+    /// caller can put a durable save between them (see `encrypt_next`).
     ///
     /// Routes with LIVE session state (`sessions[peer_ik]` as it is right now) — correct here
     /// because this is the immediate `send()` path: `encrypt_next` and this call are
@@ -1269,8 +1269,8 @@ impl<T: Transport> Peer<T> {
         self.outbox.iter().map(|e| e.envelope.clone()).collect()
     }
 
-    /// Собрать WireMessage и провести через admission с cookie-refresh. Тот же
-    /// конверт переиспользуется на повторе (cookie-challenge НЕ пере-шифрует).
+    /// Assemble the WireMessage and take it through admission with a cookie refresh. The same
+    /// envelope is reused on the retry (a cookie challenge does NOT re-encrypt).
     /// This peer's own loop box for `epoch` — where cover traffic is deposited and read
     /// back. Derived from the identity SECRET, so only we can compute it.
     fn loop_box(&self, epoch: u64) -> Identity {
@@ -1458,9 +1458,9 @@ impl<T: Transport> Peer<T> {
         Response::Rejected("persistent cookie challenge".into())
     }
 
-    /// Забрать входящие: fetch-auth + продвижение сессий. `Ok(vec)` — по элементу
-    /// на конверт (`None` = не расшифровался / не наш; `Some(Received)` несёт
-    /// отправителя); `Err` — сбой транспорта/auth.
+    /// Collect incoming mail: fetch-auth plus session advancement. `Ok(vec)` has one element per
+    /// envelope (`None` = did not decrypt / not ours; `Some(Received)` carries the sender);
+    /// `Err` is a transport or auth failure.
     /// Collect incoming mail: fetch-auth + session advance.
     ///
     /// Polls the identity mailbox (where a stranger's opener lands) plus every live
@@ -1853,9 +1853,9 @@ impl<T: Transport> Peer<T> {
         }
     }
 
-    /// Обработать один входящий груз, продвинув соответствующую сессию. Атрибутит
-    /// отправителя: Initial несёт `sender_ik` в KA; для Ratchet отправитель = ключ
-    /// сессии, которая расшифровала (trial-decryption).
+    /// Process one incoming payload, advancing the corresponding session. Sender attribution: an
+    /// Initial carries `sender_ik` in the KA; for a Ratchet the sender is the key of the session
+    /// that decrypted it (trial decryption).
     /// `process` for tests: can THIS peer open this payload? Used to assert that a
     /// stranger with real keys gets nothing from a raw slot.
     pub fn open_for_test(&mut self, payload: &Payload) -> Option<Received> {
@@ -1890,7 +1890,7 @@ impl<T: Transport> Peer<T> {
             // rather than a panic: nothing about our own dispatch should be able to abort the
             // process, and a miss here is the same "not for us" the rest of this function returns.
             Payload::Session(SessionEnvelope::Veiled { .. }) => None,
-            // Скелет-конверт этому session-peer не адресован.
+            // This envelope is not addressed to this session peer.
             Payload::Skeleton(_) => None,
             // A sealed opener: unwrap it with our OWN identity key — which works without
             // knowing who sent it, and is exactly why the relay could not read it — then

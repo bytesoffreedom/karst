@@ -1,28 +1,28 @@
-//! KARST десктоп-клиент — ЯДРО (без stdout/args; это делает бинарь `karst`).
+//! The KARST desktop client — the CORE (no stdout, no args; that is the `karst` binary's job).
 //!
-//! Тонкая оркестрация над `node`: хранит identity + capability (`store`),
-//! запечатывает и шлёт сообщения через `SocketTransport`, забирает и
-//! расшифровывает входящие. Ядро отделено от CLI, чтобы позже переиспользовать
-//! его из Android через JNI — **сам JNI здесь не строим**, это отдельный срез.
+//! Thin orchestration over `node`: it holds the identity and capability (`store`), seals and sends
+//! messages through `SocketTransport`, and collects and decrypts incoming mail. The core is kept
+//! separate from the CLI so it can later be reused from Android through JNI — **the JNI layer is
+//! not built here**, that is its own slice.
 //!
-//! Честные границы (названы, не спрятаны):
-//! - **§2.1 путь** (`send_session`/`recv_session`): PQXDH sender-auth + ratchet
-//!   поверх персистентных сессий (flock+atomic в `store`). Идентичность
-//!   отправителя аутентифицирована, но пока не прокидывается наружу приёмом
-//!   (показ «from» — отдельный срез). `send_message`/`fetch_messages` — старый
-//!   skeleton-путь, оставлен для demo/тестов;
-//! - **lease/ACK + plaintext-first на приёме:** `recv_session` =
-//!   fetch(lease)→process→**persist history (deduped)**→save→ACK. Плейнтекст durable ДО
-//!   коммита ratchet/OPK и ДО ACK, поэтому оба прежних окна потери ([OPK→session],
-//!   [session→history]) закрыты; редоставленный дубликат отсекается по `payload_id`
-//!   (или fail-closed на продвинутом ratchet). Остаток: dedup только для текста — файл/
-//!   реакция в том же окне могут примениться повторно (отдельные срезы). Для
-//!   container-backed аккаунта `Store` — лишь распакованная рабочая копия, поэтому
-//!   `recv_session_multi` НЕ шлёт ACK сам: он возвращает [`DeferredAcks`], и удалить
-//!   сообщения с relay можно только через `commit_then_send`, т.е. после успешного
-//!   коммита авторитетного контейнера (SEC-34);
-//! - **at-rest секретов нет** (см. `store`) — теперь load-bearing: на диске
-//!   ratchet chain/root-ключи.
+//! The honest boundaries, named rather than hidden:
+//! - **the §2.1 path** (`send_session`/`recv_session`): PQXDH sender auth plus a ratchet over
+//!   persistent sessions (flock + atomic writes in `store`). The sender's identity is
+//!   authenticated but not yet surfaced to the receiver (showing "from" is a separate slice).
+//!   `send_message`/`fetch_messages` are the older skeleton path, kept for the demo and tests;
+//!
+//! - **lease/ACK and plaintext-first on receive:** `recv_session` is
+//!   fetch(lease) → process → **persist history (deduped)** → save → ACK. The plaintext is durable
+//!   BEFORE the ratchet/OPK commit and BEFORE the ACK, so both former loss windows
+//!   ([OPK→session], [session→history]) are closed; a redelivered duplicate is filtered by
+//!   `payload_id` (or fails closed on an advanced ratchet). What remains: dedup covers text only —
+//!   a file or a reaction in the same window can be applied twice (separate slices). For a
+//!   container-backed account the `Store` is only an unpacked working copy, which is why
+//!   `recv_session_multi` does NOT send the ACK itself: it returns [`DeferredAcks`], and messages
+//!   can be deleted from the relay only through `commit_then_send`, i.e. after the authoritative
+//!   container has been committed (SEC-34);
+//! - **secrets have no at-rest encryption** (see `store`) — now load-bearing: the ratchet chain
+//!   and root keys are on disk.
 
 pub mod blob;
 pub mod container;
@@ -50,8 +50,8 @@ use std::sync::Arc;
 
 use store::Store;
 
-/// Честное сообщение при провале чтения секрета: нет файла (нужен init) vs
-/// файл есть, но не расшифровался (неверный `KARST_PASSPHRASE`/повреждение).
+/// An honest message when reading a secret fails: the file is absent (run init) versus the file
+/// exists but did not decrypt (a wrong `KARST_PASSPHRASE`, or corruption).
 fn secret_load_err(what: &str, e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         format!("no {what} (run karst init)")
@@ -695,10 +695,10 @@ fn carrier_adapter(proxy: Option<SocketAddr>, isolation: &str) -> Arc<dyn Transp
         .expect("the intent carrier's prerequisites are the inputs that derived it")
 }
 
-/// Дев-capability для ЛОКАЛЬНОГО теста: секрет `[0x33;32]` ПУБЛИЧЕН и совпадает
-/// с тем, что раздаёт `karst-relay`. Кто угодно может его подделать — это НЕ
-/// «провижининг работает». Настоящая выдача capability (§7.2, от issuer) —
-/// отдельный слой, здесь его нет.
+/// A dev capability for LOCAL testing: the secret `[0x33;32]` is PUBLIC and matches what
+/// `karst-relay` hands out. Anyone can forge it — this is NOT "provisioning works". Real
+/// capability issuance (§7.2, from an issuer) is a separate layer and is not here.
+
 pub fn dev_capability() -> Capability {
     Capability {
         capability_id: [0xCA; 16],
@@ -1371,9 +1371,9 @@ pub fn import_discovered_relays(store: &Store, from: &Relay, now: u64) -> Result
     Ok(added)
 }
 
-/// Идентификатор узла вне канала: Noise-pub (аутентифицирует relay при
-/// handshake) ‖ fetch-auth-pub (доказательство владения mailbox). Бинарь relay
-/// печатает как один hex `relay-id`.
+/// A node identifier obtained out of band: the Noise public key (which authenticates the relay
+/// during the handshake) followed by the fetch-auth public key (the proof of mailbox ownership).
+/// The relay binary prints them as a single hex `relay-id`.
 #[derive(Clone, Copy)]
 pub struct RelayId {
     pub noise_pub: [u8; 32],
@@ -1381,7 +1381,7 @@ pub struct RelayId {
 }
 
 impl RelayId {
-    /// Разобрать 128-hex (64 байта: noise ‖ fetch).
+    /// Parse 128 hex characters (64 bytes: noise ‖ fetch).
     pub fn parse(hex_str: &str) -> Result<Self, String> {
         let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("relay-id is not hex: {e}"))?;
         if bytes.len() != 64 {
@@ -1479,12 +1479,12 @@ fn blob_get_addr() -> Vec<u8> {
     blob::random32().to_vec()
 }
 
-/// Отправить одно сообщение получателю `to_pub` через `relay` (внутри
-/// Noise-сессии). `now` — часы вызывающего, на провод не уходят.
+/// Send one message to the recipient `to_pub` through `relay` (inside a Noise session).
+/// `now` is the caller's clock and never goes on the wire.
 ///
-/// `to_kem_ek` — долгоживущий ML-KEM-ключ получателя: конверт теперь гибридный (PRIV-3), и без
-/// этого ключа его нечем запечатать постквантово. Это СКЕЛЕТНЫЙ путь; настоящий сессионный путь
-/// берёт тот же ключ из подписанного bundle сам.
+/// `to_kem_ek` is the recipient's long-lived ML-KEM key: the envelope is hybrid now, and without
+/// that key there is nothing to seal it with post-quantum. This is the SKELETON path; the session
+/// path takes the same key from the signed bundle itself.
 pub fn send_message(
     relay: &Relay,
     cap: Capability,
@@ -1494,17 +1494,17 @@ pub fn send_message(
     now: u64,
 ) -> Response {
     let transport = relay.transport();
-    // client_addr = capability_id: стабильный per-отправитель идентификатор для
-    // привязки cookie (скелет; настоящий адрес — сетевой источник).
+    // client_addr = capability_id: a stable per-sender identifier to bind the cookie to (skeleton;
+    // the real address is the network source).
     let addr = cap.capability_id;
     let mut client = Client::new(transport, cap, &addr);
     let recipient_pub = x25519_dalek::PublicKey::from(*to_pub);
     client.send(&recipient_pub, to_kem_ek, plaintext, now)
 }
 
-/// Забрать и расшифровать входящие для нашей `identity` (внутри Noise-сессии;
-/// fetch-auth поверх). `Ok(vec)` — выборка (может быть пустой; `None` = не
-/// расшифровалось); `Err` — недоступен/протокол/отказ auth (отделено от «пусто»).
+/// Collect and decrypt incoming mail for our `identity` (inside a Noise session, with fetch-auth
+/// on top). `Ok(vec)` is the batch (possibly empty; `None` means it did not decrypt); `Err` is
+/// unreachable / protocol / auth refusal — kept distinct from "nothing there".
 pub fn fetch_messages(
     relay: &Relay,
     identity: Identity,
@@ -1521,8 +1521,8 @@ pub fn fetch_messages(
     recipient.receive(now)
 }
 
-/// §12: опубликовать §2.1-bundle нашего `account` у relay (чтобы другие могли
-/// инициировать к нам сессию). Внутри Noise-сессии, cookie + ownership-proof.
+/// §12: publish our `account`'s §2.1 bundle at the relay (so others can initiate a session
+/// towards us). Inside a Noise session, with a cookie and an ownership proof.
 pub fn publish_bundle(
     relay: &Relay,
     account: Account,
@@ -1903,10 +1903,10 @@ fn reconcile_ledger(
     kept
 }
 
-/// §2.1: отправить сообщение получателю `to_ik` (его §2.1-IK) по установленной/
-/// новой ratchet-сессии. Всё окно — под flock на сессиях (иначе гонка процессов
-/// → keystream-reuse); persist ПОСЛЕ отправки. Первый контакт забирает bundle
-/// получателя у relay (§12) — он должен был сделать `publish`.
+/// §2.1: send a message to `to_ik` (their §2.1 IK) over an established or new ratchet session.
+/// The whole window is under the session flock (otherwise a race between processes leads to
+/// keystream reuse); persistence happens AFTER sending. First contact fetches the recipient's
+/// bundle from the relay (§12) — they must have run `publish`.
 pub fn send_session(
     store: &Store,
     relay: &Relay,
@@ -2152,9 +2152,9 @@ pub fn outbox_len(store: &Store) -> Result<usize, String> {
     Ok(state.outbox_len())
 }
 
-/// Отправить ТЕКСТ со штампом времени отправителя (`msg_ts`): оборачивает в
-/// `Content::TextStamped`, чтобы получатель хранил ТОТ ЖЕ ts — сквозной идентификатор
-/// сообщения (для «удалить у всех»/реакций/ответов). `now` — часы для admission.
+/// Send TEXT stamped with the sender's clock (`msg_ts`): wraps it in `Content::TextStamped` so
+/// the recipient stores THE SAME ts — the end-to-end message identifier (used by
+/// delete-for-everyone, reactions and replies). `now` is the clock for admission.
 #[allow(clippy::too_many_arguments)]
 /// §15: offer a contact the extra routes you use to reach the relay you SHARE.
 ///
@@ -2192,8 +2192,8 @@ pub fn send_text(
     send_session(store, relay, to_ik, &payload, now)
 }
 
-/// Отправить ПРАВКУ своего сообщения `target_msg_id`. Локально `set_edit` делает
-/// вызывающий (worker) — здесь только провод.
+/// Send an EDIT of one's own message `target_msg_id`. The local `set_edit` is done by the caller
+/// (the worker); this is the wire part only.
 #[allow(clippy::too_many_arguments)]
 pub fn send_edit_message(
     store: &Store,
@@ -2212,11 +2212,11 @@ pub fn send_edit_message(
     send_session(store, relay, to_ik, &payload, now).map(|_| ())
 }
 
-/// **Guard авторизации входящей правки.** Правку сообщения `target` от `sender`
-/// применяем ТОЛЬКО если `sender` — автор цели: у нас она входящая (`from_me=false`,
-/// `peer_ik==sender`), и её канонический `msg_id` совпадает с `target`. Иначе
-/// злонамеренный пир мог бы подменить текст ВАШЕГО (или чужого) сообщения на вашем
-/// экране — та же честная граница «нельзя навязать», но здесь ещё и анти-спуфинг.
+/// **The authorisation guard for an incoming edit.** An edit of message `target` from `sender` is
+/// applied ONLY if `sender` is the target's author: for us it is incoming (`from_me=false`,
+/// `peer_ik==sender`) and its canonical `msg_id` matches `target`. Otherwise a malicious peer
+/// could rewrite the text of YOUR (or a third party's) message on your screen — the same honest
+/// "cannot be imposed" boundary, but here it is also an anti-spoofing check.
 pub fn incoming_edit_allowed(
     records: &[store::HistoryRecord],
     sender: &[u8; 32],
@@ -2261,8 +2261,8 @@ pub fn format_conversation(records: &[store::HistoryRecord], peer_ik: &[u8; 32])
     out
 }
 
-/// Отправить текст-ОТВЕТ: как `send_text`, но с `reply_to` (`msg_id` цели). Локально
-/// историю пишет и `set_reply` делает вызывающий (worker) — здесь только провод.
+/// Send a REPLY: like `send_text` but with `reply_to` (the target's `msg_id`). The history write
+/// and `set_reply` are done locally by the caller (the worker); this is the wire part only.
 #[allow(clippy::too_many_arguments)]
 pub fn send_text_reply(
     store: &Store,
@@ -2281,8 +2281,8 @@ pub fn send_text_reply(
     send_session(store, relay, to_ik, &payload, now).map(|_| ())
 }
 
-/// Отправить просьбу «удалить у всех» ранее посланное (`msg_ts` + `text`).
-/// Кооперативно — получатель на сотрудничающем клиенте сотрёт запись.
+/// Send a delete-for-everyone request for something sent earlier (`msg_ts` + `text`).
+/// Cooperative — a recipient on a cooperating client erases the record.
 #[allow(clippy::too_many_arguments)]
 pub fn send_delete_for_everyone(
     store: &Store,
@@ -2297,10 +2297,10 @@ pub fn send_delete_for_everyone(
     send_session(store, relay, to_ik, &payload, now).map(|_| ())
 }
 
-/// Послать реакцию (поставить/снять) на сообщение `msg_id` собеседнику `to_ik`.
-/// Маленький control-конверт по §2.1-сессии; автора получатель атрибутирует по
-/// расшифровавшей сессии (как обычный текст). Локальную запись `set_reaction`
-/// делает вызывающий (worker) — здесь только провод.
+/// Send a reaction (add or remove) on message `msg_id` to `to_ik`. A small control envelope over
+/// the §2.1 session; the recipient attributes the author by the session that decrypted it (as for
+/// ordinary text). The local `set_reaction` is done by the caller (the worker); this is the wire
+/// part only.
 #[allow(clippy::too_many_arguments)]
 pub fn send_reaction(
     store: &Store,
@@ -2478,10 +2478,10 @@ pub fn send_join_accept(
     send_session(store, relay, to_ik, &payload, now).map(|_| ())
 }
 
-/// Отправить ИСЧЕЗАЮЩИЙ текст: оборачивает в `Content::TextExpiring` с абсолютным
-/// `expire_at = now + ttl_secs`. Таймер идёт от отправки и одинаков у обеих сторон.
-/// Ничего не логируется в историю (это делает вызывающий — worker пропускает
-/// append для этого варианта).
+/// Send DISAPPEARING text: wraps it in `Content::TextExpiring` with an absolute
+/// `expire_at = now + ttl_secs`. The timer runs from sending and is identical on both sides.
+/// Nothing is logged to the history (the caller does that — the worker skips the append for this
+/// variant).
 #[allow(clippy::too_many_arguments)]
 pub fn send_text_expiring(
     store: &Store,
@@ -2497,12 +2497,12 @@ pub fn send_text_expiring(
     send_session(store, relay, to_ik, &payload, now).map(|_| ())
 }
 
-/// Отправить ФАЙЛ: манифест + чанки, каждый — ОТДЕЛЬНОЕ сообщение (1400-байтный
-/// лимит Ступени-0 не даёт слать файл целиком). Первый срез: ≤250 чанков (~256
-/// KiB, один mailbox). Частичная отправка (краш посреди) не соберётся у получателя
-/// — файл не появится, но и ключ не переиспользуется (каждый чанк — своя позиция).
-/// Манифест лучше слать по УЖЕ установленной сессии (как Initial он ограничен
-/// ~104 Б из-за KEM-ct) — на практике файл шлют после переписки.
+/// Send a FILE: the manifest plus the chunks, each as its OWN message (the 1400-byte Stage-0
+/// limit rules out sending a file whole). Inline transfers are bounded by `MAX_FILE_CHUNKS` (see
+/// `content`). A partial send (a crash midway) will not reassemble at the recipient — the file
+/// never appears, but no key is reused either (each chunk has its own). The manifest is best sent
+/// over an ALREADY established session (as an Initial it is limited to ~104 bytes because of the
+/// KEM ciphertext) — in practice a file follows a conversation.
 #[allow(clippy::too_many_arguments)]
 pub fn send_file(
     store: &Store,
@@ -3671,12 +3671,12 @@ fn persist_incoming_history(store: &Store, msgs: &[Option<Received>], now: u64) 
     Ok(())
 }
 
-/// §2.1: забрать входящие, ПЕРСИСТИТЬ плейнтекст, затем продвинуть сессии. Порядок
-/// (под flock на сессиях всё время): fetch(lease) → decrypt → **persist history
-/// (plaintext-first, deduped)** → save OPKs+sessions → ACK. Плейнтекст durable ДО
-/// коммита ratchet/OPK и ДО ACK, поэтому краш в любом из окон `[OPK→session]` /
-/// `[session→history]` больше НЕ теряет сообщение (при переобработке дубликат
-/// отсекается по `payload_id`, либо fail-closed на продвинутом ratchet).
+/// §2.1: collect incoming mail, PERSIST the plaintext, then advance the sessions (all under the
+/// session flock): fetch(lease) → decrypt → **persist history (plaintext-first, deduped)** → save
+/// OPKs and sessions → ACK. The plaintext is durable BEFORE the ratchet/OPK commit and BEFORE the
+/// ACK, so a crash in either window `[OPK→session]` / `[session→history]` no longer loses a
+/// message (on reprocessing the duplicate is filtered by `payload_id`, or fails closed on an
+/// advanced ratchet).
 ///
 /// **FILE-TREE ACCOUNTS ONLY.** This acks internally, which is correct exactly while the
 /// `Store` it writes to is the authority. A CONTAINER-backed account's authority is the
@@ -3693,7 +3693,7 @@ pub fn recv_session(
     let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
     let transport = relay.transport();
     let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
-    // capability не используется на приёме (fetch-auth = cookie + ownership-proof).
+    // The capability is unused on receive (fetch-auth = cookie + ownership proof).
     let mut peer = Peer::new(transport, account, dev_capability(), fetch_pub);
     // Lease/ACK receive: fetch keeps the messages on the relay until we have durably saved
     // the advanced ratchet, then `ack_all` deletes them. A crash before the ACK redelivers

@@ -1143,7 +1143,13 @@ impl RelayNode {
             // Never pass on a lapsed statement. Holding one is fine (it is evidence we once
             // verified that relay); repeating it to a client is how a stale address outlives the
             // relay that moved away from it.
-            if d.verified(now).is_none() {
+            //
+            // WINDOW ONLY — deliberately not `verified`, which would re-check the signature. Every
+            // entry here was signature-checked by `add_relay` before it was stored, and bytes in
+            // memory do not stop being signed. Re-verifying would make this PUBLIC, un-gated read
+            // cost up to `MAX_KNOWN_RELAYS` XEdDSA verifications per request, under the lock, for
+            // any stranger who asks.
+            if !d.window_contains(now) {
                 continue;
             }
             let sz = postcard::to_stdvec(d).map(|v| v.len()).unwrap_or(usize::MAX);
@@ -1737,6 +1743,57 @@ impl Transport for InMemoryTransport {
 
 #[cfg(test)]
 mod tests {
+    /// **Serving the page checks the WINDOW, not the signature.**
+    ///
+    /// `GetNodeList` is a public read with no admission gate, so re-verifying every stored entry on
+    /// the way out turns a free request into up to `MAX_KNOWN_RELAYS` XEdDSA verifications under the
+    /// relay lock — a work amplifier handed to any stranger, introduced by the very commit that made
+    /// the list signed. Entries are signature-checked ON THE WAY IN by `add_relay`; bytes in memory
+    /// do not stop being signed, so only the window can change and only the window is re-read.
+    ///
+    /// This is a UNIT test on purpose. From outside the crate the two implementations are
+    /// indistinguishable — `add_relay` refuses a bad signature, so a corrupt entry can never exist
+    /// in storage to tell them apart. The first version of this test lived in the integration file
+    /// and corrupted a CLONE returned by `known_relays()`, which left the stored copy intact: it
+    /// passed against both implementations and proved nothing.
+    ///
+    /// DISCRIMINATING: switch the page loop back to `verified(now)` and this reds.
+    #[test]
+    fn serving_the_page_checks_the_window_not_the_signature() {
+        let (secret, public) = crate::server::generate_noise_keypair();
+        let relay = node::protocol::RelayDescriptor {
+            noise_pub: public,
+            fetch_pub: [4u8; 32],
+            addrs: vec!["peer.example:9000".into()],
+            quic_addrs: Vec::new(),
+        };
+        let signed = node::protocol::NodeDescriptor::signed(relay, node::protocol::RelayPolicy {
+            blob_persistence: None,
+            blob_ttl_secs: 0,
+            max_blob_size: 0,
+            pow_bits: None,
+            mailbox_durability: node::protocol::MailboxDurability::Volatile,
+        }, 1_000, &secret);
+
+        let mut r = RelayNode::new(1_000);
+        assert!(r.add_relay(signed, 1_000), "a valid statement enters");
+
+        // Corrupt the signature OF THE STORED ENTRY — reaching the private field is the whole
+        // reason this test is here rather than next door.
+        r.known_relays[0].sig[0] ^= 0xFF;
+
+        assert_eq!(
+            r.node_list(1_000).len(),
+            1,
+            "the page must be served without re-verifying signatures"
+        );
+        assert!(
+            r.node_list(1_000 + node::protocol::DESCRIPTOR_TTL_SECS + node::protocol::DESCRIPTOR_SKEW_SECS + 1)
+                .is_empty(),
+            "…while the window, which is the part that changes with time, is still enforced"
+        );
+    }
+
     use karst_client_core::demo::{Client, Recipient};
     use node::seal::SkeletonSeal;
     /// A capability the in-crate tests can present when a publish CREATES a slot (CRYPTO-18).

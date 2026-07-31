@@ -26,7 +26,7 @@ Built in Rust around independently operated relays.
 
 The desktop client — no phone number, no signup; your identity is a 24-word phrase.
 
-<p align="center"><img src="docs/assets/screenshot-desktop.png" alt="KARST desktop client" width="620"></p>
+<p align="center"><img src="docs/assets/screenshot-desktop.png?v=2" alt="KARST desktop client" width="620"></p>
 
 Those 24 words *are* the account. Nothing is registered anywhere, so nothing can be recovered for you — the next screen asks for three of them back before it will go on:
 
@@ -62,11 +62,11 @@ KARST_RELAY_MODE=public KARST_RELAY_POW_BITS=20 \
 for the placeholder above, or drop the line and run without peers. A peer that does not parse is
 skipped with a warning rather than failing the start.
 
-<p align="center"><img src="docs/assets/screenshot-relay.png" alt="Running a KARST relay" width="860"></p>
+<p align="center"><img src="docs/assets/screenshot-relay.png?v=2" alt="Running a KARST relay" width="860"></p>
 
 Two clients through that relay: a message each way, a file that arrives with its SHA verified, and the same relay reached over QUIC instead of TCP. Verbatim output of `scripts/karst-demo.sh`, which CI runs on every push — build noise removed, nothing added:
 
-<p align="center"><img src="docs/assets/screenshot-messaging.png" alt="End-to-end messaging, file transfer and QUIC demo" width="780"></p>
+<p align="center"><img src="docs/assets/screenshot-messaging.png?v=2" alt="End-to-end messaging, file transfer and QUIC demo" width="780"></p>
 
 ---
 
@@ -112,7 +112,7 @@ See [`RESPONSIBLE_USE.md`](RESPONSIBLE_USE.md) for the project's intended purpos
 ### How a message actually travels
 
 <p align="center">
-  <img src="docs/assets/architecture.svg" alt="How a KARST message travels: sender, untrusted relay, recipient, transports and multi-homing" width="1000">
+  <img src="docs/assets/architecture.svg?v=2" alt="How a KARST message travels: sender, untrusted relay, recipient, transports and multi-homing" width="1000">
 </p>
 
 **What the relay can and cannot do.** It stores and forwards sealed envelopes and

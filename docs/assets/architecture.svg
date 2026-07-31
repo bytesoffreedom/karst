@@ -96,12 +96,14 @@
   <rect class="card" x="40" y="470" width="500" height="196"/>
   <text class="title" x="64" y="506">How the bytes travel</text>
   <text class="sub"   x="64" y="527">the user picks; the protocol above is identical</text>
-  <text class="item mono" x="64" y="559">direct TCP</text>
-  <text class="item mono" x="64" y="583">wss:// (WebSocket over TLS)</text>
-  <text class="item mono" x="64" y="607">SOCKS5 → Tor · I2P · mixnet</text>
-  <text class="note" x="300" y="559">fastest, reveals your address</text>
-  <text class="note" x="300" y="583">looks like ordinary web traffic</text>
-  <text class="note" x="300" y="607">hides the address, costs latency</text>
+  <text class="item mono" x="64" y="553">direct TCP</text>
+  <text class="item mono" x="64" y="575">QUIC (over UDP)</text>
+  <text class="item mono" x="64" y="597">wss:// (WebSocket over TLS)</text>
+  <text class="item mono" x="64" y="619">SOCKS5 → Tor · I2P · mixnet</text>
+  <text class="note" x="300" y="553">fastest, reveals your address</text>
+  <text class="note" x="300" y="575">raced beside TCP; never under a proxy</text>
+  <text class="note" x="300" y="597">looks like ordinary web traffic</text>
+  <text class="note" x="300" y="619">hides the address, costs latency</text>
   <text class="note" x="64" y="649">A path that is down is skipped; the next one carries it.</text>
 
   <!-- ─────────── Multi-homing ─────────── -->

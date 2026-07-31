@@ -19,8 +19,7 @@ fn main() {
     let pass = std::env::var("KARST_PASSPHRASE").unwrap_or_else(|_| "pw".into());
     let vault = Vault::unlock(&home, pass.as_bytes()).expect("vault unlock");
 
-    let phrase = "abandon abandon abandon abandon abandon abandon \
-                  abandon abandon abandon abandon abandon about";
+    let phrase = seed::DEMO_PHRASE;
     let entropy = seed::entropy_of(&seed::parse_mnemonic(phrase).unwrap());
     let ik = seed::derive(&entropy).account.identity_public();
     let id = hex::encode(ik);

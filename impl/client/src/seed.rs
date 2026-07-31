@@ -44,6 +44,23 @@ pub const ENTROPY_BYTES: usize = 32;
 /// Words in a phrase — a function of the entropy width (BIP-39: 32 bytes → 24 words).
 pub const PHRASE_WORDS: usize = 24;
 
+/// The all-`abandon` phrase for demo seeders and visual-verification tools — **one copy, so it
+/// cannot rot in several places at once**.
+///
+/// It already did. `PHRASE_WORDS` moved 12 → 24 when the root widened to 256 bits, and two
+/// examples kept their 12-word literal and panicked on every run — including the one the GUI
+/// notes recommend as the FAST path for visual checks. Nothing failed: examples compile without
+/// being executed, so a runtime-only break in one is invisible to `cargo test` and to CI.
+///
+/// Keeping the phrase here, with the test below, means the next width change breaks a unit test
+/// in this file instead of two tools nobody runs until they need them.
+///
+/// NOT a product constant and never a default: it is the canonical BIP-39 all-zero-entropy
+/// phrase, public in every wordlist, and anything derived from it is public by construction.
+pub const DEMO_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                               abandon abandon abandon abandon abandon abandon abandon abandon \
+                               abandon abandon abandon abandon abandon abandon abandon art";
+
 /// CRYPTO-32, enforced at COMPILE time: the root must not be weaker than the strongest primitive
 /// derived from it. ML-KEM-768 claims Category 3 (~192 bits); everything here is deterministic in
 /// the phrase, so a narrower root would silently make that claim false. Narrowing `ENTROPY_BYTES`
@@ -175,6 +192,24 @@ pub fn derive_proxy_from_secret(secret: &[u8; 32]) -> DerivedIdentity {
 
 #[cfg(test)]
 mod tests {
+
+    /// The demo phrase parses at the CURRENT width.
+    ///
+    /// DISCRIMINATING: change `PHRASE_WORDS` (or trim a word from `DEMO_PHRASE`) and this reds
+    /// here, in a test that runs, instead of at the moment somebody reaches for a seeding tool
+    /// during a visual check and finds it has been broken for weeks.
+    #[test]
+    fn the_demo_phrase_still_parses_at_the_current_width() {
+        let m = parse_mnemonic(DEMO_PHRASE).expect("the demo phrase must parse");
+        assert_eq!(
+            DEMO_PHRASE.split_whitespace().count(),
+            PHRASE_WORDS,
+            "the demo phrase drifted from PHRASE_WORDS"
+        );
+        // And it derives a usable identity, not merely a well-formed word list.
+        let _ = derive(&entropy_of(&m)).account.identity_public();
+    }
+
     use super::*;
 
     /// **Контракт совместимости — НЕ МЕНЯТЬ значения.**

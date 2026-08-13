@@ -61,10 +61,51 @@ def hkdf(salt: bytes | None, ikm: bytes, info: bytes, length: int) -> bytes:
     return out[:length]
 
 
+# ── PQXDH composition, transcribed ───────────────────────────────────────────
+# The primitives are NOT here and deliberately so: X25519 and ML-KEM are not in the standard
+# library, and importing a package would put a third party's reading of them exactly where an
+# independent reading belongs. What is transcribed is the part this project invented — the order
+# fields go into the transcript, and the order secrets go into the IKM.
+#
+#   transcript = "KARST-pqxdh-v1" ‖ IK_A ‖ IK_B ‖ EK_A ‖ prekey_B ‖ kem_ct ‖ mailbox_A
+#                ‖ (0x01 ‖ OPK_B  |  0x00)
+#   root_key   = HKDF-SHA256(salt=none, ikm = DH1 ‖ DH2 ‖ DH3 [‖ DH4] ‖ pq_shared,
+#                            info = transcript) -> 32
+#
+# The OPK presence flag is a byte, not an absence: without it "no OPK" and "an OPK of all zeros"
+# would produce the same transcript, and a stripped OPK would not change the key.
+PQXDH_DOMAIN = b"KARST-pqxdh-v1"
+
+
+def pqxdh_transcript(with_opk: bool) -> bytes:
+    ik_a, ik_b = b"\x11" * 32, b"\x22" * 32
+    ek_a, prekey_b = b"\x33" * 32, b"\x44" * 32
+    mailbox_a, opk_b = b"\x55" * 32, b"\x66" * 32
+    kem_ct = b"\x77" * 16
+    t = PQXDH_DOMAIN + ik_a + ik_b + ek_a + prekey_b + kem_ct + mailbox_a
+    return t + (b"\x01" + opk_b if with_opk else b"\x00")
+
+
+def pqxdh_root_key(with_opk: bool) -> bytes:
+    dh1, dh2, dh3, dh4 = b"\xa1" * 32, b"\xa2" * 32, b"\xa3" * 32, b"\xa4" * 32
+    pq = b"\xb0" * 32
+    ikm = dh1 + dh2 + dh3 + (dh4 if with_opk else b"") + pq
+    return hkdf(None, ikm, pqxdh_transcript(with_opk), 32)
+
+
 def derive(name: str) -> str:
     """Recompute one named vector. Inputs mirror the fixed test inputs on the Rust side."""
     rk, dh, ck, mk = b"\x11" * 32, b"\x22" * 32, b"\x33" * 32, b"\x44" * 32
     salt = b"\x55" * SALT_LEN
+
+    if name == "transcript.with_opk":
+        return pqxdh_transcript(True).hex()
+    if name == "transcript.without_opk":
+        return pqxdh_transcript(False).hex()
+    if name == "root_key.with_opk":
+        return pqxdh_root_key(True).hex()
+    if name == "root_key.without_opk":
+        return pqxdh_root_key(False).hex()
 
     if name == "routing_contrib":
         return hkdf(None, dh, ROUTING_INFO, 32).hex()

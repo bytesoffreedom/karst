@@ -1023,3 +1023,116 @@ mod tests {
         );
     }
 }
+
+/// PQXDH COMPOSITION vectors, checked against an independent reading (QA-4, second slice).
+///
+/// # What is covered, and the line the scope is drawn on
+///
+/// Not X25519, not ML-KEM. Neither is in Python's standard library, and importing a package would
+/// put a third party's reading of the primitive exactly where an independent reading is supposed
+/// to be — the same line the ratchet vectors already drew, for the same reason. Those primitives
+/// are upstream's to test and their own test vectors are published.
+///
+/// What IS covered is the part this project actually invented: how the three or four DH outputs
+/// and the KEM secret are CONCATENATED into the IKM, and what goes into the transcript that becomes
+/// the HKDF info. That composition is where a misreading is both most likely and most silent — get
+/// the field order wrong on both sides and two implementations agree with each other forever while
+/// interoperating with nobody, and get the transcript wrong and a binding the security argument
+/// depends on quietly stops being there.
+///
+/// The two cases are the two shapes the composition takes: with a one-time prekey (four DH legs)
+/// and without one (three). They differ in the IKM layout AND in the transcript's presence flag,
+/// which is exactly the pair a "no OPK" / "OPK of zeros" collision would hide.
+#[cfg(test)]
+mod composition_vectors {
+    use super::*;
+
+    const VECTORS: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/pqxdh_composition.json");
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Deliberately arbitrary and pairwise distinct: no all-zero inputs (which hide a missing
+    /// field) and no two equal (which hide a swapped argument).
+    fn cases() -> Vec<(String, String)> {
+        let ik_a = [0x11u8; 32];
+        let ik_b = [0x22u8; 32];
+        let ek_a = [0x33u8; 32];
+        let prekey_b = [0x44u8; 32];
+        let mailbox_a = [0x55u8; 32];
+        let opk_b = [0x66u8; 32];
+        let kem_ct = [0x77u8; 16]; // a stand-in length: the composition does not care how long
+        let dh1 = [0xA1u8; 32];
+        let dh2 = [0xA2u8; 32];
+        let dh3 = [0xA3u8; 32];
+        let dh4 = [0xA4u8; 32];
+        let pq = [0xB0u8; 32];
+
+        let mut out = Vec::new();
+
+        let t_opk =
+            transcript(&ik_a, &ik_b, &ek_a, &prekey_b, &kem_ct, Some(&opk_b), &mailbox_a);
+        out.push(("transcript.with_opk".into(), hex(&t_opk)));
+        out.push((
+            "root_key.with_opk".into(),
+            hex(&derive_root_key(&dh1, &dh2, &dh3, Some(&dh4), &pq, &t_opk)),
+        ));
+
+        let t_none = transcript(&ik_a, &ik_b, &ek_a, &prekey_b, &kem_ct, None, &mailbox_a);
+        out.push(("transcript.without_opk".into(), hex(&t_none)));
+        out.push((
+            "root_key.without_opk".into(),
+            hex(&derive_root_key(&dh1, &dh2, &dh3, None, &pq, &t_none)),
+        ));
+        out
+    }
+
+    fn render(cases: &[(String, String)]) -> String {
+        let body: Vec<String> = cases.iter().map(|(k, v)| format!("  \"{k}\": \"{v}\"")).collect();
+        format!("{{\n{}\n}}\n", body.join(",\n"))
+    }
+
+    /// The checked-in vectors are what this build produces.
+    ///
+    /// DISCRIMINATING by construction: reorder a transcript field, drop the OPK presence flag,
+    /// move the fourth DH leg after the PQ secret, or stop feeding the KEM ciphertext into the
+    /// transcript — each reds here with both values side by side.
+    #[test]
+    fn the_checked_in_vectors_match_this_build() {
+        let produced = render(&cases());
+        if std::env::var_os("KARST_REGEN_VECTORS").is_some() {
+            std::fs::write(VECTORS, &produced).expect("writing vectors");
+            eprintln!("KARST_REGEN_VECTORS: rewrote {VECTORS} — update verify_vectors.py to match");
+        }
+        let on_disk = std::fs::read_to_string(VECTORS).unwrap_or_default();
+        assert_eq!(
+            on_disk, produced,
+            "the PQXDH composition changed. If that was deliberate: regenerate with \
+             KARST_REGEN_VECTORS=1 AND update scripts/verify_vectors.py, which must reach the same \
+             numbers from the written rules alone. Updating only one of the two turns this into a \
+             test of nothing."
+        );
+    }
+
+    /// The independent reading agrees.
+    ///
+    /// Fails rather than skips when `python3` is absent, for the reason the ratchet vectors give:
+    /// a check that quietly skips is green and verifies nothing.
+    #[test]
+    fn an_independent_implementation_reaches_the_same_numbers() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/verify_vectors.py");
+        let out = std::process::Command::new("python3")
+            .arg(script)
+            .arg(VECTORS)
+            .output()
+            .expect("python3 is required for the independent vector check — install it");
+        assert!(
+            out.status.success(),
+            "the independent implementation disagrees with ours:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

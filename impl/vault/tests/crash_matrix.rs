@@ -167,7 +167,7 @@ fn a_torn_write_leaves_a_partial_range_not_a_whole_one() {
     let root_step = step_index(&c, |w| matches!(w, What::Root));
     let mut store = FaultyStore::new(STORE_LEN);
     c.run_prefix(&mut store, root_step);
-    store.write(ROOT_AT, &vec![0x55; 16]);
+    store.write(ROOT_AT, &[0x55; 16]);
     store.power_cut(&[0], &[Fate::TornPrefix(4)]);
     let image = store.read_durable(ROOT_AT, 16);
     assert_ne!(image, vec![0x55; 16], "a torn write landed whole");
@@ -199,7 +199,7 @@ fn a_second_transaction_cannot_start_on_top_of_an_unfinished_cleanup() {
 /// and this states it where a reader looking for the crash guarantees will find it.
 #[test]
 fn a_refused_transaction_leaves_the_container_untouched() {
-    let mut store = FaultyStore::new(STORE_LEN);
+    let store = FaultyStore::new(STORE_LEN);
     let before = store.read_durable(0, STORE_LEN);
     assert_eq!(admit(1_000_000, 10, None, 0), Err(Refusal::NoSpace));
     assert_eq!(store.read_durable(0, STORE_LEN), before);
@@ -242,7 +242,7 @@ fn the_first_commit_of_a_fresh_container_follows_the_same_boundary() {
 #[test]
 fn the_matrix_rejects_a_commit_that_writes_the_root_before_the_manifest() {
     // Hand-built in the wrong order, deliberately not going through `Commit::build`.
-    let steps = vec![
+    let steps = [
         Step::Write { offset: 1000, bytes: vec![0x11; 16], what: What::ReservedCapsule(1) },
         Step::Barrier,
         Step::Write { offset: 1200, bytes: vec![0x22; 16], what: What::Payload(1) },

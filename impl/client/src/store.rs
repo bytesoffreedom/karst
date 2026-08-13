@@ -5423,8 +5423,7 @@ mod tests {
     /// dropped either would fail), and that clearing is what empties the log — not reading it.
     #[test]
     fn a_parked_message_survives_a_reload_and_is_only_gone_once_cleared() {
-        let dir = std::env::temp_dir().join(format!("karst-replay-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("replay"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         s.quarantine_incoming([0x77; 32], b"an unapplied profile update", 500).unwrap();
@@ -5457,8 +5456,7 @@ mod tests {
     /// outright.
     #[test]
     fn an_accept_is_only_honoured_from_a_peer_we_actually_asked() {
-        let dir = std::env::temp_dir().join(format!("karst-consent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("consent"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let (asked, stranger) = ([0xA1; 32], [0xB2; 32]);
 
@@ -5491,8 +5489,7 @@ mod tests {
     /// a stopwatch that lies on a loaded machine, and would still have grown with the ring.
     #[test]
     fn recent_incoming_ids_does_not_read_the_history_log_at_all() {
-        let dir = std::env::temp_dir().join(format!("karst-dedup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("dedup"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let id = |n: u32| {
@@ -5545,8 +5542,7 @@ mod tests {
     #[test]
     fn a_rolled_back_session_file_is_refused_not_loaded_in_silence() {
         use karst_client_core::peer::PeerState;
-        let dir = std::env::temp_dir().join(format!("karst-anchor-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("anchor"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         s.save_sessions(&PeerState::empty()).unwrap();
@@ -5586,8 +5582,7 @@ mod tests {
     /// and it goes red.
     #[test]
     fn one_accounts_sealed_file_does_not_open_in_another_account() {
-        let dir = std::env::temp_dir().join(format!("karst-splice-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("splice"); // #321: under the swept root
         let vault = Vault::create(&dir, b"pw").unwrap();
         vault.create_account_dir("aaa").unwrap();
         vault.create_account_dir("bbb").unwrap();
@@ -5621,8 +5616,7 @@ mod tests {
     /// still green with the binding removed.
     #[test]
     fn a_sealed_file_does_not_open_under_a_different_name() {
-        let dir = std::env::temp_dir().join(format!("karst-swap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("swap"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         s.set_blocked([7u8; 32], true).unwrap();
         s.set_unconfirmed([8u8; 32], true).unwrap();
@@ -5664,9 +5658,9 @@ mod tests {
     /// obvious wrong implementation of the fix above.
     #[test]
     fn moving_the_vault_directory_does_not_break_decryption() {
-        let dir = std::env::temp_dir().join(format!("karst-move-a-{}", std::process::id()));
-        let moved = std::env::temp_dir().join(format!("karst-move-b-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("move-a"); // #321: under the swept root
+        let moved = node::scratch::dir_for_test("move-b");
+        // `moved` must NOT exist for the rename below to be the move this test is about.
         let _ = std::fs::remove_dir_all(&moved);
         {
             let vault = Vault::create(&dir, b"pw").unwrap();
@@ -5691,8 +5685,7 @@ mod tests {
     /// bio, avatar: None })` and this goes red.
     #[test]
     fn set_peer_profile_text_update_preserves_avatar() {
-        let dir = std::env::temp_dir().join(format!("karst-store-avatar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-avatar"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let ik = [9u8; 32];
 
@@ -5722,8 +5715,7 @@ mod tests {
     /// blob paths). Newer or equal `ts` applies; strictly-older is ignored.
     #[test]
     fn set_peer_photos_ignores_a_stale_ts() {
-        let dir = std::env::temp_dir().join(format!("karst-store-galts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-galts"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let ik = [5u8; 32];
         // Newer gallery applied first (ts=100).
@@ -5748,8 +5740,7 @@ mod tests {
     /// names/avatars/posts at once; this test is the guard.
     #[test]
     fn unconfirmed_sidecar_gates_contacts_and_migration_is_safe() {
-        let dir = std::env::temp_dir().join(format!("karst-store-unconf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-unconf"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let (a, b, c) = ([1u8; 32], [2u8; 32], [9u8; 32]);
 
@@ -5785,8 +5776,7 @@ mod tests {
     /// the peer-profile carry-over block in `migrate_contact_ik` turns this red.
     #[test]
     fn migrate_contact_ik_carries_peer_avatar_and_profile() {
-        let dir = std::env::temp_dir().join(format!("karst-store-migprof-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-migprof"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let old = [7u8; 32];
         let new = [8u8; 32];
@@ -5823,8 +5813,7 @@ mod tests {
     /// control case) — this is not "migrations are broken", only "collisions are refused".
     #[test]
     fn migrate_contact_ik_refuses_to_collide_with_a_different_contacts_identity_key() {
-        let dir = std::env::temp_dir().join(format!("karst-store-migcollide-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-migcollide"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let old = [7u8; 32]; // Alice, migrating
         let victim = [9u8; 32]; // Bob, already at this key
@@ -5886,8 +5875,7 @@ mod tests {
     /// reload sealed on disk. Neuter the dedup (drop the `any(...)` guard) and the count reddens.
     #[test]
     fn feed_appends_dedups_and_sorts() {
-        let dir = std::env::temp_dir().join(format!("karst-store-feed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-feed"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let a = [1u8; 32];
         let mk = |id: u8, ts: u64| FeedRecord { author: a, id: [id; 16], text: format!("post {id}"), ts, expire_at: None };
@@ -5911,8 +5899,7 @@ mod tests {
     /// `add_subscriber` flip `enabled`) and the final assert reddens.
     #[test]
     fn channel_flag_is_independent_of_subscriber_writes() {
-        let dir = std::env::temp_dir().join(format!("karst-store-chan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-chan"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         assert!(!s.load_channel().enabled, "default is a private account (channel off)");
@@ -5935,8 +5922,7 @@ mod tests {
     /// author's. Neuter the per-author retain and the "victim survives" assert reddens.
     #[test]
     fn feed_per_author_cap_protects_other_authors() {
-        let dir = std::env::temp_dir().join(format!("karst-store-feedcap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-feedcap"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let flooder = [1u8; 32];
         let victim = [2u8; 32];
@@ -5963,8 +5949,7 @@ mod tests {
     /// dropped when its post is deleted (no orphan), and an over-cap image is refused.
     #[test]
     fn feed_image_sidecar_stores_reunites_and_prunes() {
-        let dir = std::env::temp_dir().join(format!("karst-store-feedimg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-feedimg"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let author = [4u8; 32];
         let id = [5u8; 16];
@@ -5993,8 +5978,7 @@ mod tests {
     /// for the discriminating check that this is real deletion, not a label.
     #[test]
     fn proxy_registry_mints_indices_sequentially_and_derives_from_its_own_secret() {
-        let dir = std::env::temp_dir().join(format!("karst-store-proxy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-proxy"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         s.save_seed(&[3u8; crate::seed::ENTROPY_BYTES]).unwrap(); // the root's own seed; proxies do NOT use it
 
@@ -6034,8 +6018,7 @@ mod tests {
     /// goes red, because burning p1 then minting again reissues index 1.
     #[test]
     fn burning_the_newest_proxy_does_not_free_its_index_for_reuse() {
-        let dir = std::env::temp_dir().join(format!("karst-store-noreuse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-noreuse"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let p0 = s.create_proxy("p0", 1).unwrap();
@@ -6067,8 +6050,7 @@ mod tests {
     /// red — the fallback happily reconstructs SOME identity instead of failing.
     #[test]
     fn burning_a_proxy_deletes_its_secret_so_the_phrase_can_never_reproduce_it() {
-        let dir = std::env::temp_dir().join(format!("karst-store-burn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-burn"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         s.save_seed(&[42u8; crate::seed::ENTROPY_BYTES]).unwrap();
 
@@ -6120,8 +6102,7 @@ mod tests {
     /// check and the newcomer gets added, reddening both size assertions below.
     #[test]
     fn add_unconfirmed_contact_refuses_a_new_sender_ik_once_contacts_are_at_cap() {
-        let dir = std::env::temp_dir().join(format!("karst-store-contactcap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-contactcap"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let full: Vec<ContactRecord> = (0..MAX_CONTACTS)
@@ -6165,8 +6146,7 @@ mod tests {
     /// attacker a second, uncapped door into `contacts.dat`.
     #[test]
     fn add_confirmed_contact_refuses_a_new_sender_ik_once_contacts_are_at_cap() {
-        let dir = std::env::temp_dir().join(format!("karst-store-confirmedcap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-confirmedcap"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let full: Vec<ContactRecord> = (0..MAX_CONTACTS)
@@ -6212,8 +6192,7 @@ mod tests {
     /// as above to hit the cap boundary without an O(n) fsync loop.
     #[test]
     fn set_contact_proxy_refuses_a_new_sender_ik_once_the_map_is_at_cap() {
-        let dir = std::env::temp_dir().join(format!("karst-store-proxycap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-proxycap"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let full: BTreeMap<[u8; 32], u32> = (0..MAX_CONTACTS)
@@ -6255,8 +6234,7 @@ mod tests {
     /// on `load_sessions()` back into an `unwrap_or(0)` and this reddens.
     #[test]
     fn burn_proxy_refuses_when_its_own_outbox_cannot_be_authenticated() {
-        let dir = std::env::temp_dir().join(format!("karst-store-burn-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-burn-corrupt"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let e0 = s.create_proxy("p0", 0).unwrap();
@@ -6293,8 +6271,7 @@ mod tests {
     /// only on an actual change.
     #[test]
     fn set_contact_proxy_resets_a_stale_verified_flag_whenever_the_own_tag_actually_changes() {
-        let dir = std::env::temp_dir().join(format!("karst-store-verifiedstale-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-verifiedstale"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let alice = [0xA1u8; 32];
@@ -6349,8 +6326,7 @@ mod tests {
     /// network layer — neuter `net_file`'s namespacing and the "p1 has its own opks" assert reddens.
     #[test]
     fn proxy_mode_isolates_network_state_but_shares_data() {
-        let dir = std::env::temp_dir().join(format!("karst-store-pmode-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-pmode"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         s.save_seed(&[7u8; crate::seed::ENTROPY_BYTES]).unwrap();
         let e0 = s.create_proxy("p0", 1).unwrap();
@@ -6393,8 +6369,7 @@ mod tests {
     /// bare-`HistoryRecord` branch) and the load of the old record reddens.
     #[test]
     fn history_reads_pre_msgid_records_and_new_ones() {
-        let dir = std::env::temp_dir().join(format!("karst-store-histmig-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-histmig"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         // Write ONE record in the OLD format: [len][seal(postcard(HistoryRecord))] — no msg_id.
@@ -6429,8 +6404,7 @@ mod tests {
     /// a phantom double. This is why the non-text residual does not bite reactions.
     #[test]
     fn set_reaction_is_idempotent_under_redelivery() {
-        let dir = std::env::temp_dir().join(format!("karst-store-react-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-react"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let (mid, author) = ([1u8; 16], [2u8; 32]);
 
@@ -6451,8 +6425,7 @@ mod tests {
     /// mis-parsing. This is the explicit-versioning pattern new formats adopt.
     #[test]
     fn version_envelope_round_trips_and_rejects_legacy() {
-        let dir = std::env::temp_dir().join(format!("karst-store-ver-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-ver"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let sealed = s.seal_versioned(&s.downloads_path(), 7, b"payload");
@@ -6478,8 +6451,7 @@ mod tests {
     /// recorded one — the two durability primitives the crash-safe download rests on.
     #[test]
     fn pending_downloads_and_orphan_sweep() {
-        let dir = std::env::temp_dir().join(format!("karst-store-pd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-pd"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let pd = PendingDownload {
@@ -6510,8 +6482,7 @@ mod tests {
     /// the blob path's `blob_id` idempotency.
     #[test]
     fn inline_file_save_is_deduped_by_transfer_id() {
-        let dir = std::env::temp_dir().join(format!("karst-store-dedup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-dedup"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let tid = [9u8; 16];
         let sender = [4u8; 32];
@@ -6535,8 +6506,7 @@ mod tests {
     /// Pending uploads round-trip and expose the record (blob_id+key) that a resume reuses.
     #[test]
     fn pending_uploads_persist_and_expose_the_resume_record() {
-        let dir = std::env::temp_dir().join(format!("karst-store-pu-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-pu"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let pu = PendingUpload {
             upload_id: [1u8; 32], blob_id: [2u8; 32], key: [3u8; 32], to_ik: [4u8; 32],
@@ -6559,8 +6529,7 @@ mod tests {
     /// disappearing timer — this test pins the isolated persistence, not that coupling.
     #[test]
     fn privacy_prefs_round_trip_and_default_off() {
-        let dir = std::env::temp_dir().join(format!("karst-store-prefs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-prefs"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         // Never saved → default (disappearing off).
         assert_eq!(s.load_prefs().unwrap(), Prefs::default());
@@ -6578,8 +6547,7 @@ mod tests {
     /// redelivered edit never overwrites a newer one, and re-applying the same edit is a no-op.
     #[test]
     fn set_edit_keeps_the_newest_regardless_of_order() {
-        let dir = std::env::temp_dir().join(format!("karst-store-edit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("store-edit"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let mid = [7u8; 16];
 
@@ -6596,9 +6564,7 @@ mod tests {
     // ─── Multi-password (duress / decoy / wipe), layout A′ ────────────────────
 
     fn mp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("karst-mp-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
+        node::scratch::dir_for_test(&format!("mp-{tag}")) // #321: under the swept root
     }
 
     /// A fresh vault provisions the REAL compartment under `c/<id>/` (nothing at the root); the
@@ -7224,11 +7190,7 @@ mod orphan_sweep_tests {
     /// last thing a crash can interrupt before.
     #[test]
     fn an_interrupted_burn_leaves_residue_that_the_next_unlock_collects() {
-        let dir = std::env::temp_dir().join(format!(
-            "karst-orphan-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let dir = node::scratch::dir_for_test("orphan"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let e = s.create_proxy("doomed", 0).unwrap();
         let keeper = s.create_proxy("keeper", 0).unwrap();
@@ -7276,8 +7238,7 @@ mod history_index_tests {
     /// from the refresh loop, or key it on the wrong field, and this reds.
     #[test]
     fn a_peer_read_returns_exactly_what_a_full_scan_would() {
-        let dir = std::env::temp_dir().join(format!("karst-hidx-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("hidx"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let (a, b, c) = ([0xA1; 32], [0xB2; 32], [0xC3; 32]);
@@ -7312,8 +7273,7 @@ mod history_index_tests {
     /// touch it. Being behind is its ordinary state, not an error state.
     #[test]
     fn the_index_catches_up_with_records_appended_since_it_was_built() {
-        let dir = std::env::temp_dir().join(format!("karst-hidx-late-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("hidx-late"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let peer = [0x5A; 32];
 
@@ -7346,8 +7306,7 @@ mod history_index_tests {
     /// accident. Growing the log after the truncation is what separates the two implementations.
     #[test]
     fn a_truncated_log_that_grows_again_is_not_read_through_stale_offsets() {
-        let dir = std::env::temp_dir().join(format!("karst-hidx-trunc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("hidx-trunc"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let peer = [0x77; 32];
 
@@ -7393,8 +7352,7 @@ mod history_index_tests {
     /// or written by a key we no longer hold, and none of that may cost a message.
     #[test]
     fn a_damaged_index_is_rebuilt_instead_of_failing_the_read() {
-        let dir = std::env::temp_dir().join(format!("karst-hidx-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("hidx-bad"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let peer = [0x33; 32];
         for i in 0..4u64 {
@@ -7422,8 +7380,7 @@ mod history_index_tests {
     /// per-contact activity signal readable by anyone who can see the directory listing.
     #[test]
     fn the_index_file_size_is_quantised() {
-        let dir = std::env::temp_dir().join(format!("karst-hidx-pad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("hidx-pad"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
 
         let mut sizes = Vec::new();
@@ -7455,8 +7412,7 @@ mod history_index_tests {
     /// measured by how many records the read has to AEAD-open.
     #[test]
     fn opening_a_small_chat_does_not_pay_for_a_large_one() {
-        let dir = std::env::temp_dir().join(format!("karst-hidx-cost-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("hidx-cost"); // #321: under the swept root
         let s = Store::unlock(&dir, b"pw").unwrap();
         let (chatty, quiet) = ([0x0C; 32], [0x0D; 32]);
 

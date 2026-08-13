@@ -37,9 +37,7 @@ fn a_crash_after_the_header_leaves_a_resumable_blob_not_an_orphan() {
     if std::env::var(CHILD).is_ok() {
         child_body();
     }
-    let dir = std::env::temp_dir().join(format!("karst-crash-blob-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
+    let dir = node::scratch::dir_for_test("crash-blob"); // #321: under the swept root
 
     let exe = std::env::current_exe().expect("test binary");
     let out = std::process::Command::new(exe)

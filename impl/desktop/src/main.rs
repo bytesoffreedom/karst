@@ -4552,8 +4552,7 @@ mod tests {
     /// pending-download row so the file re-fetches on the next online poll.
     #[test]
     fn an_offline_triggered_download_cancel_is_re_queued_so_the_file_is_not_lost() {
-        let dir = std::env::temp_dir().join(format!("karst-desktop-test-offline-resume-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("desktop-offline-resume"); // #321: under the swept root
         let store = client::store::Store::unlock(&dir, b"pw").unwrap();
         let pd = client::store::PendingDownload {
             blob_id: [9u8; 32], key: [1u8; 32], hash: [2u8; 32], name: "photo.jpg".into(),
@@ -4580,8 +4579,7 @@ mod tests {
     /// Cancel would silently keep re-fetching a file the user explicitly gave up on.
     #[test]
     fn a_manually_cancelled_download_is_not_auto_requeued() {
-        let dir = std::env::temp_dir().join(format!("karst-desktop-test-manual-cancel-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = node::scratch::dir_for_test("desktop-manual-cancel"); // #321: under the swept root
         let store = client::store::Store::unlock(&dir, b"pw").unwrap();
         let pd = client::store::PendingDownload {
             blob_id: [9u8; 32], key: [1u8; 32], hash: [2u8; 32], name: "photo.jpg".into(),
@@ -4743,7 +4741,7 @@ mod tests {
     #[test]
     fn only_a_feed_source_may_open_an_inline_post_media_transfer() {
         use client::content::Content;
-        let dir = std::env::temp_dir().join(format!("karst-inline-gate-{}", std::process::id()));
+        let dir = node::scratch::dir_for_test("inline-gate"); // #321: under the swept root
         let _ = std::fs::remove_dir_all(&dir);
         let store = client::store::Store::unlock(&dir, b"pw").unwrap();
         let stranger = [0x41u8; 32];

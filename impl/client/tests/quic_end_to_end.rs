@@ -120,12 +120,7 @@ fn a_message_travels_over_quic_discovered_the_way_a_real_client_discovers_it() {
 #[test]
 fn what_the_relay_said_survives_the_sidecar_and_still_builds_a_quic_path() {
     let (addr, rid) = spawn_relay_with_quic();
-    let dir = std::env::temp_dir().join(format!(
-        "karst-test-quic-sidecar-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = node::scratch::dir_for_test("quic-sidecar"); // #321: under the swept root
 
     // Run #1 — what the desktop's background thread does after unlocking.
     let relays = vec![client::Relay::new(addr, rid, None)];

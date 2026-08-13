@@ -46,8 +46,7 @@ fn a_crash_between_the_state_and_its_anchor_leaves_the_account_openable() {
     if std::env::var(CHILD).is_ok() {
         child_body();
     }
-    let dir = std::env::temp_dir().join(format!("karst-crash-sess-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = node::scratch::dir_for_test("crash-sess"); // #321: under the swept root
 
     // Parent: a store with one saved generation.
     {

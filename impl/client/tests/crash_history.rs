@@ -43,8 +43,7 @@ fn a_crash_before_the_dedup_ring_costs_a_duplicate_and_never_the_message() {
     if std::env::var(CHILD).is_ok() {
         child_body();
     }
-    let dir = std::env::temp_dir().join(format!("karst-crash-hist-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = node::scratch::dir_for_test("crash-hist"); // #321: under the swept root
     {
         let s = Store::unlock(&dir, b"pw").expect("unlock");
         assert!(s.load_history().expect("history").is_empty(), "start from nothing");

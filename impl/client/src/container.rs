@@ -1569,7 +1569,10 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("karst-cont-{}-{}", tag, std::process::id()))
+        // A path INSIDE the swept root (#321), not the root itself: callers here treat what this
+        // returns as the container FILE, and one caller creates a directory at it instead. Either
+        // works only if the path does not exist yet, so the sweep-managed directory is the PARENT.
+        node::scratch::dir_for_test(&format!("cont-{tag}")).join("container")
     }
 
     /// The headline system-wide test: three passwords, hidden account, deniability, and the

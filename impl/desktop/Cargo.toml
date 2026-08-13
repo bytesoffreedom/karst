@@ -16,6 +16,11 @@ hex = "0.4"
 base64 = "0.22"
 karst-client-core = { version = "0.1.0", path = "../client-core" }
 
+# Test-only: `node::scratch` is where a test's working directory comes from, so that one run's
+# leftovers are swept by the next instead of accumulating in /tmp forever (#321).
+[dev-dependencies]
+node = { path = "../node" }
+
 [[bin]]
 name = "karst-desktop"
 path = "src/main.rs"

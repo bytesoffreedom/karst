@@ -2853,11 +2853,7 @@ mod tests {
     }
 
     fn mail_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "karst-relaymail-{name}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ))
+        node::scratch::dir_for_test(&format!("relaymail-{name}")) // #321: under the swept root
     }
 
     /// #142/R2-5: the ADVERTISED durability and the real behaviour must be the same fact.

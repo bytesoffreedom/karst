@@ -34,3 +34,5 @@ pub mod protocol;
 // making thirty call sites churn would bury the one change that matters.
 pub use karst_crypto::{blind, pqxdh, ratchet, safety, seal, session, veil};
 pub mod wire;
+
+pub mod scratch;

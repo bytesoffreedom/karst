@@ -62,9 +62,8 @@ fn addr32(tag: u8) -> Vec<u8> {
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("karst-blob-admission-{name}-{:?}", std::thread::current().id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    // One root, swept by later runs (#321) — `node::scratch` explains what that bounds.
+    node::scratch::dir_for_test(&format!("blob-admission-{name}"))
 }
 
 /// Build a `BlobPutRequest` for chunk `index` of `count`, correctly admitted: cookie already

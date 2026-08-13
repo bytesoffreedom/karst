@@ -621,9 +621,7 @@ mod tests {
     use super::*;
 
     fn tmp() -> PathBuf {
-        let p = std::env::temp_dir()
-            .join(format!("karst-blobstore-test-{}-{:?}", std::process::id(), std::thread::current().id()));
-        p
+        crate::scratch::dir_for_test("blobstore") // #321: under the swept root
     }
 
     fn sender(n: u8) -> [u8; 32] {

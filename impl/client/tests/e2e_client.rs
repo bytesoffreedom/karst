@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use client::store::Store;
 use relay::node::{BlobPutRequest, BlobResponse, FetchRequest, FetchResponse, Payload, PublishResponse, RelayNode, Response, SessionEnvelope, Transport, WireMessage};
@@ -24,20 +23,9 @@ const NOW: u64 = 1_000_000;
 
 /// A unique temporary state directory (one per invocation).
 fn temp_dir(tag: &str) -> PathBuf {
-    // Uniqueness must not rest on the clock alone: tests in one binary run on several threads
-    // with the SAME pid, and a coarse timer hands two of them the same nanosecond — which showed
-    // up as `AlreadyExists` on CI, not locally. A process-wide counter makes collision impossible
-    // rather than unlikely.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "karst-test-{tag}-{}-{nanos}-{seq}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    // One root, swept by later runs — see `node::scratch` for why the harness gives us no
+    // teardown hook and what that bounds (#321).
+    node::scratch::dir_for_test(tag)
 }
 
 /// A relay on an ephemeral port with a dev capability issued and a fixed clock.

@@ -4244,12 +4244,7 @@ mod tests {
     }
 
     fn tmp_store(tag: &str) -> (std::path::PathBuf, Store) {
-        let dir = std::env::temp_dir().join(format!(
-            "karst-persist-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = node::scratch::dir_for_test(&format!("persist-{tag}")); // #321
         let store = Store::unlock(&dir, b"pw").unwrap();
         (dir, store)
     }

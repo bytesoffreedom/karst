@@ -227,7 +227,9 @@ fn wss_trusts_an_extra_root_ca_loaded_from_pem() {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_der = cert.cert.der().clone();
     let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-    let pem_path = std::env::temp_dir().join(format!("karst-test-ca-{}.pem", std::process::id()));
+    // Under the swept root (#321); this one IS removed below, but a panic between write and
+    // remove would otherwise leave it in /tmp forever.
+    let pem_path = node::scratch::dir_for_test("ca").join("ca.pem");
     std::fs::write(&pem_path, cert.cert.pem()).unwrap();
 
     let client_tls = karst_transport::wss::client_config_with_extra_root_pem(&pem_path).unwrap();

@@ -445,7 +445,7 @@ fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
     let addr = listener.local_addr().unwrap();
     let mut relay = relay::node::RelayNode::new(NOW);
     relay.issue_capability(capability([0x33; 32]));
-    let blob_dir = std::env::temp_dir().join(format!("karst-hol-{}", std::process::id()));
+    let blob_dir = node::scratch::dir_for_test("hol"); // #321: under the swept root
     relay
         .enable_blobs(blob_dir.clone(), NOW, relay::node::BlobPersistence::Ephemeral)
         .unwrap();

@@ -352,11 +352,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "karst-mailstore-{name}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let p = node::scratch::dir_for_test(&format!("mailstore-{name}")); // #321
         let _ = std::fs::remove_dir_all(&p);
         p
     }

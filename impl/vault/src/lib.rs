@@ -13,3 +13,4 @@ pub mod geometry;
 pub mod plan;
 pub mod record;
 pub mod allocator;
+pub mod map;

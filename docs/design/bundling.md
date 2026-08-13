@@ -66,6 +66,11 @@ flushed through a secondary relay must be re-veiled for THAT relay, and freezing
 primary's veil into the outbox would hand two relays identical bytes again by another
 route.
 
+The relay reconstructs a veiled envelope from the slot's two fields when it deposits, so the
+**decryption** side needs no change at all. That is a narrower claim than "the receive side is
+unchanged": padding still has to be dropped after decryption, which is a separate addition — see
+"The receive path drops padding centrally" below.
+
 ### The slot count is a class, not a number
 
 `slots.len()` must be one of a short ladder and never an arbitrary count. A bundle of

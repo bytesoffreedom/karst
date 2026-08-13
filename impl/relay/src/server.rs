@@ -85,6 +85,7 @@ fn requires_admission(req: &WireRequest) -> bool {
     matches!(
         req,
         WireRequest::Send(_)
+            | WireRequest::Bundle(_)
             | WireRequest::Fetch(_)
             | WireRequest::Ack(_)
             | WireRequest::PublishBundle(_)
@@ -406,6 +407,42 @@ pub(crate) fn serve_channel(
                 Err(Response::NeedCookie(c)) => WireResponse::NeedCookie(c),
                 Err(Response::Rejected(s)) => WireResponse::Rejected(s),
                 Err(Response::Accepted) => WireResponse::Accepted,
+            }
+        }
+        WireRequest::Bundle(breq) => {
+            let now = (clock)();
+            // Same shape as `Send`: admission under the relay lock, the deposits after it is
+            // released. A bundle makes that split matter more, not less — it is several queue
+            // writes and, on a durable relay, the fsync they share.
+            let admitted = relay.write().expect("relay lock").admit_bundle(&breq, now);
+            match admitted {
+                Ok(a) => {
+                    // Per-slot outcomes, inside the encrypted response. Admission was
+                    // bundle-level; storage is not, and a partially stored bundle reported as
+                    // stored is the quiet failure this exists to avoid.
+                    let outcomes: Vec<node::protocol::SlotOutcome> = breq
+                        .slots
+                        .iter()
+                        .map(|env| {
+                            match a.deposit(
+                                &node::protocol::Payload::Session(
+                                    node::protocol::SessionEnvelope::Ratchet(env.clone()),
+                                ),
+                                now,
+                            ) {
+                                Response::Accepted => node::protocol::SlotOutcome::Stored,
+                                Response::Rejected(s) => node::protocol::SlotOutcome::NotStored(s),
+                                Response::NeedCookie(_) => node::protocol::SlotOutcome::NotStored(
+                                    "cookie required mid-bundle".into(),
+                                ),
+                            }
+                        })
+                        .collect();
+                    WireResponse::BundleStored(outcomes)
+                }
+                Err(Response::NeedCookie(c)) => WireResponse::NeedCookie(c),
+                Err(Response::Rejected(s)) => WireResponse::Rejected(s),
+                Err(Response::Accepted) => WireResponse::Rejected("unexpected".into()),
             }
         }
         WireRequest::Fetch(freq) => {

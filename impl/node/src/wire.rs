@@ -177,6 +177,11 @@ impl FetchPage {
 pub enum WireRequest {
     /// Deliver a sealed message (it goes through admission §7).
     Send(WireMessage),
+    /// Several ratchet envelopes to ONE recipient, admitted once (`docs/design/bundling.md`).
+    /// Deliberately a separate variant rather than a `Send` with a list: the two have different
+    /// admission rules — a bundle's slot count must be a size class and its quota is charged per
+    /// slot — and folding them into one shape would put both rules behind a length check.
+    Bundle(crate::protocol::BundleRequest),
     /// Collect one's own mailbox — with a cookie plus an ownership proof (§7 fetch-auth).
     Fetch(FetchRequest),
     /// Delete leased messages after durable persistence (same ownership proof as fetch).
@@ -246,6 +251,9 @@ pub enum BlobStatOutcome {
 pub enum WireResponse {
     NeedCookie(Cookie),
     Accepted,
+    /// Per-slot outcomes of a bundled deposit. Rides inside the encrypted response, where an
+    /// on-path observer cannot read it and the sender needs it to know what to re-send.
+    BundleStored(Vec<crate::protocol::SlotOutcome>),
     Rejected(String),
     /// Fixed-size fetch page — constant on-wire length, hides queue depth (§2.2).
     Fetched(FetchPage),

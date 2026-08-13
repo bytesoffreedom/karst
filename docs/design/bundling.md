@@ -1,8 +1,16 @@
 # Bundled deposits: the envelope format
 
-Status: design accepted, not yet implemented. Gates the scheduled-send slice, the
-compression slice, and the wake-up slice — all three need to know what a bundle is before
-they can be built on one.
+Status: **partly implemented.** The wire type, the nonce binding, the slot-count class check,
+the relay's admission with per-slot quota, and the serve-loop handling exist. What does not
+exist yet: the client side that assembles a bundle and pads it to a class, and the padding
+envelope itself.
+
+So a relay will accept a correct bundle today and no client sends one. That is the honest
+state — the half that had to be agreed before three other slices could proceed is the half
+that is done.
+
+Gates the scheduled-send slice, the compression slice, and the wake-up slice — all three
+need to know what a bundle is before they can be built on one.
 
 ## What a deposit costs today
 

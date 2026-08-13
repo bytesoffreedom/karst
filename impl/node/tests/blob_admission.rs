@@ -467,3 +467,97 @@ fn an_unknown_blob_and_a_bad_proof_are_refused_identically() {
     assert_eq!(known_bad, unknown, "the refusal must not reveal whether the id exists");
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Bundled deposits (#281/#293): admitted once, charged per slot.
+// ---------------------------------------------------------------------------------------------
+
+fn ratchet(n: u8) -> node::ratchet::RatchetMessage {
+    node::ratchet::RatchetMessage {
+        header: node::ratchet::Header { dh: [n; 32], pn: 0, n: u32::from(n), salt: [n; 16] },
+        ciphertext: vec![n; 64],
+    }
+}
+
+fn bundle(
+    cap: &Capability,
+    cookie: admission::cookie::Cookie,
+    client_addr: &[u8],
+    recipient: [u8; 32],
+    slots: Vec<node::ratchet::RatchetMessage>,
+) -> node::protocol::BundleRequest {
+    let nonce = node::protocol::bundle_nonce(&recipient, &slots);
+    let proof = cap.prove(&nonce, 0);
+    node::protocol::BundleRequest {
+        client_addr: client_addr.to_vec(),
+        carrier_id: b"blob".to_vec(),
+        cookie: Some(cookie),
+        request_nonce: nonce,
+        capability_proof: proof,
+        recipient,
+        slots,
+    }
+}
+
+/// A legal bundle is admitted once for all its slots.
+#[test]
+fn a_bundle_on_a_class_is_admitted() {
+    let dir = tmp("bundle-ok");
+    let mut relay = relay_with_blobs(&dir);
+    let client_addr = addr32(0xB1);
+    let cap = issued_cap(&mut relay, [0xB1; 32], generous_quota());
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let req = bundle(&cap, cookie, &client_addr, [0xC1; 32], vec![ratchet(1); 4]);
+    assert!(relay.admit_bundle(&req, NOW).is_ok(), "a four-slot bundle must be admitted");
+}
+
+/// An off-ladder slot count is refused. Accepting it would let a client opt out of the padding
+/// simply by sending a size that is not a rung — which is the whole property, declined.
+#[test]
+fn a_bundle_off_the_ladder_is_refused() {
+    let dir = tmp("bundle-offclass");
+    let mut relay = relay_with_blobs(&dir);
+    let client_addr = addr32(0xB2);
+    let cap = issued_cap(&mut relay, [0xB2; 32], generous_quota());
+    for count in [2usize, 3, 5, 17] {
+        let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+        let req = bundle(&cap, cookie, &client_addr, [0xC2; 32], vec![ratchet(1); count]);
+        assert!(
+            matches!(relay.admit_bundle(&req, NOW), Err(Response::Rejected(_))),
+            "{count} slots is not a class and must be refused"
+        );
+    }
+}
+
+/// A proof minted for one bundle does not admit another with a slot swapped in.
+#[test]
+fn a_bundle_proof_does_not_travel_to_a_different_set_of_slots() {
+    let dir = tmp("bundle-swap");
+    let mut relay = relay_with_blobs(&dir);
+    let client_addr = addr32(0xB3);
+    let cap = issued_cap(&mut relay, [0xB3; 32], generous_quota());
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let mut req = bundle(&cap, cookie, &client_addr, [0xC3; 32], vec![ratchet(1); 4]);
+    req.slots[2] = ratchet(9); // the nonce no longer matches
+    assert!(
+        matches!(relay.admit_bundle(&req, NOW), Err(Response::Rejected(_))),
+        "a swapped slot was admitted under the old proof"
+    );
+}
+
+/// The quota is charged PER SLOT. A capability with room for three requests must not carry a
+/// four-slot bundle — otherwise bundling is sixteen messages for the price of one.
+#[test]
+fn a_bundle_cannot_buy_more_messages_than_the_quota_allows() {
+    let dir = tmp("bundle-quota");
+    let mut relay = relay_with_blobs(&dir);
+    let client_addr = addr32(0xB4);
+    let tight = Quota { max_requests: 3, max_bytes: 1 << 20, window_secs: 600 };
+    let cap = issued_cap(&mut relay, [0xB4; 32], tight);
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let req = bundle(&cap, cookie, &client_addr, [0xC4; 32], vec![ratchet(1); 4]);
+    assert!(
+        matches!(relay.admit_bundle(&req, NOW), Err(Response::Rejected(_))),
+        "four slots went through a quota with room for three"
+    );
+}

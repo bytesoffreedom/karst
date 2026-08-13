@@ -1453,6 +1453,122 @@ impl RelayNode {
         }
     }
 
+    /// Admit a BUNDLED deposit: several ratchet envelopes to one recipient, admitted once
+    /// (`docs/design/bundling.md`).
+    ///
+    /// Three checks in this order, and the order is the point: the two cheap structural ones run
+    /// before the capability HMAC, so a bundle minted elsewhere costs no crypto to refuse.
+    ///
+    /// 1. **The slot count is a class.** An arbitrary count IS the number of messages the sender
+    ///    happened to write, which is exactly what padding to a rung removes. A bundle that is not
+    ///    on a rung is refused rather than quietly accepted, because accepting it would let a
+    ///    client opt out of the padding by sending an off-ladder size.
+    /// 2. **The nonce matches the recipient and every slot.** Otherwise a capability proof minted
+    ///    for one bundle could be replayed with envelopes swapped in or out.
+    /// 3. **Quota is charged PER SLOT, not per bundle.** A bundle admitted once but charged once
+    ///    would be sixteen messages for the price of one, which turns a privacy feature into a
+    ///    quota bypass. The point of bundling is fewer round trips and less visible shape — not
+    ///    more messages than the capability allows.
+    pub fn admit_bundle(
+        &mut self,
+        req: &node::protocol::BundleRequest,
+        now: u64,
+    ) -> Result<AdmittedDeposit, Response> {
+        self.advance_epoch(now);
+
+        if !node::protocol::is_bundle_class(req.slots.len()) {
+            return Err(Response::Rejected("bundle slot count is not a class".into()));
+        }
+        if req.request_nonce != node::protocol::bundle_nonce(&req.recipient, &req.slots) {
+            return Err(Response::Rejected("bad bundle nonce".into()));
+        }
+
+        // Admit once, on the whole bundle's size — the stage-0 gate is about what arrived.
+        let raw_len: usize =
+            req.slots.iter().map(|s| s.ciphertext.len()).sum::<usize>() + 128;
+        let admission_req = Request {
+            raw_len,
+            max_raw_len: admission::params::MAX_PACKET_SIZE * node::protocol::MAX_BUNDLE_SLOTS,
+            client_addr: &req.client_addr,
+            carrier_id: &req.carrier_id,
+            cookie: req.cookie,
+            request_nonce: &req.request_nonce,
+            requested_scope: Scope::MessageDelivery,
+            credential: Credential::Capability(req.capability_proof),
+        };
+        let pipe = AdmissionPipeline {
+            keyring: &self.keyring,
+            capabilities: &self.capabilities,
+            token_verifier: &self.verifier,
+            issuer_ring: &self.issuer_ring,
+        };
+        let policy = self.quota_policy;
+        let outcome = pipe.process_with_policy(
+            &admission_req,
+            now,
+            self.epoch,
+            [0u8; 64],
+            &mut self.replay,
+            &mut self.cap_quota,
+            policy,
+        );
+        match outcome {
+            Outcome::Challenge(_) => {
+                let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
+                Err(Response::NeedCookie(cookie))
+            }
+            Outcome::Admit => {
+                // The remaining slots are charged individually. The first was paid for by the
+                // admission above, so charging all of them again would double-bill the bundle.
+                //
+                // Each slot gets its OWN proof tag, derived from the bundle's nonce and the slot
+                // index. Reusing one tag would make the quota tracker treat slots two onward as
+                // verbatim replays of slot one and count none of them — the quota bypass this
+                // whole loop exists to prevent, arriving through the replay check instead of the
+                // arithmetic.
+                //
+                // Charged against the CAPABILITY's own quota, not a constant. Using a constant
+                // here was the first version and a test caught it: the slots were counted against
+                // a budget the capability does not have, so a capability with room for three
+                // requests carried a four-slot bundle. The quota that admitted the bundle has to
+                // be the quota that pays for it.
+                let quota = match self.capabilities.verify(
+                    &req.capability_proof,
+                    &req.request_nonce,
+                    Scope::MessageDelivery,
+                    now as u32,
+                ) {
+                    Ok(c) => c.quota,
+                    Err(e) => return Err(Response::Rejected(format!("capability: {e:?}"))),
+                };
+                for i in 1..req.slots.len() {
+                    let mut tag = [0u8; 16];
+                    let n = &req.request_nonce;
+                    for (b, t) in n.iter().zip(tag.iter_mut()) {
+                        *t = *b;
+                    }
+                    tag[0] ^= i as u8;
+                    match self.cap_quota.consume(
+                        req.capability_proof.capability_id,
+                        &quota,
+                        tag,
+                        1,
+                        now,
+                    ) {
+                        admission::capability::QuotaDecision::Ok => {}
+                        _ => {
+                            return Err(Response::Rejected(
+                                "bundle exceeds the capability quota".into(),
+                            ))
+                        }
+                    }
+                }
+                Ok(AdmittedDeposit { store: self.mail.clone(), recipient: req.recipient })
+            }
+            other => Err(Response::Rejected(format!("{:?}", other))),
+        }
+    }
+
     /// An authenticated fetch (§7 mailbox ownership). It requires a cookie (a DoS gate plus
     /// freshness, as on send) AND a proof of possession of the `mailbox` private key. Without the
     /// proof it is a `Reject` and **the mailbox is NOT touched** (otherwise anyone knowing the

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["admission", "crypto", "node", "transport", "client-core", "relay", "client", "desktop"]
+members = ["admission", "crypto", "node", "transport", "client-core", "relay", "client", "desktop", "vault"]
 
 # Deterministic codegen for reproducible release builds: parallel codegen units can reorder
 # output, so pin to one. Slower to compile, but a release must be byte-reproducible.

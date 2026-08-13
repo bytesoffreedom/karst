@@ -1,0 +1,10 @@
+[package]
+name = "vault"
+version = "0.1.0"
+edition = "2021"
+
+# The container's own storage layer. Depends on the crypto primitives and NOTHING else in the
+# workspace: it is below the protocol, not beside it, and a dependency the other way round would
+# let protocol concerns leak into the on-disk format.
+[dependencies]
+karst-crypto = { path = "../crypto" }

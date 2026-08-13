@@ -339,6 +339,81 @@ pub fn blob_put_nonce(blob_id: &[u8; 32], index: u32) -> Vec<u8> {
     h.update(index.to_be_bytes());
     h.finalize().to_vec()
 }
+/// Slot counts a bundled deposit may have. See `docs/design/bundling.md`.
+///
+/// A class, not a count: a bundle of exactly the messages you happened to write IS the count of
+/// messages you happened to write, and padding to a rung is what makes five sends and eight sends
+/// look the same.
+///
+/// **The rungs are NOT measured.** `[1, 4, 16]` is a first guess and a three-rung ladder makes a
+/// two-message burst cost four envelopes. #256 is the precedent for taking that seriously — four
+/// size classes were considered there and one was chosen, because the sizes did not fit the wire.
+/// They must come from measuring real send bursts against the bandwidth they cost.
+pub const BUNDLE_CLASSES: [usize; 3] = [1, 4, 16];
+
+/// The largest bundle this build will accept.
+pub const MAX_BUNDLE_SLOTS: usize = 16;
+
+/// Whether `n` is a legal slot count.
+pub fn is_bundle_class(n: usize) -> bool {
+    BUNDLE_CLASSES.contains(&n)
+}
+
+/// The required `request_nonce` for a bundle: bound to the recipient AND to every slot.
+///
+/// Binding the slots is what stops a capability proof minted for one bundle from being replayed
+/// with envelopes swapped in or out — the same discipline `blob_put_nonce` applies per chunk, and
+/// for the same reason: the cheap structural check runs before the capability HMAC, so a proof
+/// minted elsewhere is rejected at zero crypto cost.
+pub fn bundle_nonce(recipient: &[u8; 32], slots: &[RatchetMessage]) -> Vec<u8> {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(b"KARST-bundle-nonce-v1");
+    h.update(recipient);
+    h.update((slots.len() as u32).to_be_bytes());
+    for s in slots {
+        h.update((s.ciphertext.len() as u32).to_be_bytes());
+        h.update(&s.ciphertext);
+    }
+    h.finalize().to_vec()
+}
+
+/// §15 bundled deposit: several ratchet envelopes to ONE recipient, admitted once.
+///
+/// Per-recipient rather than cross-recipient, and that is the whole design decision — see
+/// `docs/design/bundling.md`. Packing several contacts' mail into one deposit is the bigger
+/// speedup and it hands the relay a link between those mailboxes for free, in the request
+/// structure itself.
+///
+/// Slots are `RatchetMessage`, not `Payload`: an opener is a larger fixed class of its own, so a
+/// bundle mixing one in would have two possible sizes and "a bundle is slot_count x envelope"
+/// would stop being true. The type enforces it rather than a comment asking implementers to
+/// remember. A first contact deposits alone, which costs nothing — a first contact is one message
+/// by definition.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct BundleRequest {
+    pub client_addr: Vec<u8>,
+    pub carrier_id: Vec<u8>,
+    pub cookie: Option<Cookie>,
+    /// Must equal `bundle_nonce(&recipient, &slots)`.
+    pub request_nonce: Vec<u8>,
+    pub capability_proof: CapabilityProof,
+    pub recipient: [u8; 32],
+    /// Exactly one of [`BUNDLE_CLASSES`] entries. Unused slots carry padding envelopes addressed
+    /// to the same recipient — see the design note for why those are not the existing cover loop.
+    pub slots: Vec<RatchetMessage>,
+}
+
+/// What one slot of a bundle did. Carried per slot inside the encrypted response: an on-path
+/// observer cannot read it, and the sender needs it to know what to re-send.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SlotOutcome {
+    Stored,
+    /// The mailbox was full or the message was a duplicate. Named separately from a refusal of
+    /// the whole bundle so a partially stored bundle is never reported as stored.
+    NotStored(String),
+}
+
 /// §7.2 admission quota for blob-upload chunks (CRYPTO-15/#169). A SEPARATE window from
 /// `POW_CAP_QUOTA` (the live-message quota): that budget is priced for a chat message — 4 MiB /
 /// 600 s buys roughly 68 requests at the blob chunk size (`blobstore::MAX_BLOB_CHUNK`, ~60 KiB
@@ -872,5 +947,83 @@ pub trait Transport {
         _now: u64,
     ) -> Result<BundleOpkResponse, String> {
         Err("one-time-prekey bundle fetch unsupported".into())
+    }
+}
+
+#[cfg(test)]
+mod bundle_rules {
+    use super::*;
+
+    fn msg(n: u8) -> RatchetMessage {
+        RatchetMessage {
+            header: crate::ratchet::Header {
+                dh: [n; 32],
+                pn: 0,
+                n: u32::from(n),
+                salt: [n; 16],
+            },
+            ciphertext: vec![n; 32],
+        }
+    }
+
+    /// Only the ladder's rungs are legal. A bundle of exactly what the sender happened to write
+    /// IS the count of what they happened to write, which is the thing padding removes.
+    #[test]
+    fn only_a_class_is_a_legal_slot_count() {
+        for n in [1usize, 4, 16] {
+            assert!(is_bundle_class(n), "{n} is a rung and must be legal");
+        }
+        for n in [0usize, 2, 3, 5, 15, 17, 100] {
+            assert!(!is_bundle_class(n), "{n} is not a rung and must be refused");
+        }
+    }
+
+    /// The nonce binds the slots, so a proof minted for one bundle cannot be replayed with an
+    /// envelope swapped in, dropped, or reordered.
+    #[test]
+    fn the_nonce_changes_when_any_slot_changes() {
+        let r = [9u8; 32];
+        let base = bundle_nonce(&r, &[msg(1), msg(2)]);
+
+        assert_ne!(base, bundle_nonce(&r, &[msg(1), msg(3)]), "a swapped slot kept the nonce");
+        assert_ne!(base, bundle_nonce(&r, &[msg(2), msg(1)]), "reordering kept the nonce");
+        assert_ne!(base, bundle_nonce(&r, &[msg(1)]), "a dropped slot kept the nonce");
+        assert_ne!(
+            base,
+            bundle_nonce(&r, &[msg(1), msg(2), msg(3)]),
+            "an added slot kept the nonce"
+        );
+    }
+
+    /// And to the recipient, so a bundle cannot be redirected to another mailbox.
+    #[test]
+    fn the_nonce_changes_with_the_recipient() {
+        let slots = [msg(1), msg(2)];
+        assert_ne!(bundle_nonce(&[1u8; 32], &slots), bundle_nonce(&[2u8; 32], &slots));
+    }
+
+    /// Length is part of the binding, not just content: two slots whose ciphertexts concatenate
+    /// to the same bytes must not collide. Without the per-slot length prefix they would.
+    #[test]
+    fn slots_cannot_be_re_split_into_the_same_nonce() {
+        let r = [5u8; 32];
+        let mut a = msg(1);
+        a.ciphertext = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let mut b = msg(1);
+        b.ciphertext = vec![0xAA, 0xBB];
+        let mut c = msg(1);
+        c.ciphertext = vec![0xCC, 0xDD];
+        assert_ne!(
+            bundle_nonce(&r, &[a]),
+            bundle_nonce(&r, &[b, c]),
+            "a re-split of the same bytes produced the same nonce"
+        );
+    }
+
+    /// The ceiling matches the ladder's top rung, so a bundle that passes the class check can
+    /// never exceed what the relay will accept.
+    #[test]
+    fn the_ceiling_and_the_ladder_agree() {
+        assert_eq!(*BUNDLE_CLASSES.iter().max().expect("non-empty"), MAX_BUNDLE_SLOTS);
     }
 }

@@ -1,13 +1,12 @@
 # Bundled deposits: the envelope format
 
-Status: **partly implemented.** The wire type, the nonce binding, the slot-count class check,
-the relay's admission with per-slot quota, and the serve-loop handling exist. What does not
-exist yet: the client side that assembles a bundle and pads it to a class, and the padding
-envelope itself.
+Status: **partly implemented.** Done: the wire type, the nonce binding, the slot-count class
+check, the relay's admission with per-slot quota, the serve-loop handling, the padding
+content marker, and the client's class/split arithmetic.
 
-So a relay will accept a correct bundle today and no client sends one. That is the honest
-state — the half that had to be agreed before three other slices could proceed is the half
-that is done.
+Not done: the send path that actually seals a padded batch and puts it on the wire, and the
+receive path dropping padding before it reaches a chat. So the pieces exist and nothing
+calls them end to end yet — a relay accepts a correct bundle and no client builds one.
 
 Gates the scheduled-send slice, the compression slice, and the wake-up slice — all three
 need to know what a bundle is before they can be built on one.

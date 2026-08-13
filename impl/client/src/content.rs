@@ -361,6 +361,19 @@ pub enum Content {
     /// request (who-views-whom), the honest cost of pull-on-demand. No fields — the requester is
     /// authenticated by the session. APPENDED LAST (postcard tag order).
     PostsRequest,
+    /// A padding slot in a bundled deposit (`docs/design/bundling.md`).
+    ///
+    /// This is NOT the cover loop, and conflating the two is the mistake the design note calls
+    /// out: a loop deposits to a box only the sender can compute, and that self-addressing is what
+    /// makes it a drop detector. Padding is addressed to the RECIPIENT — it is a real message
+    /// their client receives, stores nothing for, and discards.
+    ///
+    /// The marker is inside the seal and never on the wire. To the relay a padding envelope and a
+    /// real one are the same bytes in the same size class, which is the property that makes a
+    /// bundle's slot count say nothing about how many messages it carries. The receive path must
+    /// drop it before anything user-facing, or a padded bundle shows up as blank messages in a
+    /// chat — see `is_padding`.
+    Padding,
     /// A profile PHOTO-GALLERY transfer header (parallel to `AvatarManifest`): the assembled bytes are
     /// a length-prefixed pack of the sender's ≤ `MAX_GALLERY_PHOTOS` gallery images (`pack_gallery`),
     /// applied ATOMICALLY to `peer_profiles.dat` — replacing the peer's whole gallery, an empty pack
@@ -727,6 +740,10 @@ impl Reassembler {
             | Content::TextReply { .. }
             | Content::EditMessage { .. }
             | Content::Profile { .. }
+            // A bundle's padding slot. Dropped here as well as in the worker: the reassembler
+            // is the last place it could be mistaken for a transfer, and a padding envelope
+            // must never reach anything that stores or displays.
+            | Content::Padding
             // FileRef is a blob pointer handled by the worker (triggers a download), not
             // a chunk-reassembly transfer — the collector passes it through.
             | Content::FileRef { .. }
@@ -1662,5 +1679,108 @@ mod control_messages_are_the_same_size_as_chat {
             "control messages have varying wire sizes {sizes:?}; each distinct size is a category \
              a relay can count"
         );
+    }
+}
+
+/// Assembling a bundled deposit: how many slots, and what fills the empty ones.
+///
+/// The relay half of bundling landed first (`node::protocol::BundleRequest`); this is the client's
+/// side of the same design note. Kept here rather than in the send path because the two decisions
+/// it makes — which class, and what padding is — are about the CONTENT of a bundle, and putting
+/// them next to the transport would invite a future caller to pick a slot count that fits.
+pub mod bundle {
+    use super::Content;
+
+    /// Slot counts a bundle may have. Mirrors `node::protocol::BUNDLE_CLASSES`; the relay refuses
+    /// anything else, so a client that picked its own number would simply be rejected.
+    pub const CLASSES: [usize; 3] = [1, 4, 16];
+
+    /// The class a batch of `n` real messages must be padded to, or `None` if it needs splitting.
+    ///
+    /// The smallest rung that fits. Rounding DOWN would drop messages; picking the exact count
+    /// would publish it, which is the whole thing padding removes.
+    pub fn class_for(n: usize) -> Option<usize> {
+        CLASSES.iter().copied().find(|&c| c >= n)
+    }
+
+    /// How a batch of `n` messages splits into bundles.
+    ///
+    /// Above the top rung a batch becomes several bundles, each padded to a class. Greedy from
+    /// the largest: a hundred messages is six full bundles and a padded remainder, not a hundred
+    /// bundles of one.
+    pub fn split(n: usize) -> Vec<usize> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let top = *CLASSES.last().expect("non-empty");
+        let mut out = vec![top; n / top];
+        let rest = n % top;
+        if rest > 0 {
+            out.push(class_for(rest).expect("a remainder below the top rung has a class"));
+        }
+        out
+    }
+
+    /// The filler for an unused slot.
+    ///
+    /// A real message to the same recipient, marked inside the seal. Not the cover loop — see
+    /// `Content::Padding` for why the distinction is load-bearing.
+    pub fn filler() -> Content {
+        Content::Padding
+    }
+
+    /// Whether a received message was a bundle's padding and must be dropped before anything
+    /// user-facing.
+    pub fn is_padding(c: &Content) -> bool {
+        matches!(c, Content::Padding)
+    }
+}
+
+#[cfg(test)]
+mod bundle_assembly {
+    use super::*;
+
+    /// The class is the smallest rung that FITS. Rounding down would silently drop messages.
+    #[test]
+    fn a_batch_is_padded_up_to_a_class_never_down() {
+        assert_eq!(bundle::class_for(1), Some(1));
+        assert_eq!(bundle::class_for(2), Some(4), "two must round up to four, not down to one");
+        assert_eq!(bundle::class_for(4), Some(4));
+        assert_eq!(bundle::class_for(5), Some(16));
+        assert_eq!(bundle::class_for(16), Some(16));
+        assert_eq!(bundle::class_for(17), None, "past the top rung needs a split");
+    }
+
+    /// A batch larger than the top rung becomes several bundles, greedily — not one bundle per
+    /// message, which would undo the point.
+    #[test]
+    fn a_large_batch_splits_greedily_into_full_bundles() {
+        assert_eq!(bundle::split(0), Vec::<usize>::new());
+        assert_eq!(bundle::split(1), vec![1]);
+        assert_eq!(bundle::split(3), vec![4]);
+        assert_eq!(bundle::split(16), vec![16]);
+        assert_eq!(bundle::split(17), vec![16, 1]);
+        assert_eq!(bundle::split(20), vec![16, 4]);
+        assert_eq!(bundle::split(100), vec![16, 16, 16, 16, 16, 16, 4]);
+    }
+
+    /// Every split covers at least the messages it was given — no batch loses a message to
+    /// rounding.
+    #[test]
+    fn a_split_never_carries_fewer_slots_than_messages() {
+        for n in 0..80usize {
+            let total: usize = bundle::split(n).iter().sum();
+            assert!(total >= n, "{n} messages got {total} slots");
+        }
+    }
+
+    /// Padding survives a round trip as padding, and is recognised on the way back in. If the
+    /// marker did not survive encoding, every padded bundle would deliver blank messages.
+    #[test]
+    fn padding_is_recognisable_after_a_round_trip() {
+        let encoded = encode(&bundle::filler());
+        let decoded = decode(&encoded).expect("padding must decode");
+        assert!(bundle::is_padding(&decoded), "padding was not recognised after a round trip");
+        assert!(!bundle::is_padding(&Content::Text(b"hello".to_vec())));
     }
 }

@@ -23,3 +23,4 @@ pub mod manifest;
 pub mod tx;
 pub mod params;
 pub mod public;
+pub mod recover;

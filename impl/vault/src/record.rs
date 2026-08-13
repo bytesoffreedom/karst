@@ -108,6 +108,15 @@ impl MasterKey {
         Self(k)
     }
 
+    /// The raw key bytes.
+    ///
+    /// Needed where a key has to be STORED rather than used — a slot holds a space key, and the
+    /// session layer compares two keys to prove that two passwords open one account. Kept narrow
+    /// on purpose: everything else takes a `&MasterKey` and derives its own subkey.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
     /// A fresh master key.
     pub fn generate() -> Self {
         let mut k = [0u8; 32];

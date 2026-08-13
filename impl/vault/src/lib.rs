@@ -21,6 +21,7 @@ pub mod root;
 pub mod faulty;
 pub mod medium;
 pub mod file;
+pub mod session;
 pub mod manifest;
 pub mod tx;
 pub mod params;

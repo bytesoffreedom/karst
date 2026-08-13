@@ -22,14 +22,20 @@ karst_build() {
     -p client --bin karst
 }
 
-karst_bin() { echo "$KARST_IMPL/target/debug/$1"; }
+# Where cargo actually put the binary. `CARGO_TARGET_DIR` is not a nicety here: the local CI rule
+# is a separate target dir per (checker x feature set), so on a developer machine `impl/target` is
+# routinely absent while a warm tree sits in `target-check`. Hardcoding the default path made this
+# script build successfully and then fail to find what it had just built.
+karst_target_dir() { echo "${CARGO_TARGET_DIR:-$KARST_IMPL/target}"; }
+
+karst_bin() { echo "$(karst_target_dir)/debug/$1"; }
 
 # Release build (for the installers). `$@` = extra cargo args (which -p/--bin).
 karst_build_release() {
   cargo build --release --manifest-path "$KARST_IMPL/Cargo.toml" "$@"
 }
 
-karst_bin_release() { echo "$KARST_IMPL/target/release/$1"; }
+karst_bin_release() { echo "$(karst_target_dir)/release/$1"; }
 
 # Install $1 → $2 ATOMICALLY. Safe to run while $2 is currently executing (the
 # update-while-running case): write a sibling temp then rename in place, so a

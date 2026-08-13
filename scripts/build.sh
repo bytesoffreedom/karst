@@ -62,7 +62,7 @@ if [ "$CHECK" = 1 ]; then
   cargo test --manifest-path "$KARST_IMPL/Cargo.toml"
 fi
 
-OUT="$KARST_IMPL/target/release"
+OUT="$(karst_target_dir)/release"
 echo
 echo "built:"
 for b in karst-relay karst $( [ "$GUI" = 1 ] && echo karst-desktop ); do

@@ -2817,6 +2817,7 @@ pub fn download_post_attachment(
                 cookie,
                 blob_id: ppa.blob_id,
                 index,
+                read_proof: blob_read_proof(&ppa.key, &cookie, &ppa.blob_id, index),
             };
             match transport.blob_get(&req) {
                 BlobResponse::NeedCookie(c) => cookie = Some(c),
@@ -2824,6 +2825,12 @@ pub fn download_post_attachment(
                 BlobResponse::Chunk(None) => {
                     // The relay no longer has the blob (swept) — unrecoverable.
                     return give_up(format!("post-attachment chunk {index} unavailable"));
+                }
+                // A read-token refusal never becomes true by trying again: either the content
+                // key is not the one this blob was uploaded under, or the relay no longer has it.
+                // Retrying that is a loop, not resilience.
+                BlobResponse::Rejected(r) if r == node::protocol::BLOB_READ_REFUSED => {
+                    return give_up(format!("blob refused: {r}"))
                 }
                 BlobResponse::Rejected(r) => return DownloadOutcome::Retry(format!("blob rejected: {r}")),
                 _ => return DownloadOutcome::Retry("post-attachment download: unexpected response".into()),
@@ -2905,11 +2912,18 @@ pub fn download_gallery(
                 cookie,
                 blob_id: pg.blob_id,
                 index,
+                read_proof: blob_read_proof(&pg.key, &cookie, &pg.blob_id, index),
             };
             match transport.blob_get(&req) {
                 BlobResponse::NeedCookie(c) => cookie = Some(c),
                 BlobResponse::Chunk(Some(ct)) => break ct,
                 BlobResponse::Chunk(None) => return give_up(format!("gallery chunk {index} unavailable")),
+                // A read-token refusal never becomes true by trying again: either the content
+                // key is not the one this blob was uploaded under, or the relay no longer has it.
+                // Retrying that is a loop, not resilience.
+                BlobResponse::Rejected(r) if r == node::protocol::BLOB_READ_REFUSED => {
+                    return give_up(format!("blob refused: {r}"))
+                }
                 BlobResponse::Rejected(r) => return DownloadOutcome::Retry(format!("blob rejected: {r}")),
                 _ => return DownloadOutcome::Retry("gallery download: unexpected response".into()),
             }
@@ -2946,6 +2960,34 @@ pub fn download_gallery(
 /// Carrier id binding the blob cookie — constant so it's consistent across a transfer's
 /// chunks and cookie retries (the relay binds the cookie to `(client_addr, carrier_id)`).
 const BLOB_CARRIER: &[u8] = b"karst-blob";
+
+/// The read proof a blob request carries (PRIV-7a), derived from the content key the recipient
+/// already holds.
+///
+/// Empty before a cookie exists: the proof is bound to the cookie's MAC, so it cannot be built
+/// until the relay has issued one. That costs nothing — admission checks the cookie stage first
+/// and answers an uncookied request with a challenge before it ever looks at the proof, so the
+/// first attempt was always going to be a challenge, with or without a proof attached.
+/// The public half of a blob's read key, derived from its content key (PRIV-7a). Exposed so
+/// integration tests can build a well-formed `BlobPutRequest` without reaching into the crypto
+/// crate they do not depend on.
+pub fn blob_read_pub(content_key: &[u8; 32]) -> [u8; 32] {
+    node::blind::blob_read_keypair(content_key).1
+}
+
+fn blob_read_proof(
+    content_key: &[u8; 32],
+    cookie: &Option<admission::cookie::Cookie>,
+    blob_id: &[u8; 32],
+    index: u32,
+) -> Vec<u8> {
+    let Some(c) = cookie else { return Vec::new() };
+    let (secret, public) = node::blind::blob_read_keypair(content_key);
+    let ctx = node::blind::blob_read_context(&c.mac, blob_id, index);
+    node::blind::FetchOwnershipProof::prove(&secret, &public, &ctx)
+        .map(|p| p.to_bytes().to_vec())
+        .unwrap_or_default()
+}
 
 /// What `blob_upload` returns: `(blob_id, per-file key, plaintext SHA-256, chunk count)`
 /// — the `FileRef` fields to send inline over the session.
@@ -3003,8 +3045,12 @@ pub fn blob_upload_with<R: std::io::Read>(
 
 /// A blob's upload progress on `relay`: `(next, count, complete)` — how many chunks it holds. `None`
 /// if it has never seen the blob (a fresh upload starts at 0). The watermark a resume continues from.
-pub fn blob_stat(relay: &Relay, blob_id: [u8; 32]) -> Result<Option<(u32, u32, bool)>, String> {
-    relay.transport().blob_stat(blob_id).map_err(|e| format!("blob stat: {e}"))
+pub fn blob_stat(
+    relay: &Relay,
+    blob_id: [u8; 32],
+    content_key: &[u8; 32],
+) -> Result<Option<(u32, u32, bool)>, String> {
+    relay.transport().blob_stat(blob_id, content_key).map_err(|e| format!("blob stat: {e}"))
 }
 
 /// Like [`blob_upload`], but RESUMABLE. Given a STABLE `blob_id`+`key` (the caller persists them
@@ -3046,7 +3092,7 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
     let count = blob::chunk_count(size);
     // Resume watermark: how many chunks the relay already holds (0 if it has never seen this blob).
     let next = transport
-        .blob_stat(blob_id)
+        .blob_stat(blob_id, &key)
         .map_err(|e| format!("blob stat: {e}"))?
         .map(|(n, _, _)| n)
         .unwrap_or(0);
@@ -3135,6 +3181,7 @@ pub fn blob_upload_resumable_with<R: std::io::Read>(
                             carrier_id: BLOB_CARRIER.to_vec(),
                             cookie,
                             blob_id,
+                            read_pub: node::blind::blob_read_keypair(&key).1,
                             index,
                             count,
                             data: ct.clone(),
@@ -3236,6 +3283,7 @@ pub fn verify_durability(relay: &Relay, blob_id: [u8; 32], key: [u8; 32], count:
             cookie,
             blob_id,
             index,
+            read_proof: blob_read_proof(&key, &cookie, &blob_id, index),
         };
         match transport.blob_get(&req) {
             BlobResponse::NeedCookie(c) => cookie = Some(c),
@@ -3244,6 +3292,15 @@ pub fn verify_durability(relay: &Relay, blob_id: [u8; 32], key: [u8; 32], count:
                 return Ok(blob::open_chunk(&key, &blob_id, index, count, is_last, &ct).is_ok());
             }
             BlobResponse::Chunk(None) => return Ok(false),
+            // Since PRIV-7a a refusal and "not there" are DELIBERATELY the same answer: the relay
+            // must not tell a stranger whether an id exists, so it refuses an unknown blob and a
+            // bad read proof identically. This function asks "can I retrieve this blob?", and to
+            // both of those the honest answer is no. ONLY that refusal, though — "blobs disabled"
+            // is a relay that cannot answer, and reporting it as "not durable" would read as data
+            // loss when nothing was lost.
+            BlobResponse::Rejected(r) if r == node::protocol::BLOB_READ_REFUSED => {
+                return Ok(false)
+            }
             BlobResponse::Rejected(r) => return Err(format!("durability check rejected: {r}")),
             _ => return Err("durability check: unexpected response".into()),
         }
@@ -3305,6 +3362,7 @@ pub fn blob_download_with<W: std::io::Write>(
                 cookie,
                 blob_id: id,
                 index,
+                read_proof: blob_read_proof(&key, &cookie, &id, index),
             };
             match fetcher.get(&req) {
                 BlobResponse::NeedCookie(c) => cookie = Some(c),
@@ -3423,6 +3481,7 @@ pub fn download_blob(
                 cookie,
                 blob_id: pd.blob_id,
                 index,
+                read_proof: blob_read_proof(&pd.key, &cookie, &pd.blob_id, index),
             };
             match fetcher.get(&req) {
                 BlobResponse::NeedCookie(c) => cookie = Some(c),
@@ -3432,6 +3491,14 @@ pub fn download_blob(
                     let _ = store.remove_pending_download(&pd.blob_id);
                     let _ = store.remove_received_file(&fid);
                     return DownloadOutcome::GaveUp(format!("blob chunk {index} unavailable"));
+                }
+                // A read-token refusal never becomes true by trying again: either the content
+                // key is not the one this blob was uploaded under, or the relay no longer has it.
+                // Retrying that is a loop, not resilience.
+                BlobResponse::Rejected(r) if r == node::protocol::BLOB_READ_REFUSED => {
+                    let _ = store.remove_pending_download(&pd.blob_id);
+                    let _ = store.remove_received_file(&fid);
+                    return DownloadOutcome::GaveUp(format!("blob refused: {r}"));
                 }
                 BlobResponse::Rejected(r) => return DownloadOutcome::Retry(format!("blob rejected: {r}")),
                 _ => return DownloadOutcome::Retry("blob download: unexpected response".into()),

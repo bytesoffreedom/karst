@@ -203,7 +203,7 @@ fn a_progress_query_completes_only_after_earning_a_cookie() {
     // Blobs are disabled on this relay, so the ANSWER is a refusal — but reaching a refusal means
     // the cookie stage was cleared, which is exactly what this pins. A relay with blobs on returns
     // `None` for an unknown id; either way the client must not get an answer on attempt one.
-    let out = t.blob_stat([9u8; 32]);
+    let out = t.blob_stat([9u8; 32], &[9u8; 32]);
     assert!(
         out.is_err() || out.as_ref().is_ok_and(|v| v.is_none()),
         "unexpected stat outcome: {out:?}"

@@ -553,9 +553,12 @@ pub(crate) fn serve_channel(
             // chunk write must not also be holding up everyone's mail.
             let now = (clock)();
             match relay.write().expect("relay lock").admit_blob_stat(&req, now) {
-                Ok(store) => WireResponse::BlobStat(node::wire::BlobStatOutcome::Stat(
+                Ok(Some(store)) => WireResponse::BlobStat(node::wire::BlobStatOutcome::Stat(
                     store.lock().expect("blob store mutex").stat(&req.blob_id),
                 )),
+                // Unknown blob, or a read key that is not the one this blob was uploaded under —
+                // answered identically on purpose (see `admit_blob_stat`).
+                Ok(None) => WireResponse::BlobStat(node::wire::BlobStatOutcome::Stat(None)),
                 Err(BlobResponse::NeedCookie(c)) => {
                     WireResponse::BlobStat(node::wire::BlobStatOutcome::NeedCookie(c))
                 }

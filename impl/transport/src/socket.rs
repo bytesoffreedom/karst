@@ -527,19 +527,43 @@ impl SocketTransport {
     /// address is answered with a challenge and retried ONCE. Two attempts, not a loop — a relay
     /// that keeps challenging is not going to be talked round, and a loop there is a free way to
     /// make a client spin.
-    pub fn blob_stat(&self, blob_id: [u8; 32]) -> io::Result<Option<(u32, u32, bool)>> {
-        let mut cookie = None;
+    /// `content_key` is the blob's E2E content key: the read proof (PRIV-7a) is derived from it,
+    /// so progress is gated exactly like the bytes are. It is bound to the cookie's MAC, which is
+    /// why the proof can only be built on the SECOND attempt — the first is a challenge anyway.
+    pub fn blob_stat(
+        &self,
+        blob_id: [u8; 32],
+        content_key: &[u8; 32],
+    ) -> io::Result<Option<(u32, u32, bool)>> {
+        let mut cookie: Option<admission::cookie::Cookie> = None;
         // ONE address for both attempts. A cookie is bound to `(client_addr, carrier_id)`, so a
         // fresh address on the retry would present the challenge back under a name it was never
         // issued for and loop forever — which is exactly what happened the first time this was
         // written, against a comment that already said the cookie lives as long as the retry.
         let addr = Self::stat_addr();
         for _ in 0..2 {
+            let (read_secret, read_pub) = karst_crypto::blind::blob_read_keypair(content_key);
+            let read_proof = match &cookie {
+                Some(c) => {
+                    let (secret, public) = (read_secret, read_pub);
+                    let ctx = karst_crypto::blind::blob_read_context(
+                        &c.mac,
+                        &blob_id,
+                        node::protocol::BLOB_STAT_INDEX,
+                    );
+                    karst_crypto::blind::FetchOwnershipProof::prove(&secret, &public, &ctx)
+                        .map(|p| p.to_bytes().to_vec())
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
             let req = node::protocol::BlobStatRequest {
                 client_addr: addr.clone(),
                 carrier_id: b"blob".to_vec(),
                 cookie,
                 blob_id,
+                read_pub,
+                read_proof,
             };
             match self.round_trip(&WireRequest::BlobStat(req))? {
                 WireResponse::BlobStat(node::wire::BlobStatOutcome::Stat(s)) => return Ok(s),

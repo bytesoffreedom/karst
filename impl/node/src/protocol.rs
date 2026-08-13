@@ -739,6 +739,10 @@ pub struct BlobPutRequest {
     pub blob_id: [u8; 32],
     pub index: u32,
     pub count: u32,
+    /// The blob's READ key, public half, derived by the uploader from the content key that
+    /// already travels E2E inside the `FileRef` (PRIV-7a). Registered on the first chunk and
+    /// immutable after; the relay keeps only this half and verifies a download proof against it.
+    pub read_pub: [u8; 32],
     pub data: Vec<u8>,
 }
 /// §15 upload-progress query. Same class as [`BlobGetRequest`] — bearer-by-id, answered out of the
@@ -755,11 +759,36 @@ pub struct BlobStatRequest {
     pub carrier_id: Vec<u8>,
     pub cookie: Option<Cookie>,
     pub blob_id: [u8; 32],
+    /// The read key the requester CLAIMS, and the proof they hold its secret (PRIV-7a), bound to
+    /// `blob_read_context(cookie.mac, blob_id, BLOB_STAT_INDEX)`.
+    ///
+    /// The claimed half is carried — rather than only checked against a stored one — because an
+    /// uploader must be able to ask "how far did I get?" for a blob the relay has never seen, and
+    /// there is nothing stored to check against yet. The relay verifies the proof against the
+    /// CLAIMED key, then answers truthfully only if the stored key matches it; a mismatch is
+    /// answered exactly like an unknown blob, so this cannot be turned into "does this id exist?".
+    pub read_pub: [u8; 32],
+    pub read_proof: Vec<u8>,
 }
 
-/// §15 large-file download: fetch one ciphertext chunk. Bearer-by-id (knowing the
-/// 256-bit `blob_id` is the download right — the bytes are ciphertext regardless);
-/// cookie-gated for DoS.
+/// The index a STAT read-proof is bound to. A stat is not a chunk, so it needs an index of its
+/// own that no real chunk can ever take: `MAX_BLOB_CHUNKS` bounds every legitimate index, so
+/// `u32::MAX` is out of reach by construction. Without a distinct index, a proof captured for a
+/// stat would be replayable as a chunk download and the other way round.
+pub const BLOB_STAT_INDEX: u32 = u32::MAX;
+
+/// The one refusal a blob read gives when the read token does not admit the request — an unknown
+/// id and a bad proof BOTH produce exactly this, so the endpoint never answers "does this id
+/// exist?" (PRIV-7a).
+///
+/// It is a shared constant rather than two matching literals because both sides must agree on it:
+/// the relay produces it, and the client distinguishes it from every other refusal. A download
+/// refused for this reason can never succeed by retrying — the key is wrong or the blob is gone —
+/// whereas "blobs disabled" or a transport-level refusal is a different situation entirely.
+pub const BLOB_READ_REFUSED: &str = "read proof rejected";
+
+/// §15 large-file download: fetch one ciphertext chunk. Cookie-gated for DoS **and** read-token
+/// gated (PRIV-7a): the id alone no longer buys the bytes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlobGetRequest {
     pub client_addr: Vec<u8>,
@@ -767,6 +796,10 @@ pub struct BlobGetRequest {
     pub cookie: Option<Cookie>,
     pub blob_id: [u8; 32],
     pub index: u32,
+    /// Proof of the read right (PRIV-7a), bound to `blob_read_context(cookie.mac, blob_id,
+    /// index)`. Downloads stop being bearer-by-id: knowing the 256-bit id is no longer enough,
+    /// the requester must show they hold the content key the recipient was given.
+    pub read_proof: Vec<u8>,
 }
 /// Response to a blob upload/download.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

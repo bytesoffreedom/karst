@@ -477,6 +477,7 @@ fn a_blob_write_in_progress_does_not_block_ordinary_mail() {
                 blob_id: [0xB1; 32],
                 index: 0,
                 count: 1,
+                read_pub: [0u8; 32],
                 data: vec![7u8; 1024],
             };
             match t.blob_put(&req) {

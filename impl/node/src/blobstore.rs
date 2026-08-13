@@ -36,10 +36,10 @@ use std::path::PathBuf;
 
 /// Magic + version for the metadata sidecar header. `KBM2` = per-chunk-file layout (out-of-order
 /// capable); the older `KBM1` single-file+length-log format is discarded on recovery.
-const META_MAGIC: &[u8; 4] = b"KBM2";
+const META_MAGIC: &[u8; 4] = b"KBM3";
 /// Sidecar header size: magic(4) + sender(32) + count(4 LE) + created_at(8 LE). The header is the
 /// WHOLE sidecar now — per-chunk lengths are the chunk files' own sizes, not a log.
-const META_HEADER_LEN: usize = 4 + 32 + 4 + 8;
+const META_HEADER_LEN: usize = 4 + 32 + 4 + 8 + 32;
 
 /// Per-chunk ceiling (bytes of ciphertext). The client's plaintext chunk (`blob::BLOB_CHUNK`)
 /// plus the AEAD tag must stay under this. Bounds a single hostile `BlobPut` allocation.
@@ -81,6 +81,17 @@ pub const MAX_BLOBS_PER_SENDER: usize = 1_000;
 /// blob flood it exists for.
 pub const MAX_BLOBS_TOTAL: usize = 100_000;
 
+/// Who a blob belongs to and what opens it — the two values that are fixed on the blob's FIRST
+/// chunk and can never change after. Grouped because they travel together on every put and mean
+/// the same thing: identity, not payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobOwner {
+    /// Self-declared sender address (blob ownership + the per-sender byte caps).
+    pub sender: [u8; 32],
+    /// Public half of the blob's read key (PRIV-7a) — the relay verifies downloads against it.
+    pub read_pub: [u8; 32],
+}
+
 /// Outcome of a `put_chunk`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlobPut {
@@ -98,6 +109,11 @@ pub enum BlobPut {
 struct Meta {
     sender: [u8; 32],
     count: u32,
+    /// The blob's READ key, public half — registered by the uploader on the first chunk and
+    /// never changed after (PRIV-7a). The relay holds only this half; the secret is derived from
+    /// the content key that already travels E2E inside the `FileRef`, so a download can be
+    /// refused to anyone who never held that key. See `karst_crypto::blind::blob_read_keypair`.
+    read_pub: [u8; 32],
     /// Per-index ciphertext length, keyed by the ARRIVED index. A `HashMap`, not a
     /// `Vec<Option<u32>>` sized to `count`: #209 — an uploader declares a huge `count` (up to
     /// `MAX_BLOB_CHUNKS`) and sends only a couple of chunks at extreme indices. A count-sized
@@ -206,13 +222,14 @@ impl BlobStore {
     /// straight to disk.
     pub fn put_chunk(
         &mut self,
-        sender: [u8; 32],
+        owner: BlobOwner,
         id: [u8; 32],
         index: u32,
         count: u32,
         data: &[u8],
         now: u64,
     ) -> BlobPut {
+        let BlobOwner { sender, read_pub } = owner;
         if data.len() > MAX_BLOB_CHUNK {
             return BlobPut::Rejected("chunk too large".into());
         }
@@ -234,6 +251,12 @@ impl BlobStore {
             }
             if m.count != count {
                 return BlobPut::Rejected("chunk count changed mid-transfer".into());
+            }
+            // The read key is registered once, with the blob. Letting a later chunk change it
+            // would let whoever wins a race re-point the download right at their own key — the
+            // same class of hazard as letting `sender` or `count` drift mid-transfer.
+            if m.read_pub != read_pub {
+                return BlobPut::Rejected("read key changed mid-transfer".into());
             }
             m.lengths.get(&index).copied() // Some(old_len) if this index is a re-send (idempotent)
         } else {
@@ -278,7 +301,7 @@ impl BlobStore {
         // after the header but before the chunk just leaves an in-progress blob with fewer chunks
         // (the client resumes); a chunk file with no header would be an unrecoverable orphan.
         if is_new_blob {
-            if let Err(e) = self.write_meta_header(&id, &sender, count, now) {
+            if let Err(e) = self.write_meta_header(&id, &sender, count, now, &read_pub) {
                 return BlobPut::Rejected(format!("store meta io: {e}"));
             }
         }
@@ -295,6 +318,7 @@ impl BlobStore {
         let m = self.blobs.entry(id).or_insert_with(|| Meta {
             sender,
             count,
+            read_pub,
             lengths: HashMap::new(),
             created_at: now,
             complete: false,
@@ -340,12 +364,20 @@ impl BlobStore {
     /// Write the sidecar HEADER (magic, sender, count, created_at). The whole sidecar — there is
     /// no per-chunk length log any more (a chunk file's size is its length). Written once, on the
     /// first sight of the blob, before any chunk file.
-    fn write_meta_header(&self, id: &[u8; 32], sender: &[u8; 32], count: u32, created_at: u64) -> io::Result<()> {
+    fn write_meta_header(
+        &self,
+        id: &[u8; 32],
+        sender: &[u8; 32],
+        count: u32,
+        created_at: u64,
+        read_pub: &[u8; 32],
+    ) -> io::Result<()> {
         let mut header = Vec::with_capacity(META_HEADER_LEN);
         header.extend_from_slice(META_MAGIC);
         header.extend_from_slice(sender);
         header.extend_from_slice(&count.to_le_bytes());
         header.extend_from_slice(&created_at.to_le_bytes());
+        header.extend_from_slice(read_pub);
         let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(self.meta_path(id))?;
         f.write_all(&header)?;
         f.sync_all()
@@ -360,6 +392,12 @@ impl BlobStore {
         // Only a stored chunk (its length is known) is readable — even before the blob completes.
         m.lengths.get(&index)?;
         std::fs::read(self.chunk_path(id, index)).ok()
+    }
+
+    /// The blob's registered READ key (public half), if the blob is known. The relay checks a
+    /// download proof against this — see `RelayNode::admit_blob_get`.
+    pub fn read_pub(&self, id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.blobs.get(id).map(|m| m.read_pub)
     }
 
     /// `(count, complete)` for a blob, if known — lets a downloader learn how many
@@ -481,7 +519,7 @@ impl BlobStore {
         let ids: HashSet<[u8; 32]> = meta_bytes.keys().chain(chunks.keys()).copied().collect();
         for blob_id in ids {
             let header = meta_bytes.get(&blob_id).and_then(|raw| parse_meta_header(raw, now));
-            let Some((sender, count, created_at)) = header else {
+            let Some((sender, count, created_at, read_pub)) = header else {
                 self.drop_recovered(&blob_id, chunks.get(&blob_id));
                 continue;
             };
@@ -511,7 +549,8 @@ impl BlobStore {
             let stats = self.senders.entry(sender).or_default();
             stats.blobs += 1;
             stats.bytes += acc;
-            self.blobs.insert(blob_id, Meta { sender, count, lengths, created_at, complete, contiguous });
+            self.blobs
+                .insert(blob_id, Meta { sender, count, read_pub, lengths, created_at, complete, contiguous });
         }
         Ok(())
     }
@@ -531,7 +570,7 @@ impl BlobStore {
 
 /// Parse + validate a sidecar header's raw bytes (magic, count sanity, TTL). `None` means the
 /// whole blob is unrecoverable: absent/short/old-format header, an insane `count`, or expiry.
-fn parse_meta_header(bytes: &[u8], now: u64) -> Option<([u8; 32], u32, u64)> {
+fn parse_meta_header(bytes: &[u8], now: u64) -> Option<([u8; 32], u32, u64, [u8; 32])> {
     if bytes.len() < META_HEADER_LEN || &bytes[..4] != META_MAGIC {
         return None; // absent, short, or an older format (KBM1) — discard
     }
@@ -539,6 +578,8 @@ fn parse_meta_header(bytes: &[u8], now: u64) -> Option<([u8; 32], u32, u64)> {
     sender.copy_from_slice(&bytes[4..36]);
     let count = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
     let created_at = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let mut read_pub = [0u8; 32];
+    read_pub.copy_from_slice(&bytes[48..80]);
     if count == 0 || count > MAX_BLOB_CHUNKS {
         return None;
     }
@@ -546,7 +587,7 @@ fn parse_meta_header(bytes: &[u8], now: u64) -> Option<([u8; 32], u32, u64)> {
     if now.saturating_sub(created_at) > BLOB_TTL_SECS {
         return None;
     }
-    Some((sender, count, created_at))
+    Some((sender, count, created_at, read_pub))
 }
 
 /// Parse a 64-hex blob-store filename back into a blob id, or `None` if it is not one.
@@ -573,6 +614,10 @@ fn leading_blob_id(name: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    /// A stand-in read key for tests that are not about the read token: the store only stores
+    /// and compares it, and every put in one test uses the same one.
+    const RP: [u8; 32] = [0xAB; 32];
+
     use super::*;
 
     fn tmp() -> PathBuf {
@@ -593,9 +638,9 @@ mod tests {
         let mut s = BlobStore::new(tmp().join("rt")).unwrap();
         let a = sender(1);
         let b = id(1);
-        assert_eq!(s.put_chunk(a, b, 0, 3, b"aaa", 0), BlobPut::Ok);
-        assert_eq!(s.put_chunk(a, b, 1, 3, b"bb", 0), BlobPut::Ok);
-        assert_eq!(s.put_chunk(a, b, 2, 3, b"cccc", 0), BlobPut::Complete);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, 3, b"aaa", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 1, 3, b"bb", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 2, 3, b"cccc", 0), BlobPut::Complete);
         assert_eq!(s.get_chunk(&b, 0).as_deref(), Some(&b"aaa"[..]));
         assert_eq!(s.get_chunk(&b, 1).as_deref(), Some(&b"bb"[..]));
         assert_eq!(s.get_chunk(&b, 2).as_deref(), Some(&b"cccc"[..]));
@@ -608,15 +653,15 @@ mod tests {
         let a = sender(1);
         let b = id(2);
         // Chunks may arrive in ANY order — index 1 before index 0 is fine (the client pipelines).
-        assert_eq!(s.put_chunk(a, b, 1, 2, b"y", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 1, 2, b"y", 0), BlobPut::Ok);
         // A re-send of the same index is idempotent (overwrite), not a rejection.
-        assert_eq!(s.put_chunk(a, b, 1, 2, b"y", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 1, 2, b"y", 0), BlobPut::Ok);
         // The final missing chunk completes the blob regardless of arrival order.
-        assert_eq!(s.put_chunk(a, b, 0, 2, b"x", 0), BlobPut::Complete);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, 2, b"x", 0), BlobPut::Complete);
         assert_eq!(s.get_chunk(&b, 0).as_deref(), Some(&b"x"[..]));
         assert_eq!(s.get_chunk(&b, 1).as_deref(), Some(&b"y"[..]));
         // A complete blob is frozen.
-        assert!(matches!(s.put_chunk(a, b, 1, 2, b"z", 0), BlobPut::Rejected(_)));
+        assert!(matches!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 1, 2, b"z", 0), BlobPut::Rejected(_)));
     }
 
     #[test]
@@ -627,10 +672,10 @@ mod tests {
         let mut s = BlobStore::new(tmp().join("lastfirst")).unwrap();
         let a = sender(1);
         let b = id(7);
-        assert_eq!(s.put_chunk(a, b, 2, 3, b"cccc", 0), BlobPut::Ok); // last chunk first
-        assert_eq!(s.put_chunk(a, b, 0, 3, b"aaa", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 2, 3, b"cccc", 0), BlobPut::Ok); // last chunk first
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, 3, b"aaa", 0), BlobPut::Ok);
         assert_eq!(s.get_chunk(&b, 2).as_deref(), Some(&b"cccc"[..]), "the last chunk was not truncated away");
-        assert_eq!(s.put_chunk(a, b, 1, 3, b"bb", 0), BlobPut::Complete);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 1, 3, b"bb", 0), BlobPut::Complete);
         assert_eq!(s.total_bytes, 3 + 4 + 2, "byte accounting sums ACTUAL chunk lengths");
     }
 
@@ -638,22 +683,22 @@ mod tests {
     fn a_different_sender_cannot_write_someone_elses_blob() {
         let mut s = BlobStore::new(tmp().join("own")).unwrap();
         let b = id(3);
-        assert_eq!(s.put_chunk(sender(1), b, 0, 2, b"x", 0), BlobPut::Ok);
-        assert!(matches!(s.put_chunk(sender(2), b, 1, 2, b"y", 0), BlobPut::Rejected(_)));
+        assert_eq!(s.put_chunk(BlobOwner { sender: sender(1), read_pub: RP }, b, 0, 2, b"x", 0), BlobPut::Ok);
+        assert!(matches!(s.put_chunk(BlobOwner { sender: sender(2), read_pub: RP }, b, 1, 2, b"y", 0), BlobPut::Rejected(_)));
     }
 
     #[test]
     fn oversize_chunk_is_rejected_before_store() {
         let mut s = BlobStore::new(tmp().join("big")).unwrap();
         let huge = vec![0u8; MAX_BLOB_CHUNK + 1];
-        assert!(matches!(s.put_chunk(sender(1), id(4), 0, 1, &huge, 0), BlobPut::Rejected(_)));
+        assert!(matches!(s.put_chunk(BlobOwner { sender: sender(1), read_pub: RP }, id(4), 0, 1, &huge, 0), BlobPut::Rejected(_)));
     }
 
     #[test]
     fn sweep_drops_blobs_past_ttl_and_frees_bytes() {
         let mut s = BlobStore::new(tmp().join("ttl")).unwrap();
         let b = id(5);
-        s.put_chunk(sender(1), b, 0, 1, b"hello", 0);
+        s.put_chunk(BlobOwner { sender: sender(1), read_pub: RP }, b, 0, 1, b"hello", 0);
         assert!(s.get_chunk(&b, 0).is_some());
         s.sweep(BLOB_TTL_SECS); // exactly at TTL: still fresh (<=)
         assert!(s.get_chunk(&b, 0).is_some(), "kept at exactly TTL");
@@ -670,8 +715,8 @@ mod tests {
         // A relay stores 2 of 3 chunks, then goes down mid-upload.
         {
             let mut s = BlobStore::new(dir.clone()).unwrap();
-            assert_eq!(s.put_chunk(a, b, 0, 3, b"aaa", 100), BlobPut::Ok);
-            assert_eq!(s.put_chunk(a, b, 1, 3, b"bb", 100), BlobPut::Ok);
+            assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, 3, b"aaa", 100), BlobPut::Ok);
+            assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 1, 3, b"bb", 100), BlobPut::Ok);
         }
         // On restart the index is rebuilt from disk — the parked bytes did NOT vanish.
         let mut s = BlobStore::open(dir.clone(), 200).unwrap();
@@ -681,7 +726,7 @@ mod tests {
         assert!(s.get_chunk(&b, 2).is_none(), "the never-uploaded chunk is absent");
         assert_eq!(s.total_bytes, 5, "recovered byte accounting");
         // The upload resumes cleanly from where it stopped.
-        assert_eq!(s.put_chunk(a, b, 2, 3, b"cccc", 200), BlobPut::Complete);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 2, 3, b"cccc", 200), BlobPut::Complete);
         assert_eq!(s.get_chunk(&b, 2).as_deref(), Some(&b"cccc"[..]));
         // And the now-complete blob survives yet another restart.
         drop(s);
@@ -698,8 +743,8 @@ mod tests {
         {
             let mut s = BlobStore::new(dir.clone()).unwrap();
             // Store chunks 0 and 2 (a GAP at 1 — an in-flight pipelined upload).
-            s.put_chunk(a, b, 0, 3, b"aaa", 0);
-            s.put_chunk(a, b, 2, 3, b"cccc", 0);
+            s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, 3, b"aaa", 0);
+            s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 2, 3, b"cccc", 0);
         }
         // Simulate a crash mid-write of chunk 1: a `.tmp` file is left behind (rename never ran).
         std::fs::write(dir.join(format!("{}.c1.tmp", hex::encode(b))), b"partial").unwrap();
@@ -717,7 +762,7 @@ mod tests {
         // the watermark must stop at 1 (NOT jump to 2, which is also present but not contiguous).
         assert_eq!(s.stat(&b), Some((1, 3, false)), "recovery computed the watermark, stopped at the gap");
         // The sender fills the gap and the blob completes.
-        assert_eq!(s.put_chunk(a, b, 1, 3, b"bb", 0), BlobPut::Complete);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 1, 3, b"bb", 0), BlobPut::Complete);
         assert_eq!(s.get_chunk(&b, 1).as_deref(), Some(&b"bb"[..]));
         // put_chunk's incremental advance must pick up cleanly from the recovery-computed
         // watermark and walk it all the way to `count` now that the gap is filled.
@@ -730,7 +775,7 @@ mod tests {
         let b = id(3);
         {
             let mut s = BlobStore::new(dir.clone()).unwrap();
-            s.put_chunk(sender(1), b, 0, 1, b"hi", 0); // created_at = 0
+            s.put_chunk(BlobOwner { sender: sender(1), read_pub: RP }, b, 0, 1, b"hi", 0); // created_at = 0
         }
         let s = BlobStore::open(dir.clone(), BLOB_TTL_SECS + 1).unwrap();
         assert!(s.get_chunk(&b, 0).is_none(), "expired blob dropped on recovery");
@@ -775,8 +820,8 @@ mod tests {
         let mut s = BlobStore::new(dir.clone()).unwrap();
         let b = id(6);
         let a = sender(1);
-        assert_eq!(s.put_chunk(a, b, 0, 3, b"aaa", 0), BlobPut::Ok);
-        assert_eq!(s.put_chunk(a, b, 0, 3, b"aaa", 0), BlobPut::Ok); // retry same index
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, 3, b"aaa", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, 3, b"aaa", 0), BlobPut::Ok); // retry same index
         assert_eq!(s.total_bytes, 3, "a retry does not double-count bytes");
         assert_eq!(std::fs::metadata(s.chunk_path(&b, 0)).unwrap().len(), 3, "chunk not duplicated");
         // And it still parses cleanly on recovery.
@@ -799,8 +844,8 @@ mod tests {
         let mut s = BlobStore::new(tmp().join("sparse-cost")).unwrap();
         let a = sender(9);
         let b = id(9);
-        assert_eq!(s.put_chunk(a, b, 0, MAX_BLOB_CHUNKS, b"first", 0), BlobPut::Ok);
-        assert_eq!(s.put_chunk(a, b, MAX_BLOB_CHUNKS - 1, MAX_BLOB_CHUNKS, b"last", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, MAX_BLOB_CHUNKS, b"first", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, MAX_BLOB_CHUNKS - 1, MAX_BLOB_CHUNKS, b"last", 0), BlobPut::Ok);
         assert_eq!(s.stat(&b), Some((1, MAX_BLOB_CHUNKS, false)), "only index 0 is contiguous");
 
         // A re-send (idempotent, net-zero byte delta) exercises put_chunk's completion check;
@@ -809,7 +854,7 @@ mod tests {
         let hammer = |s: &mut BlobStore, b: [u8; 32], count: u32, watermark: u32| {
             let started = std::time::Instant::now();
             for _ in 0..20_000 {
-                assert_eq!(s.put_chunk(a, b, 0, count, b"first", 0), BlobPut::Ok);
+                assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, 0, count, b"first", 0), BlobPut::Ok);
                 assert_eq!(s.stat(&b), Some((watermark, count, false)));
             }
             started.elapsed()
@@ -826,8 +871,8 @@ mod tests {
         // it fails in whichever direction the machine leans. Its two sibling tests were already
         // converted for exactly this reason; leaving this one behind is what let it bite.
         let small = id(10);
-        assert_eq!(s.put_chunk(a, small, 0, 4, b"first", 0), BlobPut::Ok);
-        assert_eq!(s.put_chunk(a, small, 3, 4, b"last", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, small, 0, 4, b"first", 0), BlobPut::Ok);
+        assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, small, 3, 4, b"last", 0), BlobPut::Ok);
         let dense = hammer(&mut s, small, 4, 1);
 
         let floor = std::time::Duration::from_millis(1); // timer noise on a fast box
@@ -848,7 +893,7 @@ mod tests {
         // arrived makes sweep cost proportional to real chunks on disk, not declared ones.
         let mut s = BlobStore::new(tmp().join("sweep-cost")).unwrap();
         for n in 0..30u8 {
-            assert_eq!(s.put_chunk(sender(n), id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
+            assert_eq!(s.put_chunk(BlobOwner { sender: sender(n), read_pub: RP }, id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
         }
         let sparse = {
             let started = std::time::Instant::now();
@@ -867,7 +912,7 @@ mod tests {
         // calibrates itself to whatever machine it lands on.
         let mut small = BlobStore::new(tmp().join("sweep-cost-baseline")).unwrap();
         for n in 0..30u8 {
-            assert_eq!(small.put_chunk(sender(n), id(n), 0, 4, b"x", 0), BlobPut::Ok);
+            assert_eq!(small.put_chunk(BlobOwner { sender: sender(n), read_pub: RP }, id(n), 0, 4, b"x", 0), BlobPut::Ok);
         }
         let dense = {
             let started = std::time::Instant::now();
@@ -895,7 +940,7 @@ mod tests {
         {
             let mut s = BlobStore::new(dir.clone()).unwrap();
             for n in 0..30u8 {
-                assert_eq!(s.put_chunk(sender(n), id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
+                assert_eq!(s.put_chunk(BlobOwner { sender: sender(n), read_pub: RP }, id(n), 0, MAX_BLOB_CHUNKS, b"x", 0), BlobPut::Ok);
             }
         }
         let sparse = {
@@ -917,7 +962,7 @@ mod tests {
         {
             let mut s = BlobStore::new(small_dir.clone()).unwrap();
             for n in 0..30u8 {
-                assert_eq!(s.put_chunk(sender(n), id(n), 0, 4, b"x", 0), BlobPut::Ok);
+                assert_eq!(s.put_chunk(BlobOwner { sender: sender(n), read_pub: RP }, id(n), 0, 4, b"x", 0), BlobPut::Ok);
             }
         }
         let dense = {
@@ -946,7 +991,7 @@ mod tests {
         for i in 0..count {
             let data = vec![(i % 251) as u8; 10];
             let want = if i + 1 == count { BlobPut::Complete } else { BlobPut::Ok };
-            assert_eq!(s.put_chunk(a, b, i, count, &data, 0), want);
+            assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, b, i, count, &data, 0), want);
             assert_eq!(s.stat(&b), Some((i + 1, count, i + 1 == count)), "watermark tracks every chunk");
         }
         assert_eq!(s.meta(&b), Some((count, true)));
@@ -966,7 +1011,10 @@ mod tests {
     /// `blobs` AND `senders` together so the O(1) aggregate stays truthful for what these tests
     /// go on to assert (see `SenderStats`).
     fn insert_synthetic(s: &mut BlobStore, id: [u8; 32], sender: [u8; 32]) {
-        s.blobs.insert(id, Meta { sender, count: 1, lengths: HashMap::new(), created_at: 0, complete: true, contiguous: 1 });
+        s.blobs.insert(
+            id,
+            Meta { sender, count: 1, read_pub: RP, lengths: HashMap::new(), created_at: 0, complete: true, contiguous: 1 },
+        );
         s.senders.entry(sender).or_default().blobs += 1;
     }
 
@@ -998,7 +1046,7 @@ mod tests {
         // — nothing here would trip the (still-empty) byte caps.
         let one_more = [0x01u8; 32];
         assert!(
-            matches!(s.put_chunk(attacker, one_more, 0, 1, b"", 0), BlobPut::Rejected(_)),
+            matches!(s.put_chunk(BlobOwner { sender: attacker, read_pub: RP }, one_more, 0, 1, b"", 0), BlobPut::Rejected(_)),
             "per-sender blob-count cap must reject this sender's next fabricated id"
         );
         assert_eq!(s.sender_blob_count(&attacker), MAX_BLOBS_PER_SENDER, "the sender's share did not grow past the cap");
@@ -1007,7 +1055,7 @@ mod tests {
         // per-sender, not a global lockout triggered by someone else's flood.
         let other = sender(0xCD);
         assert_eq!(
-            s.put_chunk(other, [0x02u8; 32], 0, 1, b"real", 0),
+            s.put_chunk(BlobOwner { sender: other, read_pub: RP }, [0x02u8; 32], 0, 1, b"real", 0),
             BlobPut::Complete,
             "an unrelated sender's legitimate upload still succeeds while this one is capped"
         );
@@ -1034,7 +1082,7 @@ mod tests {
         let fresh_sender = [0xEEu8; 32];
         let fresh_id = [0xFFu8; 32];
         assert!(
-            matches!(s.put_chunk(fresh_sender, fresh_id, 0, 1, b"", 0), BlobPut::Rejected(_)),
+            matches!(s.put_chunk(BlobOwner { sender: fresh_sender, read_pub: RP }, fresh_id, 0, 1, b"", 0), BlobPut::Rejected(_)),
             "global blob-count cap must reject a brand-new id once the table is full"
         );
         assert_eq!(s.blobs.len(), MAX_BLOBS_TOTAL, "the table did not grow past the global cap");
@@ -1054,10 +1102,10 @@ mod tests {
         let b = sender(2);
         {
             let mut s = BlobStore::new(dir.clone()).unwrap();
-            assert_eq!(s.put_chunk(a, id(1), 0, 2, b"hello", 0), BlobPut::Ok);
-            assert_eq!(s.put_chunk(a, id(1), 1, 2, b"world", 0), BlobPut::Complete);
-            assert_eq!(s.put_chunk(a, id(2), 0, 1, b"solo", 0), BlobPut::Complete);
-            assert_eq!(s.put_chunk(b, id(3), 0, 1, b"other", 100), BlobPut::Complete);
+            assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, id(1), 0, 2, b"hello", 0), BlobPut::Ok);
+            assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, id(1), 1, 2, b"world", 0), BlobPut::Complete);
+            assert_eq!(s.put_chunk(BlobOwner { sender: a, read_pub: RP }, id(2), 0, 1, b"solo", 0), BlobPut::Complete);
+            assert_eq!(s.put_chunk(BlobOwner { sender: b, read_pub: RP }, id(3), 0, 1, b"other", 100), BlobPut::Complete);
             assert_eq!(
                 (s.sender_blob_count(&a), s.sender_bytes(&a)),
                 recomputed_sender_stats(&s, &a),

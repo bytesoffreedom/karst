@@ -465,6 +465,7 @@ mod tests {
             blob_id: [0u8; 32],
             index: 0,
             count: 0,
+            read_pub: [0u8; 32],
             data: Vec::new(),
         })
     }

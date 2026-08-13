@@ -90,6 +90,7 @@ fn good_put(
         blob_id,
         index,
         count,
+        read_pub: [0xAB; 32],
         data,
     }
 }
@@ -157,6 +158,7 @@ fn a_capability_proof_minted_for_the_message_path_does_not_open_the_blob_path() 
         blob_id,
         index: 0,
         count: 1,
+        read_pub: [0xAB; 32],
         data: vec![9, 9, 9],
     };
 
@@ -274,3 +276,194 @@ fn blob_cap_quota_has_headroom_over_the_blob_store_caps() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// PRIV-7a: the read token. Downloads and progress queries stop being bearer-by-id — knowing the
+// 256-bit blob id is no longer the download right; the requester must prove they hold the content
+// key the recipient was actually given.
+// ---------------------------------------------------------------------------------------------
+
+/// Upload one chunk under a real content key and hand back everything a download needs.
+fn uploaded_blob(relay: &mut RelayNode, key: [u8; 32]) -> ([u8; 32], Vec<u8>) {
+    let client_addr = addr32(0xD1);
+    let cap = issued_cap(relay, [0xD1; 32], generous_quota());
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let blob_id = [0xD5; 32];
+    let mut req = good_put(&cap, cookie, &client_addr, blob_id, 0, 1, vec![4, 5, 6]);
+    req.read_pub = node::blind::blob_read_keypair(&key).1;
+    assert!(
+        matches!(relay.handle_blob_put(&req, NOW), BlobResponse::Complete),
+        "the upload itself must succeed"
+    );
+    (blob_id, client_addr)
+}
+
+/// The whole point of the slice: the id alone no longer buys the bytes.
+#[test]
+fn knowing_only_the_blob_id_no_longer_downloads_a_chunk() {
+    let dir = tmp("read-token-id-alone");
+    let mut relay = relay_with_blobs(&dir);
+    let key = [0x77; 32];
+    let (blob_id, client_addr) = uploaded_blob(&mut relay, key);
+
+    // A bystander who learned the id — from the relay's own store, a backup, a log — but never
+    // held the content key. They can obtain a cookie; that was always free.
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let req = relay::node::BlobGetRequest {
+        client_addr: client_addr.clone(),
+        carrier_id: b"blob".to_vec(),
+        cookie: Some(cookie),
+        blob_id,
+        index: 0,
+        read_proof: Vec::new(),
+    };
+    assert!(
+        matches!(relay.handle_blob_get(&req, NOW), BlobResponse::Rejected(_)),
+        "an id with no read proof must not serve bytes"
+    );
+
+    // And the holder of the content key still gets the chunk, over the same endpoint.
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let (secret, public) = node::blind::blob_read_keypair(&key);
+    let ctx = node::blind::blob_read_context(&cookie.mac, &blob_id, 0);
+    let proof = node::blind::FetchOwnershipProof::prove(&secret, &public, &ctx).expect("prove");
+    let req = relay::node::BlobGetRequest {
+        client_addr,
+        carrier_id: b"blob".to_vec(),
+        cookie: Some(cookie),
+        blob_id,
+        index: 0,
+        read_proof: proof.to_bytes().to_vec(),
+    };
+    assert!(
+        matches!(relay.handle_blob_get(&req, NOW), BlobResponse::Chunk(Some(_))),
+        "the content-key holder must still be served"
+    );
+}
+
+/// A proof is bound to its chunk index, so one captured for chunk 0 cannot pull chunk 1 — and a
+/// STAT proof cannot stand in for a chunk download either (that is what `BLOB_STAT_INDEX` is for).
+#[test]
+fn a_read_proof_does_not_travel_between_indices_or_between_get_and_stat() {
+    let dir = tmp("read-token-binding");
+    let mut relay = relay_with_blobs(&dir);
+    let key = [0x78; 32];
+    let (blob_id, client_addr) = uploaded_blob(&mut relay, key);
+    let (secret, public) = node::blind::blob_read_keypair(&key);
+
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let for_chunk_zero = node::blind::FetchOwnershipProof::prove(
+        &secret,
+        &public,
+        &node::blind::blob_read_context(&cookie.mac, &blob_id, 0),
+    )
+    .expect("prove")
+    .to_bytes()
+    .to_vec();
+
+    // Replayed at a different index.
+    let req = relay::node::BlobGetRequest {
+        client_addr: client_addr.clone(),
+        carrier_id: b"blob".to_vec(),
+        cookie: Some(cookie),
+        blob_id,
+        index: 1,
+        read_proof: for_chunk_zero.clone(),
+    };
+    assert!(
+        matches!(relay.handle_blob_get(&req, NOW), BlobResponse::Rejected(_)),
+        "a proof minted for chunk 0 must not admit chunk 1"
+    );
+
+    // Replayed as a progress query.
+    let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+    let chunk_proof = node::blind::FetchOwnershipProof::prove(
+        &secret,
+        &public,
+        &node::blind::blob_read_context(&cookie.mac, &blob_id, 0),
+    )
+    .expect("prove")
+    .to_bytes()
+    .to_vec();
+    let stat = node::protocol::BlobStatRequest {
+        client_addr,
+        carrier_id: b"blob".to_vec(),
+        cookie: Some(cookie),
+        blob_id,
+        read_pub: public,
+        read_proof: chunk_proof,
+    };
+    assert!(
+        matches!(relay.admit_blob_stat(&stat, NOW), Err(BlobResponse::Rejected(_))),
+        "a chunk proof must not admit a stat — the indices are disjoint by construction"
+    );
+}
+
+/// A stat under the WRONG read key is answered exactly like a stat for an id the relay has never
+/// seen. Otherwise the endpoint that must stay usable before a blob exists — an uploader asking
+/// "how far did I get?" — would become the existence oracle the token exists to close.
+#[test]
+fn a_stat_under_the_wrong_key_looks_exactly_like_an_unknown_blob() {
+    let dir = tmp("read-token-stat-unknown");
+    let mut relay = relay_with_blobs(&dir);
+    let key = [0x7A; 32];
+    let (blob_id, client_addr) = uploaded_blob(&mut relay, key);
+
+    let stat_with = |relay: &mut RelayNode, id: [u8; 32], k: [u8; 32]| {
+        let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+        let (secret, public) = node::blind::blob_read_keypair(&k);
+        let ctx =
+            node::blind::blob_read_context(&cookie.mac, &id, node::protocol::BLOB_STAT_INDEX);
+        let proof = node::blind::FetchOwnershipProof::prove(&secret, &public, &ctx).expect("prove");
+        let req = node::protocol::BlobStatRequest {
+            client_addr: client_addr.clone(),
+            carrier_id: b"blob".to_vec(),
+            cookie: Some(cookie),
+            blob_id: id,
+            read_pub: public,
+            read_proof: proof.to_bytes().to_vec(),
+        };
+        relay.admit_blob_stat(&req, NOW).expect("a well-formed proof is admitted").is_some()
+    };
+
+    assert!(stat_with(&mut relay, blob_id, key), "the uploader sees their own blob");
+    assert!(
+        !stat_with(&mut relay, blob_id, [0x99; 32]),
+        "a stranger's key must be answered as if the blob were unknown"
+    );
+    assert!(
+        !stat_with(&mut relay, [0xEE; 32], key),
+        "and an id the relay never saw is answered the same way"
+    );
+}
+
+/// An unknown id and a bad proof must be refused THE SAME WAY: otherwise the endpoint answers
+/// "does this blob exist?" for free, which is most of what the token was introduced to stop.
+#[test]
+fn an_unknown_blob_and_a_bad_proof_are_refused_identically() {
+    let dir = tmp("read-token-no-oracle");
+    let mut relay = relay_with_blobs(&dir);
+    let key = [0x79; 32];
+    let (blob_id, client_addr) = uploaded_blob(&mut relay, key);
+
+    let refusal = |relay: &mut RelayNode, id: [u8; 32], proof: Vec<u8>| {
+        let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+        let req = relay::node::BlobGetRequest {
+            client_addr: client_addr.clone(),
+            carrier_id: b"blob".to_vec(),
+            cookie: Some(cookie),
+            blob_id: id,
+            index: 0,
+            read_proof: proof,
+        };
+        match relay.handle_blob_get(&req, NOW) {
+            BlobResponse::Rejected(r) => r,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    };
+
+    let known_bad = refusal(&mut relay, blob_id, vec![0u8; 64]);
+    let unknown = refusal(&mut relay, [0xEE; 32], vec![0u8; 64]);
+    assert_eq!(known_bad, unknown, "the refusal must not reveal whether the id exists");
+}
+

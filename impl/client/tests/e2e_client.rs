@@ -240,7 +240,7 @@ fn blob_upload_resumes_from_the_relay_watermark() {
     let key = client::blob::random32();
 
     // Fresh blob: the relay has never seen it.
-    assert_eq!(client::blob_stat(&r, id).unwrap(), None, "unknown blob → no watermark");
+    assert_eq!(client::blob_stat(&r, id, &key).unwrap(), None, "unknown blob → no watermark");
 
     // "Crash" after 2 chunks: a reader with only 2*chunk bytes but a size claiming 4 chunks stores
     // chunks 0,1 then errors reading chunk 2.
@@ -249,13 +249,13 @@ fn blob_upload_resumes_from_the_relay_watermark() {
         client::blob_upload_resumable(&r, &client::dev_capability(), partial, size, id, key).is_err(),
         "the truncated attempt fails mid-upload"
     );
-    assert_eq!(client::blob_stat(&r, id).unwrap(), Some((2, 4, false)), "watermark parked at chunk 2");
+    assert_eq!(client::blob_stat(&r, id, &key).unwrap(), Some((2, 4, false)), "watermark parked at chunk 2");
 
     // Resume with the FULL file: skips 0,1 (hashes them for the FileRef), uploads only 2,3.
     let (rid2, rkey2, hash, count) =
         client::blob_upload_resumable(&r, &client::dev_capability(), std::io::Cursor::new(&data), size, id, key).expect("resume completes");
     assert_eq!((rid2, rkey2, count), (id, key, 4));
-    assert_eq!(client::blob_stat(&r, id).unwrap(), Some((4, 4, true)), "blob now complete");
+    assert_eq!(client::blob_stat(&r, id, &key).unwrap(), Some((4, 4, true)), "blob now complete");
 
     // The resumed upload downloads back byte-identical, hash verified.
     let out = client::blob_download(&r, id, key, count, hash, Vec::new()).expect("download");
@@ -2453,6 +2453,7 @@ fn probe_blob_put() -> BlobPutRequest {
         blob_id: [7u8; 32],
         index: 0,
         count: 1,
+        read_pub: client::blob_read_pub(&[7u8; 32]),
         data: vec![0u8; 16],
     }
 }
@@ -2483,6 +2484,7 @@ fn one_session_streams_a_whole_blob() {
                 blob_id,
                 index,
                 count,
+                read_pub: client::blob_read_pub(&blob_id),
                 data: vec![index as u8; 32],
             };
             match sess.put(&req).expect("the session stays open across requests") {
@@ -2495,7 +2497,7 @@ fn one_session_streams_a_whole_blob() {
     }
     assert!(requests > count, "the cookie handshake means more than {count} requests rode one session");
     assert_eq!(
-        t.blob_stat(blob_id).unwrap(),
+        t.blob_stat(blob_id, &blob_id).unwrap(),
         Some((count, count, true)),
         "the whole blob completed over a single reused session"
     );
@@ -2537,6 +2539,7 @@ fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
             blob_id: [0x77; 32],
             index: index as u32,
             count: 1,
+            read_pub: client::blob_read_pub(&[0x77; 32]),
             data: vec![0u8; 16],
         };
         match sess.put(&req) {
@@ -2575,6 +2578,7 @@ fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
                 blob_id,
                 index,
                 count,
+                read_pub: client::blob_read_pub(&blob_id),
                 data: vec![index as u8; 32],
             };
             match sess.put(&req).expect("an ADMITTED session must survive past the leash") {
@@ -2589,7 +2593,7 @@ fn a_connection_that_never_gets_admitted_is_dropped_at_the_leash() {
         "the control must actually cross the leash: {requests} requests"
     );
     assert_eq!(
-        t.blob_stat(blob_id).unwrap(),
+        t.blob_stat(blob_id, &blob_id).unwrap(),
         Some((count, count, true)),
         "the whole blob completed over one admitted session"
     );
@@ -2660,7 +2664,7 @@ fn the_carrier_badge_names_the_path_that_actually_carried_the_message() {
     // A real request over the real relay: the dead SOCKS5 primary fails, direct carries it.
     // `blob_stat` is a public read that goes through the very same path list.
     assert!(
-        client::blob_stat(&relay, [0x5c; 32]).is_ok(),
+        client::blob_stat(&relay, [0x5c; 32], &[0x5c; 32]).is_ok(),
         "the live alternate should have reached the relay"
     );
 

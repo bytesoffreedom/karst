@@ -152,7 +152,9 @@ impl AdmittedBlobPut {
     /// and nothing else.
     pub fn put(&self, req: &BlobPutRequest, now: u64) -> BlobResponse {
         let mut store = self.store.lock().expect("blob store mutex");
-        match store.put_chunk(self.sender, req.blob_id, req.index, req.count, &req.data, now) {
+        let owner =
+            node::blobstore::BlobOwner { sender: self.sender, read_pub: req.read_pub };
+        match store.put_chunk(owner, req.blob_id, req.index, req.count, &req.data, now) {
             node::blobstore::BlobPut::Ok => BlobResponse::Stored,
             node::blobstore::BlobPut::Complete => BlobResponse::Complete,
             node::blobstore::BlobPut::Rejected(r) => BlobResponse::Rejected(r),
@@ -787,40 +789,110 @@ impl RelayNode {
         Ok(AdmittedBlobPut { sender, store })
     }
 
-    /// The admission half of a blob DOWNLOAD: cookie only (see `handle_blob_get` for why this
-    /// path is deliberately not capability-gated). Same split as `admit_blob_put`.
+    /// The admission half of a blob DOWNLOAD: cookie, then the READ TOKEN (PRIV-7a). Same split
+    /// as `admit_blob_put`. Still not capability-gated — that gate is scoped to the storage cost
+    /// of a put; egress remains its own named question.
     pub fn admit_blob_get(
         &mut self,
         req: &BlobGetRequest,
         now: u64,
     ) -> Result<Arc<Mutex<node::blobstore::BlobStore>>, BlobResponse> {
         self.advance_epoch(now);
-        match req.cookie {
-            Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => {}
-            _ => {
-                let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
-                return Err(BlobResponse::NeedCookie(cookie));
-            }
-        }
-        self.blobs.clone().ok_or_else(|| BlobResponse::Rejected("blobs disabled".into()))
+        let mac = self.cookie_mac(&req.cookie, &req.client_addr, &req.carrier_id, now)?;
+        let store =
+            self.blobs.clone().ok_or_else(|| BlobResponse::Rejected("blobs disabled".into()))?;
+        Self::check_read_proof(&store, &req.blob_id, req.index, &mac, &req.read_proof)?;
+        Ok(store)
     }
 
-    /// Admit a progress query. Same cookie stage as `admit_blob_get` — see `BlobStatRequest` on
-    /// why this stopped being the one blob endpoint with no admission at all.
+    /// Admit a progress query. Same two stages as `admit_blob_get`, with the proof bound to
+    /// [`BLOB_STAT_INDEX`] so a stat proof and a chunk proof can never stand in for each other.
+    /// Progress is not more public than the bytes: if the id alone no longer buys a chunk, it
+    /// must not buy the transfer's shape either.
+    ///
+    /// `Ok(None)` means **answer as if the blob were unknown**. A stat differs from a download in
+    /// one way that matters: an uploader must be able to ask "how far did I get?" for a blob the
+    /// relay has never seen — a fresh upload's very first call — so there is nothing stored to
+    /// verify against. Hence the requester carries the read key they claim, proves they hold its
+    /// secret, and the relay answers truthfully only when the STORED key matches the claimed one.
+    /// A mismatch and an unknown id give the identical answer, which is what keeps this from
+    /// becoming the "does this id exist?" oracle the token was introduced to close.
     pub fn admit_blob_stat(
         &mut self,
         req: &node::protocol::BlobStatRequest,
         now: u64,
-    ) -> Result<Arc<Mutex<node::blobstore::BlobStore>>, BlobResponse> {
+    ) -> Result<Option<Arc<Mutex<node::blobstore::BlobStore>>>, BlobResponse> {
         self.advance_epoch(now);
-        match req.cookie {
-            Some(c) if self.keyring.verify(&c, &req.client_addr, &req.carrier_id, now).is_ok() => {}
+        let mac = self.cookie_mac(&req.cookie, &req.client_addr, &req.carrier_id, now)?;
+        let store =
+            self.blobs.clone().ok_or_else(|| BlobResponse::Rejected("blobs disabled".into()))?;
+        let ctx = node::blind::blob_read_context(
+            &mac,
+            &req.blob_id,
+            node::protocol::BLOB_STAT_INDEX,
+        );
+        if req.read_proof.len() != 64 {
+            return Err(BlobResponse::Rejected(node::protocol::BLOB_READ_REFUSED.into()));
+        }
+        let mut fixed = [0u8; 64];
+        fixed.copy_from_slice(&req.read_proof);
+        if !node::blind::FetchOwnershipProof::from_bytes(&fixed).verify(&req.read_pub, &ctx) {
+            return Err(BlobResponse::Rejected(node::protocol::BLOB_READ_REFUSED.into()));
+        }
+        let stored = store.lock().expect("blob store lock").read_pub(&req.blob_id);
+        Ok(match stored {
+            Some(k) if k == req.read_pub => Some(store),
+            _ => None,
+        })
+    }
+
+    /// Verify the cookie stage and hand back the MAC the read proof is bound to. Pulled out so
+    /// get and stat cannot drift apart on either half — they are one admission rule with two
+    /// entry points, and the previous version of this file had already let them drift once.
+    fn cookie_mac(
+        &mut self,
+        cookie: &Option<Cookie>,
+        client_addr: &[u8],
+        carrier_id: &[u8],
+        now: u64,
+    ) -> Result<[u8; 16], BlobResponse> {
+        match cookie {
+            Some(c) if self.keyring.verify(c, client_addr, carrier_id, now).is_ok() => Ok(c.mac),
             _ => {
-                let cookie = self.keyring.issue(&req.client_addr, &req.carrier_id, now as u32);
-                return Err(BlobResponse::NeedCookie(cookie));
+                let cookie = self.keyring.issue(client_addr, carrier_id, now as u32);
+                Err(BlobResponse::NeedCookie(cookie))
             }
         }
-        self.blobs.clone().ok_or_else(|| BlobResponse::Rejected("blobs disabled".into()))
+    }
+
+    /// The read-token check (PRIV-7a). An unknown blob and a bad proof give the SAME refusal:
+    /// otherwise the endpoint would answer "does this id exist?" for free, which is most of what
+    /// the token was introduced to stop.
+    fn check_read_proof(
+        store: &Arc<Mutex<node::blobstore::BlobStore>>,
+        blob_id: &[u8; 32],
+        index: u32,
+        cookie_mac: &[u8; 16],
+        proof_bytes: &[u8],
+    ) -> Result<(), BlobResponse> {
+        const REFUSED: &str = node::protocol::BLOB_READ_REFUSED;
+        if proof_bytes.len() != 64 {
+            return Err(BlobResponse::Rejected(REFUSED.into()));
+        }
+        let read_pub = {
+            let s = store.lock().expect("blob store lock");
+            s.read_pub(blob_id)
+        };
+        let Some(read_pub) = read_pub else {
+            return Err(BlobResponse::Rejected(REFUSED.into()));
+        };
+        let ctx = node::blind::blob_read_context(cookie_mac, blob_id, index);
+        let mut fixed = [0u8; 64];
+        fixed.copy_from_slice(proof_bytes);
+        if !node::blind::FetchOwnershipProof::from_bytes(&fixed).verify(&read_pub, &ctx) {
+            return Err(BlobResponse::Rejected(REFUSED.into()));
+        }
+        Ok(())
     }
 
     /// The blob store's own handle, for the serve loop's public reads (`BlobStat`) — taken

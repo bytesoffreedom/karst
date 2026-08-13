@@ -131,7 +131,7 @@ fn an_upload_resumes_after_the_client_itself_restarts() {
             client::blob_upload_resumable(&r, &client::dev_capability(), partial, size, blob_id, key).is_err(),
             "the interrupted attempt fails mid-upload"
         );
-        assert_eq!(client::blob_stat(&r, blob_id).unwrap(), Some((2, 4, false)), "2 chunks parked");
+        assert_eq!(client::blob_stat(&r, blob_id, &key).unwrap(), Some((2, 4, false)), "2 chunks parked");
     }
 
     // ---- Client process #2: nothing but the disk and the user's file. ----
@@ -153,7 +153,7 @@ fn an_upload_resumes_after_the_client_itself_restarts() {
     .expect("the restarted client resumes its own upload");
 
     assert_eq!((id, key), (pu.blob_id, pu.key), "it continued the SAME blob, not a fresh one");
-    assert_eq!(client::blob_stat(&r2, id).unwrap(), Some((4, 4, true)), "resumed to complete");
+    assert_eq!(client::blob_stat(&r2, id, &key).unwrap(), Some((4, 4, true)), "resumed to complete");
 
     // And the resumed blob is the file: the two chunks from the dead process and the two from the
     // live one decrypt into one byte-identical whole under one key.

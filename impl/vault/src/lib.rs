@@ -20,3 +20,4 @@ pub mod slot;
 pub mod root;
 pub mod faulty;
 pub mod manifest;
+pub mod tx;

@@ -37,6 +37,21 @@ pub const LOGICAL_TOTAL: u64 = 1 << 32;
 /// Object slots. Slot 0 is the catalogue itself; objects are numbered from 1.
 pub const OBJ_MAX: u64 = 1 << 16;
 
+/// Bytes a stored capsule occupies: the clear generation prefix plus a sealed claim.
+///
+/// A capsule is `generation(8) ‖ record(framing + claim)`, and the claim is
+/// `state(1) ‖ generation(8) ‖ transaction(8) ‖ binding(32)`.
+pub const CAPSULE_SLOT: usize = 8 + RECORD_FRAMING + 49;
+
+/// Alignment of a capsule slot within a block.
+///
+/// The two copies must not share a unit a single torn write can span. Alignment alone does not
+/// PROVE that — on a plain file the true atomic unit belongs to the filesystem, the page cache,
+/// the block layer and the device, and the application does not know it. What alignment buys is
+/// that the two copies are never issued in one write and never share a page; the correctness
+/// argument is then carried by the model, where any single unfinished write may tear arbitrarily.
+pub const CAPSULE_ALIGN: usize = 4096;
+
 /// The derived shape of one container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geometry {
@@ -95,6 +110,26 @@ impl Geometry {
         (LOGICAL_TOTAL / OBJ_MAX) * self.logical_data() as u64
     }
 
+    /// Bytes one physical block occupies on disk, capsules and alignment included.
+    pub fn block_stride(&self) -> u64 {
+        (2 * CAPSULE_ALIGN + self.block_payload) as u64
+    }
+
+    /// Byte offset of block `b`, after the header.
+    pub fn block_offset(&self, header_len: u64, b: u64) -> u64 {
+        header_len + b * self.block_stride()
+    }
+
+    /// Byte offset of copy `copy` of block `b`'s capsule.
+    pub fn capsule_offset(&self, header_len: u64, b: u64, copy: u8) -> u64 {
+        self.block_offset(header_len, b) + u64::from(copy) * CAPSULE_ALIGN as u64
+    }
+
+    /// Byte offset of block `b`'s payload.
+    pub fn payload_offset(&self, header_len: u64, b: u64) -> u64 {
+        self.block_offset(header_len, b) + 2 * CAPSULE_ALIGN as u64
+    }
+
     /// Whether this geometry is usable at all. A fanout below 2 cannot address the space at any
     /// depth, and a container with fewer blocks than the map alone needs is not a container.
     pub fn is_sane(&self) -> bool {
@@ -144,6 +179,25 @@ mod tests {
         assert_eq!(first_end, second_start, "a gap between slot 0 and slot 1");
         let (_, last_end) = Geometry::slice(OBJ_MAX - 1);
         assert_eq!(last_end, LOGICAL_TOTAL, "the last slice does not reach the end of the space");
+    }
+
+    /// The two capsule copies never share an aligned unit, so no single write can span both and a
+    /// tear in one cannot reach the other. The model does the rest of the work — see
+    /// `CAPSULE_ALIGN` for why alignment alone is not a proof.
+    #[test]
+    fn the_two_capsule_copies_are_in_separate_aligned_units() {
+        let g = Geometry::new(DEFAULT_BLOCK_PAYLOAD, 1 << 20);
+        let (a, b) = (g.capsule_offset(0, 5, 0), g.capsule_offset(0, 5, 1));
+        assert_ne!(a / CAPSULE_ALIGN as u64, b / CAPSULE_ALIGN as u64, "same aligned unit");
+        assert!(a + CAPSULE_SLOT as u64 <= b, "copy 0 overruns into copy 1");
+    }
+
+    /// Blocks do not overlap: block n's payload ends before block n+1's first capsule starts.
+    #[test]
+    fn blocks_do_not_overlap() {
+        let g = Geometry::new(DEFAULT_BLOCK_PAYLOAD, 1 << 20);
+        let end = g.payload_offset(0, 3) + g.block_payload as u64;
+        assert!(end <= g.block_offset(0, 4), "block 3 runs into block 4");
     }
 
     /// A degenerate block size is rejected rather than producing a tree of absurd depth.

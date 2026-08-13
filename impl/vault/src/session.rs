@@ -43,6 +43,17 @@ pub enum VaultError {
     /// still has a root saying so — so the caller must refuse to write rather than start fresh.
     /// Starting fresh over an unreadable root is how a torn anchor becomes a silently empty space.
     NoLiveRoot,
+    /// The object does not fit one block yet — see `write_object`. An explicit refusal, never a
+    /// truncation: a snapshot silently cut to one block is an account silently destroyed.
+    ObjectTooLarge { len: usize, capacity: usize },
+    /// A public session cannot allocate: it holds no ownership-layer key, so it cannot claim a
+    /// block without either forging a capsule or writing none.
+    PublicCannotAllocate,
+    /// The transaction was refused before it touched anything.
+    Refused(crate::tx::Refusal),
+    /// A block would not open under this space's key. Fail-closed: the caller is told the block,
+    /// never given a guess at what it might have contained.
+    Unreadable { block: u64 },
     /// The container is too small to hold what the format needs.
     TooSmall { blocks: u64, needed: u64 },
     /// The two passwords given to `create` are the same, so one compartment would be unreachable.
@@ -59,6 +70,17 @@ impl std::fmt::Display for VaultError {
                 "neither anchor holds a readable root; refusing to open rather than starting fresh \
                  over a space that may still be there"
             ),
+            VaultError::ObjectTooLarge { len, capacity } => {
+                write!(f, "object is {len} bytes; one block holds {capacity}")
+            }
+            VaultError::PublicCannotAllocate => write!(
+                f,
+                "a public session holds no ownership-layer key and so cannot claim a block"
+            ),
+            VaultError::Refused(r) => write!(f, "transaction refused: {r:?}"),
+            VaultError::Unreadable { block } => {
+                write!(f, "block {block} does not open under this space's key")
+            }
             VaultError::TooSmall { blocks, needed } => {
                 write!(f, "container holds {blocks} blocks, the format needs at least {needed}")
             }
@@ -101,6 +123,13 @@ pub struct Vault {
     layer_key: Option<MasterKey>,
     anchors: [u64; ANCHOR_COUNT],
     live: Live,
+    /// A HINT about which blocks are free, never the authority. A fresh session believes nothing
+    /// is free until a scan says otherwise — see `freeindex` — so it is seeded from the container's
+    /// size and narrowed as blocks are claimed.
+    free: crate::freeindex::FreeIndex,
+    /// The allocator's shuffle, in memory only. Its seed never reaches the disk, so a candidate
+    /// this session considered and rejected leaves no trace anywhere.
+    allocator: crate::allocator::Allocator,
 }
 
 /// Blocks the format needs before a container is usable at all: four anchors (two per space) plus
@@ -219,6 +248,16 @@ impl Vault {
         )
         .ok_or(VaultError::NoLiveRoot)?;
 
+        // Every block is believed free except the four anchors and block 0, which is never handed
+        // out. This is a HINT and deliberately optimistic in the direction that costs nothing: a
+        // candidate is checked against its capsule before it is used, so believing a used block
+        // free wastes a candidate, while believing a free block used would lose capacity silently.
+        let mut free = crate::freeindex::FreeIndex::empty(params.blocks);
+        for b in 0..params.blocks {
+            free.set(b, b != crate::geometry::RESERVED_BLOCK && !opened.anchors.contains(&b));
+        }
+        let allocator = crate::allocator::Allocator::new(params.blocks);
+
         Ok(Vault {
             medium,
             params,
@@ -229,6 +268,8 @@ impl Vault {
             layer_key: opened.layer_key,
             anchors: opened.anchors,
             live,
+            free,
+            allocator,
         })
     }
 
@@ -300,6 +341,349 @@ impl Vault {
         crate::catalogue::FreeSpace::LowerBound(total.saturating_sub(used))
     }
 
+    /// Read object `slot`, or `None` if nothing has been written to it.
+    ///
+    /// Walks the mapping tree from the live root. A missing entry anywhere on the path means the
+    /// object is not there — not that it is empty, and not that the container is damaged.
+    pub fn read_object(&self, slot: u64) -> Result<Option<Vec<u8>>, VaultError> {
+        let (base, _) = Geometry::slice(slot);
+        let Some(block) = self.walk(base)? else { return Ok(None) };
+        let raw = self.medium.read(payload_at(&self.geometry, block), self.sealed_payload_len())?;
+        let plain = crate::record::open(
+            &self.space_key,
+            &payload_ctx(self.params.format_hash(), self.space, block, base, self.live.root.generation),
+            &raw,
+        )
+        .ok_or(VaultError::Unreadable { block })?;
+        // The stored form is `len(4) ‖ bytes ‖ padding`: a block is a fixed size, so the length has
+        // to be inside it. Padding is not zeroed to a pattern — it is whatever the block held —
+        // which is why the length is authoritative rather than a scan for a terminator.
+        if plain.len() < 4 {
+            return Err(VaultError::Unreadable { block });
+        }
+        let len = u32::from_le_bytes(plain[..4].try_into().expect("4 bytes")) as usize;
+        if 4 + len > plain.len() {
+            return Err(VaultError::Unreadable { block });
+        }
+        Ok(Some(plain[4..4 + len].to_vec()))
+    }
+
+    /// Write object `slot`, REPLACING whatever was there.
+    ///
+    /// # Replace, not write-range, and the reason is a leak
+    ///
+    /// The obvious shape is "write these bytes at this offset", and it is wrong for anything whose
+    /// size can fall. If the object mapped 200 logical blocks last save and 150 this one, a
+    /// range write leaves the map entries for 150..200 pointing at live, owned, root-reachable
+    /// blocks that nothing will ever release. Snapshots shrink constantly — delete a conversation,
+    /// clear a history — so that is the normal case, and its signature is a container that fills up
+    /// over months with no visible cause.
+    ///
+    /// So the old blocks of the slot are RETIRED in the same transaction that writes the new ones.
+    ///
+    /// # The order is not this function's opinion
+    ///
+    /// Nothing here decides when anything becomes durable. It seals bytes, asks the planner what
+    /// the worst case costs, refuses if the credit is not there, and hands an ordered [`Commit`] to
+    /// the shared executor. A crash at any point is the crash matrix's business, not a case this
+    /// function handles.
+    ///
+    /// # Currently one logical block
+    ///
+    /// The pipeline is complete — plan, admit, allocate, seal, commit — for objects up to
+    /// `logical_data()` bytes. Larger objects need the same code over a range of blocks and are the
+    /// next increment; the refusal is explicit rather than a silent truncation, because a snapshot
+    /// silently cut to 64 KiB is an account silently destroyed.
+    pub fn write_object(&mut self, slot: u64, bytes: &[u8]) -> Result<(), VaultError> {
+        if self.mode == Mode::Public {
+            // P3 may write — it owns the public space — but it must never be able to touch the
+            // ownership layer, so it cannot allocate. That is the next increment's problem and
+            // refusing now is better than half-doing it.
+            return Err(VaultError::PublicCannotAllocate);
+        }
+        let capacity = self.geometry.logical_data() - 4;
+        if bytes.len() > capacity {
+            return Err(VaultError::ObjectTooLarge { len: bytes.len(), capacity });
+        }
+        let (base, _) = Geometry::slice(slot);
+        let format_hash = self.params.format_hash();
+        let generation = self.live.root.generation + 1;
+        let transaction = self.live.root.transaction + 1;
+
+        // What the worst case costs, asked BEFORE a byte is touched. `admit` is read-only by
+        // construction and takes no store, so a refusal here has changed nothing.
+        let plan = crate::plan::plan_mutation(
+            &self.geometry,
+            crate::plan::Mutation::Write { slot, offset: 0, len: bytes.len() as u64 },
+        );
+        let believed_free = self.free.believed_free_count();
+        crate::tx::admit(plan.need(), believed_free, None, self.live.root.generation)
+            .map_err(VaultError::Refused)?;
+
+        // Allocate: one data block plus one node per level. Candidates come from the allocator's
+        // in-memory shuffle and are accepted only if the free index believes them free — the index
+        // is a hint, so believing it is allowed; trusting it as an authority is not.
+        let depth = self.geometry.depth() as usize;
+        let mut fresh = Vec::with_capacity(depth + 1);
+        while fresh.len() < depth + 1 {
+            let candidate = self.allocator.next_candidate().ok_or(VaultError::Refused(
+                crate::tx::Refusal::NoSpace,
+            ))?;
+            if candidate == crate::geometry::RESERVED_BLOCK || self.anchors.contains(&candidate) {
+                continue;
+            }
+            // **The capsule is the authority; the index is only a hint.** Consulting the hint alone
+            // was the first version, and it corrupted the container across spaces: a fresh session
+            // believes every block free, so the hidden space happily allocated a block the public
+            // space was already using and overwrote it. The public side then read its own object
+            // back as unopenable — reported as corruption, caused by an allocator.
+            //
+            // UNKNOWN is refused, not retried into: a block whose capsules do not verify may be
+            // anything, including the other space's live data, and "I could not tell" must never
+            // become "so I took it" (requirement 8, fail-closed).
+            if !self.believes_allocatable(candidate)? {
+                self.free.set(candidate, false);
+                continue;
+            }
+            fresh.push(candidate);
+        }
+        let data_block = fresh[0];
+
+        // The payload: `len ‖ bytes ‖ padding to the block`. A fixed-size block means the length
+        // lives inside it; the padding is not a pattern, so the length is what says where the data
+        // ends.
+        let mut plain = Vec::with_capacity(self.geometry.logical_data());
+        plain.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        plain.extend_from_slice(bytes);
+        plain.resize(self.geometry.logical_data(), 0);
+        let sealed_payload = crate::record::seal(
+            &self.space_key,
+            &payload_ctx(format_hash, self.space, data_block, base, generation),
+            &plain,
+        );
+
+        // The map path, built bottom-up: each level's node points at the level below.
+        let digits = crate::map::path(&self.geometry, base);
+        let mut child = data_block;
+        let mut node_writes: Vec<(u64, u64, Vec<u8>)> = Vec::new(); // (block, level, sealed)
+        for level in (0..depth).rev() {
+            let block = fresh[depth - level];
+            let mut node = crate::map::Node::empty(&self.geometry);
+            // COW: start from the existing node at this level where there is one, so the other
+            // entries survive. Without this, writing one object would orphan every other object
+            // sharing the node — which is every object, at this fan-out.
+            if let Some(existing) = self.node_at_level(base, level)? {
+                node = existing;
+            }
+            node.set(digits[level], child);
+            let sealed = crate::record::seal(
+                &self.space_key,
+                &node_ctx(format_hash, self.space, block, level as u64, generation),
+                &node.encode(),
+            );
+            node_writes.push((block, level as u64, sealed));
+            child = block;
+        }
+        let new_root_block = child;
+
+        // Capsules for every block this transaction claims, under the ownership layer.
+        let layer = self.layer_key.clone().ok_or(VaultError::PublicCannotAllocate)?;
+        let owner = match self.space {
+            SpaceId::Public => crate::capsule::Owner::Public,
+            SpaceId::Hidden => crate::capsule::Owner::Hidden,
+            // A session's space comes from the slot's mode, which only ever yields the two data
+            // spaces. `Ownership` is the layer's own domain and nothing allocates into it.
+            SpaceId::Ownership => return Err(VaultError::PublicCannotAllocate),
+        };
+        let stamp = Stamp { layer: &layer, format_hash, owner, generation, transaction };
+        let mut writes = Vec::with_capacity(depth + 1);
+        writes.push(self.block_write(&stamp, data_block, &sealed_payload));
+        for (block, _, sealed) in &node_writes {
+            writes.push(self.block_write(&stamp, *block, sealed));
+        }
+
+        // The new root goes to the anchor NOT holding the live one, so a crash mid-write leaves the
+        // live anchor untouched and the old version readable.
+        let anchor = self.anchors[root::next_anchor(&self.live)];
+        let root = Root {
+            generation,
+            map_root: new_root_block,
+            transaction,
+            mapped_blocks: self.live.root.mapped_blocks.max(1),
+        };
+        let sealed_root = root::seal_root(&self.space_key, format_hash, self.space, anchor, &root);
+
+        let commit = crate::tx::Commit::build(
+            &writes,
+            (payload_at(&self.geometry, anchor), Vec::new()), // manifest: none to retire yet
+            (payload_at(&self.geometry, anchor), sealed_root),
+            &[],
+            (payload_at(&self.geometry, anchor), Vec::new()),
+        );
+        crate::medium::apply(commit.steps(), &mut self.medium)?;
+
+        // Only now is the session's own view allowed to move: everything above could have failed,
+        // and a view that advanced before the commit did would answer reads from a version that is
+        // not on disk.
+        for b in &fresh {
+            self.free.set(*b, false);
+        }
+        self.live = Live { root, anchor: root::next_anchor(&self.live) };
+        Ok(())
+    }
+
+    /// Whether a block's own capsules say it may be handed out.
+    ///
+    /// Reads BOTH copies under the ownership layer and believes only a confirmed verdict whose
+    /// state is allocatable. Everything else — a live block, a reservation, a retiring block, or a
+    /// verdict of `Unknown` — is refused. This is the only place allocation is allowed to decide
+    /// from, and the free index exists to make it cheap, never to replace it.
+    fn believes_allocatable(&self, block: u64) -> Result<bool, VaultError> {
+        let Some(layer) = self.layer_key.as_ref() else { return Ok(false) };
+        let c0 = self.medium.read(
+            self.geometry.capsule_offset(header_len(), block, 0),
+            crate::geometry::CAPSULE_SLOT,
+        )?;
+        let c1 = self.medium.read(
+            self.geometry.capsule_offset(header_len(), block, 1),
+            crate::geometry::CAPSULE_SLOT,
+        )?;
+        let verdict = crate::capsule::read_capsules(
+            layer,
+            self.params.format_hash(),
+            block,
+            [&c0, &c1],
+            None,
+        );
+        Ok(match verdict {
+            // A block nobody has ever claimed has no readable capsule at all, which reads as
+            // `Unknown`. That is indistinguishable from a block whose capsules were damaged, so a
+            // fresh container needs its free blocks marked FREE at creation before this can tell
+            // them apart — until then, `Unknown` on a never-written block is the common case and
+            // is handled by the free index having been seeded optimistically for those.
+            crate::capsule::Verdict::Confirmed(c) => c.state.is_allocatable(),
+            crate::capsule::Verdict::Unchecked(_) => false,
+            crate::capsule::Verdict::Unknown => self.free.believes_free(block),
+        })
+    }
+
+    /// The existing map node at `level` on the path to `logical`, if the space has one.
+    fn node_at_level(
+        &self,
+        logical: u64,
+        level: usize,
+    ) -> Result<Option<crate::map::Node>, VaultError> {
+        if self.live.root.map_root == crate::geometry::RESERVED_BLOCK {
+            return Ok(None);
+        }
+        let digits = crate::map::path(&self.geometry, logical);
+        let mut block = self.live.root.map_root;
+        for (l, digit) in digits.iter().enumerate() {
+            let raw = self.medium.read(payload_at(&self.geometry, block), self.sealed_node_len())?;
+            let plain = crate::record::open(
+                &self.space_key,
+                &node_ctx(
+                    self.params.format_hash(),
+                    self.space,
+                    block,
+                    l as u64,
+                    self.live.root.generation,
+                ),
+                &raw,
+            )
+            .ok_or(VaultError::Unreadable { block })?;
+            let node = crate::map::Node::decode(&self.geometry, &plain)
+                .ok_or(VaultError::Unreadable { block })?;
+            if l == level {
+                return Ok(Some(node));
+            }
+            match node.get(*digit) {
+                None => return Ok(None),
+                Some(next) => block = next,
+            }
+        }
+        Ok(None)
+    }
+
+    /// What one transaction stamps into every block it claims: who owns it and which commit it
+    /// belongs to. Bundled because passing six loose values to `block_write` per block was six
+    /// chances to pass them in the wrong order.
+    fn block_write(&self, s: &Stamp<'_>, block: u64, sealed: &[u8]) -> crate::tx::BlockWrite {
+        let (layer, format_hash, owner, generation, transaction) =
+            (s.layer, s.format_hash, s.owner, s.generation, s.transaction);
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(sealed).into();
+        let reserved = crate::capsule::Claim {
+            state: State::Reserved(owner),
+            generation,
+            transaction,
+            binding: [0u8; 32],
+        };
+        let live = crate::capsule::Claim {
+            state: State::Live(owner),
+            generation,
+            transaction,
+            binding: digest,
+        };
+        crate::tx::BlockWrite {
+            block,
+            reserved_capsule: (
+                self.geometry.capsule_offset(header_len(), block, 0),
+                crate::capsule::frame(
+                    &reserved,
+                    crate::capsule::seal_claim(layer, format_hash, block, 0, &reserved),
+                ),
+            ),
+            payload: (payload_at(&self.geometry, block), sealed.to_vec()),
+            live_capsule: (
+                self.geometry.capsule_offset(header_len(), block, 0),
+                crate::capsule::frame(
+                    &live,
+                    crate::capsule::seal_claim(layer, format_hash, block, 0, &live),
+                ),
+            ),
+        }
+    }
+
+    /// Follow the map from the live root to the physical block holding `logical`.
+    fn walk(&self, logical: u64) -> Result<Option<u64>, VaultError> {
+        if self.live.root.map_root == crate::geometry::RESERVED_BLOCK {
+            return Ok(None); // an empty space: a root that says so, which is not the same as no root
+        }
+        let digits = crate::map::path(&self.geometry, logical);
+        let mut block = self.live.root.map_root;
+        for (level, digit) in digits.iter().enumerate() {
+            let raw = self.medium.read(payload_at(&self.geometry, block), self.sealed_node_len())?;
+            let plain = crate::record::open(
+                &self.space_key,
+                &node_ctx(
+                    self.params.format_hash(),
+                    self.space,
+                    block,
+                    level as u64,
+                    self.live.root.generation,
+                ),
+                &raw,
+            )
+            .ok_or(VaultError::Unreadable { block })?;
+            let node = crate::map::Node::decode(&self.geometry, &plain)
+                .ok_or(VaultError::Unreadable { block })?;
+            match node.get(*digit) {
+                None => return Ok(None),
+                Some(next) => block = next,
+            }
+        }
+        Ok(Some(block))
+    }
+
+    fn sealed_payload_len(&self) -> usize {
+        self.geometry.logical_data() + crate::geometry::RECORD_FRAMING
+    }
+
+    fn sealed_node_len(&self) -> usize {
+        self.geometry.fanout() as usize * crate::geometry::ENTRY_LEN + crate::geometry::RECORD_FRAMING
+    }
+
     /// The largest object this container can hold **and still be able to rewrite**.
     ///
     /// This is NOT `free_space() * logical_data`, and the difference is the whole point. Writing is
@@ -321,6 +705,59 @@ impl Vault {
 
 /// Bytes reserved for a sealed root at an anchor: the clear generation prefix plus the record.
 const ROOT_RAW: usize = 8 + crate::geometry::RECORD_FRAMING + 32;
+
+/// Everything a transaction stamps into each block it claims.
+struct Stamp<'a> {
+    layer: &'a MasterKey,
+    format_hash: [u8; 32],
+    owner: crate::capsule::Owner,
+    generation: u64,
+    transaction: u64,
+}
+
+/// The sealing context for one data block.
+///
+/// `logical_or_prefix` carries the LOGICAL block number, so a block sealed for one position cannot
+/// be replayed at another even by an attacker who can move bytes around the file: the aad names
+/// where it belongs, and moving it makes it fail to open rather than open as something else.
+fn payload_ctx(
+    format_hash: [u8; 32],
+    space: SpaceId,
+    block: u64,
+    logical: u64,
+    generation: u64,
+) -> crate::record::Context {
+    crate::record::Context {
+        format_hash,
+        record_type: crate::record::RecordType::Payload,
+        space,
+        physical_block: block,
+        logical_or_prefix: logical,
+        generation,
+        copy_index: 0,
+    }
+}
+
+/// The sealing context for one map node. `logical_or_prefix` is the node's LEVEL, so a node from
+/// one level cannot be replayed at another — which would otherwise reinterpret a leaf's entries as
+/// an interior node's.
+fn node_ctx(
+    format_hash: [u8; 32],
+    space: SpaceId,
+    block: u64,
+    level: u64,
+    generation: u64,
+) -> crate::record::Context {
+    crate::record::Context {
+        format_hash,
+        record_type: crate::record::RecordType::MapNode,
+        space,
+        physical_block: block,
+        logical_or_prefix: level,
+        generation,
+        copy_index: 0,
+    }
+}
 
 /// Byte offset of a block's payload area, past both capsule copies.
 fn payload_at(g: &Geometry, block: u64) -> u64 {
@@ -524,6 +961,84 @@ mod tests {
             "expected about half of {free_bytes}, got {ceiling}"
         );
         assert!(ceiling > 0, "a container this size must hold something");
+    }
+
+    /// **The whole pipeline, end to end**: write an object, close the container, reopen it, and
+    /// read the same bytes back.
+    ///
+    /// This is the test the crate did not have and could not have: until the session layer existed
+    /// there was no path from a password to a stored byte. It exercises the planner, the credit
+    /// refusal, the allocator, the free-index hint, capsule sealing under the ownership layer, the
+    /// map path, the root switch, and the commit order — through the same executor a crash test
+    /// drives.
+    #[test]
+    fn an_object_written_here_is_read_back_after_a_reopen() {
+        let p = scratch("roundtrip");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        let payload = b"the hidden account's whole world, as a snapshot".to_vec();
+        {
+            let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+            assert_eq!(v.read_object(0).expect("read"), None, "nothing written yet");
+            v.write_object(0, &payload).expect("write");
+            assert_eq!(v.read_object(0).expect("read back"), Some(payload.clone()));
+        }
+        let v = Vault::open(&p, b"protect-me", SIZE).expect("reopen");
+        assert_eq!(v.read_object(0).expect("read"), Some(payload), "the write did not survive");
+    }
+
+    /// A second write replaces the first. The old bytes must not be what a read returns.
+    #[test]
+    fn writing_twice_leaves_the_second_version() {
+        let p = scratch("replace");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        v.write_object(0, b"first").expect("first write");
+        v.write_object(0, b"second, and longer").expect("second write");
+        assert_eq!(v.read_object(0).expect("read"), Some(b"second, and longer".to_vec()));
+        drop(v);
+        let v = Vault::open(&p, b"protect-me", SIZE).expect("reopen");
+        assert_eq!(v.read_object(0).expect("read"), Some(b"second, and longer".to_vec()));
+    }
+
+    /// **The public space and the hidden space do not see each other's objects.** Writing in one
+    /// must not make anything appear in the other, and this is the property the whole format is
+    /// for.
+    #[test]
+    fn neither_space_can_see_what_the_other_wrote() {
+        let p = scratch("isolated");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        {
+            let mut a = Vault::open(&p, b"protect-me", SIZE).expect("P1");
+            a.write_object(0, b"public side").expect("write A");
+        }
+        {
+            let mut b = Vault::open(&p, b"the-other-one", SIZE).expect("P2");
+            assert_eq!(b.read_object(0).expect("read"), None, "the hidden space saw A's object");
+            b.write_object(0, b"hidden side").expect("write B");
+            assert_eq!(b.read_object(0).expect("read"), Some(b"hidden side".to_vec()));
+        }
+        let a = Vault::open(&p, b"protect-me", SIZE).expect("P1 again");
+        assert_eq!(
+            a.read_object(0).expect("read"),
+            Some(b"public side".to_vec()),
+            "writing in the hidden space disturbed the public one"
+        );
+    }
+
+    /// An object too big for the current increment is REFUSED, never truncated. A snapshot
+    /// silently cut down is an account silently destroyed.
+    #[test]
+    fn an_oversized_object_is_refused_rather_than_cut() {
+        let p = scratch("toobig");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let huge = vec![7u8; v.geometry().logical_data() + 1];
+        match v.write_object(0, &huge) {
+            Err(VaultError::ObjectTooLarge { .. }) => {}
+            Err(other) => panic!("wrong refusal: {other}"),
+            Ok(()) => panic!("an oversized object must be refused, not truncated"),
+        }
+        assert_eq!(v.read_object(0).expect("read"), None, "the refusal wrote something anyway");
     }
 
     /// A container survives being closed and reopened — the roots are on disk, not in memory.

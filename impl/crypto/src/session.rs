@@ -124,7 +124,11 @@ const PAD_HEADER: usize = 4;
 /// Smallest bucket >= `n`, or `n` rounded up to a multiple of the top bucket. Called
 /// ONLY on trusted local sizes (never on an attacker-supplied wire length), so the
 /// above-ladder ceil rule can't be driven by a hostile input.
-pub(crate) fn bucket_for(n: usize) -> usize {
+///
+/// Public so the size CLASSES a message type lands in can be asserted where those types are
+/// defined, rather than restated from memory. The classes are what an on-path observer sees, so
+/// "which class does this land in" is a fact worth pinning next to the constant that decides it.
+pub fn bucket_for(n: usize) -> usize {
     for &b in &BUCKETS {
         if n <= b {
             return b;

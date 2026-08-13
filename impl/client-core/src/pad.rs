@@ -229,3 +229,53 @@ mod tests {
         assert!(unpad(&dirty).is_err(), "a non-zero tail must not be accepted");
     }
 }
+
+/// What an on-path observer can tell apart, pinned as numbers rather than described.
+///
+/// The transport pads every Noise frame to one of a fixed ladder of buckets, so what leaves the
+/// machine is not a length but a CLASS. Which class each kind of traffic lands in is therefore a
+/// privacy property, and it is decided by constants scattered across four crates — the packet
+/// ceiling, the fetch page, the blob chunk. Nothing checked that they land where anyone thought.
+///
+/// These tests do not assert that the current arrangement is good. They assert what it IS, so that
+/// changing a constant moves a class loudly instead of quietly.
+#[cfg(test)]
+mod wire_classes {
+    use super::*;
+    use karst_crypto::session::bucket_for;
+
+    /// The classes as they stand. A blob chunk is alone above every other kind of traffic — one
+    /// frame of it is enough to say "this is a file transfer", with no volume analysis at all.
+    #[test]
+    fn a_blob_chunk_is_alone_in_its_size_class() {
+        let message = bucket_for(PADDED_LEN + 200); // envelope framing and addresses
+        let fetch_page = bucket_for(node::wire::FETCH_PAGE_LEN);
+        let blob_chunk = bucket_for(60 * 1024);
+
+        assert!(message < fetch_page, "a message and a fetch page share a class");
+        assert!(
+            fetch_page < blob_chunk,
+            "the blob class merged with the fetch page class — if that was deliberate, this test \
+             is the place to say so"
+        );
+    }
+
+    /// The merge that would close it, stated as arithmetic rather than as a plan: a blob chunk
+    /// sized to land in the fetch-page class costs roughly four times as many chunks.
+    ///
+    /// Recorded because the cost is the whole argument. Merging the classes is not free and not
+    /// obviously worth it — it hides one FRAME, not a transfer, since volume gives a large upload
+    /// away whatever the frame size. What it would buy is that a single captured frame stops
+    /// naming file traffic, which matters for short transfers and for mixing with cover.
+    #[test]
+    fn merging_the_blob_class_into_the_fetch_page_class_costs_four_chunks_for_one() {
+        let fetch_page = bucket_for(node::wire::FETCH_PAGE_LEN);
+        // Largest chunk that still lands in the fetch-page class, leaving room for framing.
+        let merged_chunk = fetch_page - 512;
+        let ratio = (60 * 1024) / merged_chunk;
+        assert!(
+            (3..=5).contains(&ratio),
+            "the cost of merging moved: {ratio}x more chunks per file, not ~4x"
+        );
+    }
+}

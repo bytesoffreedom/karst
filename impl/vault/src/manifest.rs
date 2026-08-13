@@ -28,6 +28,19 @@
 //! "manifest newer than the live root", meaning the commit did not happen. There, `retire` must
 //! not be touched: those blocks are still reachable from the live root and still hold live data.
 //! Only `release` is safe to reclaim, because nothing ever referenced it.
+//!
+//! # The invariant [`Replay::Stale`] depends on, and who enforces it
+//!
+//! `Stale` discards a manifest older than the live root, on the grounds that its cleanup already
+//! ran. That reasoning holds only while **a transaction cannot commit past an unfinished
+//! cleanup**: if commit N crashed mid-cleanup and commit N+1 were allowed to proceed, N's manifest
+//! would then be older than live, be discarded as stale, and its retire list would leak
+//! permanently with nothing left recording that those blocks existed.
+//!
+//! There is nothing in this module that could enforce that — a manifest cannot know what the
+//! driver is about to do. [`blocks_new_transaction`] is the check the driver must run, and
+//! `a_pending_cleanup_blocks_the_next_transaction` is the test that says so. Leaving the rule in
+//! prose only is how it stops being true.
 
 use crate::record::{Context, MasterKey, RecordType, SpaceId};
 
@@ -57,6 +70,15 @@ pub enum Replay {
     Stale,
     /// The commit did NOT happen. Reclaim `release` only; `retire` is still live data.
     RollBack,
+}
+
+/// Whether an unfinished cleanup is outstanding, which forbids starting another transaction.
+///
+/// The driver calls this before every mutation. See the module docs: `Replay::Stale` is only sound
+/// while this is respected, because a manifest that falls behind the live root is discarded, and a
+/// manifest discarded before its retire list ran is a permanent leak with no record of itself.
+pub fn blocks_new_transaction(manifest: Option<&Manifest>, live_generation: u64) -> bool {
+    matches!(replay_for(manifest, live_generation), Replay::FinishCleanup)
 }
 
 /// Decide what to do with `manifest` given the live root's generation.
@@ -95,9 +117,12 @@ fn decode(b: &[u8]) -> Option<Manifest> {
     if b.len() != expected {
         return None;
     }
-    let mut read = |i: usize| g(32 + i * 8);
-    let retire = (0..n_retire).map(&mut read).collect();
-    let release = (n_retire..n_retire + n_release).map(&mut read).collect();
+    // The two lists are stored back to back after the fixed header, retire first. The ranges
+    // below encode that layout; changing the write order in `encode` without changing them here
+    // would silently swap the lists — and swapping "wipe these" with "free these" is destructive.
+    let entry = |i: usize| g(32 + i * 8);
+    let retire = (0..n_retire).map(entry).collect();
+    let release = (n_retire..n_retire + n_release).map(entry).collect();
     Some(Manifest { transaction, root_generation, retire, release })
 }
 
@@ -188,6 +213,17 @@ mod tests {
     #[test]
     fn an_older_manifest_is_stale() {
         assert_eq!(replay_for(Some(&manifest(3)), 8), Replay::Stale);
+    }
+
+    /// The driver must not start a transaction while a cleanup is outstanding. Without this,
+    /// commit N crashing mid-cleanup and N+1 proceeding would leave N's manifest older than live,
+    /// discarded as stale, and its retire list leaked with nothing recording that it existed.
+    #[test]
+    fn a_pending_cleanup_blocks_the_next_transaction() {
+        assert!(blocks_new_transaction(Some(&manifest(7)), 7), "cleanup outstanding at generation 7");
+        assert!(!blocks_new_transaction(Some(&manifest(3)), 8), "an already-cleaned manifest");
+        assert!(!blocks_new_transaction(Some(&manifest(9)), 8), "a rolled-back one blocks nothing");
+        assert!(!blocks_new_transaction(None, 8));
     }
 
     #[test]

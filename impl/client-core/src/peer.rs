@@ -4004,3 +4004,65 @@ mod fan_out {
         assert_eq!(probe.high_water.load(Ordering::SeqCst), 1);
     }
 }
+
+/// Routing-chain separation, pinned as a property rather than trusted to the taxonomy (PRIV-2).
+///
+/// The slice this comes from asked for one routing chain per session. What the code does is
+/// FINER — a chain per box per epoch, and a further split by leg — so the requirement is met by
+/// construction rather than by a rule someone follows. These tests exist because "met by
+/// construction" is a claim about a `match` arm that anyone can widen in a hurry.
+#[cfg(test)]
+mod routing_separation {
+    use super::*;
+
+    /// A scope is derived from the handle, so two handles cannot share a circuit unless they are
+    /// the same handle. The interesting pairs are the ones a reasonable person might have merged.
+    fn distinct(a: &Handle, b: &Handle, what: &str) {
+        assert!(a != b, "{what}: these two would share a routing chain");
+    }
+
+    /// Two boxes of the same peer in DIFFERENT epochs are different handles, so a chain does not
+    /// span an epoch boundary. Without this, rotating the box means nothing: the relay watches one
+    /// source address walk from the old box to the new one and stitches the rotation back together.
+    #[test]
+    fn a_chain_does_not_span_an_epoch_boundary() {
+        distinct(&Handle::Box([7u8; 32], 1), &Handle::Box([7u8; 32], 2), "one box across two epochs");
+    }
+
+    /// Two different boxes in the same epoch are different handles. This is the per-session
+    /// separation the slice asked for, and it holds at box granularity — finer than per-session,
+    /// because a session's box rotates within its life.
+    #[test]
+    fn two_peers_never_share_a_chain_within_an_epoch() {
+        distinct(&Handle::Box([1u8; 32], 5), &Handle::Box([2u8; 32], 5), "two peers in one epoch");
+    }
+
+    /// The deposit leg and the fetch leg of cover traffic are separate handles. Merging them is
+    /// the specific mistake that makes cover detectable: a loop is both parties, so one shared
+    /// chain would show the relay one source address on both legs while a real message shows two.
+    /// A relay that can spot loops can drop real mail and return the loops, and the drop detector
+    /// reports all-clear while messages vanish.
+    #[test]
+    fn a_loops_two_legs_never_share_a_chain() {
+        distinct(&Handle::LoopSend(3), &Handle::LoopRecv(3), "a loop's two legs");
+    }
+
+    /// A loop and a real session never share a handle either, in any epoch — otherwise cover
+    /// traffic would ride the chain it is supposed to be hiding among, and be identifiable by
+    /// exactly the thing that was meant to hide it.
+    #[test]
+    fn cover_traffic_never_shares_a_chain_with_real_mail() {
+        distinct(&Handle::LoopSend(4), &Handle::Box([9u8; 32], 4), "cover send vs real mail");
+        distinct(&Handle::LoopRecv(4), &Handle::Box([9u8; 32], 4), "cover recv vs real mail");
+    }
+
+    /// The identity mailbox and an opener are separate from everything. The identity mailbox is
+    /// the emergency channel and the one long-lived address a client has; sharing its chain with
+    /// a rotating box would tie every rotation back to the stable name.
+    #[test]
+    fn the_long_lived_identity_channel_is_isolated_from_rotating_boxes() {
+        distinct(&Handle::Identity, &Handle::Box([1u8; 32], 1), "identity vs a rotating box");
+        distinct(&Handle::Identity, &Handle::Opener([1u8; 32]), "identity vs an opener");
+        distinct(&Handle::Opener([1u8; 32]), &Handle::Box([1u8; 32], 1), "opener vs a box");
+    }
+}

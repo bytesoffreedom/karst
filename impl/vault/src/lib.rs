@@ -19,3 +19,4 @@ pub mod freeindex;
 pub mod slot;
 pub mod root;
 pub mod faulty;
+pub mod manifest;

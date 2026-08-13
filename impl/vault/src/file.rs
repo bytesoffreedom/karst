@@ -219,13 +219,8 @@ mod tests {
     use crate::tx::{Step, What};
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("karst-test").join(format!(
-            "vault-file-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir.join("container.bin")
+        // One swept root for the whole crate (#321) — a container here is megabytes, not bytes.
+        crate::scratch::container_path(tag)
     }
 
     const LEN: u64 = 16 * PAGE;

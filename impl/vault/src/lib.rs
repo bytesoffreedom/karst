@@ -22,6 +22,9 @@ pub mod faulty;
 pub mod medium;
 pub mod file;
 pub mod session;
+
+#[cfg(test)]
+pub(crate) mod scratch;
 pub mod manifest;
 pub mod tx;
 pub mod params;

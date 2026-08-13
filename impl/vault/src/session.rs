@@ -803,13 +803,8 @@ mod tests {
     const SIZE: u64 = 8 * 1024 * 1024;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("karst-test").join(format!(
-            "vault-session-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir.join("container.bin")
+        // One swept root for the whole crate (#321) — a container here is megabytes, not bytes.
+        crate::scratch::container_path(tag)
     }
 
     fn pw<'a>() -> Passwords<'a> {

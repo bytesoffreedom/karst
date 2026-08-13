@@ -2107,6 +2107,107 @@ pub fn send_session_batch(
     Ok(())
 }
 
+/// Send several payloads to one peer as BUNDLES: padded to a slot class and deposited in one
+/// admitted request per bundle (`docs/design/bundling.md`).
+///
+/// This is the end-to-end path — it seals the padded batch and puts it on the wire; the receive
+/// side drops the padding in [`strip_bundle_padding`], before any caller can see it.
+///
+/// What it does that `send_session_batch` does not:
+///
+/// - **Pads the batch to a class.** `content::bundle::split` decides the shape; the unused slots
+///   carry `Content::Padding` addressed to the same recipient. Five messages and eight messages
+///   both leave as one sixteen-slot bundle, which is the property being bought.
+/// - **Keeps the padding out of the record.** Filler is queued and sealed exactly like a real
+///   message — the relay must not be able to tell them apart — but it never enters the pending-send
+///   ledger, so a lost filler cannot surface as a phantom "message lost" for a message the user
+///   never wrote.
+///
+/// What it costs, and it is not free: every padding slot burns a ratchet position, a mailbox
+/// slot, an outbox slot, and a slice of the capability's quota. A two-message send padded to four
+/// consumes the recipient's skipped-key window four times as fast as two deposits would. The
+/// design note names this; the caller chooses it by calling this function rather than
+/// `send_session_batch`.
+///
+/// All-or-nothing on the outbox, exactly as `send_session_batch`: padding included, since a batch
+/// that evicted its own messages to make room for its own filler would be the worst version of
+/// this.
+pub fn send_session_bundle(
+    store: &Store,
+    relay: &Relay,
+    to_ik: &[u8; 32],
+    payloads: &[Vec<u8>],
+    now: u64,
+) -> Result<(), String> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    let account = store.load_account().map_err(|e| secret_load_err("account", e))?;
+    let cap = store
+        .load_capability_for(&relay.id)
+        .map_err(|e| format!("cannot send through this relay: {e}"))?;
+    let transport = relay.transport();
+    let fetch_pub = x25519_dalek::PublicKey::from(relay.id.fetch_pub);
+    let mut peer = Peer::new(transport, account, cap, fetch_pub);
+
+    let _lock = store.lock_sessions().map_err(|e| format!("session lock: {e}"))?;
+    peer.import_state(store.load_sessions().map_err(|e| format!("reading sessions: {e}"))?);
+    if !peer.has_session(to_ik) && peer.connect(to_ik, now)? == ForwardSecrecy::NoOneTimePrekey {
+        store.mark_reduced_fs(*to_ik).map_err(|e| format!("reduced-FS record: {e}"))?;
+    }
+    // Lay the batch out as the wire will carry it: bundle by bundle, each padded to its class.
+    // `real` marks which queued entries are the user's, so only those reach the ledger.
+    let filler = content::encode(&content::bundle::filler());
+    // `Some(i)` = the user's payload at index i; `None` = a padding slot.
+    let mut laid_out: Vec<(&[u8], Option<usize>)> = Vec::new();
+    let mut next = 0usize;
+    for slots in content::bundle::split(payloads.len()) {
+        for _ in 0..slots {
+            match payloads.get(next) {
+                Some(p) => laid_out.push((p.as_slice(), Some(next))),
+                None => laid_out.push((filler.as_slice(), None)),
+            }
+            next += 1;
+        }
+    }
+    let mut ledger = load_ledger_or_empty(store);
+    let mut ids: Vec<(u64, Option<usize>)> = Vec::with_capacity(laid_out.len());
+    for (i, (p, real)) in laid_out.iter().enumerate() {
+        let before = peer.outbox_len();
+        let id = peer.queue(to_ik, p, now)?;
+        if peer.outbox_len() <= before {
+            return Err(format!(
+                "outbox has no room for this {}-message bundle (only {} of {} slots, padding \
+                 included, would fit without evicting an existing queued message); refusing the \
+                 whole batch — nothing sent, ratchet not advanced",
+                payloads.len(),
+                i,
+                laid_out.len()
+            ));
+        }
+        ids.push((id, *real));
+    }
+    store.save_sessions(&peer.export_state()).map_err(|e| format!("writing sessions (pre): {e}"))?;
+    // Only the real messages are accounted for. The index comes from the layout itself rather
+    // than from walking `payloads` in step with it — the pairing is already decided above, and
+    // re-deriving it here would be a second place for it to be wrong.
+    for (id, real) in &ids {
+        if let Some(idx) = real {
+            ledger.push(store::PendingSend {
+                id: *id,
+                peer_ik: *to_ik,
+                plaintext: payloads[*idx].clone(),
+                queued_at: now,
+            });
+        }
+    }
+    let delivered = peer.flush_outbox_bundled(now);
+    store.save_sessions(&peer.export_state()).map_err(|e| format!("writing sessions (post): {e}"))?;
+    let ledger = reconcile_ledger(store, &peer, ledger, &delivered, now);
+    save_ledger_best_effort(store, &ledger);
+    Ok(())
+}
+
 /// Retry delivery of any messages left queued by a prior transport failure — the send-side
 /// analog of a poll. Loads the sessions, flushes the outbox (exact retransmit in FIFO order),
 /// and persists the result. Cheap when the outbox is empty (the common case). Meant to run on
@@ -2620,7 +2721,10 @@ pub fn send_avatar(
     let mut payloads = Vec::with_capacity(chunks.len() + 1);
     payloads.push(content::encode(&manifest)); // manifest FIRST (reassembler invariant)
     payloads.extend(chunks.iter().map(content::encode));
-    send_session_batch(store, relay, to_ik, &payloads, now)
+    // BUNDLED (#281): an in-band transfer is the one place a client reliably has many messages
+    // for one recipient at once, so it is where bundling pays — the chunk count leaves as a
+    // ladder of classes instead of as itself, and a hundred deposits become seven requests.
+    send_session_bundle(store, relay, to_ik, &payloads, now)
 }
 
 /// Send our whole profile PHOTO GALLERY to one contact as a single atomic transfer (mirrors
@@ -2638,7 +2742,10 @@ pub fn send_gallery(
     let mut payloads = Vec::with_capacity(chunks.len() + 1);
     payloads.push(content::encode(&manifest)); // manifest FIRST (reassembler invariant)
     payloads.extend(chunks.iter().map(content::encode));
-    send_session_batch(store, relay, to_ik, &payloads, now)
+    // BUNDLED (#281): an in-band transfer is the one place a client reliably has many messages
+    // for one recipient at once, so it is where bundling pays — the chunk count leaves as a
+    // ladder of classes instead of as itself, and a hundred deposits become seven requests.
+    send_session_bundle(store, relay, to_ik, &payloads, now)
 }
 
 /// Send our whole profile gallery to one contact via the BLOB path (the receive side is
@@ -2692,7 +2799,10 @@ pub fn send_post_image(
     let mut payloads = Vec::with_capacity(chunks.len() + 1);
     payloads.push(content::encode(&manifest)); // manifest FIRST (reassembler invariant)
     payloads.extend(chunks.iter().map(content::encode));
-    send_session_batch(store, relay, to_ik, &payloads, now)
+    // BUNDLED (#281): an in-band transfer is the one place a client reliably has many messages
+    // for one recipient at once, so it is where bundling pays — the chunk count leaves as a
+    // ladder of classes instead of as itself, and a hundred deposits become seven requests.
+    send_session_bundle(store, relay, to_ik, &payloads, now)
 }
 
 /// Send ONE post attachment (image or file) to one contact — the multi-attachment fan-out. `kind`
@@ -2714,7 +2824,10 @@ pub fn send_post_attachment(
     let mut payloads = Vec::with_capacity(chunks.len() + 1);
     payloads.push(content::encode(&manifest)); // manifest FIRST (reassembler invariant)
     payloads.extend(chunks.iter().map(content::encode));
-    send_session_batch(store, relay, to_ik, &payloads, now)
+    // BUNDLED (#281): an in-band transfer is the one place a client reliably has many messages
+    // for one recipient at once, so it is where bundling pays — the chunk count leaves as a
+    // ladder of classes instead of as itself, and a hundred deposits become seven requests.
+    send_session_bundle(store, relay, to_ik, &payloads, now)
 }
 
 /// Send ONE post attachment to one contact via the relay's BLOB store (the transport #98 swaps in
@@ -3771,7 +3884,8 @@ pub fn recv_session(
     // Load one-time prekey secrets so an opener that consumed one can be accepted; receive
     // deletes the used ones, and we persist the remainder so they are never reused.
     peer.load_opks(&store.load_opks().map_err(|e| format!("reading one-time prekeys: {e}"))?);
-    let msgs = peer.receive(now)?;
+    let mut msgs = peer.receive(now)?;
+    strip_bundle_padding(&mut msgs);
     // PLAINTEXT-FIRST: persist the decrypted text to history BEFORE the state commit or the ACK,
     // so a crash between them cannot lose the message (`[save_sessions → history]`: advanced
     // ratchet, unpersisted plaintext). A crash here just redelivers; the dedup (or the ratchet's
@@ -3913,7 +4027,27 @@ pub fn receive_threaded<T: Transport + Clone>(
             }
         }
     }
+    strip_bundle_padding(&mut messages);
     MultiReceive { messages, state, opks, failed, acks, out_of_step }
+}
+
+/// Drop a bundle's padding slots before ANY caller sees them.
+///
+/// There are exactly two places a decrypted batch enters this crate — `recv_session` and
+/// `receive_threaded` — and both call this, which is why no dispatch site downstream needs a
+/// `Content::Padding` arm. Leaving it to the dispatch sites was the alternative and it is the
+/// version that eventually shows blank messages in a chat: the desktop's decode loop has a
+/// catch-all that would have handed padding to the file reassembler, and the CLI's would have
+/// done the same.
+///
+/// Dropped, not counted: the padding is still ACKED (the receipts are collected separately), so
+/// the relay deletes it exactly like a real message. A padding slot that stayed leased would
+/// redeliver forever.
+fn strip_bundle_padding(messages: &mut Vec<Option<Received>>) {
+    messages.retain(|m| match m {
+        Some(r) => !content::decode(&r.plaintext).map(|c| content::bundle::is_padding(&c)).unwrap_or(false),
+        None => true,
+    });
 }
 
 /// The outcome of a multi-homed poll through the store: the decrypted messages, which

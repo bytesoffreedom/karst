@@ -359,23 +359,84 @@ pub fn is_bundle_class(n: usize) -> bool {
     BUNDLE_CLASSES.contains(&n)
 }
 
-/// The required `request_nonce` for a bundle: bound to the recipient AND to every slot.
+/// One slot of a bundle: a ratchet envelope **already veiled for this relay** (PRIV-4).
 ///
-/// Binding the slots is what stops a capability proof minted for one bundle from being replayed
-/// with envelopes swapped in or out — the same discipline `blob_put_nonce` applies per chunk, and
-/// for the same reason: the cheap structural check runs before the capability HMAC, so a proof
-/// minted elsewhere is rejected at zero crypto cost.
-pub fn bundle_nonce(recipient: &[u8; 32], slots: &[RatchetMessage]) -> Vec<u8> {
+/// Veiled and nothing else, and the type is the enforcement. Two things fall out of that:
+///
+/// - **An opener cannot be expressed.** The veil key is a session's `drop_seed`, which a first
+///   contact does not have, so an `InitialSealed` envelope has no veiled form at all. That is the
+///   same exclusion the old `RatchetMessage` slot type bought — a bundle stays exactly
+///   `slot_count × envelope` — arrived at through the property that matters rather than by
+///   naming a variant.
+/// - **The veil cannot be silently dropped.** The first version of this format carried bare
+///   `RatchetMessage`s, and nothing would have failed: the recipient accepts both veiled and
+///   unveiled envelopes, so bundled mail would have decrypted perfectly while losing PRIV-4 on
+///   every message a bundle carried. Two relays holding the same envelope — the ordinary case on
+///   send-side failover — would have seen byte-identical ciphertext again.
+///
+/// The relay reconstructs [`SessionEnvelope::Veiled`] from these two fields when it deposits, so
+/// the whole receive side is unchanged.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct BundleSlot {
+    /// The veil's own nonce (`karst_crypto::veil`), NOT the request nonce.
+    pub veil_nonce: [u8; crate::veil::NONCE_LEN],
+    /// The veiled envelope bytes.
+    pub veiled: Vec<u8>,
+}
+
+impl BundleSlot {
+    /// The payload the relay deposits for this slot.
+    pub fn into_envelope(self) -> SessionEnvelope {
+        SessionEnvelope::Veiled { nonce: self.veil_nonce, inner: self.veiled }
+    }
+}
+
+/// Length of the random salt that opens a bundle's `request_nonce`.
+pub const BUNDLE_SALT_LEN: usize = 32;
+
+/// The `request_nonce` for a bundle: a fresh random salt, then a hash binding the recipient and
+/// every slot **under that salt**.
+///
+/// Binding the slots stops a capability proof minted for one bundle from being replayed with
+/// envelopes swapped in or out — the same discipline `blob_put_nonce` applies per chunk, and for
+/// the same reason: the cheap structural check runs before the capability HMAC, so a proof minted
+/// elsewhere is rejected at zero crypto cost.
+///
+/// **The salt is what makes a retransmit possible at all**, and it is not decoration. The relay's
+/// replay filter keys on the request nonce, so a nonce that were a pure function of the bundle's
+/// contents would make every retry of that bundle byte-identical — and rejected as a replay. The
+/// entries would stay queued, retry identically, and be rejected again: a livelock, on the exact
+/// path that exists to survive a lost response. The ordinary deposit path does not have this
+/// problem because `transmit` draws a random nonce per attempt; the salt gives a bundle the same
+/// freshness without giving up the binding.
+pub fn bundle_nonce(recipient: &[u8; 32], slots: &[BundleSlot], salt: &[u8; BUNDLE_SALT_LEN]) -> Vec<u8> {
     use sha2::Digest;
     let mut h = Sha256::new();
-    h.update(b"KARST-bundle-nonce-v1");
+    h.update(b"KARST-bundle-nonce-v2");
+    h.update(salt);
     h.update(recipient);
     h.update((slots.len() as u32).to_be_bytes());
     for s in slots {
-        h.update((s.ciphertext.len() as u32).to_be_bytes());
-        h.update(&s.ciphertext);
+        h.update(s.veil_nonce);
+        h.update((s.veiled.len() as u32).to_be_bytes());
+        h.update(&s.veiled);
     }
-    h.finalize().to_vec()
+    let mut out = salt.to_vec();
+    out.extend_from_slice(&h.finalize());
+    out
+}
+
+/// Whether `nonce` is a well-formed [`bundle_nonce`] for this recipient and these slots — the
+/// relay's side of the check, which reads the salt off the front rather than choosing it.
+pub fn bundle_nonce_binds(recipient: &[u8; 32], slots: &[BundleSlot], nonce: &[u8]) -> bool {
+    if nonce.len() != BUNDLE_SALT_LEN + 32 {
+        return false;
+    }
+    let mut salt = [0u8; BUNDLE_SALT_LEN];
+    salt.copy_from_slice(&nonce[..BUNDLE_SALT_LEN]);
+    // Not constant-time on purpose: both sides are public, and an attacker who wants a matching
+    // nonce can simply compute one — the check is structural, not a secret comparison.
+    bundle_nonce(recipient, slots, &salt) == nonce
 }
 
 /// §15 bundled deposit: several ratchet envelopes to ONE recipient, admitted once.
@@ -385,23 +446,35 @@ pub fn bundle_nonce(recipient: &[u8; 32], slots: &[RatchetMessage]) -> Vec<u8> {
 /// speedup and it hands the relay a link between those mailboxes for free, in the request
 /// structure itself.
 ///
-/// Slots are `RatchetMessage`, not `Payload`: an opener is a larger fixed class of its own, so a
-/// bundle mixing one in would have two possible sizes and "a bundle is slot_count x envelope"
-/// would stop being true. The type enforces it rather than a comment asking implementers to
-/// remember. A first contact deposits alone, which costs nothing — a first contact is one message
-/// by definition.
+/// Slots are [`BundleSlot`] — veiled ratchet envelopes — not `Payload`: an opener is a larger
+/// fixed class of its own, so a bundle mixing one in would have two possible sizes and "a bundle
+/// is slot_count x envelope" would stop being true. The type enforces it rather than a comment
+/// asking implementers to remember. A first contact deposits alone, which costs nothing — a first
+/// contact is one message by definition.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BundleRequest {
     pub client_addr: Vec<u8>,
     pub carrier_id: Vec<u8>,
     pub cookie: Option<Cookie>,
-    /// Must equal `bundle_nonce(&recipient, &slots)`.
+    /// Must satisfy [`bundle_nonce_binds`] for `recipient` and `slots`.
     pub request_nonce: Vec<u8>,
     pub capability_proof: CapabilityProof,
     pub recipient: [u8; 32],
     /// Exactly one of [`BUNDLE_CLASSES`] entries. Unused slots carry padding envelopes addressed
     /// to the same recipient — see the design note for why those are not the existing cover loop.
-    pub slots: Vec<RatchetMessage>,
+    pub slots: Vec<BundleSlot>,
+}
+
+/// The result of offering a bundle to a transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleOutcome {
+    /// The relay answered per slot.
+    Stored(Vec<SlotOutcome>),
+    NeedCookie(Cookie),
+    Rejected(String),
+    /// This transport cannot bundle. NOT an error and NOT a silent fallback — see
+    /// [`Transport::bundle`].
+    Unsupported,
 }
 
 /// What one slot of a bundle did. Carried per slot inside the encrypted response: an on-path
@@ -913,6 +986,22 @@ pub trait Transport {
         self.fetch(req, now)
     }
 
+    /// Deposit several envelopes to one recipient in one admitted request
+    /// (`docs/design/bundling.md`).
+    ///
+    /// The default REFUSES rather than falling back to a loop of `send`s. A silent fallback would
+    /// be the worst of both: the caller believes it sent a bundle, so it stops padding and stops
+    /// batching, while the wire shows exactly the per-message deposits bundling exists to hide.
+    /// A transport that cannot bundle says so, and the caller decides.
+    /// `scope` is the same per-request isolation scope `send_isolated` carries, and it is a
+    /// PARAMETER rather than an omission: a bundle that rode the default circuit while every
+    /// ordinary deposit rode a per-handle one would undo path isolation exactly for the requests
+    /// that carry the most messages — and `docs/design/bundling.md` leans on that isolation when
+    /// it argues against cross-recipient bundles.
+    fn bundle(&self, _req: &BundleRequest, _now: u64, _scope: Option<&str>) -> BundleOutcome {
+        BundleOutcome::Unsupported
+    }
+
     /// Delete leased (fetched-with-`ack`) messages after durable persistence. The default
     /// is unsupported: a transport that cannot ACK simply never sets `FetchRequest::ack`,
     /// so it stays on legacy delete-on-fetch and this is never called.
@@ -954,17 +1043,11 @@ pub trait Transport {
 mod bundle_rules {
     use super::*;
 
-    fn msg(n: u8) -> RatchetMessage {
-        RatchetMessage {
-            header: crate::ratchet::Header {
-                dh: [n; 32],
-                pn: 0,
-                n: u32::from(n),
-                salt: [n; 16],
-            },
-            ciphertext: vec![n; 32],
-        }
+    fn msg(n: u8) -> BundleSlot {
+        BundleSlot { veil_nonce: [n; crate::veil::NONCE_LEN], veiled: vec![n; 32] }
     }
+
+    const SALT: [u8; BUNDLE_SALT_LEN] = [3u8; BUNDLE_SALT_LEN];
 
     /// Only the ladder's rungs are legal. A bundle of exactly what the sender happened to write
     /// IS the count of what they happened to write, which is the thing padding removes.
@@ -983,14 +1066,14 @@ mod bundle_rules {
     #[test]
     fn the_nonce_changes_when_any_slot_changes() {
         let r = [9u8; 32];
-        let base = bundle_nonce(&r, &[msg(1), msg(2)]);
+        let base = bundle_nonce(&r, &[msg(1), msg(2)], &SALT);
 
-        assert_ne!(base, bundle_nonce(&r, &[msg(1), msg(3)]), "a swapped slot kept the nonce");
-        assert_ne!(base, bundle_nonce(&r, &[msg(2), msg(1)]), "reordering kept the nonce");
-        assert_ne!(base, bundle_nonce(&r, &[msg(1)]), "a dropped slot kept the nonce");
+        assert_ne!(base, bundle_nonce(&r, &[msg(1), msg(3)], &SALT), "a swapped slot kept the nonce");
+        assert_ne!(base, bundle_nonce(&r, &[msg(2), msg(1)], &SALT), "reordering kept the nonce");
+        assert_ne!(base, bundle_nonce(&r, &[msg(1)], &SALT), "a dropped slot kept the nonce");
         assert_ne!(
             base,
-            bundle_nonce(&r, &[msg(1), msg(2), msg(3)]),
+            bundle_nonce(&r, &[msg(1), msg(2), msg(3)], &SALT),
             "an added slot kept the nonce"
         );
     }
@@ -999,25 +1082,56 @@ mod bundle_rules {
     #[test]
     fn the_nonce_changes_with_the_recipient() {
         let slots = [msg(1), msg(2)];
-        assert_ne!(bundle_nonce(&[1u8; 32], &slots), bundle_nonce(&[2u8; 32], &slots));
+        assert_ne!(
+            bundle_nonce(&[1u8; 32], &slots, &SALT),
+            bundle_nonce(&[2u8; 32], &slots, &SALT)
+        );
     }
 
-    /// Length is part of the binding, not just content: two slots whose ciphertexts concatenate
-    /// to the same bytes must not collide. Without the per-slot length prefix they would.
+    /// Length is part of the binding, not just content: two slots whose bodies concatenate to the
+    /// same bytes must not collide. Without the per-field length prefix they would.
     #[test]
     fn slots_cannot_be_re_split_into_the_same_nonce() {
         let r = [5u8; 32];
-        let mut a = msg(1);
-        a.ciphertext = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let mut b = msg(1);
-        b.ciphertext = vec![0xAA, 0xBB];
-        let mut c = msg(1);
-        c.ciphertext = vec![0xCC, 0xDD];
+        let nz = [1u8; crate::veil::NONCE_LEN];
+        let a = BundleSlot { veil_nonce: nz, veiled: vec![0xAA, 0xBB, 0xCC, 0xDD] };
+        let b = BundleSlot { veil_nonce: nz, veiled: vec![0xAA, 0xBB] };
+        let c = BundleSlot { veil_nonce: nz, veiled: vec![0xCC, 0xDD] };
         assert_ne!(
-            bundle_nonce(&r, &[a]),
-            bundle_nonce(&r, &[b, c]),
+            bundle_nonce(&r, &[a], &SALT),
+            bundle_nonce(&r, &[b, c], &SALT),
             "a re-split of the same bytes produced the same nonce"
         );
+    }
+
+    /// The salt is on the wire and the binding is checked against it, so the relay never has to
+    /// guess which salt a sender used.
+    #[test]
+    fn the_relay_verifies_the_binding_from_the_nonce_alone() {
+        let r = [7u8; 32];
+        let slots = [msg(1), msg(2)];
+        let nonce = bundle_nonce(&r, &slots, &SALT);
+        assert!(bundle_nonce_binds(&r, &slots, &nonce));
+        assert!(!bundle_nonce_binds(&r, &[msg(1), msg(3)], &nonce), "a swapped slot still bound");
+        assert!(!bundle_nonce_binds(&[8u8; 32], &slots, &nonce), "another recipient still bound");
+        assert!(!bundle_nonce_binds(&r, &slots, &nonce[..nonce.len() - 1]), "a short nonce bound");
+        let mut forged = nonce.clone();
+        forged[0] ^= 1; // a different salt, same tail
+        assert!(!bundle_nonce_binds(&r, &slots, &forged), "the tail was not checked against the salt");
+    }
+
+    /// TWO bundles of the SAME slots must get DIFFERENT nonces, or a retransmit after a lost
+    /// response is a verbatim replay — rejected by the relay's replay filter, forever, on the one
+    /// path that exists to survive a lost response.
+    #[test]
+    fn the_same_bundle_twice_is_two_different_requests() {
+        let r = [4u8; 32];
+        let slots = [msg(1), msg(2), msg(3), msg(4)];
+        let first = bundle_nonce(&r, &slots, &[1u8; BUNDLE_SALT_LEN]);
+        let second = bundle_nonce(&r, &slots, &[2u8; BUNDLE_SALT_LEN]);
+        assert_ne!(first, second, "an identical retransmit produced an identical nonce");
+        assert!(bundle_nonce_binds(&r, &slots, &first));
+        assert!(bundle_nonce_binds(&r, &slots, &second), "the second attempt lost the binding");
     }
 
     /// The ceiling matches the ladder's top rung, so a bundle that passes the class check can

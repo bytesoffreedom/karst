@@ -423,11 +423,12 @@ pub(crate) fn serve_channel(
                     let outcomes: Vec<node::protocol::SlotOutcome> = breq
                         .slots
                         .iter()
-                        .map(|env| {
+                        .map(|slot| {
+                            // A slot IS a veiled envelope (PRIV-4) — the relay reassembles the
+                            // payload the receive side already knows how to open, and never sees
+                            // an unveiled one.
                             match a.deposit(
-                                &node::protocol::Payload::Session(
-                                    node::protocol::SessionEnvelope::Ratchet(env.clone()),
-                                ),
+                                &node::protocol::Payload::Session(slot.clone().into_envelope()),
                                 now,
                             ) {
                                 Response::Accepted => node::protocol::SlotOutcome::Stored,

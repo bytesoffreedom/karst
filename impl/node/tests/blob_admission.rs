@@ -472,10 +472,11 @@ fn an_unknown_blob_and_a_bad_proof_are_refused_identically() {
 // Bundled deposits (#281/#293): admitted once, charged per slot.
 // ---------------------------------------------------------------------------------------------
 
-fn ratchet(n: u8) -> node::ratchet::RatchetMessage {
-    node::ratchet::RatchetMessage {
-        header: node::ratchet::Header { dh: [n; 32], pn: 0, n: u32::from(n), salt: [n; 16] },
-        ciphertext: vec![n; 64],
+/// A slot: a veiled envelope, which is the only thing a bundle can carry.
+fn slot(n: u8) -> node::protocol::BundleSlot {
+    node::protocol::BundleSlot {
+        veil_nonce: [n; node::veil::NONCE_LEN],
+        veiled: vec![n; 64],
     }
 }
 
@@ -484,9 +485,9 @@ fn bundle(
     cookie: admission::cookie::Cookie,
     client_addr: &[u8],
     recipient: [u8; 32],
-    slots: Vec<node::ratchet::RatchetMessage>,
+    slots: Vec<node::protocol::BundleSlot>,
 ) -> node::protocol::BundleRequest {
-    let nonce = node::protocol::bundle_nonce(&recipient, &slots);
+    let nonce = node::protocol::bundle_nonce(&recipient, &slots, &[0x5A; node::protocol::BUNDLE_SALT_LEN]);
     let proof = cap.prove(&nonce, 0);
     node::protocol::BundleRequest {
         client_addr: client_addr.to_vec(),
@@ -507,7 +508,7 @@ fn a_bundle_on_a_class_is_admitted() {
     let client_addr = addr32(0xB1);
     let cap = issued_cap(&mut relay, [0xB1; 32], generous_quota());
     let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
-    let req = bundle(&cap, cookie, &client_addr, [0xC1; 32], vec![ratchet(1); 4]);
+    let req = bundle(&cap, cookie, &client_addr, [0xC1; 32], vec![slot(1); 4]);
     assert!(relay.admit_bundle(&req, NOW).is_ok(), "a four-slot bundle must be admitted");
 }
 
@@ -521,7 +522,7 @@ fn a_bundle_off_the_ladder_is_refused() {
     let cap = issued_cap(&mut relay, [0xB2; 32], generous_quota());
     for count in [2usize, 3, 5, 17] {
         let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
-        let req = bundle(&cap, cookie, &client_addr, [0xC2; 32], vec![ratchet(1); count]);
+        let req = bundle(&cap, cookie, &client_addr, [0xC2; 32], vec![slot(1); count]);
         assert!(
             matches!(relay.admit_bundle(&req, NOW), Err(Response::Rejected(_))),
             "{count} slots is not a class and must be refused"
@@ -537,8 +538,8 @@ fn a_bundle_proof_does_not_travel_to_a_different_set_of_slots() {
     let client_addr = addr32(0xB3);
     let cap = issued_cap(&mut relay, [0xB3; 32], generous_quota());
     let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
-    let mut req = bundle(&cap, cookie, &client_addr, [0xC3; 32], vec![ratchet(1); 4]);
-    req.slots[2] = ratchet(9); // the nonce no longer matches
+    let mut req = bundle(&cap, cookie, &client_addr, [0xC3; 32], vec![slot(1); 4]);
+    req.slots[2] = slot(9); // the nonce no longer matches
     assert!(
         matches!(relay.admit_bundle(&req, NOW), Err(Response::Rejected(_))),
         "a swapped slot was admitted under the old proof"
@@ -555,9 +556,57 @@ fn a_bundle_cannot_buy_more_messages_than_the_quota_allows() {
     let tight = Quota { max_requests: 3, max_bytes: 1 << 20, window_secs: 600 };
     let cap = issued_cap(&mut relay, [0xB4; 32], tight);
     let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
-    let req = bundle(&cap, cookie, &client_addr, [0xC4; 32], vec![ratchet(1); 4]);
+    let req = bundle(&cap, cookie, &client_addr, [0xC4; 32], vec![slot(1); 4]);
     assert!(
         matches!(relay.admit_bundle(&req, NOW), Err(Response::Rejected(_))),
         "four slots went through a quota with room for three"
+    );
+}
+
+/// **Why the bundle nonce carries a salt.** A retransmit exists because a response can be lost:
+/// the relay stored the bundle, the sender never heard, and the entries stay queued. If the nonce
+/// were a pure function of the bundle's contents, that retransmit would be byte-identical — and
+/// the replay filter would refuse it, forever, on the one path that exists to survive a lost
+/// response. This test states both halves: the verbatim repeat IS refused (so the hazard is real,
+/// not hypothetical), and a re-salted bundle of the SAME slots is admitted.
+#[test]
+fn an_identical_bundle_can_be_retransmitted_but_a_verbatim_replay_cannot() {
+    let dir = tmp("bundle-replay");
+    let mut relay = relay_with_blobs(&dir);
+    let client_addr = addr32(0xB7);
+    let cap = issued_cap(&mut relay, [0xB7; 32], generous_quota());
+    let recipient = [0xC7; 32];
+    let slots = vec![slot(1), slot(2), slot(3), slot(4)];
+
+    let attempt = |relay: &mut RelayNode, salt: [u8; node::protocol::BUNDLE_SALT_LEN]| {
+        let cookie = relay.issue_cookie_for_test(&client_addr, b"blob", NOW);
+        let nonce = node::protocol::bundle_nonce(&recipient, &slots, &salt);
+        node::protocol::BundleRequest {
+            client_addr: client_addr.to_vec(),
+            carrier_id: b"blob".to_vec(),
+            cookie: Some(cookie),
+            capability_proof: cap.prove(&nonce, 0),
+            request_nonce: nonce,
+            recipient,
+            slots: slots.clone(),
+        }
+    };
+
+    let first = attempt(&mut relay, [0x11; node::protocol::BUNDLE_SALT_LEN]);
+    assert!(relay.admit_bundle(&first, NOW).is_ok(), "the first attempt must be admitted");
+
+    // The hazard, demonstrated: the SAME request again is refused as a replay.
+    assert!(
+        matches!(relay.admit_bundle(&first, NOW), Err(Response::Rejected(_))),
+        "a verbatim repeat must be refused — this is exactly what a deterministic nonce would \
+         make every retransmit"
+    );
+
+    // The escape: same recipient, same slots, fresh salt.
+    let retry = attempt(&mut relay, [0x22; node::protocol::BUNDLE_SALT_LEN]);
+    assert!(
+        relay.admit_bundle(&retry, NOW).is_ok(),
+        "a re-salted retransmit of the same bundle must be admitted, or a lost response strands \
+         the messages forever"
     );
 }

@@ -37,3 +37,9 @@ POS2_GITIGNORE.md
 # construction rather than by remembering to stage explicit paths.
 *_gitignore*.md
 *_gitignore*/
+
+# Integration tests create their working directories under TMPDIR and do not remove them (#321).
+# On a machine whose /tmp is a tmpfs that fills the tmpfs and stops the machine dead, so the local
+# runs point TMPDIR here instead. Ignored rather than cleaned by hand: the leak is the bug, this is
+# only where it is survivable.
+/impl/.tmp-tests/

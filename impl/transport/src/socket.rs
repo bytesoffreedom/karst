@@ -697,6 +697,28 @@ impl Transport for SocketTransport {
         }
     }
 
+    /// A bundled deposit over the real transport.
+    ///
+    /// One request and no loop, which is the point — sending a bundle as several deposits would
+    /// put back exactly the per-message shape it exists to remove. It carries the SAME per-handle
+    /// isolation scope an ordinary deposit does, so a bundle does not become the one request that
+    /// rides the default circuit.
+    fn bundle(
+        &self,
+        req: &node::protocol::BundleRequest,
+        _now: u64,
+        scope: Option<&str>,
+    ) -> node::protocol::BundleOutcome {
+        use node::protocol::BundleOutcome;
+        match self.round_trip_scoped(&WireRequest::Bundle(req.clone()), scope) {
+            Ok(WireResponse::BundleStored(outcomes)) => BundleOutcome::Stored(outcomes),
+            Ok(WireResponse::NeedCookie(c)) => BundleOutcome::NeedCookie(c),
+            Ok(WireResponse::Rejected(s)) => BundleOutcome::Rejected(s),
+            Ok(_) => BundleOutcome::Rejected("protocol: unexpected response to Bundle".into()),
+            Err(e) => BundleOutcome::Rejected(format!("transport: {e}")),
+        }
+    }
+
     fn fetch_isolated(&self, req: &FetchRequest, _now: u64, scope: Option<&str>) -> FetchResponse {
         match self.round_trip_scoped(&WireRequest::Fetch(req.clone()), scope) {
             Ok(WireResponse::NeedCookie(c)) => FetchResponse::NeedCookie(c),

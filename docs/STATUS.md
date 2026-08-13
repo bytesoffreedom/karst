@@ -1741,12 +1741,28 @@ with no network of our own:
   over the real path, which is exactly why they work. Cost is honest: bandwidth and
   battery, always, forever.
 
-### Second: garlic bundling (I2P)
+### Second: garlic bundling (I2P) — BUILT
 
 I2P wraps several messages ("cloves") into one encrypted packet. For us: batch multiple
-deposits (and the fetch) into a single relay request. Fewer round trips, and — the real
-prize — **fewer distinguishable timing events for a correlator to line up**. It composes
-with cover traffic and needs nothing but our own wire format. I2P's other ideas
+deposits into a single relay request. Fewer round trips, and — the real prize — **fewer
+distinguishable timing events for a correlator to line up**. It composes with cover traffic
+and needed nothing but our own wire format.
+
+**This is now end to end** (#281, `docs/design/bundling.md`): a padded batch is sealed and
+deposited as ONE admitted request per slot class, the relay charges quota per slot and
+answers per slot, and the receive path drops the padding before any caller sees it. The
+in-band transfers (avatar, gallery, post image, post attachment) send through it, so a
+hundred-chunk transfer leaves as seven requests rather than a hundred deposits.
+
+Wiring it up found two things the format had wrong on paper, both of which would have
+passed every test: slots carried UNVEILED envelopes (silently undoing PRIV-4 for exactly
+the messages a bundle carries), and the request nonce was a pure function of the bundle —
+which would have made every retransmit a verbatim replay the relay refuses forever. Slots
+are veiled by type now, and the nonce carries a per-attempt salt.
+
+The remaining honest limit: a bundle and an ordinary deposit are different requests on the
+wire, so "this one was bundled" is itself a signal. Erasing it means making the bundle the
+only deposit shape there is. I2P's other ideas
 (unidirectional in/out tunnels breaking correlation symmetry; subjective peer profiling
 instead of a global consensus) are good but presuppose the network we are not building.
 

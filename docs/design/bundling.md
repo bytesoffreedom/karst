@@ -1,12 +1,12 @@
 # Bundled deposits: the envelope format
 
-Status: **partly implemented.** Done: the wire type, the nonce binding, the slot-count class
-check, the relay's admission with per-slot quota, the serve-loop handling, the padding
-content marker, and the client's class/split arithmetic.
+Status: **implemented end to end.** `client::send_session_bundle` seals a padded batch and
+puts it on the wire; `Peer::flush_outbox_bundled` groups the outbox and offers each class as
+one request; the relay admits it once and answers per slot; the receive path drops the
+padding before any caller sees it.
 
-Not done: the send path that actually seals a padded batch and puts it on the wire, and the
-receive path dropping padding before it reaches a chat. So the pieces exist and nothing
-calls them end to end yet — a relay accepts a correct bundle and no client builds one.
+Wiring it up changed two things in the format that were wrong on paper, both recorded below:
+slots carry VEILED envelopes, and the request nonce carries a salt.
 
 Gates the scheduled-send slice, the compression slice, and the wake-up slice — all three
 need to know what a bundle is before they can be built on one.
@@ -27,21 +27,44 @@ A bundle is a deposit that carries several envelopes **to one recipient**.
 
     BundleRequest {
         client_addr, carrier_id, cookie,     // same admission preamble as a deposit
-        request_nonce,                       // = bundle_nonce(recipient, slots)
+        request_nonce,                       // salt ‖ H(recipient, slots, salt)
         capability_proof,
         recipient: [u8; 32],                 // ONE recipient for the whole bundle
-        slots: Vec<RatchetEnvelope>,         // exactly SLOT_CLASS entries
+        slots: Vec<BundleSlot>,              // exactly SLOT_CLASS entries
     }
 
-Every slot holds an ordinary **ratchet** envelope, already padded to the one fixed class,
-so a bundle's size is exactly `slot_count × envelope`.
+    BundleSlot { veil_nonce, veiled }        // a ratchet envelope, veiled for THIS relay
 
-**Openers are not bundled.** `Payload` has two variants and `InitialSealed` is a larger
-fixed class of its own (`pad.rs`): a bundle mixing an opener with ratchet envelopes would
-have two possible sizes, and the size claim above would stop being true. A first contact
-deposits alone — which costs nothing in practice, because a first contact is one message
-by definition. The slot type says so rather than a comment asking implementers to
-remember.
+Every slot holds an ordinary ratchet envelope, already padded to the one fixed class, so a
+bundle's size is exactly `slot_count × envelope`.
+
+### Slots are veiled, and the first version of this format got it wrong
+
+The slot type was `RatchetEnvelope` — the bare envelope — and **nothing would have failed.**
+The recipient accepts veiled and unveiled envelopes alike, so bundled mail would have
+decrypted perfectly. What it would have lost is PRIV-4: the veil re-randomises an envelope
+per relay, and it is applied at deposit time, so an envelope that never becomes a slot's
+veiled form is the same bytes at every relay it reaches. Send-side failover deposits the
+same queued envelope at a second relay as a matter of course, so this was not an edge case —
+it was most of what the veil exists for, silently switched off for exactly the messages a
+bundle carries.
+
+So a slot is a veiled envelope and nothing else. Two properties fall out of the type rather
+than out of a rule someone has to remember:
+
+- **An opener cannot be expressed.** The veil key is the session's `drop_seed`, which a
+  first contact does not have; an `InitialSealed` envelope has no veiled form at all. That
+  is the same exclusion the old slot type bought — an opener is a larger fixed class of its
+  own, and a bundle mixing one in would have two possible sizes — arrived at through the
+  property that matters. A first contact deposits alone, which costs nothing: a first
+  contact is one message by definition.
+- **The veil cannot be dropped by a later caller.** There is no way to put a bare envelope
+  in a slot.
+
+The veil is applied at flush time, per relay, never at queue time: a queued envelope
+flushed through a secondary relay must be re-veiled for THAT relay, and freezing the
+primary's veil into the outbox would hand two relays identical bytes again by another
+route.
 
 ### The slot count is a class, not a number
 
@@ -103,10 +126,22 @@ own threat argument, not a knob quietly added here.
 sixteen messages for the price of one admission. The point of bundling is to spend fewer
 round trips and reveal less shape — not to send more than the capability allows.
 
-**The nonce binds the whole bundle.** `request_nonce = bundle_nonce(recipient, slots)`,
-so a capability proof minted for one bundle cannot be replayed with slots swapped in or
-out. Same discipline as `blob_put_nonce`: the cheap structural check runs before the
-capability HMAC, so a proof minted elsewhere is rejected at zero crypto cost.
+**The nonce binds the whole bundle — under a fresh salt.**
+`request_nonce = salt ‖ H(recipient, slots, salt)`, with the salt drawn per attempt and the
+relay verifying the tail rather than recomputing a nonce of its own. The binding stops a
+capability proof minted for one bundle being replayed with slots swapped in or out — same
+discipline as `blob_put_nonce`, and the cheap structural check runs before the capability
+HMAC, so a proof minted elsewhere costs no crypto to reject.
+
+The salt is the half that is easy to leave out, and leaving it out is a livelock. The
+relay's replay filter keys on the request nonce. A nonce that were a pure function of the
+bundle's contents would make every retransmit of that bundle byte-identical — and a
+retransmit exists precisely because the response can be lost, with the bundle already
+stored. Those entries would retry identically and be refused as replays, forever, on the
+one path that exists to survive a lost response. The ordinary deposit path does not have
+this problem because it draws a random nonce per attempt; the salt gives a bundle the same
+freshness without giving up the binding. `an_identical_bundle_can_be_retransmitted_but_a_
+verbatim_replay_cannot` states both halves against a real relay.
 
 **Admission is bundle-level; storage outcome is per slot.** Cookie, capability and the
 size gate apply to the bundle as a unit. What each slot did — stored, duplicate, mailbox
@@ -117,10 +152,29 @@ cannot read it and the sender needs it to know what to retry.
 fails, the response says so; the sender re-bundles what failed rather than assuming
 delivery. The failure that matters here is the quiet one, not the loud one.
 
-**Padding slots are not free.** A padding envelope costs the sender's quota exactly like a
-real message, because to the relay it IS one. Any accounting that exempts it re-introduces
-the distinguisher the padding exists to remove — and it also costs the recipient a fetch,
-which is the half of the bill that is easy to forget because someone else pays it.
+**Padding slots are not free**, and the bill is longer than storage. A padding envelope
+costs the sender's quota exactly like a real message, because to the relay it IS one — any
+accounting that exempts it re-introduces the distinguisher the padding exists to remove. It
+also costs:
+
+- **a ratchet position.** Filler is sealed through the ratchet like anything else, so a
+  two-message send padded to four consumes the recipient's skipped-key window (`MAX_SKIP`,
+  `MAX_STORE`) four times as fast as two deposits would. At the top rung, sixteen.
+- **an outbox slot**, against the same cap the all-or-nothing batch reservation checks. A
+  batch is refused whole if its slots — padding included — do not fit.
+- **a fetch, and often more than one.** Twenty slots do not fit one fixed-size fetch page,
+  so a top-rung bundle is drained by the recipient over several polls. That is ordinary
+  backlog behaviour, not a fault, but it means a bundle's latency is not one round trip.
+
+**Padding is never recorded as a pending send.** It is sealed and queued exactly like a real
+message — the relay must not be able to tell them apart — but it does not enter the loss
+ledger, or an evicted/expired filler would surface as a "message lost" report for a message
+the user never wrote.
+
+**The receive path drops padding centrally.** There are exactly two places a decrypted batch
+enters the client crate, and both strip it there rather than leaving a `Padding` arm to
+every dispatch site. The desktop's decode loop and the CLI's both have catch-alls that would
+have handed filler to the file reassembler.
 
 ## What this does not do
 
@@ -132,3 +186,14 @@ supposed to smear.
 
 It does not reduce what a relay learns about **who** you talk to. One bundle names one
 recipient, exactly as one deposit does.
+
+**It does not hide that a deposit WAS bundled.** A bundle and an ordinary deposit are
+different requests on the wire, so while both shapes exist, "this one was bundled" is itself
+a signal — and it correlates with the sender having several messages to send. The ladder
+starts at 1, so a lone message could in principle go out as a one-slot bundle and erase the
+difference; it deliberately does not, because a one-slot bundle would ADD a distinguisher
+(a single message that chose to look bundled) rather than remove one. Erasing it properly
+means making the bundle the only deposit shape there is — the same argument
+`splitting-the-edge.md` reaches about forwarding: either everything takes the path, or the
+choice leaks the choice. That is a later slice, and it is named here rather than left to be
+discovered.

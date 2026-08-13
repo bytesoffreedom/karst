@@ -361,19 +361,6 @@ pub enum Content {
     /// request (who-views-whom), the honest cost of pull-on-demand. No fields — the requester is
     /// authenticated by the session. APPENDED LAST (postcard tag order).
     PostsRequest,
-    /// A padding slot in a bundled deposit (`docs/design/bundling.md`).
-    ///
-    /// This is NOT the cover loop, and conflating the two is the mistake the design note calls
-    /// out: a loop deposits to a box only the sender can compute, and that self-addressing is what
-    /// makes it a drop detector. Padding is addressed to the RECIPIENT — it is a real message
-    /// their client receives, stores nothing for, and discards.
-    ///
-    /// The marker is inside the seal and never on the wire. To the relay a padding envelope and a
-    /// real one are the same bytes in the same size class, which is the property that makes a
-    /// bundle's slot count say nothing about how many messages it carries. The receive path must
-    /// drop it before anything user-facing, or a padded bundle shows up as blank messages in a
-    /// chat — see `is_padding`.
-    Padding,
     /// A profile PHOTO-GALLERY transfer header (parallel to `AvatarManifest`): the assembled bytes are
     /// a length-prefixed pack of the sender's ≤ `MAX_GALLERY_PHOTOS` gallery images (`pack_gallery`),
     /// applied ATOMICALLY to `peer_profiles.dat` — replacing the peer's whole gallery, an empty pack
@@ -389,6 +376,24 @@ pub enum Content {
     /// offline past the blob TTL (7 days) misses the update (their previous gallery stays). `hash` is
     /// verified on completion; the relay never sees `key`. APPENDED LAST (postcard tag order).
     GalleryRef { blob_id: [u8; 32], key: [u8; 32], hash: [u8; 32], size: u64, chunks: u32 },
+    /// A padding slot in a bundled deposit (`docs/design/bundling.md`).
+    ///
+    /// This is NOT the cover loop, and conflating the two is the mistake the design note calls
+    /// out: a loop deposits to a box only the sender can compute, and that self-addressing is what
+    /// makes it a drop detector. Padding is addressed to the RECIPIENT — it is a real message
+    /// their client receives, stores nothing for, and discards.
+    ///
+    /// The marker is inside the seal and never on the wire. To the relay a padding envelope and a
+    /// real one are the same bytes in the same size class, which is the property that makes a
+    /// bundle's slot count say nothing about how many messages it carries. The receive path must
+    /// drop it before anything user-facing, or a padded bundle shows up as blank messages in a
+    /// chat — see `is_padding`.
+    ///
+    /// APPENDED LAST, and it was not the first time: this variant was originally declared in the
+    /// MIDDLE of the enum, which shifted `GalleryManifest` and `GalleryRef` by one tag each and
+    /// changed what those two decode to. The two variant-number tests caught it. Postcard numbers
+    /// variants by declaration order, so a new one goes at the end — every time.
+    Padding,
 }
 
 /// Serialise the envelope into plaintext bytes.
@@ -1026,6 +1031,22 @@ mod tests {
             Assembled::Gallery { bytes } => assert!(unpack_gallery(&bytes).unwrap().1.is_empty()),
             other => panic!("expected empty Gallery, got {other:?}"),
         }
+    }
+
+    /// Padding is the LAST variant, and it has its own pin now.
+    ///
+    /// It was first declared in the middle of the enum, which silently renumbered
+    /// `GalleryManifest` and `GalleryRef` — postcard tags by declaration order, so a variant
+    /// inserted anywhere but the end changes what every later one decodes to. Their two pins
+    /// caught it; this one is so the same mistake made against Padding itself is caught too.
+    #[test]
+    fn padding_is_the_last_variant_29() {
+        let p = Content::Padding;
+        assert_eq!(decode(&encode(&p)).unwrap(), p);
+        assert_eq!(encode(&p)[0], 29, "Padding is variant 29 (appended after GalleryRef=28)");
+        // A padding slot is not a transfer of any kind — the reassembler must ignore it, exactly
+        // as it ignores a blob ref.
+        assert_eq!(Reassembler::new().offer(p, 0).unwrap(), None);
     }
 
     #[test]

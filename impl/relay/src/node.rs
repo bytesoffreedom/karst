@@ -82,7 +82,7 @@ const XEDDSA_SIG_LEN: usize = 64;
 /// sweep — so a key only occupies a table slot for mail that is genuinely UNDELIVERED, not for
 /// every key a conversation has ever used.
 ///
-/// Honest residual (same shape as `BundleSlot`'s CRYPTO-18 note): once the table is completely
+/// Honest residual (same shape as `PublishedBundle`'s CRYPTO-18 note): once the table is completely
 /// full, first-contact delivery to a BRAND-NEW recipient is refused until TTL reclaims a slot —
 /// this cap cannot distinguish a hostile flood from a legitimate surge of new correspondents. An
 /// already-known recipient (already a key in the table) is never affected.
@@ -191,7 +191,7 @@ fn random_key() -> [u8; 32] {
 /// user out of publishing permanently — the store only emptied on relay restart (CRYPTO-18).
 /// A live client republishes on every launch, so a TTL costs nothing real and turns "forever"
 /// into "as long as somebody is actually using it".
-struct BundleSlot {
+struct PublishedBundle {
     bundle: PreKeyBundle,
     refreshed_at: u64,
 }
@@ -539,7 +539,7 @@ pub struct RelayNode {
     /// §12 discovery: published prekey bundles by the owner's IK. Public material; writing is
     /// gated by an ownership proof, reading is open. Bounded by `MAX_BUNDLES` (refusal when full,
     /// never a silent drop).
-    bundles: HashMap<[u8; 32], BundleSlot>,
+    bundles: HashMap<[u8; 32], PublishedBundle>,
     /// One-time prekey batches per IK; a fetch pops one (see `PublishRequest::opks`).
     opk_batches: HashMap<[u8; 32], VecDeque<node::pqxdh::SignedOpk>>,
     /// Rotating start offset for `node_list`, so advertisement is fair rather than always
@@ -1479,13 +1479,16 @@ impl RelayNode {
         if !node::protocol::is_bundle_class(req.slots.len()) {
             return Err(Response::Rejected("bundle slot count is not a class".into()));
         }
-        if req.request_nonce != node::protocol::bundle_nonce(&req.recipient, &req.slots) {
+        // The salt rides in the nonce, so the relay VERIFIES the binding rather than recomputing a
+        // nonce of its own — which is what lets an identical retransmit be a fresh request instead
+        // of a replay the filter kills forever. See `bundle_nonce`.
+        if !node::protocol::bundle_nonce_binds(&req.recipient, &req.slots, &req.request_nonce) {
             return Err(Response::Rejected("bad bundle nonce".into()));
         }
 
         // Admit once, on the whole bundle's size — the stage-0 gate is about what arrived.
         let raw_len: usize =
-            req.slots.iter().map(|s| s.ciphertext.len()).sum::<usize>() + 128;
+            req.slots.iter().map(|s| s.veiled.len() + s.veil_nonce.len()).sum::<usize>() + 128;
         let admission_req = Request {
             raw_len,
             max_raw_len: admission::params::MAX_PACKET_SIZE * node::protocol::MAX_BUNDLE_SLOTS,
@@ -1760,7 +1763,7 @@ impl RelayNode {
                 other => return PublishResponse::Rejected(format!("{other:?}")),
             }
         }
-        self.bundles.insert(ik, BundleSlot { bundle: req.bundle.clone(), refreshed_at: now });
+        self.bundles.insert(ik, PublishedBundle { bundle: req.bundle.clone(), refreshed_at: now });
         // NOTE: publishing a bundle does NOT make you findable. Discovery is a separate, explicit
         // opt-in (`PublishDiscovery`) so that merely being reachable never leaks fact-of-partici-
         // pation into a lookup-able directory. See `handle_publish_discovery`.

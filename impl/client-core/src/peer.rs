@@ -1379,6 +1379,219 @@ impl<T: Transport> Peer<T> {
         delivered
     }
 
+    /// As [`Peer::flush_outbox`], but delivering what it can as BUNDLES: several queued envelopes
+    /// to one recipient in ONE admitted request (`docs/design/bundling.md`).
+    ///
+    /// Grouping is by `(peer_ik, drop_seed, peer_mailbox_pub)` — the routing snapshot, not the
+    /// live session — because those are exactly the entries that share a deposit address, and
+    /// because a convergence swap must not merge two sessions' mail into one bundle. Order within
+    /// a group is preserved, so a manifest still precedes its own chunks.
+    ///
+    /// **Only exact classes bundle, and never a class of one.** `BUNDLE_CLASSES` starts at 1, but
+    /// a one-slot bundle and an ordinary deposit are two different requests on the wire, so
+    /// bundling a lone message would ADD a distinguisher instead of removing one. A group is
+    /// carved greedily from the largest rung that fits and is at least four; whatever is left goes
+    /// out as ordinary deposits. A caller that pads its batch to a class (see
+    /// `client::send_session_bundle`) therefore gets exactly the bundles it paid for; a caller
+    /// that does not gets the honest mixture rather than a silently mis-shaped bundle.
+    ///
+    /// A transport that cannot bundle (`BundleOutcome::Unsupported`) falls back to ordinary
+    /// deposits HERE, at the flush, where nothing has been shaped yet — never inside the transport,
+    /// which would let a caller believe it had bundled.
+    pub fn flush_outbox_bundled(&mut self, now: u64) -> Vec<u64> {
+        // (peer, drop_seed, peer_mailbox) — the routing snapshot that decides which entries share
+        // a deposit address, and therefore which may share a bundle.
+        type GroupKey = ([u8; 32], [u8; 32], [u8; 32]);
+        let mut delivered = Vec::new();
+        let mut groups: Vec<(GroupKey, Vec<OutboxEntry>)> = Vec::new();
+        for entry in std::mem::take(&mut self.outbox) {
+            if now.saturating_sub(entry.queued_at) > OUTBOX_TTL_SECS {
+                continue; // expired: same rule as `flush_outbox`
+            }
+            // An opener has no veiled form (no session on the recipient's side yet), so it can
+            // never be a slot — it is its own group of one and goes out as a deposit.
+            let key = (entry.peer_ik, entry.drop_seed, entry.peer_mailbox_pub);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => v.push(entry),
+                None => groups.push((key, vec![entry])),
+            }
+        }
+        for ((peer_ik, drop_seed, peer_mailbox_pub), entries) in groups {
+            let routing = Some((drop_seed, peer_mailbox_pub));
+            let mut rest: &[OutboxEntry] = &entries;
+            while !rest.is_empty() {
+                // An OPENER cannot be a slot: the veil key is the recipient's session, which a
+                // first contact does not have yet, so there is no veiled form of it. It is
+                // deposited on its own and the run behind it can still bundle — a first-contact
+                // batch is one opener followed by ordinary envelopes, and making the opener
+                // disqualify the whole group would leave the common bulk case unbundled.
+                if !matches!(rest[0].envelope, SessionEnvelope::Ratchet(_)) {
+                    if !self.deposit_one(&rest[0], routing, now, &mut delivered) {
+                        self.requeue_rest(rest);
+                        break;
+                    }
+                    rest = &rest[1..];
+                    continue;
+                }
+                let run = rest.iter().take_while(|e| matches!(e.envelope, SessionEnvelope::Ratchet(_))).count();
+                // The largest rung that fits the run. Never a rung of ONE: while bundles and
+                // ordinary deposits are two shapes on the wire, a one-slot bundle would be a lone
+                // message that chose to look bundled — a distinguisher added, not removed.
+                let take = node::protocol::BUNDLE_CLASSES.iter().rev().copied().find(|&c| c > 1 && c <= run);
+                let Some(c) = take else {
+                    let stopped = rest[..run]
+                        .iter()
+                        .position(|e| !self.deposit_one(e, routing, now, &mut delivered));
+                    match stopped {
+                        Some(i) => {
+                            self.requeue_rest(&rest[i..]);
+                            break;
+                        }
+                        None => {
+                            rest = &rest[run..];
+                            continue;
+                        }
+                    }
+                };
+                let (chunk, tail) = rest.split_at(c);
+                let stopped = match self.transmit_bundle(&peer_ik, chunk, routing, now) {
+                    // Per-slot outcomes map to ids BY POSITION: only a slot the relay actually
+                    // stored is removed. This is where "a partially stored bundle must not be
+                    // reported as stored" is enforced rather than assumed.
+                    Some(outcomes) => {
+                        let first_fail = chunk
+                            .iter()
+                            .zip(&outcomes)
+                            .position(|(_, o)| matches!(o, node::protocol::SlotOutcome::NotStored(_)));
+                        for entry in &chunk[..first_fail.unwrap_or(chunk.len())] {
+                            delivered.push(entry.id);
+                        }
+                        first_fail
+                    }
+                    // The whole bundle failed (refused, unreachable, or the transport does not
+                    // bundle at all): deposit the chunk one by one rather than dropping it.
+                    None => chunk
+                        .iter()
+                        .position(|e| !self.deposit_one(e, routing, now, &mut delivered)),
+                };
+                // **A failure stops the group, and everything from it onward goes back queued.**
+                // Re-queuing only the failed entry was the first version and it is wrong in a way
+                // no per-slot assertion catches: if the relay declines slot 0 of a bulk transfer
+                // and stores 1..15, the manifest retransmits on a later flush and arrives AFTER
+                // its own chunks — and `content::Reassembler` answers a chunk with no manifest
+                // with "chunk without a manifest" and drops it. The whole transfer would vanish,
+                // quietly, with every individual slot correctly accounted for. Delivering a
+                // PREFIX and retrying the SUFFIX keeps order by construction.
+                if let Some(i) = stopped {
+                    self.requeue_rest(&rest[i..]);
+                    break;
+                }
+                rest = tail;
+            }
+        }
+        delivered
+    }
+
+    /// Deposit ONE queued entry the ordinary way. `true` = the relay took it (recorded in
+    /// `delivered`); `false` = it did not, and the caller decides what happens to this entry and
+    /// the ones behind it — see the ordering rule in [`Peer::flush_outbox_bundled`].
+    fn deposit_one(
+        &mut self,
+        entry: &OutboxEntry,
+        routing: Option<([u8; 32], [u8; 32])>,
+        now: u64,
+        delivered: &mut Vec<u64>,
+    ) -> bool {
+        if let Response::Accepted =
+            self.transmit_envelope_routed(&entry.peer_ik, entry.envelope.clone(), routing, now)
+        {
+            delivered.push(entry.id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Put a group's undelivered tail back on the queue, in order — the exact same ciphertext
+    /// next flush, never a re-encrypt.
+    fn requeue_rest(&mut self, rest: &[OutboxEntry]) {
+        for entry in rest {
+            self.outbox.push(entry.clone());
+        }
+    }
+
+    /// Build and offer ONE bundle from `chunk` (all sharing `routing`). `None` = nothing was
+    /// stored and the caller must fall back; `Some(outcomes)` is one verdict per slot, in slot
+    /// order.
+    ///
+    /// A relay that answers the cookie challenge TWICE gets `None` and the chunk is deposited
+    /// message by message. Safe, and worth naming because it is invisible from outside: a relay
+    /// that always challenges never bundles, and nothing reports that — the mail simply arrives
+    /// the old way.
+    fn transmit_bundle(
+        &mut self,
+        peer_ik: &[u8; 32],
+        chunk: &[OutboxEntry],
+        routing: Option<([u8; 32], [u8; 32])>,
+        now: u64,
+    ) -> Option<Vec<node::protocol::SlotOutcome>> {
+        // Route on the first entry: every entry in the chunk shares `peer_ik` and the routing
+        // snapshot, so they all resolve to the same deposit address and the same handle.
+        let (recipient, handle) = self.route_for(peer_ik, &chunk[0].envelope, routing, now).ok()?;
+        // The veil is applied HERE, per relay, not at queue time — the key is the session's
+        // `drop_seed` but the nonce covers `relay_id`, so an entry flushed through a secondary
+        // relay on failover must be re-veiled for THAT relay. Veiling at queue time would freeze
+        // the primary's veil into the outbox and hand two relays identical bytes again.
+        let mut slots = Vec::with_capacity(chunk.len());
+        for entry in chunk {
+            let veiled = self.veiled_for_this_relay(peer_ik, entry.envelope.clone(), routing).ok()?;
+            match veiled {
+                SessionEnvelope::Veiled { nonce, inner } => {
+                    slots.push(node::protocol::BundleSlot { veil_nonce: nonce, veiled: inner })
+                }
+                // Unreachable: `veiled_for_this_relay` returns `Veiled` for every `Ratchet`, and
+                // the caller only ever hands us `Ratchet`s. Falling back rather than panicking —
+                // an un-veilable envelope must go out as a deposit, not as a bare slot.
+                _ => return None,
+            }
+        }
+        // A FRESH salt per attempt. Without it a retransmit of the same bundle is byte-identical
+        // and the relay's replay filter rejects it forever — see `bundle_nonce`.
+        let salt = random32();
+        let nonce = node::protocol::bundle_nonce(&recipient, &slots, &salt);
+        let proof = self.capability.prove(&nonce, 0);
+        let client_addr = self.handle(handle.clone());
+        let scope = self.scope_for(&handle);
+        let rid = self.relay_id();
+        let mut req = node::protocol::BundleRequest {
+            client_addr: client_addr.clone(),
+            carrier_id: self.carrier_id.clone(),
+            cookie: self.cookies.get(&(rid, client_addr.clone())).copied(),
+            request_nonce: nonce,
+            capability_proof: proof,
+            recipient,
+            slots,
+        };
+        // The cookie retry reuses the SAME request (nonce included), exactly as `transmit` does:
+        // a challenge is answered before the replay filter ever sees the nonce.
+        for _ in 0..2 {
+            match self.transport.bundle(&req, now, scope.as_deref()) {
+                node::protocol::BundleOutcome::NeedCookie(c) => {
+                    self.cookies.insert((rid, client_addr.clone()), c);
+                    req.cookie = Some(c);
+                }
+                node::protocol::BundleOutcome::Stored(outcomes) => {
+                    // A relay that answered with the wrong number of verdicts is not trusted to
+                    // have stored anything: matching them to ids by position would be a guess.
+                    return (outcomes.len() == req.slots.len()).then_some(outcomes);
+                }
+                node::protocol::BundleOutcome::Rejected(_)
+                | node::protocol::BundleOutcome::Unsupported => return None,
+            }
+        }
+        None
+    }
+
     /// Whether a queued message (by the id `queue` returned) is still awaiting delivery.
     /// After a `flush_outbox`, `false` means the relay accepted it (or it expired).
     pub fn is_queued(&self, id: u64) -> bool {
@@ -3465,13 +3678,77 @@ pub(crate) struct LoopbackMail {
     bundles: std::rc::Rc<
         std::cell::RefCell<HashMap<[u8; 32], (PreKeyBundle, Vec<karst_crypto::pqxdh::SignedOpk>)>>,
     >,
+    /// How the far end answers a bundled deposit, and how many of each request kind it saw. A
+    /// counter rather than an inference from the mailbox: "did this leave as one request or four"
+    /// is the whole claim of bundling, and mailbox contents cannot answer it.
+    bundling: std::rc::Rc<std::cell::RefCell<BundleBehaviour>>,
+}
+
+/// The far end's bundle behaviour, for tests.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct BundleBehaviour {
+    /// Bundle requests seen, and their slot counts in order.
+    pub bundles: Vec<usize>,
+    /// Ordinary deposits seen.
+    pub sends: usize,
+    /// Refuse to bundle at all (a transport that cannot).
+    pub unsupported: bool,
+    /// Slot indices this relay declines to store, per bundle.
+    pub not_stored: Vec<usize>,
+    /// The isolation scopes bundle requests arrived under.
+    pub scopes: Vec<Option<String>>,
+}
+
+#[cfg(test)]
+impl LoopbackMail {
+    pub(crate) fn behaviour(&self) -> BundleBehaviour {
+        self.bundling.borrow().clone()
+    }
+    pub(crate) fn refuse_to_bundle(&self) {
+        self.bundling.borrow_mut().unsupported = true;
+    }
+    pub(crate) fn decline_slots(&self, which: &[usize]) {
+        self.bundling.borrow_mut().not_stored = which.to_vec();
+    }
 }
 
 #[cfg(test)]
 impl Transport for LoopbackMail {
     fn send(&self, msg: &WireMessage, _now: u64) -> Response {
+        self.bundling.borrow_mut().sends += 1;
         self.boxes.borrow_mut().entry(msg.recipient).or_default().push(msg.payload.clone());
         Response::Accepted
+    }
+    fn bundle(
+        &self,
+        req: &node::protocol::BundleRequest,
+        _now: u64,
+        scope: Option<&str>,
+    ) -> node::protocol::BundleOutcome {
+        use node::protocol::{BundleOutcome, SlotOutcome};
+        let mut b = self.bundling.borrow_mut();
+        if b.unsupported {
+            return BundleOutcome::Unsupported;
+        }
+        b.bundles.push(req.slots.len());
+        b.scopes.push(scope.map(str::to_string));
+        let declined = b.not_stored.clone();
+        drop(b);
+        let mut outcomes = Vec::with_capacity(req.slots.len());
+        for (i, slot) in req.slots.iter().enumerate() {
+            if declined.contains(&i) {
+                outcomes.push(SlotOutcome::NotStored("mailbox full".into()));
+                continue;
+            }
+            self.boxes
+                .borrow_mut()
+                .entry(req.recipient)
+                .or_default()
+                .push(Payload::Session(slot.clone().into_envelope()));
+            outcomes.push(SlotOutcome::Stored);
+        }
+        BundleOutcome::Stored(outcomes)
     }
     fn fetch(&self, req: &FetchRequest, _now: u64) -> FetchResponse {
         let drained = self.boxes.borrow_mut().remove(&req.mailbox).unwrap_or_default();
@@ -4064,5 +4341,244 @@ mod routing_separation {
         distinct(&Handle::Identity, &Handle::Box([1u8; 32], 1), "identity vs a rotating box");
         distinct(&Handle::Identity, &Handle::Opener([1u8; 32]), "identity vs an opener");
         distinct(&Handle::Opener([1u8; 32]), &Handle::Box([1u8; 32], 1), "opener vs a box");
+    }
+}
+
+/// Bundled deposits: what leaves as ONE request, what does not, and what happens when the far end
+/// stores only part of it (#281, `docs/design/bundling.md`).
+#[cfg(test)]
+mod bundled_flush {
+    use super::*;
+    use admission::capability::{Quota, Scope};
+    use karst_crypto::pqxdh::Account;
+    use x25519_dalek::PublicKey;
+
+    const NOW: u64 = 1_700_000_000;
+
+    fn dev_cap() -> Capability {
+        Capability {
+            capability_id: [0x77; 16],
+            scope: Scope::MessageDelivery,
+            quota: Quota { max_requests: 100_000, max_bytes: 1 << 30, window_secs: 600 },
+            not_before: 0,
+            not_after: u32::MAX,
+            secret: [0x35; 32],
+        }
+    }
+
+    /// Alice with a LIVE ratchet session to Bob, past the opener — a bundle carries ordinary
+    /// ratchet envelopes only, so a pair still in the opener state would test nothing.
+    fn established_pair() -> (LoopbackMail, Peer<LoopbackMail>, [u8; 32]) {
+        let transport = LoopbackMail::default();
+        let mut bob =
+            Peer::new(transport.clone(), Account::generate(), dev_cap(), PublicKey::from([7u8; 32]));
+        bob.publish(NOW);
+        let bob_ik = bob.identity();
+        let mut alice =
+            Peer::new(transport.clone(), Account::generate(), dev_cap(), PublicKey::from([7u8; 32]));
+        alice.connect(&bob_ik, NOW).expect("PQXDH against a published bundle");
+        let opener = alice.encrypt_next(&bob_ik, b"hello").expect("opener");
+        assert!(matches!(alice.transmit_envelope(&bob_ik, opener, NOW), Response::Accepted));
+        (transport, alice, bob_ik)
+    }
+
+    /// Four queued messages to one peer leave as ONE request, not four. This is the whole point:
+    /// what the relay counts is requests, and four deposits thirty seconds apart is a
+    /// conversation.
+    #[test]
+    fn a_class_worth_of_queued_mail_leaves_as_one_request() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        let before = transport.behaviour().sends;
+        for i in 0..4u8 {
+            alice.queue(&bob_ik, &[i; 8], NOW).expect("queue");
+        }
+        let delivered = alice.flush_outbox_bundled(NOW);
+
+        assert_eq!(delivered.len(), 4, "every slot should have been delivered");
+        assert_eq!(alice.outbox_len(), 0, "nothing should still be queued");
+        let b = transport.behaviour();
+        assert_eq!(b.bundles, vec![4], "four messages must leave as one four-slot bundle");
+        assert_eq!(b.sends, before, "not one of them may ALSO leave as an ordinary deposit");
+    }
+
+    /// Every slot is VEILED (PRIV-4). The first version of this format carried bare ratchet
+    /// envelopes and nothing failed — the recipient accepts both — so bundled mail would have
+    /// decrypted perfectly while handing two relays byte-identical ciphertext again. Nothing but
+    /// an assertion on the deposited payload catches that.
+    #[test]
+    fn every_slot_is_veiled_for_this_relay() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        for i in 0..4u8 {
+            alice.queue(&bob_ik, &[i; 8], NOW).expect("queue");
+        }
+        alice.flush_outbox_bundled(NOW);
+
+        let boxes = transport.boxes.borrow();
+        let deposited: Vec<&Payload> = boxes.values().flatten().collect();
+        let veiled = deposited
+            .iter()
+            .filter(|p| matches!(p, Payload::Session(SessionEnvelope::Veiled { .. })))
+            .count();
+        let bare = deposited
+            .iter()
+            .filter(|p| matches!(p, Payload::Session(SessionEnvelope::Ratchet(_))))
+            .count();
+        assert_eq!(veiled, 4, "every bundled slot must arrive veiled");
+        assert_eq!(bare, 0, "an unveiled ratchet envelope reached the relay inside a bundle");
+    }
+
+    /// A bundle rides the SAME per-handle isolation scope an ordinary deposit does. Without it,
+    /// the request carrying the most messages would be the one on the default circuit.
+    #[test]
+    fn a_bundle_carries_the_per_handle_isolation_scope() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        for i in 0..4u8 {
+            alice.queue(&bob_ik, &[i; 8], NOW).expect("queue");
+        }
+        alice.flush_outbox_bundled(NOW);
+        let scopes = transport.behaviour().scopes;
+        assert_eq!(scopes.len(), 1);
+        assert!(scopes[0].is_some(), "the bundle went out with no isolation scope at all");
+    }
+
+    /// Below a class, nothing is bundled. `BUNDLE_CLASSES` starts at 1, so a lone message COULD
+    /// be a one-slot bundle — and must not be: while both request shapes exist, "this one was
+    /// bundled" is itself a signal, so a one-slot bundle would add a distinguisher rather than
+    /// remove one.
+    #[test]
+    fn two_messages_are_not_bundled_and_a_lone_one_is_never_a_bundle_of_one() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        let before = transport.behaviour().sends;
+        alice.queue(&bob_ik, b"one", NOW).expect("queue");
+        alice.queue(&bob_ik, b"two", NOW).expect("queue");
+        let delivered = alice.flush_outbox_bundled(NOW);
+
+        assert_eq!(delivered.len(), 2, "both must still be delivered");
+        let b = transport.behaviour();
+        assert!(b.bundles.is_empty(), "two messages must not become a bundle: {:?}", b.bundles);
+        assert_eq!(b.sends, before + 2, "they go out as ordinary deposits instead");
+    }
+
+    /// Twenty messages become 16 + 4 — greedy from the top rung — and the remainder that is not a
+    /// class goes out as deposits rather than as a mis-shaped bundle.
+    #[test]
+    fn a_long_queue_splits_into_full_bundles_and_an_honest_remainder() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        let before = transport.behaviour().sends;
+        for i in 0..22u8 {
+            alice.queue(&bob_ik, &[i; 8], NOW).expect("queue");
+        }
+        let delivered = alice.flush_outbox_bundled(NOW);
+
+        assert_eq!(delivered.len(), 22);
+        let b = transport.behaviour();
+        assert_eq!(b.bundles, vec![16, 4], "the greedy split from the top rung");
+        assert_eq!(b.sends, before + 2, "the two left over go out as ordinary deposits");
+    }
+
+    /// A transport that cannot bundle still DELIVERS. The fallback lives here, at the flush, not
+    /// inside the transport — a transport that quietly looped would let a caller believe it had
+    /// bundled while the wire showed exactly the per-message deposits bundling removes.
+    #[test]
+    fn a_relay_that_cannot_bundle_still_gets_the_mail() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        transport.refuse_to_bundle();
+        let before = transport.behaviour().sends;
+        for i in 0..4u8 {
+            alice.queue(&bob_ik, &[i; 8], NOW).expect("queue");
+        }
+        let delivered = alice.flush_outbox_bundled(NOW);
+
+        assert_eq!(delivered.len(), 4, "refusing to bundle must not lose mail");
+        assert_eq!(alice.outbox_len(), 0);
+        let b = transport.behaviour();
+        assert!(b.bundles.is_empty());
+        assert_eq!(b.sends, before + 4, "it fell back to four ordinary deposits");
+    }
+
+    /// A PARTIALLY stored bundle is not reported as stored — and the slots BEHIND the declined
+    /// one go back queued too, so the retry cannot overtake them.
+    ///
+    /// Re-queuing only the declined slot was the first version, and it is wrong in a way no
+    /// per-slot assertion catches. A bulk transfer is a manifest followed by its chunks. If the
+    /// relay declines slot 0 and stores 1..15, the manifest retransmits on a later flush and
+    /// arrives AFTER its own chunks — and `content::Reassembler` answers a chunk with no manifest
+    /// with "chunk without a manifest" and drops it. Every individual slot would be correctly
+    /// accounted for while the whole transfer vanished.
+    #[test]
+    fn a_declined_slot_stops_the_group_and_the_retry_keeps_the_order() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        transport.decline_slots(&[1]);
+        let mut ids = Vec::new();
+        for i in 0..4u8 {
+            ids.push(alice.queue(&bob_ik, &[i; 8], NOW).expect("queue"));
+        }
+        let first = alice.flush_outbox_bundled(NOW);
+
+        assert_eq!(first, vec![ids[0]], "only the prefix before the declined slot is delivered");
+        assert_eq!(alice.outbox_len(), 3, "the declined slot AND everything after it stay queued");
+        for id in &ids[1..] {
+            assert!(alice.is_queued(*id), "slot {id} must still be queued");
+        }
+
+        // Second pass, relay healthy: the suffix goes out, in the order it was queued.
+        transport.decline_slots(&[]);
+        let second = alice.flush_outbox_bundled(NOW);
+        assert_eq!(second, ids[1..].to_vec(), "the retry must preserve queue order");
+        assert_eq!(alice.outbox_len(), 0);
+    }
+
+    /// A first contact's OPENER is deposited alone and the run behind it still bundles.
+    ///
+    /// The opener has no veiled form — the recipient has no session to derive the veil key from —
+    /// so it can never be a slot. Letting it disqualify its whole group was the simpler rule and
+    /// the wrong one: a first-contact bulk transfer is one opener followed by many ordinary
+    /// envelopes, which is exactly the case bundling is for.
+    #[test]
+    fn an_opener_deposits_alone_and_does_not_stop_the_rest_bundling() {
+        let transport = LoopbackMail::default();
+        let mut bob =
+            Peer::new(transport.clone(), Account::generate(), dev_cap(), PublicKey::from([7u8; 32]));
+        bob.publish(NOW);
+        let bob_ik = bob.identity();
+        let mut alice =
+            Peer::new(transport.clone(), Account::generate(), dev_cap(), PublicKey::from([7u8; 32]));
+        alice.connect(&bob_ik, NOW).expect("PQXDH");
+
+        // Queue WITHOUT transmitting first: entry 0 is the opener, the other four are ordinary.
+        for i in 0..5u8 {
+            alice.queue(&bob_ik, &[i; 8], NOW).expect("queue");
+        }
+        let before = transport.behaviour().sends;
+        let delivered = alice.flush_outbox_bundled(NOW);
+
+        assert_eq!(delivered.len(), 5, "everything must be delivered");
+        let b = transport.behaviour();
+        assert_eq!(b.bundles, vec![4], "the four ordinary envelopes behind the opener bundle");
+        assert_eq!(b.sends, before + 1, "and exactly one deposit — the opener");
+    }
+
+    /// Two peers' mail never shares a bundle. One bundle names one recipient — mixing them would
+    /// tell the relay those two mailboxes got mail from one sender in one breath, for free, in
+    /// the request structure itself.
+    #[test]
+    fn two_recipients_are_never_packed_into_one_bundle() {
+        let (transport, mut alice, bob_ik) = established_pair();
+        let mut carol =
+            Peer::new(transport.clone(), Account::generate(), dev_cap(), PublicKey::from([7u8; 32]));
+        carol.publish(NOW);
+        let carol_ik = carol.identity();
+        alice.connect(&carol_ik, NOW).expect("PQXDH");
+        let opener = alice.encrypt_next(&carol_ik, b"hi").expect("opener");
+        assert!(matches!(alice.transmit_envelope(&carol_ik, opener, NOW), Response::Accepted));
+
+        for i in 0..4u8 {
+            alice.queue(&bob_ik, &[i; 8], NOW).expect("queue");
+            alice.queue(&carol_ik, &[i; 8], NOW).expect("queue");
+        }
+        alice.flush_outbox_bundled(NOW);
+
+        let b = transport.behaviour();
+        assert_eq!(b.bundles, vec![4, 4], "interleaved mail must split into one bundle per peer");
     }
 }

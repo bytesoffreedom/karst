@@ -15,3 +15,4 @@ pub mod record;
 pub mod allocator;
 pub mod map;
 pub mod capsule;
+pub mod freeindex;

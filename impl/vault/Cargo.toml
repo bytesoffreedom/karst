@@ -8,3 +8,7 @@ edition = "2021"
 # let protocol concerns leak into the on-disk format.
 [dependencies]
 karst-crypto = { path = "../crypto" }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"

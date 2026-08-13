@@ -299,6 +299,24 @@ impl Vault {
         let used = self.live.root.mapped_blocks;
         crate::catalogue::FreeSpace::LowerBound(total.saturating_sub(used))
     }
+
+    /// The largest object this container can hold **and still be able to rewrite**.
+    ///
+    /// This is NOT `free_space() * logical_data`, and the difference is the whole point. Writing is
+    /// copy-on-write: the old version stays live until the new one has committed, so rewriting an
+    /// object of B blocks needs B FREE blocks while B are still held. The steady state is 2B, and
+    /// the ceiling is therefore half the usable blocks — about 44% of the file once the reserve and
+    /// the per-block capsule overhead are paid.
+    ///
+    /// A caller that sized a snapshot by the free count instead would fill the container on the
+    /// FIRST save and be unable to commit the second — `admit` would refuse it correctly, and the
+    /// user would be told there is no space in a container that looks half empty. That failure is
+    /// invisible until the second save, which is why the question is answered here rather than left
+    /// to whoever calls `free_space`.
+    pub fn max_rewritable_bytes(&self) -> u64 {
+        let usable = self.params.blocks.saturating_sub(self.params.workspace_reserve);
+        (usable / 2) * self.geometry.logical_data() as u64
+    }
 }
 
 /// Bytes reserved for a sealed root at an anchor: the clear generation prefix plus the record.
@@ -478,6 +496,34 @@ mod tests {
         assert_eq!(v.container_bytes(), SIZE);
         assert_eq!(v.params().container_size, SIZE);
         assert!(v.geometry().block_stride() > 0);
+    }
+
+    /// The rewritable ceiling is HALF the usable space, not all of it — copy-on-write holds the old
+    /// version while the new one is written.
+    ///
+    /// Discriminating: this asserts the ceiling is meaningfully below the free-space figure, so a
+    /// version that returned `free * logical_data` fails here rather than at somebody's second
+    /// save.
+    #[test]
+    fn the_rewritable_ceiling_is_about_half_the_container() {
+        let p = scratch("ceiling");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        let v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+
+        let free_bytes = v.free_space().blocks() * v.geometry().logical_data() as u64;
+        let ceiling = v.max_rewritable_bytes();
+        assert!(
+            ceiling < free_bytes,
+            "the ceiling ({ceiling}) must be below the free figure ({free_bytes}); copy-on-write \
+             needs room for the new version while the old one is still live"
+        );
+        // Half, within the rounding of one block.
+        let half = free_bytes / 2;
+        assert!(
+            ceiling <= half && ceiling + v.geometry().logical_data() as u64 >= half,
+            "expected about half of {free_bytes}, got {ceiling}"
+        );
+        assert!(ceiling > 0, "a container this size must hold something");
     }
 
     /// A container survives being closed and reopened — the roots are on disk, not in memory.

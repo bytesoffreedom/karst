@@ -96,6 +96,9 @@ pub struct MailLog {
     /// Test-only: see `poison_for_test`.
     #[cfg(test)]
     poisoned: bool,
+    /// Fsyncs performed. Test-only: the batching claim is about how many there are.
+    #[cfg(test)]
+    syncs: usize,
 }
 
 impl MailLog {
@@ -125,6 +128,8 @@ impl MailLog {
             broken: false,
             #[cfg(test)]
             poisoned: false,
+            #[cfg(test)]
+            syncs: 0,
         };
         if log.records == 0 {
             log.write_magic_if_empty()?;
@@ -147,6 +152,55 @@ impl MailLog {
     /// caller may answer `Accepted` on the strength of it.
     pub fn deposit(&mut self, mailbox: [u8; 32], enqueued_at: u64, payload: &Payload) -> io::Result<()> {
         self.append(&MailRecord::Deposit { mailbox, enqueued_at, payload: payload.clone() })?;
+        self.sync()
+    }
+
+    /// Record several admitted messages with ONE fsync.
+    ///
+    /// **Not yet on the serve path, and deliberately so.** Today one request is one deposit, so
+    /// there is nothing to batch: the caller that makes this pay is the bundled deposit
+    /// (`docs/design/bundling.md`), which carries several envelopes in one admission. Wiring it
+    /// before that exists would mean a batch of one, which is the current cost with extra code.
+    ///
+    /// The second caller is the group commit across CONCURRENT connections — the relay serves a
+    /// thread per connection, so several deposits really are in flight at once. That one needs the
+    /// fsync moved out of the relay lock first, which is its own slice: an fsync inside the global
+    /// lock blocks every other request in the process, and batching under the same lock would
+    /// coalesce the syncs while still serialising everything behind them.
+    ///
+    /// The durability contract is unchanged and that is the whole point: this returns only after
+    /// the single sync, so no message in the batch may be answered `Accepted` before every one of
+    /// them is durable. What changes is the cost — an fsync is a device round trip, and paying one
+    /// per message is what makes a burst of deposits cost a burst of them.
+    ///
+    /// A crash mid-batch is already handled by the format: the replay stops at the first torn
+    /// record and keeps everything before it, so a partial batch leaves a prefix of COMPLETE
+    /// records. Those are deposits stored but never acknowledged — a duplicate at worst, which the
+    /// client's dedup ring absorbs, and the same at-least-once trade the delete path already makes.
+    pub fn deposit_many(&mut self, items: &[(([u8; 32], u64), Payload)]) -> io::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        for ((mailbox, enqueued_at), payload) in items {
+            self.append(&MailRecord::Deposit {
+                mailbox: *mailbox,
+                enqueued_at: *enqueued_at,
+                payload: payload.clone(),
+            })?;
+        }
+        self.sync()
+    }
+
+    /// Make everything appended so far durable.
+    ///
+    /// Separate from [`append`](Self::append) so a caller can batch. Counted in tests, because
+    /// "one fsync instead of N" is a claim about behaviour and a claim about behaviour that
+    /// nothing counts is a comment.
+    fn sync(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.syncs += 1;
+        }
         self.file.sync_data()
     }
 
@@ -404,5 +458,76 @@ mod tests {
         assert_eq!(entries[0].mailbox[0], 9);
         assert!(log.record_count() < before, "compaction rewrote {before} records to {}", log.record_count());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The claim is "one fsync instead of N", so it is COUNTED. A batch that quietly synced per
+    /// record would pass every durability test in this file and deliver none of the saving.
+    #[test]
+    fn a_batch_costs_one_fsync_not_one_per_message() {
+        let dir = tmp("group-commit-one-sync");
+        let (mut log, _) = MailLog::open(dir).unwrap();
+        let before = log.syncs;
+        log.deposit_many(&[
+            (([1u8; 32], 10), seal(1)),
+            (([1u8; 32], 11), seal(2)),
+            (([2u8; 32], 12), seal(3)),
+        ])
+        .unwrap();
+        assert_eq!(log.syncs - before, 1, "the batch paid more than one fsync");
+
+        // And the unbatched path still pays one each — so the saving is real rather than a
+        // change in how syncs are counted.
+        let before = log.syncs;
+        log.deposit([3u8; 32], 13, &seal(4)).unwrap();
+        log.deposit([3u8; 32], 14, &seal(5)).unwrap();
+        assert_eq!(log.syncs - before, 2);
+    }
+
+    /// Durability is unchanged: every record of the batch is on disk once the call returns, which
+    /// is what lets the caller answer for all of them.
+    #[test]
+    fn every_message_in_a_batch_is_durable_when_the_call_returns() {
+        let dir = tmp("group-commit-durable");
+        {
+            let (mut log, _) = MailLog::open(dir.clone()).unwrap();
+            log.deposit_many(&[
+                (([1u8; 32], 10), seal(1)),
+                (([1u8; 32], 11), seal(2)),
+                (([2u8; 32], 12), seal(3)),
+            ])
+            .unwrap();
+        }
+        let (_, entries) = MailLog::open(dir).unwrap();
+        assert_eq!(entries.len(), 3, "a batched deposit lost records across a reopen");
+    }
+
+    /// An empty batch is a no-op and does not pay an fsync for nothing.
+    #[test]
+    fn an_empty_batch_costs_nothing() {
+        let dir = tmp("group-commit-empty");
+        let (mut log, _) = MailLog::open(dir).unwrap();
+        let before = log.syncs;
+        log.deposit_many(&[]).unwrap();
+        assert_eq!(log.syncs, before, "an empty batch fsynced");
+    }
+
+    /// Batched and unbatched deposits produce the same log. The batch is a change in when the
+    /// sync happens, not in what is written.
+    #[test]
+    fn a_batch_writes_the_same_records_as_separate_deposits() {
+        let one = tmp("group-commit-same-a");
+        let two = tmp("group-commit-same-b");
+        {
+            let (mut log, _) = MailLog::open(one.clone()).unwrap();
+            log.deposit([1u8; 32], 10, &seal(1)).unwrap();
+            log.deposit([2u8; 32], 11, &seal(2)).unwrap();
+        }
+        {
+            let (mut log, _) = MailLog::open(two.clone()).unwrap();
+            log.deposit_many(&[(([1u8; 32], 10), seal(1)), (([2u8; 32], 11), seal(2))]).unwrap();
+        }
+        let a = std::fs::read(one.join("mail.log")).unwrap();
+        let b = std::fs::read(two.join("mail.log")).unwrap();
+        assert_eq!(a, b, "batching changed the bytes on disk");
     }
 }

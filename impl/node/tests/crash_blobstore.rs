@@ -12,7 +12,11 @@
 
 #![cfg(feature = "failpoints")]
 
-use node::blobstore::BlobStore;
+use node::blobstore::{BlobOwner, BlobStore};
+
+/// The blob's identity: who owns it and what opens it. Fixed for this test — the crash window
+/// under examination is about the sidecar header, not about ownership.
+const OWNER: BlobOwner = BlobOwner { sender: SENDER, read_pub: [0xAB; 32] };
 
 const HOME: &str = "KARST_CRASH_HOME";
 const CHILD: &str = "KARST_CRASH_CHILD";
@@ -23,7 +27,7 @@ const NOW: u64 = 1_000_000;
 fn child_body() -> ! {
     let dir = std::env::var(HOME).expect("home from parent");
     let mut s = BlobStore::open(dir.into(), NOW).expect("open in child");
-    let _ = s.put_chunk(SENDER, ID, 0, 2, b"first chunk", NOW);
+    let _ = s.put_chunk(OWNER, ID, 0, 2, b"first chunk", NOW);
     eprintln!("child survived the failpoint");
     std::process::exit(7);
 }
@@ -73,12 +77,12 @@ fn a_crash_after_the_header_leaves_a_resumable_blob_not_an_orphan() {
     }
 
     // And the upload can be finished: this is the property the write ORDER exists to protect.
-    let put = s.put_chunk(SENDER, ID, 0, 2, b"first chunk", NOW);
+    let put = s.put_chunk(OWNER, ID, 0, 2, b"first chunk", NOW);
     assert!(
         !matches!(put, node::blobstore::BlobPut::Rejected(_)),
         "resuming the interrupted upload was rejected: {put:?}"
     );
-    let put2 = s.put_chunk(SENDER, ID, 1, 2, b"second chunk", NOW);
+    let put2 = s.put_chunk(OWNER, ID, 1, 2, b"second chunk", NOW);
     assert!(!matches!(put2, node::blobstore::BlobPut::Rejected(_)), "second chunk rejected");
     assert_eq!(
         s.get_chunk(&ID, 0).as_deref(),

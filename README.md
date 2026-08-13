@@ -230,6 +230,11 @@ cargo test --features unaudited-crypto   # + the reference §7.3 crypto
 # shows up, and it has happened here.
 cargo clippy --all-targets
 cargo clippy --all-targets --features unaudited-crypto
+
+# Feature-gated test targets do not compile in the default build at all, so a green run above
+# says nothing about them. Check them explicitly, or a signature change lands broken in a file
+# nobody builds until someone turns the feature on.
+cargo check --workspace --all-targets --features failpoints
 ```
 
 ### 2c. Verify a downloaded release

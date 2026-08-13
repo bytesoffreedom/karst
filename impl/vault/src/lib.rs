@@ -18,3 +18,4 @@ pub mod capsule;
 pub mod freeindex;
 pub mod slot;
 pub mod root;
+pub mod faulty;

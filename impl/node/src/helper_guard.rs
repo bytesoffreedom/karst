@@ -100,6 +100,11 @@ const CLASSIFIED: &[(&str, Role)] = &[
     ("relay", Role::Relay),
     ("client", Role::NotAHelper),
     ("desktop", Role::NotAHelper),
+    // The container's storage layer. Not a helper and structurally incapable of becoming one: it
+    // runs entirely on the owner's machine, holds no network code, and depends on the crypto
+    // primitives and nothing else in the workspace. There is no vantage point to classify because
+    // there is no second party.
+    ("vault", Role::NotAHelper),
 ];
 
 /// The roles a helper may be given, and what each may see. A new helper picks a row here or adds

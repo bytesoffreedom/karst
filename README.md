@@ -224,7 +224,12 @@ Sanity-check the build:
 ```sh
 cargo test                               # default (audited-primitive path)
 cargo test --features unaudited-crypto   # + the reference §7.3 crypto
+
+# Lint under BOTH feature sets, not one. A lint sitting above a feature-gated item is
+# invisible to a single-feature run — a clean local pass and a red CI is exactly how that
+# shows up, and it has happened here.
 cargo clippy --all-targets
+cargo clippy --all-targets --features unaudited-crypto
 ```
 
 ### 2c. Verify a downloaded release

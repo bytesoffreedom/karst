@@ -62,13 +62,13 @@ fn r03_r04_placement_is_random_and_the_order_is_per_session() {
 
 /// 5. A refused candidate leaves no trace the public password can read.
 ///
-/// Structural: the allocator holds its order and cursor in memory and exposes no way to persist
-/// them. Stated as a compile-time fact — there is no serialiser to call.
+/// COMPILE-TIME ONLY, and this body is documentation rather than evidence. `Allocator` exposes no
+/// accessor for its order or cursor and implements no serialisation, so the property is enforced by
+/// the type — but a test cannot demonstrate the absence of an API. An earlier version asserted on
+/// `remaining()`, which checks a counter and proves nothing about persistence; that is exactly the
+/// shape of a test that looks like evidence and is not.
 #[test]
-fn r05_the_allocator_has_no_way_to_persist_its_state() {
-    let a = vault::allocator::Allocator::new(100);
-    assert_eq!(a.remaining(), 99, "the only state exposed is a count, not a sequence");
-}
+fn r05_the_allocator_cannot_persist_its_state_by_construction() {}
 
 /// 6. FREE appears only after every confirmed reference is gone, and after the wipe.
 ///

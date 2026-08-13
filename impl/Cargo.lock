@@ -4688,6 +4688,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vault"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "hkdf",
+ "karst-crypto",
+ "rand 0.8.7",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

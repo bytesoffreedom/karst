@@ -119,7 +119,18 @@ pub struct Claim {
 /// The verdict of reading a block's capsules. `Unknown` is a RESULT, never a stored state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    Known(Claim),
+    /// The claim verified, and where it binds the payload the payload was checked against it.
+    Confirmed(Claim),
+    /// The claim verified, but it is a `Live` claim whose payload was NOT checked because the
+    /// caller supplied no digest.
+    ///
+    /// This exists as its own answer rather than folding into [`Verdict::Confirmed`] because the
+    /// two are safe in different places. The free-block scan may act on it — it only ever asks
+    /// whether the block is allocatable, and a `Live` claim is not, checked or otherwise. Recovery
+    /// may NOT: deciding a block is ours and keeping it turns on the payload actually being ours,
+    /// and an unchecked claim does not say that. Making the caller name which it can accept is the
+    /// only way a lazy check stays a deferred cost instead of a dropped requirement.
+    Unchecked(Claim),
     /// Neither copy verified, or the payload does not match a `Live` claim. Fail-closed: the block
     /// is not free, not ours, not touchable.
     Unknown,
@@ -127,10 +138,22 @@ pub enum Verdict {
 
 impl Verdict {
     /// The only question the allocator is allowed to ask.
+    ///
+    /// Safe on an unchecked claim: allocatability turns on the STATE, and `Live` is not
+    /// allocatable whether or not its payload was verified.
     pub fn is_allocatable(&self) -> bool {
         match self {
-            Verdict::Known(c) => c.state.is_allocatable(),
+            Verdict::Confirmed(c) | Verdict::Unchecked(c) => c.state.is_allocatable(),
             Verdict::Unknown => false,
+        }
+    }
+
+    /// The claim, only if it was fully verified. Recovery and anything else deciding ownership
+    /// must go through this, so an unchecked `Live` cannot be mistaken for a confirmed one.
+    pub fn confirmed(&self) -> Option<Claim> {
+        match self {
+            Verdict::Confirmed(c) => Some(*c),
+            Verdict::Unchecked(_) | Verdict::Unknown => None,
         }
     }
 }
@@ -197,11 +220,6 @@ pub fn read_capsules(
 ) -> Verdict {
     let mut best: Option<Claim> = None;
     for (i, raw) in copies.iter().enumerate() {
-        // The generation is inside the sealed claim and also in the aad, so it cannot be read
-        // before decrypting. Both copies are tried against every generation the caller could be
-        // holding by decoding with the generation the record itself asserts — which is why the
-        // claim carries it and the aad binds it: a copy re-sealed at another generation will not
-        // open at this one.
         if let Some(claim) = try_open(key, format_hash, block, i as u8, raw) {
             if best.is_none_or(|b| claim.generation > b.generation) {
                 best = Some(claim);
@@ -212,18 +230,24 @@ pub fn read_capsules(
 
     if claim.state.binds_payload() {
         match payload_digest {
-            Some(d) if d == claim.binding => Verdict::Known(claim),
+            Some(d) if d == claim.binding => Verdict::Confirmed(claim),
             Some(_) => Verdict::Unknown, // contents changed behind the layer's back
-            None => Verdict::Known(claim), // caller did not ask for the expensive check
+            // The caller did not pay for the hash. The claim is real, but it is not evidence the
+            // payload is — so it comes back as `Unchecked` and only a caller that says it can live
+            // with that gets to use it.
+            None => Verdict::Unchecked(claim),
         }
     } else {
-        Verdict::Known(claim)
+        Verdict::Confirmed(claim)
     }
 }
 
-/// Try both plausible generations for a copy. The aad binds the generation, so opening requires
-/// knowing it; a claim asserts its own, so the search is over what the record could say — bounded
-/// by trying the value the claim would have to carry.
+/// Open one copy.
+///
+/// The generation is bound into the aad, so it has to be known BEFORE decrypting — which is why
+/// each copy carries it in the clear ahead of the sealed record. That prefix is covered by the
+/// aad, so editing it makes the record fail to open rather than redirecting it to a generation of
+/// the attacker's choosing, and the sealed claim repeats it so the two can be compared.
 fn try_open(
     key: &MasterKey,
     format_hash: [u8; 32],
@@ -231,11 +255,6 @@ fn try_open(
     copy: u8,
     raw: &[u8],
 ) -> Option<Claim> {
-    // The generation lives in the aad, so it must be guessed before decryption. Rather than
-    // searching, the sealed plaintext repeats it: seal with generation G in the aad, and the
-    // reader learns G from the copy's own header slot. That header is the generation itself,
-    // written in the clear ahead of the record and covered by the record's aad — so tampering with
-    // it makes the record fail to open rather than redirecting it.
     if raw.len() < 8 {
         return None;
     }
@@ -286,7 +305,7 @@ mod tests {
         let c = claim(State::Live(Owner::Hidden), 5);
         let s = stored(&k, 7, 0, &c);
         let v = read_capsules(&k, FH, 7, [&s, &[]], None);
-        assert!(matches!(v, Verdict::Known(_)));
+        assert!(matches!(v, Verdict::Confirmed(_) | Verdict::Unchecked(_)));
         assert!(!v.is_allocatable(), "the hidden space's live block was offered to the allocator");
     }
 
@@ -324,7 +343,7 @@ mod tests {
         let mut c = claim(State::Live(Owner::Public), 2);
         c.binding = [1u8; 32];
         let s = stored(&k, 4, 0, &c);
-        assert!(matches!(read_capsules(&k, FH, 4, [&s, &[]], Some([1u8; 32])), Verdict::Known(_)));
+        assert!(matches!(read_capsules(&k, FH, 4, [&s, &[]], Some([1u8; 32])), Verdict::Confirmed(_)));
         assert_eq!(
             read_capsules(&k, FH, 4, [&s, &[]], Some([2u8; 32])),
             Verdict::Unknown,
@@ -341,7 +360,7 @@ mod tests {
         let a = stored(&k, 2, 0, &old);
         let b = stored(&k, 2, 1, &new);
         match read_capsules(&k, FH, 2, [&a, &b], None) {
-            Verdict::Known(c) => assert_eq!(c.generation, 9),
+            Verdict::Confirmed(c) | Verdict::Unchecked(c) => assert_eq!(c.generation, 9),
             Verdict::Unknown => panic!("both copies were readable"),
         }
     }
@@ -354,7 +373,7 @@ mod tests {
         let c = claim(State::Live(Owner::Public), 3);
         let good = stored(&k, 6, 1, &c);
         let torn = vec![0u8; 40];
-        assert!(matches!(read_capsules(&k, FH, 6, [&torn, &good], None), Verdict::Known(_)));
+        assert!(matches!(read_capsules(&k, FH, 6, [&torn, &good], None), Verdict::Unchecked(_)));
     }
 
     /// Tampering with the clear generation prefix breaks the record rather than redirecting it.
@@ -374,6 +393,24 @@ mod tests {
         let c = claim(State::Free, 1);
         let s = stored(&k, 10, 0, &c);
         assert_eq!(read_capsules(&k, FH, 11, [&s, &[]], None), Verdict::Unknown);
+    }
+
+    /// A `Live` claim read WITHOUT a digest is not evidence the payload is ours. The allocator may
+    /// act on it (the state alone answers its question); recovery may not, and `confirmed()` is
+    /// what enforces the difference.
+    #[test]
+    fn an_unchecked_live_claim_is_not_confirmed() {
+        let k = MasterKey::generate();
+        let c = claim(State::Live(Owner::Public), 2);
+        let s = stored(&k, 12, 0, &c);
+
+        let lazy = read_capsules(&k, FH, 12, [&s, &[]], None);
+        assert!(matches!(lazy, Verdict::Unchecked(_)), "an unchecked claim came back confirmed");
+        assert!(lazy.confirmed().is_none(), "recovery could have trusted an unverified payload");
+        assert!(!lazy.is_allocatable(), "but it is still not free");
+
+        let checked = read_capsules(&k, FH, 12, [&s, &[]], Some(c.binding));
+        assert!(checked.confirmed().is_some(), "a verified claim must be usable by recovery");
     }
 
     /// And to its copy slot, so copy 0 cannot be duplicated into copy 1 to fake agreement.

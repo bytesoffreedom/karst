@@ -16,3 +16,4 @@ pub mod allocator;
 pub mod map;
 pub mod capsule;
 pub mod freeindex;
+pub mod slot;

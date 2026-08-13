@@ -203,10 +203,31 @@ fn r19_admission_is_read_only() {
 
 /// 20. One space mounted at a time.
 ///
-/// NOT YET ENFORCED in this crate. The exclusion is a file lock taken by whatever owns the
-/// container file, and nothing here opens a file yet. Recorded as open.
+/// NOW ENFORCED: `FileStore` takes an exclusive `flock` for the life of the open file, so a second
+/// opener is refused. `flock` is per open-file-description, which means this also refuses a second
+/// handle inside ONE process — the case a refactor produces and that inter-process care would
+/// never catch.
+///
+/// The ordering argument the whole format rests on assumes a single writer. Two writers
+/// interleaving transactions would break it in a way no invariant inside a single transaction can
+/// detect, which is why this had to stop being a comment.
 #[test]
-fn r20_mount_exclusion_is_not_yet_enforced_here() {}
+fn r20_a_second_opener_is_refused() {
+    use vault::file::{FileStore, PAGE};
+    let dir = std::env::temp_dir().join("karst-test").join(format!(
+        "vault-conformance-r20-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let path = dir.join("container.bin");
+    let _ = std::fs::remove_file(&path);
+
+    let first = FileStore::create(&path, 8 * PAGE).expect("create");
+    assert!(FileStore::open(&path, 8 * PAGE).is_err(), "a second writer must be refused");
+    drop(first);
+    assert!(FileStore::open(&path, 8 * PAGE).is_ok(), "and allowed once the first is gone");
+}
 
 /// 21. Under the public mode the interface offers nothing that names a hidden space.
 ///

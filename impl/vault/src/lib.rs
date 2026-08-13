@@ -19,6 +19,8 @@ pub mod freeindex;
 pub mod slot;
 pub mod root;
 pub mod faulty;
+pub mod medium;
+pub mod file;
 pub mod manifest;
 pub mod tx;
 pub mod params;

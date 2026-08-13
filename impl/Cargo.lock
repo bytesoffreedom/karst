@@ -881,6 +881,7 @@ dependencies = [
  "client",
  "hex",
  "karst-client-core",
+ "node",
  "serde",
  "serde_json",
  "tauri",
@@ -4695,6 +4696,7 @@ dependencies = [
  "chacha20poly1305",
  "hkdf",
  "karst-crypto",
+ "libc",
  "rand 0.8.7",
  "sha2 0.10.9",
 ]

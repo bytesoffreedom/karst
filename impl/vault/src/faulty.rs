@@ -88,6 +88,19 @@ impl FaultyStore {
         self.epochs += 1;
     }
 
+    /// The store's fixed size. A container never grows, so this is a constant of the instance and
+    /// the bound `Medium` refuses accesses against.
+    pub fn len(&self) -> usize {
+        self.durable.len()
+    }
+
+    /// Whether the store has no bytes at all — only ever true for a zero-length store, which is
+    /// not a container. Present because clippy asks for it beside `len`, and answering honestly is
+    /// cheaper than an allow.
+    pub fn is_empty(&self) -> bool {
+        self.durable.is_empty()
+    }
+
     /// Completed barriers so far — the epoch counter a test asserts against.
     pub fn epochs(&self) -> usize {
         self.epochs

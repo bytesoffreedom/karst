@@ -175,13 +175,15 @@ impl Commit {
     }
 
     /// Run the first `n` steps against a store, then stop — as if the power went out there.
-    pub fn run_prefix(&self, store: &mut crate::faulty::FaultyStore, n: usize) {
-        for step in self.steps.iter().take(n) {
-            match step {
-                Step::Write { offset, bytes, .. } => store.write(*offset, bytes),
-                Step::Barrier => store.barrier(),
-            }
-        }
+    pub fn run_prefix<M: crate::medium::Medium>(
+        &self,
+        store: &mut M,
+        n: usize,
+    ) -> Result<(), crate::medium::MediumError> {
+        // Delegates rather than repeating the loop. A second copy of "a Barrier is an fsync" is a
+        // second place for the discipline to drift, and the copy that drifted would be the one the
+        // crash matrix was NOT driving.
+        crate::medium::apply(&self.steps[..n.min(self.steps.len())], store)
     }
 }
 
@@ -298,7 +300,7 @@ mod tests {
         let commit_at = commit_point(c.steps()).expect("there is a commit point");
         for n in 0..=commit_at {
             let mut store = FaultyStore::new(20_000);
-            c.run_prefix(&mut store, n);
+            c.run_prefix(&mut store, n).expect("the commit stays inside the store");
             store.power_cut_losing_everything();
             assert_eq!(
                 store.read_durable(6000, 8),
@@ -315,7 +317,7 @@ mod tests {
         let c = commit();
         let commit_at = commit_point(c.steps()).expect("there is a commit point");
         let mut store = FaultyStore::new(20_000);
-        c.run_prefix(&mut store, commit_at + 1);
+        c.run_prefix(&mut store, commit_at + 1).expect("the commit stays inside the store");
         store.power_cut_losing_everything();
         assert_eq!(store.read_durable(6000, 8), vec![5u8; 8], "the root should be durable here");
     }
@@ -331,7 +333,7 @@ mod tests {
             .position(|s| matches!(s, Step::Write { what: What::Root, .. }))
             .expect("root step");
         let mut store = FaultyStore::new(20_000);
-        c.run_prefix(&mut store, root_step);
+        c.run_prefix(&mut store, root_step).expect("the commit stays inside the store");
         store.power_cut_losing_everything();
         assert_eq!(store.read_durable(5000, 8), vec![4u8; 8], "the manifest was not durable yet");
         assert_eq!(store.read_durable(6000, 8), vec![0u8; 8], "the root was durable too early");
@@ -349,7 +351,7 @@ mod tests {
             .expect("free step");
         for n in 0..=free_step {
             let mut store = FaultyStore::new(20_000);
-            c.run_prefix(&mut store, n);
+            c.run_prefix(&mut store, n).expect("the commit stays inside the store");
             store.power_cut_losing_everything();
             if store.read_durable(9100, 8) == vec![6u8; 8] {
                 assert_eq!(
@@ -370,7 +372,7 @@ mod tests {
         let commit_at = commit_point(c.steps()).expect("commit point");
         for n in 0..=commit_at {
             let mut store = FaultyStore::new(20_000);
-            c.run_prefix(&mut store, n);
+            c.run_prefix(&mut store, n).expect("the commit stays inside the store");
             store.power_cut_losing_everything();
             assert_ne!(
                 store.read_durable(9100, 8),

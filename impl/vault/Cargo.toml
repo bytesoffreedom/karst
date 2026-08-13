@@ -13,3 +13,6 @@ hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 argon2 = "0.5"
+# `flock`. The format's ordering argument assumes ONE writer; without an exclusive lock that
+# assumption is a comment. See `file::lock_exclusive`.
+libc = "0.2"

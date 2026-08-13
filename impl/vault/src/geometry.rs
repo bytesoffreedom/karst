@@ -206,4 +206,65 @@ mod tests {
         let g = Geometry::new(RECORD_FRAMING + 8, 1 << 20);
         assert!(!g.is_sane(), "a one-entry node cannot address anything");
     }
+
+    /// **The two capsule copies never share a page**, for every block, at a real header offset.
+    ///
+    /// This is the plan's medium rule, and it is the reason `CAPSULE_ALIGN` has the value it has.
+    /// It held before this test existed — but by arithmetic nobody had written down: the copies sit
+    /// `CAPSULE_ALIGN` apart, so they are in different pages exactly while `CAPSULE_ALIGN` is a
+    /// multiple of the page size. Halve it to 512 and both copies land in ONE page, a single torn
+    /// write can damage both, the format loses the property its recovery rests on — and every
+    /// existing test still passes, because nothing else looks at where the copies are.
+    ///
+    /// Checked against a real `header_len`, which is NOT page-aligned (2458 bytes as of this
+    /// writing). An assertion that only held for an aligned header would be testing a container
+    /// this crate never builds.
+    ///
+    /// Not a duplicate of `the_two_capsule_copies_are_in_separate_aligned_units`: that one divides
+    /// by `CAPSULE_ALIGN` and starts at header 0, so it is true by construction for ANY alignment
+    /// — including one smaller than a page. This one divides by the PAGE and starts where the
+    /// header really ends, which is the form the medium rule is actually stated in.
+    #[test]
+    fn capsules_never_share_a_page() {
+        const PAGE: u64 = crate::file::PAGE;
+        assert!(
+            (CAPSULE_ALIGN as u64).is_multiple_of(PAGE),
+            "capsule alignment must be a whole number of pages, or the two copies can share one"
+        );
+        let g = Geometry::new(DEFAULT_BLOCK_PAYLOAD, 1 << 30);
+        let header = crate::params::header_len();
+        for b in 0..64u64 {
+            let c0 = g.capsule_offset(header, b, 0);
+            let c1 = g.capsule_offset(header, b, 1);
+            assert_ne!(c0 / PAGE, c1 / PAGE, "block {b}: both capsule copies are in one page");
+            // And each copy must fit inside its own page, so writing one never reaches the other's.
+            assert_eq!(
+                c0 / PAGE,
+                (c0 + CAPSULE_SLOT as u64 - 1) / PAGE,
+                "block {b}: copy 0 spills out of its page"
+            );
+            assert_eq!(
+                c1 / PAGE,
+                (c1 + CAPSULE_SLOT as u64 - 1) / PAGE,
+                "block {b}: copy 1 spills out of its page"
+            );
+        }
+    }
+
+    /// The payload never overlaps either capsule — the other half of "a write to one cannot
+    /// damage the other".
+    #[test]
+    fn the_payload_starts_after_both_capsules() {
+        let g = Geometry::new(DEFAULT_BLOCK_PAYLOAD, 1 << 30);
+        let header = crate::params::header_len();
+        for b in 0..8u64 {
+            let payload = g.block_offset(header, b) + 2 * CAPSULE_ALIGN as u64;
+            let c1_end = g.capsule_offset(header, b, 1) + CAPSULE_SLOT as u64;
+            assert!(payload >= c1_end, "block {b}: the payload starts inside a capsule");
+            assert!(
+                payload + g.block_payload as u64 <= g.block_offset(header, b + 1),
+                "block {b}: the payload runs into the next block"
+            );
+        }
+    }
 }

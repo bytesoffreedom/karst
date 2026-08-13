@@ -60,7 +60,7 @@ fn every_cut_before_the_commit_point_leaves_the_old_version() {
     let commit_at = commit_point(c.steps()).expect("a commit point exists");
     for n in 0..=commit_at {
         let mut store = FaultyStore::new(STORE_LEN);
-        c.run_prefix(&mut store, n);
+        c.run_prefix(&mut store, n).expect("the commit stays inside the store");
         store.power_cut_losing_everything();
         assert_eq!(
             store.read_durable(ROOT_AT, 16),
@@ -80,7 +80,7 @@ fn no_cleanup_happens_before_the_commit_is_durable() {
     let commit_at = commit_point(c.steps()).expect("a commit point exists");
     for n in 0..=commit_at {
         let mut store = FaultyStore::new(STORE_LEN);
-        c.run_prefix(&mut store, n);
+        c.run_prefix(&mut store, n).expect("the commit stays inside the store");
         store.power_cut_losing_everything();
         assert_ne!(
             store.read_durable(FREE_CAPSULE_AT, 16),
@@ -100,7 +100,7 @@ fn a_released_block_has_always_been_wiped_first() {
     let c = commit();
     for n in 0..=c.steps().len() {
         let mut store = FaultyStore::new(STORE_LEN);
-        c.run_prefix(&mut store, n);
+        c.run_prefix(&mut store, n).expect("the commit stays inside the store");
         store.power_cut_losing_everything();
         if store.read_durable(FREE_CAPSULE_AT, 16) == vec![0x66; 16] {
             assert_eq!(
@@ -119,7 +119,7 @@ fn the_manifest_is_durable_no_later_than_the_root() {
     let c = commit();
     for n in 0..=c.steps().len() {
         let mut store = FaultyStore::new(STORE_LEN);
-        c.run_prefix(&mut store, n);
+        c.run_prefix(&mut store, n).expect("the commit stays inside the store");
         store.power_cut_losing_everything();
         let root_durable = store.read_durable(ROOT_AT, 16) == vec![0x55; 16];
         let manifest_durable = store.read_durable(MANIFEST_AT, 16) == vec![0x44; 16];
@@ -147,7 +147,7 @@ fn no_ordering_within_an_epoch_commits_early() {
     for n in 0..root_step {
         for order in vault::faulty::all_orderings(3) {
             let mut store = FaultyStore::new(STORE_LEN);
-            c.run_prefix(&mut store, n);
+            c.run_prefix(&mut store, n).expect("the commit stays inside the store");
             store.power_cut(&order, &[Fate::Whole, Fate::Whole, Fate::Whole]);
             assert_eq!(
                 store.read_durable(ROOT_AT, 16),
@@ -166,7 +166,7 @@ fn a_torn_write_leaves_a_partial_range_not_a_whole_one() {
     let c = commit();
     let root_step = step_index(&c, |w| matches!(w, What::Root));
     let mut store = FaultyStore::new(STORE_LEN);
-    c.run_prefix(&mut store, root_step);
+    c.run_prefix(&mut store, root_step).expect("the commit stays inside the store");
     store.write(ROOT_AT, &[0x55; 16]);
     store.power_cut(&[0], &[Fate::TornPrefix(4)]);
     let image = store.read_durable(ROOT_AT, 16);
@@ -220,12 +220,12 @@ fn the_first_commit_of_a_fresh_container_follows_the_same_boundary() {
     let commit_at = commit_point(c.steps()).expect("a commit point exists");
     for n in 0..=commit_at {
         let mut store = FaultyStore::new(STORE_LEN);
-        c.run_prefix(&mut store, n);
+        c.run_prefix(&mut store, n).expect("the commit stays inside the store");
         store.power_cut_losing_everything();
         assert_eq!(store.read_durable(ROOT_AT, 16), vec![0u8; 16], "committed early at {n}");
     }
     let mut store = FaultyStore::new(STORE_LEN);
-    c.run_prefix(&mut store, commit_at + 1);
+    c.run_prefix(&mut store, commit_at + 1).expect("the commit stays inside the store");
     store.power_cut_losing_everything();
     assert_eq!(store.read_durable(ROOT_AT, 16), vec![0x55; 16], "never committed at all");
 }
@@ -256,12 +256,7 @@ fn the_matrix_rejects_a_commit_that_writes_the_root_before_the_manifest() {
     let mut caught = false;
     for n in 0..=steps.len() {
         let mut store = FaultyStore::new(STORE_LEN);
-        for step in steps.iter().take(n) {
-            match step {
-                Step::Write { offset, bytes, .. } => store.write(*offset, bytes),
-                Step::Barrier => store.barrier(),
-            }
-        }
+        vault::medium::apply(&steps[..n], &mut store).expect("inside the store");
         store.power_cut_losing_everything();
         let root_durable = store.read_durable(ROOT_AT, 16) == vec![0x55; 16];
         let manifest_present = store.read_durable(MANIFEST_AT, 16) == vec![0x44; 16];

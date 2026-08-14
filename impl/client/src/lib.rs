@@ -25,8 +25,8 @@
 //!   and root keys are on disk.
 
 pub mod blob;
-pub mod container;
 pub mod vaultbox;
+pub mod workdir;
 pub mod content;
 pub mod secretbox;
 pub mod seed;

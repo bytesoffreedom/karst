@@ -231,39 +231,6 @@ impl MasterKey {
         out
     }
 
-    /// RAW seal for an OPAQUE fixed-size region (the Tier-2 hidden volume): `nonce(24) ‖ ct`, with NO
-    /// magic prefix — so the whole blob is indistinguishable from random (a random nonce + an AEAD
-    /// ciphertext is computationally random). The caller pads the plaintext to a FIXED length so the
-    /// output size never varies, and treats an `open_raw` failure as "no such volume".
-    pub(crate) fn seal_raw(&self, label: &str, plaintext: &[u8]) -> Vec<u8> {
-        let key = self.subkey(label);
-        let cipher = XChaCha20Poly1305::new((&key).into());
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let aad = Self::context_aad(label, STATE_VERSION);
-        let ct = cipher
-            .encrypt(&nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad: &aad })
-            .expect("XChaCha20-Poly1305 encryption");
-        let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
-        out.extend_from_slice(nonce.as_slice());
-        out.extend_from_slice(&ct);
-        out
-    }
-
-    /// Open a `seal_raw` blob. `Err` = wrong key OR this region holds no hidden volume (just random) —
-    /// the two are indistinguishable, which is the whole point.
-    pub(crate) fn open_raw(&self, label: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
-        if blob.len() < NONCE_LEN + 16 {
-            return Err("no hidden volume".into());
-        }
-        let key = self.subkey(label);
-        let nonce = XNonce::from_slice(&blob[..NONCE_LEN]);
-        let cipher = XChaCha20Poly1305::new((&key).into());
-        let aad = Self::context_aad(label, STATE_VERSION);
-        cipher
-            .decrypt(nonce, chacha20poly1305::aead::Payload { msg: &blob[NONCE_LEN..], aad: &aad })
-            .map_err(|_| "no hidden volume / wrong key".to_string())
-    }
-
     /// Decrypt the contents of `label`. Three DISTINGUISHABLE failures: not our format (re-init
     /// needed); the file was written by a different schema version (a newer binary is needed, not
     /// "read it with defaults"); wrong password, corruption, or a foreign file.

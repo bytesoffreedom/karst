@@ -6,10 +6,10 @@
 //!
 //! # Why an adapter and not a rewrite
 //!
-//! The old `ContainerVault` has exactly one shape: open a compartment, materialise its ONE opaque
-//! blob into a work dir, snapshot the dir back on save. It never asks for objects, offsets or
-//! partial updates. So the whole app can move to the new container by replacing what stores that
-//! blob — not by teaching every write path about objects.
+//! The container this replaced had exactly one shape: open a compartment, materialise its ONE
+//! opaque blob into a work dir, snapshot the dir back on save. The app never asked it for objects,
+//! offsets or partial updates. So the whole app could move to the new container by replacing what
+//! stores that blob — not by teaching every write path about objects.
 //!
 //! An object-native version, where the `Store`'s files ARE vault objects and a save writes only
 //! what changed, uses the machinery as designed and is the better end state. It also touches every
@@ -19,8 +19,8 @@
 //!
 //! # What this deliberately does NOT hide
 //!
-//! The old container reported free space as a number the caller could size a snapshot by. This one
-//! does not: copy-on-write means rewriting an object of B blocks needs B free blocks while B are
+//! The container this replaced reported free space as a number the caller could size a snapshot by.
+//! This one does not: copy-on-write means rewriting an object of B blocks needs B free blocks while B are
 //! still held, so a snapshot sized by the free count fills the container on the first save and
 //! cannot commit the second. `max_snapshot_bytes` answers the question the caller actually has,
 //! and the authoritative answer stays the attempt itself — see `write_snapshot`.
@@ -36,7 +36,7 @@ use vault::session::{Unlocked, Vault, VaultError};
 pub use vault::session::Passwords;
 use vault::slot::Mode;
 
-use crate::container::{restore_dir, snapshot_dir};
+use crate::workdir::{restore_dir, snapshot_dir};
 
 /// The object slot the account's snapshot lives in.
 ///
@@ -127,8 +127,8 @@ pub fn create(path: &Path, size: u64, pw: &Passwords<'_>) -> io::Result<()> {
 /// A hidden account's `work_dir` must be RAM-backed — the caller passes one, and passing a
 /// disk-backed directory for a hidden account writes its plaintext to the disk the container
 /// exists to keep it off. That check belongs to the caller because only the caller knows which
-/// directories are which; this is stated rather than enforced here, and the old container's
-/// `open_container` is where the enforcement lives today.
+/// directories are which; `open_routed` below is where that rule is enforced, and it is what the
+/// app calls.
 pub fn open(path: &Path, password: &[u8], size: u64, work_dir: PathBuf) -> io::Result<Opened> {
     open_with(path, password, size, |_| Ok(work_dir))
 }

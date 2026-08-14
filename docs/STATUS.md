@@ -972,35 +972,23 @@ build; clippy clean.**
   older build.
 - **Multipassword / duress — Tier 1 (`impl/client`).** Decoy / wipe / dead-man keyslot foundation
   (threat model A′).
-- **Multipassword Tier 2 — deniable CONTAINER with a hidden ACCOUNT (`impl/client::container` +
-  `impl/desktop`, opt-in, UNDER EMBARGO — not announced).** Supersedes the earlier note-based
-  `hidden.dat`, which was DELETED on 2026‑07‑31 — it had survived beside its own replacement for five
-  days, offering the exact cover this design rejects ("a secret note proves you deliberately hid
-  something"). One fixed-size `container.dat` of all-random bytes, byte-indistinguishable from noise
-  without a password; holds a whole serialized account per compartment (format-(b) blob + append-only
-  history log, in-place region writes so a save never rewrites the whole file), with an in-container
-  8-slot keyslot table so the number of passwords never leaks. **Three passwords:** P1 (main, protect),
-  P2 (a full HIDDEN account — not a note), P3 (main, blind-cover), plus Wipe (whole-container erase). The
-  management slot-directory is sealed under the P1 key, so revealing P3 under duress cannot enumerate
-  P1/P2 (test-pinned). Hidden account materializes into a **VERIFIED** RAM/tmpfs work dir (deleted on
-  lock) — the mount TYPE is checked against `/proc/mounts`, and if no RAM-backed store can be proven the
-  hidden account **refuses to open** rather than falling back to disk (it used to fall back silently to a
-  predictable `base/.hidden-work`, which voided this claim on macOS/Windows/minimal containers; a main
-  account is unaffected). It also refuses
-  disk-export + bulk media (zero external artifacts), and defaults to OFFLINE (emits no network traffic
-  until a deliberate sync). GUI-verified end-to-end: create a 64 MB container account, add a hidden
-  account, both open with their own password, container size unchanged. **Honest ceiling (say it):
-  deniable at rest on disk + while offline; NOT deniable against an adversary with relay/network logs
-  once the hidden account goes online** (circuit isolation + timing settings deferred — see #123).
-  32 container tests. Desktop: `container_create/unlock/flush/active/hidden/recreate`,
-  `net_offline/set_net_offline`, `Vault::adopt`.
-- **The desktop now runs on the NEW container (`impl/vault` + `client::vaultbox`, #324).** The
-  paragraphs above describe the container the app used until this switch; the format it uses now is
-  the one in `impl/vault` — fixed-size blocks, two capsules per block in different pages,
-  copy-on-write through a radix map, credit-checked transactions and an eight-barrier commit order,
-  with a crypto-erase that overwrites the salt first. `client::vaultbox` is the seam: the app still
-  operates on a working directory, and that directory is a snapshot object inside the container
-  instead of a region of the old one.
+- **Multipassword Tier 2 — deniable CONTAINER with a hidden ACCOUNT (`impl/vault` +
+  `impl/client::vaultbox` + `impl/desktop`, opt-in, UNDER EMBARGO — not announced).** Supersedes the
+  earlier note-based `hidden.dat`, which was DELETED on 2026‑07‑31 — it had survived beside its own
+  replacement for five days, offering the exact cover this design rejects ("a secret note proves you
+  deliberately hid something"). One fixed-size `container.dat` of all-random bytes,
+  byte-indistinguishable from noise without a password, holding a whole account per compartment.
+  **The region-based first implementation was removed in #319**; what remains of it is the pair of
+  functions that turn a working directory into one blob and back (`client::workdir`), which were
+  never about that format.
+  **The format (`impl/vault`).** Fixed-size blocks; two ownership capsules per block, in DIFFERENT
+  pages, so a torn write cannot leave a block with no readable owner; copy-on-write through a radix
+  map of fixed depth; every transaction admitted on credit before a byte moves; a commit order of
+  eight barriers with the root write as the single commit point; the generation carried inside the
+  record header, so a record cannot be replayed into a slot it did not come from; one writer per
+  file, enforced by an exclusive `flock` for the session's lifetime (a second window is refused, not
+  raced); and a wipe that overwrites the salt FIRST, making it a crypto-erase that holds even if the
+  bulk fill never finishes.
   **Four passwords, written together.** Protecting (P1), hidden (P2), cover (P3) and wipe. All four
   slots always exist, whether or not their passwords do — an unset one holds random bytes nobody
   has, because a container with three slots would tell anyone holding the file that a compartment
@@ -1021,42 +1009,35 @@ build; clippy clean.**
   mid-build" from "committed", and promoting the first over a good container destroys the account
   with no error anywhere — an empty object is a new account, not a damaged one.
   **Minimum size is published** (`vault::session::minimum_size`, ~4.8 MiB, page-aligned) and the
-  create clamps to it, instead of building a file and then refusing it. Tests: 8 in
-  `client::vaultbox` (round-trip, cover password, hidden isolation, duress wipe, repeated saves,
-  rebuild+migration, interrupted rebuild, abandoned build), 180 in `vault`, and
-  `a_message_reaches_an_account_that_lives_in_the_new_container` — a real relay, a real message,
-  decrypted into the container's work dir, committed, and read back after reopening the container
-  into a directory that never saw it.
-  **Container is the authority for the work dir (A3-3, fixed).** Opening a compartment now makes the
-  work dir EQUAL its snapshot — `restore_dir` clears the directory first instead of overlaying the
+  create clamps to it, instead of building a file and then refusing it. The old 1 GiB RAM ceiling is
+  gone with the format that needed it: the container is read and written through a file handle at
+  offsets, never buffered whole.
+  **The hidden account** materializes into a **VERIFIED** RAM/tmpfs work dir (deleted on lock) — the
+  mount TYPE is checked against `/proc/mounts`, and if no RAM-backed store can be proven the hidden
+  account **refuses to open** rather than falling back to disk (it used to fall back silently to a
+  predictable `base/.hidden-work`, which voided this claim on macOS/Windows/minimal containers; a
+  main account is unaffected). It also refuses disk-export + bulk media (zero external artifacts),
+  and defaults to OFFLINE (emits no network traffic until a deliberate sync).
+  **Honest ceiling (say it): deniable at rest on disk + while offline; NOT deniable against an
+  adversary with relay/network logs once the hidden account goes online** (circuit isolation +
+  timing settings deferred — see #123).
+  Tests: 180 in `vault`, 8 in `client::vaultbox` (round-trip, cover password, hidden isolation,
+  duress wipe, repeated saves, rebuild+migration, interrupted rebuild, abandoned build), 4 in
+  `client::workdir`, and `a_message_reaches_an_account_that_lives_in_the_new_container` — a real
+  relay, a real message, decrypted into the container's work dir, committed, and read back after
+  reopening the container into a directory that never saw it. Desktop:
+  `container_create/unlock/flush/active/hidden/recreate`, `net_offline/set_net_offline`,
+  `Vault::adopt`.
+  **The container is the authority for the work dir (A3-3).** Opening a compartment makes the work
+  dir EQUAL its snapshot — `restore_dir` clears the directory first instead of overlaying the
   snapshot onto whatever was left there. A visible account's work dir (`<vault>/work`) survives
   between sessions, so the overlay let deleted contacts/settings/sidecars come back and be
-  re-snapshotted (permanent resurrection), and could mix two generations of state file-by-file with
-  nothing reporting it. A blob that fails to decode is refused *before* anything is removed. **Named
-  cost:** work that never reached a `save()` is discarded cleanly at the next open rather than left
-  behind torn — safe for received mail (ACKs are deferred behind the commit, so it redelivers), a real
-  loss for a queued `flush_outbox` send or an in-progress download, which have no relay copy. Test:
-  `reopening_a_compartment_replaces_the_work_dir_instead_of_merging_into_it`.
-  **One writer per container (A3-8, fixed — UNIX only).** `Container` holds an exclusive `flock` on
-  `container.dat` for its lifetime, so a second window (or a second instance in one process) is
-  refused rather than racing. Two writers previously shared one `<container>.tmp` and could rename an
-  interleaved mixture over the file — losing EVERY compartment, not just the loser's changes — while
-  `load` could unlink another process's in-flight save. **No equivalent on non-UNIX platforms**: a
-  lock *file* is not available to us, because a hidden account's directory must hold `container.dat`
-  and nothing else. A lock conflict (and an over-ceiling container) is reported with a distinct
-  `io::ErrorKind` so `container_unlock` does not fold it into the opaque "wrong password" it must
-  return for a genuine open failure — a user with a correct password should never be told otherwise.
-  `wipe` deliberately does NOT re-take the lock: a wipe that lost the relock race would report
-  failure for a container it had just erased. Test:
-  `a_second_live_container_over_one_file_is_refused_until_the_first_is_dropped`.
-  **Container size is a RAM budget, capped at 1 GiB (A3-9, fixed).** The whole file lives in a
-  `Vec<u8>`, and the desktop passed `size_mb` from the frontend through unchecked;
-  `client::container::MAX_CONTAINER_BYTES` now refuses an oversized container at `create` (before the
-  allocation) and at `load` (by `stat`, before the read). Memory-mapping would not lift this: format
-  (b) stores one sealed blob per compartment, so a save buffers the whole snapshot and its whole
-  ciphertext regardless — peak ≈ 2× the container size, of which only the file term is mmap-able.
-  1 GiB ⇒ ~384 MiB of usable account. Test:
-  `a_container_over_the_ram_ceiling_is_refused_at_both_create_and_load`.
+  snapshotted in permanently, and let two generations of state mix file by file with nothing
+  reporting it.
+  **A snapshot is bounded before it is read (SEC-35).** The files under a work dir are not all ours
+  — attachments a CORRESPONDENT sent live there too — so `snapshot_dir` checks each file's size by
+  `stat` against the compartment's usable write capacity BEFORE reading it, and refuses loudly,
+  naming the file. Unbounded, a correspondent could turn an ordinary save into an OOM for free.
   **Receive durability (SEC-34, fixed).** A container-backed session's `Store` is a materialized
   working copy; the authority is the container, written by a separate later `save()`. Receiving used
   to ack the relay — telling it to delete its only copy — as soon as that working copy was written,
@@ -1069,22 +1050,19 @@ build; clippy clean.**
   container, relay-clock lease expiry), plus `a_control_only_batch_still_carries_a_commit_barrier`.
   **Named limits.** (a) "Redeliverable" means *after a relock/restart*: within the same session the
   work dir still holds the advanced ratchet, so a redelivery fails closed and shows as nothing — no
-  loss, but no in-session recovery either. (Since A3-3 the relock/restart half is cleaner than it
-  was: the reopen resets the work dir to the container's snapshot outright, so the ratchet really
-  does return to the last committed state instead of being partly overlaid by leftovers.) A failed
-  commit DROPS its receipts rather than deferring them to the next successful save, so those messages
-  occupy relay mailbox slots until the deposit TTL sweeps them (bounded, never lossy — the copy that
-  matters is the container's). (b) The **ratchet rollback itself is not fixed**: reopening a
-  compartment restores the container's snapshot over the work dir — now a full replace rather than a
-  merge, so a stale snapshot rolls the account back wholesale — and a rollback deeper than `MAX_SKIP`
-  can still wedge a conversation. Deferring the ack removes the message LOSS, not the rollback.
-  (c) Only the receive path is gated. Other writers of a container-backed work dir — `flush_outbox`,
-  the spawned download/attachment threads — are still durable only at the next container save, and
-  since A3-3 their un-saved work is *discarded* at the next open rather than surviving in the
-  directory. Nothing is deleted from a relay on their behalf, so a rollback costs a redundant resend
-  or re-download, not mail — but the queued item itself does not survive the reopen. (d) The
-  quarantine/replay log is **not** a mitigation here: it lives in the work dir, so it rolls back with
-  everything else.
+  loss, but no in-session recovery either. A failed commit DROPS its receipts rather than deferring
+  them to the next successful save, so those messages occupy relay mailbox slots until the deposit
+  TTL sweeps them (bounded, never lossy — the copy that matters is the container's). (b) The
+  **ratchet rollback itself is not fixed**: reopening a compartment restores the container's
+  snapshot over the work dir — a full replace, so a stale snapshot rolls the account back wholesale
+  — and a rollback deeper than `MAX_SKIP` can still wedge a conversation. Deferring the ack removes
+  the message LOSS, not the rollback. (c) Only the receive path is gated. Other writers of a
+  container-backed work dir — `flush_outbox`, the spawned download/attachment threads — are still
+  durable only at the next container save, and their un-saved work is *discarded* at the next open
+  rather than surviving in the directory. Nothing is deleted from a relay on their behalf, so a
+  rollback costs a redundant resend or re-download, not mail — but the queued item itself does not
+  survive the reopen. (d) The quarantine/replay log is **not** a mitigation here: it lives in the
+  work dir, so it rolls back with everything else.
 - **Public-node admission door (`impl/admission`, `impl/node`).** A stateless proof-of-work → a
   short-lived capability, so a public relay admits strangers without an invite and without keeping
   per-client state at the door.

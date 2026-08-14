@@ -294,15 +294,13 @@ not while absent. Document the weakened‑absence limit. `wipe` password destroy
 - **User chooses N** at creation, plus an **A/B slider** (main vs hidden reserve) with the
   honest warning that hidden is best‑effort under P3 and best kept light. Writing N random
   bytes is slow → progress off the UI thread.
-- **N is capped at 1 GiB by RAM, not by free disk (A3-9, implemented).** The earlier
-  `free − max(2 GiB, 10%)` framing was wrong about which resource binds: this is a
-  whole-file-in-RAM design, and `client::container::MAX_CONTAINER_BYTES` refuses anything
-  larger at both `create` and `load`. Memory-mapping would not lift the ceiling, which is why
-  the cap is the fix rather than a placeholder for a rewrite: format (b) keeps **one sealed
-  blob per compartment**, so a save necessarily builds the entire account snapshot in RAM and
-  then its entire ciphertext. Peak is roughly **2 × N** (file + snapshot + ciphertext), of
-  which only the file term is what mmap would remove. 1 GiB ⇒ ~2 GiB peak and ~384 MiB of
-  usable main account. A container the machine cannot hold twice over is unusable by design.
+- **The 1 GiB RAM cap is GONE with the format that needed it (#319).** It was real while the
+  container was a whole-file-in-RAM design — one sealed blob per compartment meant a save built
+  the entire snapshot and then its entire ciphertext, peaking near 2 × N. The container in
+  `impl/vault` reads and writes through a file handle at offsets, so N is bounded by disk again.
+  What remains in RAM is the account SNAPSHOT (`snapshot_dir`), which is bounded separately and
+  before it is read — see SEC-35. The floor moved instead: `vault::session::minimum_size`
+  publishes the smallest container the format can lay out, and the create clamps to it.
 - **Main‑region full policy (settled with user):** format (b) hard‑caps the main
   account at A, so its growing metadata (sessions/history/contacts) can fill it.
   Policy = **generous A default + an always‑on "container nearly full" warning** +

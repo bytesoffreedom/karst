@@ -1320,17 +1320,20 @@ fn spawn_relay_handle_clock() -> (SocketAddr, client::RelayId, Arc<RwLock<RelayN
     (addr, client::RelayId { noise_pub, fetch_pub }, handle, clock)
 }
 
+/// The size every container in this file is created at. Big enough to hold a provisioned account
+/// comfortably, small enough that one planted file can exceed what a save may write.
+const CONTAINER_BYTES: u64 = 32 * 1024 * 1024;
+
 /// A container-backed account, set up the way `container_create` does it: a container file, a
-/// `ContainerVault` materialized into `work`, and a `Store` over that work dir. The vault comes
-/// back so the test can drive `save()` — the commit that a container-backed session's ACK must
-/// wait on.
-fn open_container_store(
-    cpath: &std::path::Path,
-    work: PathBuf,
-) -> (client::container::ContainerVault, Store) {
-    let cv = client::container::ContainerVault::open(cpath, b"container-pw", work).unwrap();
-    let store = Store::unlock(&cv.work_dir, b"pw").unwrap();
-    (cv, store)
+/// session materialised into `work`, and a `Store` over that work dir. The session comes back so
+/// the test can drive `save()` — the commit that a container-backed session's ACK must wait on.
+fn open_container_store(cpath: &std::path::Path, work: PathBuf) -> (client::vaultbox::VaultBox, Store) {
+    let vb = match client::vaultbox::open(cpath, b"protect-me", CONTAINER_BYTES, work).unwrap() {
+        client::vaultbox::Opened::Account(vb) => *vb,
+        client::vaultbox::Opened::Wiped => panic!("the protecting password reported a wipe"),
+    };
+    let store = Store::unlock(&vb.work_dir, b"pw").unwrap();
+    (vb, store)
 }
 
 /// **The messenger, end to end, on the NEW container (#324).** Bob's whole account lives inside a
@@ -1440,11 +1443,21 @@ fn a_failed_container_commit_leaves_the_batch_redeliverable() {
     let adir = temp_dir("sec34-alice");
     let base = temp_dir("sec34-container");
     let cpath = base.join("container.dat");
-    // 1 MiB container, main region 3/4 of it. A region holds two ping-pong copy slots, so the
-    // usable payload is roughly 3/8 MiB — far more than a provisioned account, far less than the
-    // oversized file planted below.
-    let total = 1024 * 1024;
-    client::container::Container::create(&cpath, total, b"container-pw", total / 4 * 3).unwrap();
+    // Copy-on-write means a save needs as many free blocks as the object it rewrites while the old
+    // version is still held, so what a save may write is about half the container — far more than a
+    // provisioned account, far less than the oversized file planted below.
+    let total = CONTAINER_BYTES;
+    client::vaultbox::create(
+        &cpath,
+        total,
+        &client::vaultbox::Passwords {
+            protected: b"protect-me",
+            hidden: b"the-other-one",
+            public: b"just-a-phone",
+            wipe: b"burn-it-all",
+        },
+    )
+    .unwrap();
 
     let (mut cv, bstore) = open_container_store(&cpath, base.join("work-1"));
     let astore = Store::unlock(&adir, b"pw").unwrap();

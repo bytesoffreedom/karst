@@ -1264,7 +1264,7 @@ fn hidden_work_dir(base: &std::path::Path) -> Option<std::path::PathBuf> {
     // every `karst-hid-*`, would wipe the LIVE plaintext work dir of an already-running process,
     // leaving it reading files that had vanished underneath it (A3-7). Per-process names make the
     // sweep able to tell "mine / dead owner" from "someone else's live session".
-    client::container::ram_backed_hidden_dir(&format!("{:016x}-p{}", h.finish(), std::process::id()))
+    client::workdir::ram_backed_hidden_dir(&format!("{:016x}-p{}", h.finish(), std::process::id()))
 }
 
 /// Snapshot the container-backed account's work dir back into the deniable container. Called after
@@ -1360,10 +1360,13 @@ fn container_recreate(
         None
     } else {
         Some(
-            client::container::ram_backed_hidden_dir(&format!("build-p{}", std::process::id()))
+            client::workdir::ram_backed_hidden_dir(&format!("build-p{}", std::process::id()))
                 .ok_or("a hidden account needs a RAM-backed store (tmpfs); none is available on this system")?,
         )
     };
+
+    // Read before taking the session out, so a failure here is one where nothing has moved yet.
+    let size = client::vaultbox::size_of(&cpath).map_err(|e| e.to_string())?;
 
     // The session is taken OUT of the app, not borrowed: it holds the container's exclusive lock,
     // and the file is about to be replaced. Everything below must put a working session back or
@@ -1382,7 +1385,6 @@ fn container_recreate(
     }
     let work_dir = cv.work_dir.clone();
     let account_key = cv.account_key();
-    let size = client::vaultbox::size_of(&cpath).map_err(|e| e.to_string())?;
     drop(cv); // releases the exclusive lock; the file may be replaced from here on
 
     // Check the typed password against the LIVE container before replacing it. Without this a typo
@@ -1393,7 +1395,7 @@ fn container_recreate(
         match client::vaultbox::open_routed(
             &cpath,
             main_password.as_bytes(),
-            client::vaultbox::size_of(&cpath).map_err(|e| e.to_string())?,
+            size,
             work_dir.clone(),
             hidden_work_dir(&base),
         ) {

@@ -60,9 +60,14 @@ block).
 
 | block payload | fan-out | depth |
 |---|---|---|
-| 4 KiB | 506 | 4 |
-| 64 KiB | 8 186 | 3 |
-| 1 MiB | 131 066 | 2 |
+| 4 KiB | 505 | 4 |
+| 64 KiB | 8 185 | 3 |
+| 1 MiB | 131 065 | 2 |
+
+Fan-out fell by one per level when `RECORD_FRAMING` went 42 → 50: the generation moved into the
+record header so that a record can say which generation it belongs to (`record-generation.md`).
+Depth is unchanged, so nothing else in this note moves — the block-size trade, the commit shape and
+the header cost are all as measured.
 
 Depth is computed over the LOGICAL address space, not over the container's size, so it does not
 change when a container does — which is the property that keeps a transaction's worst case

@@ -20,7 +20,7 @@ pub const DEFAULT_BLOCK_PAYLOAD: usize = 64 * 1024;
 /// holds strictly fewer entries than `payload / 8`. Getting this wrong in the optimistic direction
 /// is how a transaction ends up needing one more block than it reserved, which is the one failure
 /// the credit protocol exists to make impossible.
-pub const RECORD_FRAMING: usize = 2 + 24 + 16;
+pub const RECORD_FRAMING: usize = 10 + 24 + 16;
 
 /// One entry of a map node: a physical block number.
 pub const ENTRY_LEN: usize = 8;

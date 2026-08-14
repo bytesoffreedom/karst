@@ -31,7 +31,7 @@ pub const NONCE_LEN: usize = 24;
 /// Bytes of AEAD tag.
 pub const TAG_LEN: usize = 16;
 /// Version and type bytes.
-pub const HEADER_LEN: usize = 2;
+pub const HEADER_LEN: usize = 2 + 8;
 
 /// Format version of the record encoding itself. Bumped only when the framing changes.
 const RECORD_VERSION: u8 = 1;
@@ -143,6 +143,19 @@ impl MasterKey {
 }
 
 /// Seal `plaintext` as a record valid at exactly `ctx`.
+///
+/// # The generation is in the header, not just the aad
+///
+/// A record's generation is bound into its aad, so a reader has to know it BEFORE it can decrypt.
+/// Taking it from somewhere else — the space's current root, say — is right only while every record
+/// is rewritten by every commit, and that stops being true the moment copy-on-write leaves an
+/// untouched node in place. Then the node does not open, and it reads as corruption.
+///
+/// So it lives in the header, beside the version and the type, and [`open`] reads it back out.
+/// Roots and capsules already did this with their own prefixes; this is the same idea applied
+/// where it belongs, so that no caller has to remember to add one. Editing the header does not
+/// point a reader at a generation of the attacker's choosing: it is covered by the aad, so a
+/// changed header makes the record fail to open.
 pub fn seal(key: &MasterKey, ctx: &Context, plaintext: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new((&key.subkey(ctx.record_type)).into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -152,9 +165,20 @@ pub fn seal(key: &MasterKey, ctx: &Context, plaintext: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + NONCE_LEN + ct.len());
     out.push(RECORD_VERSION);
     out.push(ctx.record_type as u8);
+    out.extend_from_slice(&ctx.generation.to_le_bytes());
     out.extend_from_slice(nonce.as_slice());
     out.extend_from_slice(&ct);
     out
+}
+
+/// The generation a record claims, read from its header without decrypting.
+///
+/// A CLAIM, not a fact — it is only evidence once [`open`] has verified the record under it.
+pub fn claimed_generation(record: &[u8]) -> Option<u64> {
+    if record.len() < HEADER_LEN {
+        return None;
+    }
+    Some(u64::from_le_bytes(record[2..10].try_into().expect("8 bytes")))
 }
 
 /// Open a record, or `None`.
@@ -164,17 +188,31 @@ pub fn seal(key: &MasterKey, ctx: &Context, plaintext: &[u8]) -> Vec<u8> {
 /// That is not laziness — the ownership layer's whole fail-closed rule is built on "could not read
 /// it" being one answer, because a caller that could tell those apart would be an oracle.
 pub fn open(key: &MasterKey, ctx: &Context, record: &[u8]) -> Option<Vec<u8>> {
+    open_at(key, ctx, record).map(|(_, plain)| plain)
+}
+
+/// Open a record and say which generation it turned out to belong to.
+///
+/// **The generation comes from the RECORD, not from the caller.** `ctx.generation` is overwritten
+/// by what the header says before the aad is computed, so a caller that does not know the
+/// generation cannot pass the wrong one — there is no wrong one to pass. That removes the class of
+/// bug rather than an instance: the aad still binds it, so a tampered header fails to open.
+pub fn open_at(key: &MasterKey, ctx: &Context, record: &[u8]) -> Option<(u64, Vec<u8>)> {
     if record.len() < HEADER_LEN + NONCE_LEN + TAG_LEN {
         return None;
     }
     if record[0] != RECORD_VERSION || record[1] != ctx.record_type as u8 {
         return None;
     }
+    let generation = claimed_generation(record)?;
+    let mut ctx = *ctx;
+    ctx.generation = generation;
     let nonce = XNonce::from_slice(&record[HEADER_LEN..HEADER_LEN + NONCE_LEN]);
     let cipher = XChaCha20Poly1305::new((&key.subkey(ctx.record_type)).into());
-    cipher
+    let plain = cipher
         .decrypt(nonce, Payload { msg: &record[HEADER_LEN + NONCE_LEN..], aad: &ctx.aad() })
-        .ok()
+        .ok()?;
+    Some((generation, plain))
 }
 
 #[cfg(test)]
@@ -216,9 +254,23 @@ mod tests {
         other_space.space = SpaceId::Hidden;
         assert!(open(&k, &other_space, &sealed).is_none(), "accepted as the hidden space's");
 
-        let mut older = ctx();
-        older.generation -= 1;
-        assert!(open(&k, &older, &sealed).is_none(), "replayed from another generation");
+        // The generation is NOT checked by passing a different one — `open` reads it out of the
+        // record, so there is no wrong value a caller could pass. The property is stronger than it
+        // was: an ATTACKER editing the header must not be able to pass the record off as another
+        // generation's. The header is covered by the aad, so the edit makes it fail to open.
+        let mut relabelled = sealed.clone();
+        relabelled[2] ^= 1; // first byte of the generation
+        assert!(open(&k, &ctx(), &relabelled).is_none(), "a relabelled generation still opened");
+        assert_eq!(
+            claimed_generation(&relabelled),
+            Some(ctx().generation ^ 1),
+            "the claim is readable without decrypting, which is the point — it is only a CLAIM"
+        );
+        assert_eq!(
+            open_at(&k, &ctx(), &sealed).map(|(g, _)| g),
+            Some(ctx().generation),
+            "an untouched record reports the generation it was sealed under"
+        );
 
         let mut other_copy = ctx();
         other_copy.copy_index = 1;

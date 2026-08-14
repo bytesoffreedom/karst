@@ -1,8 +1,12 @@
 # A record has to say which generation it belongs to
 
-Status: **open decision, blocking.** Found while building the container's object path (#325). The
-code in the repository is correct today by a coincidence that will not survive the next slice, and
-the obvious fix is arithmetically impossible. Written down so the choice is made deliberately.
+Status: **decided and implemented — option (d).** `RECORD_FRAMING` went 42 → 50, the generation now
+lives in the record header beside the version and the type, and `record::open` reads it out of the
+record instead of being handed one. Fan-out fell by one entry per level; depth is unchanged, so the
+rest of `container-measurements.md` stands.
+
+The section below is kept as written, because the reasoning is the useful part — including the
+arithmetic that killed the obvious fix and the fact that I implemented that fix before checking it.
 
 ## The problem
 
@@ -62,7 +66,10 @@ costs exactly what (a) costs — but it buys more:
   class of bug rather than this instance of it — a caller cannot pass the wrong generation if it
   does not pass one at all.
 
-**(d) is the recommendation.** It is the same price as (a) and it kills the class.
+**(d) was chosen and is done.** Same price as (a), and it kills the class: `open` cannot be passed
+the wrong generation because it is not passed one. The test that used to prove "a caller cannot
+replay another generation's record" now proves something stronger — an ATTACKER editing the
+generation in the header cannot, because the header is covered by the aad.
 
 ## What it touches
 

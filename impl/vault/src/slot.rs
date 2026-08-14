@@ -76,6 +76,14 @@ pub enum Mode {
     Hidden = 2,
     /// Opens the public space with no knowledge of the ownership layer.
     Public = 3,
+    /// Destroys the container. Holds no key and opens no space.
+    ///
+    /// The plan describes three passwords; this is a fourth, and it is a PRODUCT feature rather
+    /// than part of the deniability construction — the duress wipe the app already offers. It
+    /// lives in the slot table because the slot table IS the "this password means X" mechanism:
+    /// every slot is the same size and indistinguishable from random, so a wipe slot cannot be
+    /// told from an unused one, and adding the mode costs one byte value.
+    Wipe = 4,
 }
 
 impl Mode {
@@ -84,6 +92,7 @@ impl Mode {
             1 => Some(Mode::Protected),
             2 => Some(Mode::Hidden),
             3 => Some(Mode::Public),
+            4 => Some(Mode::Wipe),
             _ => None,
         }
     }
@@ -158,7 +167,9 @@ fn decode(plain: &[u8]) -> Option<Opened> {
     let mut space = [0u8; 32];
     space.copy_from_slice(&plain[1..33]);
     let layer_key = match mode {
-        Mode::Public => None,
+        // A wipe slot carries no key at all: it names an action, not a compartment. The bytes in
+        // the key fields are random padding, and reading them as a key would be reading noise.
+        Mode::Public | Mode::Wipe => None,
         Mode::Protected | Mode::Hidden => {
             let mut l = [0u8; 32];
             l.copy_from_slice(&plain[33..65]);

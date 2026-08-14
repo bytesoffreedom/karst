@@ -130,6 +130,44 @@ impl FileStore {
         Ok(FileStore { file, len: expect_len, path })
     }
 
+    /// Destroy the container: every byte becomes random, and the salt goes FIRST.
+    ///
+    /// # The order is the whole design
+    ///
+    /// The salt is what every slot key is derived from, so overwriting it is a crypto-erase that
+    /// takes one write: from that instant no password opens anything, whatever happens next. Only
+    /// then does the bulk fill run. A process killed halfway through the fill has still destroyed
+    /// the container — which matters, because the one situation this path exists for is somebody
+    /// being made to run it while under pressure, and it may not be allowed to finish.
+    ///
+    /// # Two details that look like style and are not
+    ///
+    /// The fill reuses one chunk buffer rather than materialising a second image of the file:
+    /// allocating container-sized memory on the duress path is how a wipe fails on a phone at the
+    /// worst possible moment.
+    ///
+    /// And the lock is DROPPED rather than re-taken at the end. There is nothing left in this file
+    /// to protect from a second writer, and a failed re-lock must never turn a COMPLETED wipe into
+    /// an error the caller reports as failure.
+    pub fn wipe(self) -> Result<(), MediumError> {
+        let mut salt = [0u8; 16];
+        fill_random(&mut salt);
+        self.file.write_all_at(&salt, 0).map_err(MediumError::Io)?;
+        self.file.sync_data().map_err(MediumError::Io)?; // the erase is committed HERE
+
+        const CHUNK: usize = 1 << 20;
+        let mut buf = vec![0u8; CHUNK];
+        let mut at = 0u64;
+        while at < self.len {
+            let take = CHUNK.min((self.len - at) as usize);
+            fill_random(&mut buf[..take]);
+            self.file.write_all_at(&buf[..take], at).map_err(MediumError::Io)?;
+            at += take as u64;
+        }
+        self.file.sync_data().map_err(MediumError::Io)?;
+        Ok(()) // `self` drops here, and with it the lock
+    }
+
     /// Where this container lives — for an error message that names the file.
     pub fn path(&self) -> &Path {
         &self.path

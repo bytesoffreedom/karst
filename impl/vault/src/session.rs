@@ -110,6 +110,31 @@ pub struct Passwords<'a> {
     pub hidden: &'a [u8],
     /// Opens the public space knowing nothing of the ownership layer.
     pub public: &'a [u8],
+    /// Destroys the container. Always present, for the same reason the hidden space always exists:
+    /// a container WITHOUT a wipe slot would differ from one with, and the difference would be
+    /// visible to anyone comparing two files.
+    pub wipe: &'a [u8],
+}
+
+/// What a password turned out to be for.
+pub enum Unlocked {
+    /// A compartment, open and ready.
+    Session(Box<Vault>),
+    /// A wipe password. **The container is already gone** by the time this is returned — there is
+    /// no "are you sure", because the situation this exists for is one where the person holding
+    /// the keyboard is not the person who wants the data kept.
+    Wiped,
+}
+
+impl Unlocked {
+    /// The session, or `None` if the container was wiped. For callers that have already decided
+    /// what a wipe means to them.
+    pub fn session(self) -> Option<Vault> {
+        match self {
+            Unlocked::Session(v) => Some(*v),
+            Unlocked::Wiped => None,
+        }
+    }
 }
 
 /// An open container.
@@ -147,11 +172,13 @@ impl Vault {
     ) -> Result<(), VaultError> {
         // Distinct passwords, checked before anything is written: two equal passwords would make
         // one compartment permanently unreachable, and the container would look fine.
-        if !slot::passwords_are_distinct(pw.protected, pw.hidden)
-            || !slot::passwords_are_distinct(pw.protected, pw.public)
-            || !slot::passwords_are_distinct(pw.hidden, pw.public)
-        {
-            return Err(VaultError::PasswordsCollide);
+        let all = [pw.protected, pw.hidden, pw.public, pw.wipe];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                if !slot::passwords_are_distinct(a, b) {
+                    return Err(VaultError::PasswordsCollide);
+                }
+            }
         }
         let params = FormatParams::derive(size);
         if params.blocks < minimum_blocks() {
@@ -200,6 +227,14 @@ impl Vault {
         slots.push(slot::seal_slot(pw.protected, &salt, 0, Mode::Protected, &ka, Some(&kl), &anchors_a));
         slots.push(slot::seal_slot(pw.hidden, &salt, 1, Mode::Hidden, &kb, Some(&kl), &anchors_b));
         slots.push(slot::seal_slot(pw.public, &salt, 2, Mode::Public, &ka, None, &anchors_a));
+        // The wipe slot carries no key: its key fields are random, so it has the same shape and
+        // the same entropy as every other slot, occupied or not.
+        let mut noise = [0u8; 32];
+        {
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut noise);
+        }
+        slots.push(slot::seal_slot(pw.wipe, &salt, 3, Mode::Wipe, &noise, None, &[0, 0]));
         while slots.len() < SLOT_COUNT {
             slots.push(slot::random_slot());
         }
@@ -213,12 +248,17 @@ impl Vault {
         Ok(())
     }
 
-    /// Open the compartment `password` unlocks.
-    pub fn open(
+    /// Open whatever `password` unlocks — a compartment, or the end of the container.
+    ///
+    /// A wipe password is not an error and not a compartment: it is an instruction, and this
+    /// carries it out before returning. That is why the whole thing is one call rather than
+    /// "tell me the mode, then I will decide" — a caller that could look at the mode first is a
+    /// caller that could be persuaded, under duress, to look and not act.
+    pub fn unlock(
         path: impl AsRef<std::path::Path>,
         password: &[u8],
         size: u64,
-    ) -> Result<Vault, VaultError> {
+    ) -> Result<Unlocked, VaultError> {
         let params = FormatParams::derive(size);
         let medium = FileStore::open(path, size)?;
         let geometry = Geometry::new(params.block_payload as usize, size);
@@ -232,9 +272,14 @@ impl Vault {
         }
 
         let opened = slot::open_table(password, &salt, &slots).ok_or(VaultError::NoSuchCompartment)?;
+        if opened.mode == Mode::Wipe {
+            medium.wipe()?;
+            return Ok(Unlocked::Wiped);
+        }
         let space = match opened.mode {
             Mode::Hidden => SpaceId::Hidden,
             Mode::Protected | Mode::Public => SpaceId::Public,
+            Mode::Wipe => unreachable!("handled above, before anything else looks at the mode"),
         };
 
         let raw0 = medium.read(payload_at(&geometry, opened.anchors[0]), ROOT_RAW)?;
@@ -258,7 +303,7 @@ impl Vault {
         }
         let allocator = crate::allocator::Allocator::new(params.blocks);
 
-        Ok(Vault {
+        Ok(Unlocked::Session(Box::new(Vault {
             medium,
             params,
             geometry,
@@ -270,7 +315,7 @@ impl Vault {
             live,
             free,
             allocator,
-        })
+        })))
     }
 
     /// Which compartment this session opened.
@@ -886,8 +931,26 @@ mod tests {
         crate::scratch::container_path(tag)
     }
 
+    /// Unlock and expect a session. Wiping is its own test; everywhere else a wipe would be a
+    /// silent data loss disguised as a passing assertion, so it panics here.
+    fn open_session(
+        p: &std::path::Path,
+        password: &[u8],
+        size: u64,
+    ) -> Result<Vault, VaultError> {
+        match Vault::unlock(p, password, size)? {
+            Unlocked::Session(v) => Ok(*v),
+            Unlocked::Wiped => panic!("this password wiped the container; the test expected a session"),
+        }
+    }
+
     fn pw<'a>() -> Passwords<'a> {
-        Passwords { protected: b"protect-me", hidden: b"the-other-one", public: b"just-a-phone" }
+        Passwords {
+            protected: b"protect-me",
+            hidden: b"the-other-one",
+            public: b"just-a-phone",
+            wipe: b"burn-it-all",
+        }
     }
 
     /// The headline: a container is created, and all three passwords open it — each into what it
@@ -897,19 +960,19 @@ mod tests {
         let p = scratch("three");
         Vault::create(&p, SIZE, &pw()).expect("create");
 
-        let a = Vault::open(&p, b"protect-me", SIZE).expect("P1");
+        let a = open_session(&p, b"protect-me", SIZE).expect("P1");
         assert_eq!(a.mode(), Mode::Protected);
         assert_eq!(a.space(), SpaceId::Public);
         assert!(a.has_layer(), "P1 holds the ownership layer");
         drop(a);
 
-        let b = Vault::open(&p, b"the-other-one", SIZE).expect("P2");
+        let b = open_session(&p, b"the-other-one", SIZE).expect("P2");
         assert_eq!(b.mode(), Mode::Hidden);
         assert_eq!(b.space(), SpaceId::Hidden);
         assert!(b.has_layer(), "P2 holds the ownership layer");
         drop(b);
 
-        let c = Vault::open(&p, b"just-a-phone", SIZE).expect("P3");
+        let c = open_session(&p, b"just-a-phone", SIZE).expect("P3");
         assert_eq!(c.mode(), Mode::Public);
         assert_eq!(c.space(), SpaceId::Public, "P3 opens the SAME space as P1");
         assert!(!c.has_layer(), "P3 must know nothing of the ownership layer");
@@ -922,11 +985,11 @@ mod tests {
     fn the_protected_and_public_passwords_open_one_account() {
         let p = scratch("shared-key");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let a = Vault::open(&p, b"protect-me", SIZE).expect("P1");
+        let a = open_session(&p, b"protect-me", SIZE).expect("P1");
         let key_a = a.space_key().clone();
         let root_a = a.root();
         drop(a);
-        let c = Vault::open(&p, b"just-a-phone", SIZE).expect("P3");
+        let c = open_session(&p, b"just-a-phone", SIZE).expect("P3");
         assert_eq!(c.space_key().to_bytes(), key_a.to_bytes(), "P1 and P3 must share the key");
         assert_eq!(c.root(), root_a, "and therefore see the same root");
     }
@@ -937,10 +1000,10 @@ mod tests {
     fn the_hidden_space_has_a_key_of_its_own() {
         let p = scratch("distinct");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let a = Vault::open(&p, b"protect-me", SIZE).expect("P1");
+        let a = open_session(&p, b"protect-me", SIZE).expect("P1");
         let key_a = a.space_key().to_bytes();
         drop(a);
-        let b = Vault::open(&p, b"the-other-one", SIZE).expect("P2");
+        let b = open_session(&p, b"the-other-one", SIZE).expect("P2");
         assert_ne!(b.space_key().to_bytes(), key_a, "the two spaces share a key");
     }
 
@@ -949,7 +1012,7 @@ mod tests {
     fn a_wrong_password_says_nothing_about_what_is_there() {
         let p = scratch("wrong");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        match Vault::open(&p, b"not any of them", SIZE) {
+        match Vault::unlock(&p, b"not any of them", SIZE) {
             Err(VaultError::NoSuchCompartment) => {}
             Err(other) => panic!("wrong refusal: {other}"),
             Ok(_) => panic!("a password that opens nothing must not open a session"),
@@ -961,7 +1024,8 @@ mod tests {
     #[test]
     fn colliding_passwords_are_refused_before_the_file_exists() {
         let p = scratch("collide");
-        let same = Passwords { protected: b"same", hidden: b"same", public: b"other" };
+        let same =
+            Passwords { protected: b"same", hidden: b"same", public: b"other", wipe: b"another" };
         assert!(matches!(Vault::create(&p, SIZE, &same), Err(VaultError::PasswordsCollide)));
         assert!(!p.exists(), "nothing may be written when the passwords are refused");
     }
@@ -972,7 +1036,7 @@ mod tests {
     fn a_public_session_can_only_ever_lower_bound_the_free_space() {
         let p = scratch("free");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let c = Vault::open(&p, b"just-a-phone", SIZE).expect("P3");
+        let c = open_session(&p, b"just-a-phone", SIZE).expect("P3");
         assert!(!c.free_space().is_exact(), "P3 reported an exact free-space figure");
         assert!(c.free_space().blocks() > 0);
     }
@@ -985,10 +1049,10 @@ mod tests {
     fn the_two_spaces_anchors_are_disjoint() {
         let p = scratch("anchors");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let a = Vault::open(&p, b"protect-me", SIZE).expect("P1");
+        let a = open_session(&p, b"protect-me", SIZE).expect("P1");
         let anchors_a = *a.anchors();
         drop(a);
-        let b = Vault::open(&p, b"the-other-one", SIZE).expect("P2");
+        let b = open_session(&p, b"the-other-one", SIZE).expect("P2");
         let anchors_b = *b.anchors();
         for x in anchors_a {
             assert!(!anchors_b.contains(&x), "block {x} anchors BOTH spaces");
@@ -1003,7 +1067,7 @@ mod tests {
     fn the_header_and_the_file_agree_on_how_big_the_container_is() {
         let p = scratch("size-agree");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let v = open_session(&p, b"protect-me", SIZE).expect("open");
         assert_eq!(v.container_bytes(), SIZE);
         assert_eq!(v.params().container_size, SIZE);
         assert!(v.geometry().block_stride() > 0);
@@ -1019,7 +1083,7 @@ mod tests {
     fn the_rewritable_ceiling_is_about_half_the_container() {
         let p = scratch("ceiling");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let v = open_session(&p, b"protect-me", SIZE).expect("open");
 
         let free_bytes = v.free_space().blocks() * v.geometry().logical_data() as u64;
         let ceiling = v.max_rewritable_bytes();
@@ -1051,12 +1115,12 @@ mod tests {
         Vault::create(&p, SIZE, &pw()).expect("create");
         let payload = b"the hidden account's whole world, as a snapshot".to_vec();
         {
-            let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+            let mut v = open_session(&p, b"protect-me", SIZE).expect("open");
             assert_eq!(v.read_object(0).expect("read"), None, "nothing written yet");
             v.write_object(0, &payload).expect("write");
             assert_eq!(v.read_object(0).expect("read back"), Some(payload.clone()));
         }
-        let v = Vault::open(&p, b"protect-me", SIZE).expect("reopen");
+        let v = open_session(&p, b"protect-me", SIZE).expect("reopen");
         assert_eq!(v.read_object(0).expect("read"), Some(payload), "the write did not survive");
     }
 
@@ -1065,12 +1129,12 @@ mod tests {
     fn writing_twice_leaves_the_second_version() {
         let p = scratch("replace");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let mut v = open_session(&p, b"protect-me", SIZE).expect("open");
         v.write_object(0, b"first").expect("first write");
         v.write_object(0, b"second, and longer").expect("second write");
         assert_eq!(v.read_object(0).expect("read"), Some(b"second, and longer".to_vec()));
         drop(v);
-        let v = Vault::open(&p, b"protect-me", SIZE).expect("reopen");
+        let v = open_session(&p, b"protect-me", SIZE).expect("reopen");
         assert_eq!(v.read_object(0).expect("read"), Some(b"second, and longer".to_vec()));
     }
 
@@ -1079,14 +1143,14 @@ mod tests {
     fn a_multi_block_object_round_trips() {
         let p = scratch("multiblock");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let mut v = open_session(&p, b"protect-me", SIZE).expect("open");
         let per = v.geometry().logical_data();
         // Three blocks' worth, with a recognisable pattern so a mis-ordered chunk shows up.
         let body: Vec<u8> = (0..(per * 3 - 8)).map(|i| (i % 251) as u8).collect();
         v.write_object(0, &body).expect("write");
         assert_eq!(v.read_object(0).expect("read"), Some(body.clone()));
         drop(v);
-        let v = Vault::open(&p, b"protect-me", SIZE).expect("reopen");
+        let v = open_session(&p, b"protect-me", SIZE).expect("reopen");
         assert_eq!(v.read_object(0).expect("read"), Some(body), "the multi-block write did not survive");
     }
 
@@ -1104,7 +1168,7 @@ mod tests {
     fn shrinking_an_object_gives_its_blocks_back() {
         let p = scratch("shrink");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let mut v = open_session(&p, b"protect-me", SIZE).expect("open");
         let per = v.geometry().logical_data();
 
         let big: Vec<u8> = (0..(per * 4 - 8)).map(|i| (i % 251) as u8).collect();
@@ -1128,7 +1192,7 @@ mod tests {
     fn rewriting_in_place_does_not_consume_the_container() {
         let p = scratch("churn");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let mut v = open_session(&p, b"protect-me", SIZE).expect("open");
         v.write_object(0, b"first").expect("write");
         let baseline = v.free_space().blocks();
         for i in 0..10u8 {
@@ -1142,6 +1206,32 @@ mod tests {
         assert_eq!(v.read_object(0).expect("read"), Some(vec![9u8; 200]));
     }
 
+    /// **The wipe password destroys the container**, and nothing opens afterwards — not the public
+    /// compartment, not the hidden one, not the wipe password itself.
+    ///
+    /// The salt is overwritten FIRST, which is what makes this a crypto-erase rather than a long
+    /// overwrite: from that single write onward no password derives anything, whatever happens
+    /// next. That matters because the situation this exists for is one where the wipe may not be
+    /// allowed to finish.
+    #[test]
+    fn the_wipe_password_destroys_the_container() {
+        let p = scratch("wipe");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        {
+            let mut v = open_session(&p, b"protect-me", SIZE).expect("open");
+            v.write_object(0, b"everything that matters").expect("write");
+        }
+        match Vault::unlock(&p, b"burn-it-all", SIZE).expect("the wipe password is recognised") {
+            Unlocked::Wiped => {}
+            Unlocked::Session(_) => panic!("the wipe password opened a session instead of wiping"),
+        }
+        // Still there, still the same size: a container that vanished would be an answer in itself.
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), SIZE, "the file changed size");
+        for pass in [&b"protect-me"[..], b"the-other-one", b"just-a-phone", b"burn-it-all"] {
+            assert!(Vault::unlock(&p, pass, SIZE).is_err(), "something still opened after the wipe");
+        }
+    }
+
     /// **The public space and the hidden space do not see each other's objects.** Writing in one
     /// must not make anything appear in the other, and this is the property the whole format is
     /// for.
@@ -1150,16 +1240,16 @@ mod tests {
         let p = scratch("isolated");
         Vault::create(&p, SIZE, &pw()).expect("create");
         {
-            let mut a = Vault::open(&p, b"protect-me", SIZE).expect("P1");
+            let mut a = open_session(&p, b"protect-me", SIZE).expect("P1");
             a.write_object(0, b"public side").expect("write A");
         }
         {
-            let mut b = Vault::open(&p, b"the-other-one", SIZE).expect("P2");
+            let mut b = open_session(&p, b"the-other-one", SIZE).expect("P2");
             assert_eq!(b.read_object(0).expect("read"), None, "the hidden space saw A's object");
             b.write_object(0, b"hidden side").expect("write B");
             assert_eq!(b.read_object(0).expect("read"), Some(b"hidden side".to_vec()));
         }
-        let a = Vault::open(&p, b"protect-me", SIZE).expect("P1 again");
+        let a = open_session(&p, b"protect-me", SIZE).expect("P1 again");
         assert_eq!(
             a.read_object(0).expect("read"),
             Some(b"public side".to_vec()),
@@ -1178,7 +1268,7 @@ mod tests {
     fn an_object_that_does_not_fit_is_refused_before_anything_is_written() {
         let p = scratch("toobig");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let mut v = open_session(&p, b"protect-me", SIZE).expect("open");
         v.write_object(0, b"the version that must survive").expect("first write");
 
         // Bigger than the whole FILE, so no arithmetic about reserves or copy-on-write can make
@@ -1204,9 +1294,9 @@ mod tests {
     fn a_container_reopens_after_the_process_that_made_it_is_gone() {
         let p = scratch("reopen");
         Vault::create(&p, SIZE, &pw()).expect("create");
-        let first = Vault::open(&p, b"protect-me", SIZE).expect("open").root();
+        let first = open_session(&p, b"protect-me", SIZE).expect("open").root();
         // Dropping releases the flock; a second open with no live handle must succeed.
-        let second = Vault::open(&p, b"protect-me", SIZE).expect("reopen").root();
+        let second = open_session(&p, b"protect-me", SIZE).expect("reopen").root();
         assert_eq!(first, second);
     }
 }

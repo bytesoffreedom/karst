@@ -3738,5 +3738,16 @@
   "zh": "隐藏账户",
   "ja": "隠しアカウント",
   "id": "Akun tersembunyi"
+ },
+ "Cover password — this session cannot save. Nothing you do here is kept.": {
+  "en": "Cover password — this session cannot save. Nothing you do here is kept.",
+  "ru": "Прикрывающий пароль — эта сессия не может сохранять. Ничего из сделанного здесь не останется.",
+  "es": "Contraseña de tapadera: esta sesión no puede guardar. Nada de lo que hagas aquí se conserva.",
+  "pt": "Senha de fachada: esta sessão não pode salvar. Nada do que você fizer aqui é mantido.",
+  "de": "Deckpasswort — diese Sitzung kann nichts speichern. Nichts, was du hier tust, bleibt erhalten.",
+  "fr": "Mot de passe de couverture — cette session ne peut rien enregistrer. Rien de ce que vous faites ici n'est conservé.",
+  "zh": "掩护密码——此会话无法保存。你在这里做的一切都不会保留。",
+  "ja": "カバーパスワード — このセッションは保存できません。ここでの操作は何も残りません。",
+  "id": "Kata sandi penyamaran — sesi ini tidak dapat menyimpan. Tidak ada yang Anda lakukan di sini yang tersimpan."
  }
 }

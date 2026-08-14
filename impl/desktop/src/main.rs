@@ -1273,9 +1273,26 @@ fn hidden_work_dir(base: &std::path::Path) -> Option<std::path::PathBuf> {
 fn container_flush(app: State<App>) -> Result<(), String> {
     let mut g = app.container.lock().unwrap();
     if let Some(cv) = g.as_mut() {
+        // Nothing to flush from a cover session, and never was: it cannot claim a block. Reporting
+        // that as a failure after every ordinary action would be noise about a fixed property, and
+        // the honest statement belongs where the user can act on it — `container_readonly`, which
+        // the session banner reads.
+        if cv.is_read_only() {
+            return Ok(());
+        }
         cv.save().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// True when the open session CANNOT write to the container — the cover password's session.
+///
+/// The UI says this out loud, because a session that quietly discards everything is worse than one
+/// that says so: a user who opened the cover account by accident would otherwise believe their
+/// messages were kept.
+#[tauri::command]
+fn container_readonly(app: State<App>) -> bool {
+    app.container.lock().unwrap().as_ref().map(|cv| cv.is_read_only()).unwrap_or(false)
 }
 
 /// True when the current session is backed by a deniable container (so the UI can offer the
@@ -1686,6 +1703,11 @@ fn lock(app: State<App>) -> Result<(), String> {
     // On failure we keep the session OPEN so the user still has their data and can retry.
     let mut guard = app.container.lock().unwrap();
     if let Some(cv) = guard.as_mut() {
+        // A COVER session holds no ownership-layer key, so it can never write — refusing to lock
+        // over a save that was never possible would strand the plaintext session open on the screen
+        // of someone who just asked to close it, which under duress is the worst moment there is.
+        // `save_and_release` knows this and skips the save; the error path below stays for the
+        // sessions that CAN write and genuinely failed.
         if let Err(e) = cv.save_and_release() {
             // Leave the vault and the session exactly as they were: still open, data still there.
             return Err(format!(
@@ -4366,6 +4388,7 @@ fn main() {
             container_active,
             container_hidden,
             container_recreate,
+            container_readonly,
             net_offline,
             set_net_offline,
             set_relay,

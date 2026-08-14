@@ -396,12 +396,27 @@ impl VaultBox {
         self.inner.write_object(SNAPSHOT_SLOT, &blob).map_err(vault_err)
     }
 
+    /// **Nothing this session does can be persisted, and that is the format, not a fault.**
+    ///
+    /// A cover session holds no ownership-layer key, so it cannot claim a block — which is exactly
+    /// why revealing the cover password cannot damage or detect the hidden space. Every caller that
+    /// would otherwise "save before X" has to ask this first, or it fails on an operation that was
+    /// never going to work: locking the app is the one that matters, because refusing to lock
+    /// leaves the plaintext session open on the screen of someone who just asked to close it —
+    /// under duress, the worst possible moment (found by driving the real app, not by a test).
+    pub fn is_read_only(&self) -> bool {
+        self.role == Role::Public
+    }
+
     /// Save, then release the session's plaintext work dir — in that order and only that order.
     ///
     /// A hidden account's work dir is its only copy between saves, so it is removed only after the
     /// save has SUCCEEDED. A main account's work dir is its own storage and is never removed.
     pub fn save_and_release(&mut self) -> io::Result<()> {
-        self.save()?;
+        // A cover session has nothing to write and never had — see `is_read_only`.
+        if !self.is_read_only() {
+            self.save()?;
+        }
         if self.role == Role::Hidden {
             std::fs::remove_dir_all(&self.work_dir)?;
         }
@@ -627,6 +642,32 @@ mod tests {
             b"must survive",
             "the interrupted recreation lost the account"
         );
+    }
+
+    /// **A cover session cannot write, and every caller has to be able to ASK before trying.**
+    ///
+    /// The inability is the format working as intended — no ownership-layer key, no claimed block,
+    /// which is why revealing the cover password can neither damage nor detect the hidden space. The
+    /// bug it caused was one layer up: the app saved before locking, the save failed, and locking
+    /// was refused — leaving a plaintext session open on the screen of someone who had just asked to
+    /// close it. Found by driving the real app; pinned here so the next caller can check instead of
+    /// discovering it the same way.
+    #[test]
+    fn a_cover_session_says_it_cannot_write_and_releasing_it_still_works() {
+        let dir = scratch("readonly");
+        let p = make(&dir);
+        {
+            let mut a = account(&p, b"protect", dir.join("work"));
+            std::fs::write(a.work_dir.join("note.txt"), b"the main account").unwrap();
+            a.save().expect("the protecting session can save");
+            assert!(!a.is_read_only(), "the protecting session must be writable");
+        }
+        let mut cover = account(&p, b"cover-story", dir.join("cover"));
+        assert!(cover.is_read_only(), "a cover session must declare itself read-only");
+        cover.save().expect_err("a cover session cannot claim a block, so a save must fail");
+        // The lock path goes through this one, and it must NOT fail: there was never anything to
+        // write, so refusing here would strand the session open.
+        cover.save_and_release().expect("releasing a cover session must not depend on a save");
     }
 
     /// **A crash while the replacement is still being BUILT must not touch the account.**

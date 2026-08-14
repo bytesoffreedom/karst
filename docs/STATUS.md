@@ -1012,6 +1012,17 @@ build; clippy clean.**
   create clamps to it, instead of building a file and then refusing it. The old 1 GiB RAM ceiling is
   gone with the format that needed it: the container is read and written through a file handle at
   offsets, never buffered whole.
+  **A cover session cannot write, and the app now asks instead of finding out.** A P3 session holds
+  no ownership-layer key, so it cannot claim a block — which is precisely why revealing the cover
+  password can neither damage nor detect the hidden space. The app used to save before locking, so
+  the save failed and locking was REFUSED: the plaintext session stayed open on the screen of
+  someone who had just asked to close it, under duress, which is the worst moment there is. Found by
+  driving the real app, not by a test. Now `VaultBox::is_read_only` is the question every such
+  caller asks first: locking skips the save it could never do, `container_flush` is a no-op instead
+  of an error after every action, and the session says so out loud ("this session cannot save").
+  The receive path is unchanged and still correct: a cover session's commit barrier fails, so
+  nothing is ACKed and the relay keeps the mail rather than deleting it after it landed only in a
+  throwaway working copy. Test: `a_cover_session_says_it_cannot_write_and_releasing_it_still_works`.
   **The hidden account** materializes into a **VERIFIED** RAM/tmpfs work dir (deleted on lock) — the
   mount TYPE is checked against `/proc/mounts`, and if no RAM-backed store can be proven the hidden
   account **refuses to open** rather than falling back to disk (it used to fall back silently to a

@@ -7,6 +7,9 @@ license = "AGPL-3.0-only"
 [dependencies]
 admission = { path = "../admission" }
 node = { path = "../node" }
+# The deniable container's storage layer. `vault` depends only on `karst-crypto`, so this edge
+# runs the right way: the format sits BELOW the protocol, not beside it.
+vault = { path = "../vault" }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

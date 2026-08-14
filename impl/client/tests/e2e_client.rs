@@ -1333,6 +1333,92 @@ fn open_container_store(
     (cv, store)
 }
 
+/// **The messenger, end to end, on the NEW container (#324).** Bob's whole account lives inside a
+/// `VaultBox`: Alice sends him a message over a real relay, Bob decrypts it into the working
+/// directory the container materialised, the session is saved back, and the container is REOPENED
+/// into a different directory. The history has to be there.
+///
+/// The reopen is the point. Everything up to it also passes if the container is doing nothing at
+/// all — the work dir alone would answer every read. Only the second open, into a directory that
+/// has never seen a message, asks whether the container actually stored the account.
+///
+/// It also pins the account key across the reopen implicitly: the files are encrypted under the key
+/// the container hands out, so a key that differed between the two opens would surface here as an
+/// account that cannot be read rather than as a key mismatch.
+#[test]
+fn a_message_reaches_an_account_that_lives_in_the_new_container() {
+    let (relay_addr, relay_id, _relay, _clock) = spawn_relay_handle_clock();
+    let adir = temp_dir("vaultbox-alice");
+    let base = temp_dir("vaultbox-container");
+    let cpath = base.join("container.dat");
+    let size = 32 * 1024 * 1024;
+    client::vaultbox::create(
+        &cpath,
+        size,
+        &client::vaultbox::Passwords {
+            protected: b"protect-me",
+            hidden: b"the-other-one",
+            public: b"just-a-phone",
+            wipe: b"burn-it-all",
+        },
+    )
+    .unwrap();
+
+    let open = |work: PathBuf| match client::vaultbox::open(&cpath, b"protect-me", size, work).unwrap() {
+        client::vaultbox::Opened::Account(vb) => *vb,
+        client::vaultbox::Opened::Wiped => panic!("the protecting password reported a wipe"),
+    };
+
+    let astore = Store::unlock(&adir, b"pw").unwrap();
+    seed_provision(&astore);
+    astore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+
+    let bob_ik;
+    {
+        let mut vb = open(base.join("work-1"));
+        // Exactly the desktop's shape: a vault adopted over the container's work dir, keyed by the
+        // account key the container holds.
+        let vault = client::store::Vault::adopt(&vb.work_dir, vb.account_key());
+        let entropy = client::seed::entropy_of(&client::seed::generate_mnemonic());
+        let ik = client::seed::derive(&entropy).account.identity_public();
+        let id = hex::encode(ik);
+        vault.create_account_dir(&id).unwrap();
+        let bstore = vault.account(&id);
+        bstore.save_seed(&entropy).unwrap();
+        bstore.save_shared_capability_for(&relay_id, &client::dev_capability()).unwrap();
+        bob_ik = bstore.load_account().unwrap().identity_public();
+
+        let r = ctx(relay_addr, &relay_id);
+        let pr = client::publish_bundle(&r, bstore.load_account().unwrap(), client::dev_capability(), NOW);
+        assert!(matches!(pr, PublishResponse::Published), "publish: {pr:?}");
+        client::send_text(&astore, &r, &bob_ik, b"hello from outside the container", NOW, NOW).unwrap();
+
+        let poll = client::recv_session_multi(&bstore, std::slice::from_ref(&r), NOW).unwrap();
+        assert_eq!(
+            poll_texts(&poll.messages),
+            vec![b"hello from outside the container".to_vec()],
+            "the message did not decrypt into the container's working directory"
+        );
+        // The container is the authority, so the ack waits on ITS commit — the same barrier the
+        // desktop wires up in `poll`.
+        poll.acks.commit_then_send(NOW, || vb.save().map_err(|e| e.to_string())).unwrap();
+    }
+
+    // A directory that has never held this account. Everything read from here came out of the
+    // container.
+    let vb2 = open(base.join("work-2"));
+    let vault2 = client::store::Vault::adopt(&vb2.work_dir, vb2.account_key());
+    let reg = vault2.load_registry().unwrap();
+    let id2 = reg.first().map(|e| e.id.clone()).unwrap_or_else(|| hex::encode(bob_ik));
+    let bstore2 = vault2.account(&id2);
+    let history = bstore2.load_history().unwrap();
+    assert!(
+        history.iter().any(|h| h.text == b"hello from outside the container"),
+        "the reopened container does not hold the message: {} entries",
+        history.len()
+    );
+}
+
 /// **SEC-34 — the discriminating test.** A container-backed client's `Store` is a materialized
 /// working copy; the AUTHORITY is the encrypted container, written by a separate later `save()`.
 /// Receiving used to ack (= tell the relay to delete its only copy) as soon as that working copy

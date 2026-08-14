@@ -163,6 +163,22 @@ fn minimum_blocks() -> u64 {
     2 * ANCHOR_COUNT as u64 + crate::params::SYSTEM_WORKSPACE_RESERVE
 }
 
+/// The smallest container `create` will accept, in bytes.
+///
+/// A caller that asks for a size has no way to know this otherwise: it falls out of the block
+/// stride, the anchor count and the workspace reserve, none of which are the caller's business. The
+/// alternative is a user typing a number, waiting for a container to be built, and being handed a
+/// refusal phrased in blocks — so the number is published here and the UI clamps to it.
+pub fn minimum_size() -> u64 {
+    let stride = (2 * crate::geometry::CAPSULE_ALIGN + crate::geometry::DEFAULT_BLOCK_PAYLOAD) as u64;
+    let bytes = header_len() + minimum_blocks() * stride;
+    // Rounded UP to a whole page, because a container's length must be a multiple of one — the
+    // file is written page-aligned and `FileStore::create` refuses anything else. Rounding up only
+    // ever leaves a few unused bytes past the last block; rounding down would publish a minimum
+    // that `create` rejects, which is the one thing a published minimum must never do.
+    bytes.div_ceil(crate::file::PAGE) * crate::file::PAGE
+}
+
 impl Vault {
     /// Create a container of exactly `size` bytes with all three compartments.
     pub fn create(
@@ -1204,6 +1220,22 @@ mod tests {
             "ten rewrites moved free space from {baseline} to {after}; each one is leaking"
         );
         assert_eq!(v.read_object(0).expect("read"), Some(vec![9u8; 200]));
+    }
+
+    /// **`minimum_size` is the real boundary, not an estimate of it.** A published number that is
+    /// merely close is worse than none: a caller clamps to it, the create still fails, and the
+    /// failure arrives after the user has waited for a container to be built.
+    #[test]
+    fn the_published_minimum_is_exactly_where_create_starts_working() {
+        let min = minimum_size();
+        let p = scratch("minimum");
+        Vault::create(&p, min, &pw()).expect("create at the published minimum");
+        // One page under — the next size down that is still a legal container length at all.
+        let q = scratch("below-minimum");
+        match Vault::create(&q, min - crate::file::PAGE, &pw()) {
+            Err(VaultError::TooSmall { .. }) => {}
+            other => panic!("one page under the minimum: expected TooSmall, got {other:?}"),
+        }
     }
 
     /// **The wipe password destroys the container**, and nothing opens afterwards — not the public

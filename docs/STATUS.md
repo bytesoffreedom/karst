@@ -992,8 +992,41 @@ build; clippy clean.**
   account, both open with their own password, container size unchanged. **Honest ceiling (say it):
   deniable at rest on disk + while offline; NOT deniable against an adversary with relay/network logs
   once the hidden account goes online** (circuit isolation + timing settings deferred — see #123).
-  32 container tests. Desktop: `container_create/unlock/flush/active/hidden/add_hidden`,
+  32 container tests. Desktop: `container_create/unlock/flush/active/hidden/recreate`,
   `net_offline/set_net_offline`, `Vault::adopt`.
+- **The desktop now runs on the NEW container (`impl/vault` + `client::vaultbox`, #324).** The
+  paragraphs above describe the container the app used until this switch; the format it uses now is
+  the one in `impl/vault` — fixed-size blocks, two capsules per block in different pages,
+  copy-on-write through a radix map, credit-checked transactions and an eight-barrier commit order,
+  with a crypto-erase that overwrites the salt first. `client::vaultbox` is the seam: the app still
+  operates on a working directory, and that directory is a snapshot object inside the container
+  instead of a region of the old one.
+  **Four passwords, written together.** Protecting (P1), hidden (P2), cover (P3) and wipe. All four
+  slots always exist, whether or not their passwords do — an unset one holds random bytes nobody
+  has, because a container with three slots would tell anyone holding the file that a compartment
+  was never set up. A password's key lives only inside the slot that password opens, so the
+  protecting password **cannot install a hidden one later**: anywhere the hidden key could be kept
+  for it to find, P1 could reach it, which is the property the format exists for. Setting any of the
+  three therefore REBUILDS the container (`container_recreate`, one dialog collecting all of them),
+  carrying the main account across. The old three "add a password" buttons are gone: each would have
+  silently retired what the other two had set.
+  **The account key is stored in the container, not derived from it** (`ACCOUNT_KEY_SLOT`). A
+  rebuild produces new container keys, and the working directory is carried across still encrypted
+  under the account's key — so tying the two together would have made every file in the account stop
+  opening during an operation the user asked for. Test-pinned across a rebuild.
+  **Crash recovery is in the FILE NAMES.** A replacement is built at `container.building` and
+  renamed to `container.new` only once the account is durably inside it; `finish_pending` (run
+  before every open) deletes a `.building` and completes a `.new`, wiping the old file in place
+  first so its bytes are overwritten rather than merely unlinked. One name could not tell "abandoned
+  mid-build" from "committed", and promoting the first over a good container destroys the account
+  with no error anywhere — an empty object is a new account, not a damaged one.
+  **Minimum size is published** (`vault::session::minimum_size`, ~4.8 MiB, page-aligned) and the
+  create clamps to it, instead of building a file and then refusing it. Tests: 8 in
+  `client::vaultbox` (round-trip, cover password, hidden isolation, duress wipe, repeated saves,
+  rebuild+migration, interrupted rebuild, abandoned build), 180 in `vault`, and
+  `a_message_reaches_an_account_that_lives_in_the_new_container` — a real relay, a real message,
+  decrypted into the container's work dir, committed, and read back after reopening the container
+  into a directory that never saw it.
   **Container is the authority for the work dir (A3-3, fixed).** Opening a compartment now makes the
   work dir EQUAL its snapshot — `restore_dir` clears the directory first instead of overlaying the
   snapshot onto whatever was left there. A visible account's work dir (`<vault>/work`) survives

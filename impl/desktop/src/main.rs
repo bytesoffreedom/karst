@@ -234,10 +234,12 @@ struct App {
     /// arrives as a run of `file_push` chunks accumulated here, then dispatched by `file_commit`.
     /// This is what lets an attachment exceed the old ~8 MB single-payload ceiling (#35 / FT1).
     pending_sends: Mutex<HashMap<String, Vec<u8>>>,
-    /// Tier-2 REDESIGN (opt-in, not yet UI-exposed): when a container-backed account is open, this
-    /// holds the `ContainerVault` so `container_flush` can snapshot the work dir back into the
-    /// deniable container after changes. `None` for the normal file-tree vault path.
-    container: Mutex<Option<client::container::ContainerVault>>,
+    /// When a container-backed account is open, this holds the container session so
+    /// `container_flush` can snapshot the work dir back into it after changes. `None` for the
+    /// normal file-tree vault path. It also holds the file's exclusive lock for as long as the
+    /// session lasts, so anything that replaces the file (see `container_recreate`) must take the
+    /// session OUT of here first.
+    container: Mutex<Option<client::vaultbox::VaultBox>>,
     /// OFFLINE mode: when true, the session emits NOTHING to the network — no publish, no poll — so
     /// an observer sees no traffic for it at all. Default ON for a HIDDEN account (its whole network
     /// deniability is "silent unless you deliberately sync"); the user toggles it off to sync.
@@ -268,7 +270,7 @@ impl App {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|cv| cv.role == client::container::Role::Hidden)
+            .map(|cv| cv.role == client::vaultbox::Role::Hidden)
             .unwrap_or(false)
     }
 
@@ -1137,10 +1139,15 @@ fn unlock(app: State<App>, password: String, vault_dir: Option<String>) -> Resul
     }
 }
 
-/// Tier-2 REDESIGN (opt-in, NOT yet UI-exposed). Create a deniable container of `size_mb` MB at
-/// `dir/container.dat`, provision the real account inside it, and enter a container-backed session.
-/// The container replaces the vault's keyslots; the account is sealed under a password-derived key
-/// and the whole work dir is snapshotted into the container on `container_flush`.
+/// Create a deniable container of `size_mb` MB at `dir/container.dat`, provision the real account
+/// inside it, and enter a container-backed session. The container replaces the vault's keyslots;
+/// the account is sealed under the compartment's key and the whole work dir is snapshotted into the
+/// container on `container_flush`.
+///
+/// Only the protecting password is asked for here. The other three slots exist — they always do,
+/// that uniformity is the deniability — but hold passwords nobody has. Setting a real one is
+/// `container_recreate`, and it is a NEW container rather than an edit, for the reason spelled out
+/// there.
 #[tauri::command]
 fn container_create(app: State<App>, phrase: String, password: String, vault_dir: Option<String>, size_mb: u64) -> Result<Me, String> {
     if password.is_empty() {
@@ -1151,15 +1158,32 @@ fn container_create(app: State<App>, phrase: String, password: String, vault_dir
     let base = resolve_home(vault_dir);
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     let cpath = base.join("container.dat");
-    let n = size_mb.saturating_mul(1024 * 1024).max(256 * 1024);
-    // Reserve ~1/4 for the (future) hidden tail. NOTE the halving: a region now holds TWO copy
-    // slots so a torn save cannot brick it (CRYPTO-13), so the usable payload of a region is
-    // about half its declared capacity. The declared figure below is the region size, not what
-    // fits in it — a user asking for N MiB of container gets roughly 3N/8 of usable main account.
-    let main_cap = n / 4 * 3;
-    client::container::Container::create(&cpath, n, password.as_bytes(), main_cap).map_err(|e| e.to_string())?;
-    let mut cv = client::container::ContainerVault::open(&cpath, password.as_bytes(), base.join("work"))
-        .map_err(|e| e.to_string())?;
+    // Clamped, not validated-and-refused: the floor is a property of the format (block stride,
+    // anchors, workspace reserve) that no user could be expected to know, and refusing a number
+    // after building a file is a worse answer than quietly giving them a container that works.
+    let n = size_mb.saturating_mul(1024 * 1024).max(client::vaultbox::minimum_size());
+    let (unset_hidden, unset_cover, unset_wipe) = (
+        client::vaultbox::unopenable_password(),
+        client::vaultbox::unopenable_password(),
+        client::vaultbox::unopenable_password(),
+    );
+    client::vaultbox::create(
+        &cpath,
+        n,
+        &client::vaultbox::Passwords {
+            protected: password.as_bytes(),
+            hidden: &unset_hidden,
+            public: &unset_cover,
+            wipe: &unset_wipe,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let mut cv = match client::vaultbox::open(&cpath, password.as_bytes(), n, base.join("work"))
+        .map_err(|e| e.to_string())?
+    {
+        client::vaultbox::Opened::Account(cv) => *cv,
+        client::vaultbox::Opened::Wiped => return Err("WIPED".to_string()),
+    };
     let acct_key = cv.account_key();
     let vault = Vault::adopt(&cv.work_dir, acct_key);
     let ik = client::seed::derive(&entropy).account.identity_public();
@@ -1177,19 +1201,25 @@ fn container_create(app: State<App>, phrase: String, password: String, vault_dir
     Ok(me)
 }
 
-/// Tier-2 REDESIGN (opt-in). Open a container-backed account for `password` and enter its session.
-/// (Wipe/hidden role handling + a RAM/tmpfs work dir for the hidden account are a later slice.)
+/// Open a container-backed account for `password` and enter its session.
 #[tauri::command]
 fn container_unlock(app: State<App>, password: String, vault_dir: Option<String>) -> Result<Me, String> {
     if password.is_empty() {
         return Err("enter your password".into());
     }
     let base = resolve_home(vault_dir);
+    let cpath = base.join("container.dat");
+    // A recreation that was interrupted is finished BEFORE anything reads the file — otherwise the
+    // user is shown a wiped container with their account lying beside it under a name nothing
+    // opens. Cheap and a no-op in the normal case; see `vaultbox::finish_pending`.
+    client::vaultbox::finish_pending(&cpath).map_err(|e| e.to_string())?;
+    let size = client::vaultbox::size_of(&cpath).map_err(|e| e.to_string())?;
     // Route by the password's role: a Wipe password erases the container (reports WIPED); a HIDDEN
     // account is materialized into a RAM/tmpfs work dir so no plaintext files touch the real disk.
-    let outcome = client::container::open_container(
-        &base.join("container.dat"),
+    let outcome = client::vaultbox::open_routed(
+        &cpath,
         password.as_bytes(),
+        size,
         base.join("work"),
         hidden_work_dir(&base),
     )
@@ -1205,15 +1235,15 @@ fn container_unlock(app: State<App>, password: String, vault_dir: Option<String>
         _ => "wrong password".to_string(),
     })?;
     let cv = match outcome {
-        client::container::Unlocked::Wiped => return Err("WIPED".to_string()),
-        client::container::Unlocked::Account(cv) => cv,
+        client::vaultbox::Opened::Wiped => return Err("WIPED".to_string()),
+        client::vaultbox::Opened::Account(cv) => *cv,
     };
     let acct_key = cv.account_key();
     let vault = Vault::adopt(&cv.work_dir, acct_key);
     let reg = vault.load_registry().map_err(|e| e.to_string())?;
     let id = reg.first().map(|e| e.id.clone()).ok_or("no account in this container")?;
     // A hidden account defaults to OFFLINE (emits nothing until deliberately synced).
-    let offline = cv.role == client::container::Role::Hidden;
+    let offline = cv.role == client::vaultbox::Role::Hidden;
     let me = enter(&app, vault, id, false, offline);
     *app.container.lock().unwrap() = Some(cv);
     Ok(me)
@@ -1290,76 +1320,185 @@ async fn set_net_offline(app: State<'_, App>, offline: bool) -> Result<(), Strin
     }
 }
 
-/// Add a HIDDEN account to the open container: mints a FRESH identity + recovery phrase, provisions
-/// an empty account for it entirely in RAM, folds it into the container's hidden region, and wipes
-/// the RAM build. Returns the 24-word phrase for the user to save (the only way to recover it).
-/// Requires an open MAIN container session (uses the ONE held instance — no two-writers hazard).
+/// Set the container's other three passwords — hidden, cover and wipe — by REBUILDING it.
+///
+/// # Why this is one command and not three "add" buttons
+///
+/// The container's four slots are written together, and a password's key exists only inside the
+/// slot that password opens. So the main password cannot install a hidden one later: anywhere the
+/// hidden key could be kept for it to find, the main password could reach it, and "the protecting
+/// password cannot read the hidden space" is the property the whole format is for. Setting any of
+/// them therefore builds a NEW container — which also means it builds a new slot table, so every
+/// password the user wants has to be named here. Three separate buttons would each silently retire
+/// what the other two had set, and the user would find out at the moment it mattered.
+///
+/// A password left empty is not "unchanged" — it is a slot with a random password nobody has,
+/// including us. The dialog says so.
+///
+/// Carries the MAIN account across (see `vaultbox::recreate_with_hidden`). If a hidden password is
+/// given, a fresh identity is minted for the hidden compartment and its 24-word phrase returned —
+/// the only copy, and the hidden account cannot be recovered without it.
 #[tauri::command]
-fn container_add_hidden(app: State<App>, hidden_password: String) -> Result<Vec<String>, String> {
-    if hidden_password.trim().is_empty() {
-        return Err("choose a hidden password".into());
+fn container_recreate(
+    app: State<App>,
+    main_password: String,
+    hidden_password: String,
+    cover_password: String,
+    wipe_password: String,
+    vault_dir: Option<String>,
+) -> Result<Vec<String>, String> {
+    if main_password.is_empty() {
+        return Err("enter your current password".into());
     }
-    let m = client::seed::generate_mnemonic();
-    let words: Vec<String> = m.to_string().split_whitespace().map(|s| s.to_string()).collect();
-    let entropy = client::seed::entropy_of(&m);
-    // The hidden account is BUILT in the clear before being sealed into the container, so this
-    // directory holds the seed. It used to fall back to `std::env::temp_dir()` when /dev/shm was
-    // missing — putting that seed on the real disk, the same hole already closed for the work dir
-    // — and it was named `karst-hidbuild-*`, which the `karst-hid-` sweep never matched, so a
-    // crash mid-creation left it behind (A3-5). Now: RAM-backed or refuse, and one naming scheme.
-    let build = client::container::ram_backed_hidden_dir(&format!("build-p{}", std::process::id()))
-        .ok_or("a hidden account needs a RAM-backed store (tmpfs); none is available on this system")?;
-    let mut g = app.container.lock().unwrap();
-    let cv = g.as_mut().ok_or("open a container account first")?;
-    // Build the empty hidden account in RAM, sealed under the HIDDEN region's key (so its own
-    // password opens it — NOT a password-derived key, which would break P3-style aliases), snapshot
-    // it, then wipe the plaintext build. `add_hidden` gives us the region key inside the closure.
-    let res = cv.add_hidden(hidden_password.as_bytes(), |region_key, max_payload| {
-        let _ = std::fs::remove_dir_all(&build);
-        std::fs::create_dir_all(&build)?;
-        let out = (|| -> std::io::Result<Vec<u8>> {
-            let hvault = Vault::adopt(&build, region_key.clone());
+    let base = resolve_home(vault_dir);
+    let cpath = base.join("container.dat");
+    // The RAM-backed directory is resolved FIRST, before anything is touched. A hidden account is
+    // built in the clear before it is sealed, so it needs one — and finding that out after the
+    // container had been rebuilt would leave the user with a hidden password that opens an empty
+    // compartment and no way back.
+    let build = if hidden_password.is_empty() {
+        None
+    } else {
+        Some(
+            client::container::ram_backed_hidden_dir(&format!("build-p{}", std::process::id()))
+                .ok_or("a hidden account needs a RAM-backed store (tmpfs); none is available on this system")?,
+        )
+    };
+
+    // The session is taken OUT of the app, not borrowed: it holds the container's exclusive lock,
+    // and the file is about to be replaced. Everything below must put a working session back or
+    // leave the app locked — a `None` here with a live session is a container that has silently
+    // stopped persisting.
+    let mut cv = app.container.lock().unwrap().take().ok_or("open a container account first")?;
+    if cv.role != client::vaultbox::Role::Main {
+        let e = "only the protecting password can rebuild the container".to_string();
+        *app.container.lock().unwrap() = Some(cv);
+        return Err(e);
+    }
+    if let Err(e) = cv.save() {
+        let msg = format!("could not save this session before rebuilding: {e}. Nothing was changed.");
+        *app.container.lock().unwrap() = Some(cv);
+        return Err(msg);
+    }
+    let work_dir = cv.work_dir.clone();
+    let account_key = cv.account_key();
+    let size = client::vaultbox::size_of(&cpath).map_err(|e| e.to_string())?;
+    drop(cv); // releases the exclusive lock; the file may be replaced from here on
+
+    // Check the typed password against the LIVE container before replacing it. Without this a typo
+    // becomes the new container's password: nothing is lost, but the user's password has silently
+    // changed to something they mistyped once. A duress password entered here still wipes — it
+    // means the same thing wherever it is typed.
+    let reopen = |app: &App| -> Result<(), String> {
+        match client::vaultbox::open_routed(
+            &cpath,
+            main_password.as_bytes(),
+            client::vaultbox::size_of(&cpath).map_err(|e| e.to_string())?,
+            work_dir.clone(),
+            hidden_work_dir(&base),
+        ) {
+            Ok(client::vaultbox::Opened::Account(cv)) => {
+                *app.container.lock().unwrap() = Some(*cv);
+                Ok(())
+            }
+            Ok(client::vaultbox::Opened::Wiped) => Err("WIPED".to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    match client::vaultbox::role_of(&cpath, main_password.as_bytes(), size) {
+        Ok(Some(client::vaultbox::Role::Main)) => {}
+        Ok(Some(_)) | Err(_) => {
+            let e = "wrong password".to_string();
+            let _ = reopen(&app);
+            return Err(e);
+        }
+        Ok(None) => return Err("WIPED".to_string()),
+    }
+
+    let hidden = if hidden_password.is_empty() {
+        client::vaultbox::unopenable_password().to_vec()
+    } else {
+        hidden_password.as_bytes().to_vec()
+    };
+    let cover = if cover_password.is_empty() {
+        client::vaultbox::unopenable_password().to_vec()
+    } else {
+        cover_password.as_bytes().to_vec()
+    };
+    let wipe = if wipe_password.is_empty() {
+        client::vaultbox::unopenable_password().to_vec()
+    } else {
+        wipe_password.as_bytes().to_vec()
+    };
+    if let Err(e) = client::vaultbox::recreate_with_hidden(
+        &cpath,
+        size,
+        &client::vaultbox::Passwords {
+            protected: main_password.as_bytes(),
+            hidden: &hidden,
+            public: &cover,
+            wipe: &wipe,
+        },
+        &work_dir,
+        &account_key,
+    ) {
+        // The account is safe wherever this stopped: before the commit point the old container is
+        // untouched, after it the replacement holds everything and `finish_pending` (run on the
+        // way in) completes it. Reopen so the user is not left with a session that saves nowhere.
+        let msg = format!("could not rebuild the container: {e}");
+        return match reopen(&app) {
+            Ok(()) => Err(msg),
+            Err(e2) => Err(format!(
+                "{msg}. The session could not be reopened either ({e2}) — lock the app and unlock \
+                 it again before doing anything else."
+            )),
+        };
+    }
+
+    // Provision the hidden compartment. It exists but is empty, and an empty compartment is worse
+    // than none: the password opens onto "no account in this container", which is a distinguishing
+    // answer that proves the compartment is there.
+    let mut words = Vec::new();
+    if let Some(build) = build {
+        let m = client::seed::generate_mnemonic();
+        words = m.to_string().split_whitespace().map(|s| s.to_string()).collect();
+        let entropy = client::seed::entropy_of(&m);
+        let provision = (|| -> Result<(), String> {
+            let mut hv = match client::vaultbox::open(
+                &cpath,
+                hidden.as_slice(),
+                size,
+                build.clone(),
+            )
+            .map_err(|e| e.to_string())?
+            {
+                client::vaultbox::Opened::Account(hv) => *hv,
+                client::vaultbox::Opened::Wiped => return Err("WIPED".to_string()),
+            };
+            let hvault = Vault::adopt(&hv.work_dir, hv.account_key());
             let ik = client::seed::derive(&entropy).account.identity_public();
             let id = hex::encode(ik);
-            hvault.create_account_dir(&id)?;
-            hvault.account(&id).save_seed(&entropy)?;
-            let mut reg = hvault.load_registry()?;
-            reg.push(AccountEntry { id: id.clone(), label: "Hidden".into(), ik });
-            hvault.save_registry(&reg)?;
-            // The REAL usable capacity of the hidden region, threaded in from `add_hidden`.
-            // Passing `usize::MAX` here would reopen SEC-35 on this exact path: the snapshot is
-            // read into RAM before anything can refuse it, so the ceiling has to bind the READ.
-            client::container::snapshot_dir(&build, max_payload)
+            hvault.create_account_dir(&id).map_err(|e| e.to_string())?;
+            hvault.account(&id).save_seed(&entropy).map_err(|e| e.to_string())?;
+            let mut reg = hvault.load_registry().map_err(|e| e.to_string())?;
+            reg.push(AccountEntry { id, label: "Hidden".into(), ik });
+            hvault.save_registry(&reg).map_err(|e| e.to_string())?;
+            // Save, THEN delete the RAM plaintext — in that order, and only that order.
+            hv.save_and_release().map_err(|e| e.to_string())
         })();
-        let _ = std::fs::remove_dir_all(&build); // wipe the RAM plaintext regardless of outcome
-        out
-    });
-    res.map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&build); // the plaintext build goes regardless of outcome
+        if let Err(e) = provision {
+            let _ = reopen(&app);
+            return Err(format!(
+                "the container was rebuilt and the main account is safe, but the hidden account \
+                 could not be created: {e}. The hidden password opens an EMPTY compartment — run \
+                 this again with the same passwords to finish it."
+            ));
+        }
+    }
+
+    reopen(&app)?;
     Ok(words)
-}
-
-/// Add the P3 "cover" password — a second password for the MAIN account that is SAFE TO REVEAL under
-/// duress (its key can't read the slot directory, so it can't detect the hidden account). Reveal THIS,
-/// never your main password, if forced to unlock.
-#[tauri::command]
-fn container_add_cover(app: State<App>, password: String) -> Result<(), String> {
-    if password.trim().is_empty() {
-        return Err("choose a cover password".into());
-    }
-    let mut g = app.container.lock().unwrap();
-    let cv = g.as_mut().ok_or("open a container account first")?;
-    cv.add_blind(password.as_bytes()).map_err(|e| e.to_string())
-}
-
-/// Add a wipe/duress password to the container: entering it crypto-erases the WHOLE container.
-#[tauri::command]
-fn container_add_wipe(app: State<App>, password: String) -> Result<(), String> {
-    if password.trim().is_empty() {
-        return Err("choose a wipe password".into());
-    }
-    let mut g = app.container.lock().unwrap();
-    let cv = g.as_mut().ok_or("open a container account first")?;
-    cv.add_wipe(password.as_bytes()).map_err(|e| e.to_string())
 }
 
 
@@ -4224,9 +4363,7 @@ fn main() {
             container_flush,
             container_active,
             container_hidden,
-            container_add_hidden,
-            container_add_cover,
-            container_add_wipe,
+            container_recreate,
             net_offline,
             set_net_offline,
             set_relay,

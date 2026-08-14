@@ -347,189 +347,274 @@ impl Vault {
     /// object is not there — not that it is empty, and not that the container is damaged.
     pub fn read_object(&self, slot: u64) -> Result<Option<Vec<u8>>, VaultError> {
         let (base, _) = Geometry::slice(slot);
-        let Some(block) = self.walk(base)? else { return Ok(None) };
+        let Some(first) = self.read_block(base)? else { return Ok(None) };
+        // The stored form is a STREAM: `total_len(8) ‖ bytes`, chunked one block at a time and
+        // padded out at the end. A block is a fixed size and the padding is not a pattern, so the
+        // length is what says where the data stops — never a scan for a terminator.
+        if first.len() < 8 {
+            return Err(VaultError::Unreadable { block: base });
+        }
+        let total = u64::from_le_bytes(first[..8].try_into().expect("8 bytes")) as usize;
+        let per = self.geometry.logical_data();
+        let mut out = Vec::with_capacity(total.min(1 << 24));
+        out.extend_from_slice(&first[8..]);
+        let mut logical = base + 1;
+        while out.len() < total {
+            let chunk = self
+                .read_block(logical)?
+                .ok_or(VaultError::Unreadable { block: logical })?;
+            out.extend_from_slice(&chunk);
+            logical += 1;
+            // The stream cannot need more blocks than its declared length implies. A map that
+            // keeps answering past that is a bug, and looping on it would hang rather than fail.
+            if (logical - base) as usize > total / per + 2 {
+                return Err(VaultError::Unreadable { block: logical });
+            }
+        }
+        out.truncate(total);
+        Ok(Some(out))
+    }
+
+    /// The plaintext of one logical block, or `None` if nothing is mapped there.
+    fn read_block(&self, logical: u64) -> Result<Option<Vec<u8>>, VaultError> {
+        let Some(block) = self.walk(logical)? else { return Ok(None) };
         let raw = self.medium.read(payload_at(&self.geometry, block), self.sealed_payload_len())?;
-        let plain = crate::record::open(
+        crate::record::open(
             &self.space_key,
-            &payload_ctx(self.params.format_hash(), self.space, block, base, self.live.root.generation),
+            &payload_ctx(self.params.format_hash(), self.space, block, logical, 0),
             &raw,
         )
-        .ok_or(VaultError::Unreadable { block })?;
-        // The stored form is `len(4) ‖ bytes ‖ padding`: a block is a fixed size, so the length has
-        // to be inside it. Padding is not zeroed to a pattern — it is whatever the block held —
-        // which is why the length is authoritative rather than a scan for a terminator.
-        if plain.len() < 4 {
-            return Err(VaultError::Unreadable { block });
-        }
-        let len = u32::from_le_bytes(plain[..4].try_into().expect("4 bytes")) as usize;
-        if 4 + len > plain.len() {
-            return Err(VaultError::Unreadable { block });
-        }
-        Ok(Some(plain[4..4 + len].to_vec()))
+        .map(Some)
+        .ok_or(VaultError::Unreadable { block })
     }
 
     /// Write object `slot`, REPLACING whatever was there.
     ///
     /// # Replace, not write-range, and the reason is a leak
     ///
-    /// The obvious shape is "write these bytes at this offset", and it is wrong for anything whose
-    /// size can fall. If the object mapped 200 logical blocks last save and 150 this one, a
-    /// range write leaves the map entries for 150..200 pointing at live, owned, root-reachable
-    /// blocks that nothing will ever release. Snapshots shrink constantly — delete a conversation,
-    /// clear a history — so that is the normal case, and its signature is a container that fills up
-    /// over months with no visible cause.
-    ///
-    /// So the old blocks of the slot are RETIRED in the same transaction that writes the new ones.
+    /// "Write these bytes at this offset" is wrong for anything whose size can fall. An object that
+    /// mapped 200 logical blocks and now maps 150 would leave the entries for 150..200 pointing at
+    /// live, owned, root-reachable blocks that nothing ever releases. Snapshots shrink constantly —
+    /// delete a conversation, clear a history — so that is the normal case, and its signature is a
+    /// container that fills up over months with no visible cause. So the slot's old blocks are
+    /// RETIRED in the same transaction that writes the new ones.
     ///
     /// # The order is not this function's opinion
     ///
     /// Nothing here decides when anything becomes durable. It seals bytes, asks the planner what
-    /// the worst case costs, refuses if the credit is not there, and hands an ordered [`Commit`] to
-    /// the shared executor. A crash at any point is the crash matrix's business, not a case this
-    /// function handles.
-    ///
-    /// # Currently one logical block
-    ///
-    /// The pipeline is complete — plan, admit, allocate, seal, commit — for objects up to
-    /// `logical_data()` bytes. Larger objects need the same code over a range of blocks and are the
-    /// next increment; the refusal is explicit rather than a silent truncation, because a snapshot
-    /// silently cut to 64 KiB is an account silently destroyed.
+    /// the worst case costs, refuses on credit before touching anything, and hands an ordered
+    /// commit to the shared executor. A crash at any point is the crash matrix's business.
     pub fn write_object(&mut self, slot: u64, bytes: &[u8]) -> Result<(), VaultError> {
         if self.mode == Mode::Public {
-            // P3 may write — it owns the public space — but it must never be able to touch the
-            // ownership layer, so it cannot allocate. That is the next increment's problem and
-            // refusing now is better than half-doing it.
+            // P3 owns the public space but holds no ownership-layer key, so it cannot claim a
+            // block without either forging a capsule or writing none. Refusing is the honest
+            // answer; a P3 write path is its own slice.
             return Err(VaultError::PublicCannotAllocate);
         }
-        let capacity = self.geometry.logical_data() - 4;
-        if bytes.len() > capacity {
-            return Err(VaultError::ObjectTooLarge { len: bytes.len(), capacity });
+        let per = self.geometry.logical_data();
+        let stream_len = 8u64 + bytes.len() as u64;
+        let n_data = stream_len.div_ceil(per as u64).max(1);
+        let max = self.geometry.max_object_bytes();
+        if bytes.len() as u64 > max {
+            return Err(VaultError::ObjectTooLarge { len: bytes.len(), capacity: max as usize });
         }
+
         let (base, _) = Geometry::slice(slot);
         let format_hash = self.params.format_hash();
         let generation = self.live.root.generation + 1;
         let transaction = self.live.root.transaction + 1;
+        let depth = self.geometry.depth() as usize;
 
-        // What the worst case costs, asked BEFORE a byte is touched. `admit` is read-only by
-        // construction and takes no store, so a refusal here has changed nothing.
+        // What the slot maps TODAY, so it can be retired in the same transaction.
+        let old_blocks = self.mapped_blocks_of(slot)?;
+
         let plan = crate::plan::plan_mutation(
             &self.geometry,
             crate::plan::Mutation::Write { slot, offset: 0, len: bytes.len() as u64 },
         );
-        let believed_free = self.free.believed_free_count();
-        crate::tx::admit(plan.need(), believed_free, None, self.live.root.generation)
-            .map_err(VaultError::Refused)?;
+        crate::tx::admit(
+            plan.need(),
+            self.free.believed_free_count(),
+            None,
+            self.live.root.generation,
+        )
+        .map_err(VaultError::Refused)?;
 
-        // Allocate: one data block plus one node per level. Candidates come from the allocator's
-        // in-memory shuffle and are accepted only if the free index believes them free — the index
-        // is a hint, so believing it is allowed; trusting it as an authority is not.
-        let depth = self.geometry.depth() as usize;
-        let mut fresh = Vec::with_capacity(depth + 1);
-        while fresh.len() < depth + 1 {
-            let candidate = self.allocator.next_candidate().ok_or(VaultError::Refused(
-                crate::tx::Refusal::NoSpace,
-            ))?;
-            if candidate == crate::geometry::RESERVED_BLOCK || self.anchors.contains(&candidate) {
-                continue;
-            }
-            // **The capsule is the authority; the index is only a hint.** Consulting the hint alone
-            // was the first version, and it corrupted the container across spaces: a fresh session
-            // believes every block free, so the hidden space happily allocated a block the public
-            // space was already using and overwrote it. The public side then read its own object
-            // back as unopenable — reported as corruption, caused by an allocator.
-            //
-            // UNKNOWN is refused, not retried into: a block whose capsules do not verify may be
-            // anything, including the other space's live data, and "I could not tell" must never
-            // become "so I took it" (requirement 8, fail-closed).
-            if !self.believes_allocatable(candidate)? {
-                self.free.set(candidate, false);
-                continue;
-            }
-            fresh.push(candidate);
-        }
-        let data_block = fresh[0];
-
-        // The payload: `len ‖ bytes ‖ padding to the block`. A fixed-size block means the length
-        // lives inside it; the padding is not a pattern, so the length is what says where the data
-        // ends.
-        let mut plain = Vec::with_capacity(self.geometry.logical_data());
-        plain.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        plain.extend_from_slice(bytes);
-        plain.resize(self.geometry.logical_data(), 0);
-        let sealed_payload = crate::record::seal(
-            &self.space_key,
-            &payload_ctx(format_hash, self.space, data_block, base, generation),
-            &plain,
-        );
-
-        // The map path, built bottom-up: each level's node points at the level below.
-        let digits = crate::map::path(&self.geometry, base);
-        let mut child = data_block;
-        let mut node_writes: Vec<(u64, u64, Vec<u8>)> = Vec::new(); // (block, level, sealed)
-        for level in (0..depth).rev() {
-            let block = fresh[depth - level];
-            let mut node = crate::map::Node::empty(&self.geometry);
-            // COW: start from the existing node at this level where there is one, so the other
-            // entries survive. Without this, writing one object would orphan every other object
-            // sharing the node — which is every object, at this fan-out.
-            if let Some(existing) = self.node_at_level(base, level)? {
-                node = existing;
-            }
-            node.set(digits[level], child);
-            let sealed = crate::record::seal(
-                &self.space_key,
-                &node_ctx(format_hash, self.space, block, level as u64, generation),
-                &node.encode(),
-            );
-            node_writes.push((block, level as u64, sealed));
-            child = block;
-        }
-        let new_root_block = child;
-
-        // Capsules for every block this transaction claims, under the ownership layer.
         let layer = self.layer_key.clone().ok_or(VaultError::PublicCannotAllocate)?;
         let owner = match self.space {
             SpaceId::Public => crate::capsule::Owner::Public,
             SpaceId::Hidden => crate::capsule::Owner::Hidden,
-            // A session's space comes from the slot's mode, which only ever yields the two data
-            // spaces. `Ownership` is the layer's own domain and nothing allocates into it.
             SpaceId::Ownership => return Err(VaultError::PublicCannotAllocate),
         };
         let stamp = Stamp { layer: &layer, format_hash, owner, generation, transaction };
-        let mut writes = Vec::with_capacity(depth + 1);
-        writes.push(self.block_write(&stamp, data_block, &sealed_payload));
-        for (block, _, sealed) in &node_writes {
-            writes.push(self.block_write(&stamp, *block, sealed));
+
+        // The byte stream: total length, then the payload, padded to a whole number of blocks.
+        let mut stream = Vec::with_capacity(n_data as usize * per);
+        stream.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        stream.extend_from_slice(bytes);
+        stream.resize(n_data as usize * per, 0);
+
+        let mut writes: Vec<crate::tx::BlockWrite> = Vec::new();
+        let mut placed: Vec<(u64, u64)> = Vec::with_capacity(n_data as usize);
+        for i in 0..n_data {
+            let block = self.claim_block()?;
+            let logical = base + i;
+            let chunk = &stream[i as usize * per..(i as usize + 1) * per];
+            let sealed = crate::record::seal(
+                &self.space_key,
+                &payload_ctx(format_hash, self.space, block, logical, generation),
+                chunk,
+            );
+            writes.push(self.block_write(&stamp, block, &sealed));
+            placed.push((logical, block));
         }
 
-        // The new root goes to the anchor NOT holding the live one, so a crash mid-write leaves the
-        // live anchor untouched and the old version readable.
+        // The map, bottom-up. Children are grouped by their parent's prefix so a node shared by
+        // several data blocks is written ONCE — writing it per child would orphan every sibling
+        // but the last, which at this fan-out is most of the object.
+        let mut level_children = placed.clone();
+        for level in (0..depth).rev() {
+            let mut parents: Vec<(u64, u64)> = Vec::new();
+            let mut i = 0usize;
+            while i < level_children.len() {
+                let head_logical = level_children[i].0;
+                let head_digits = crate::map::path(&self.geometry, head_logical);
+                let mut node = self
+                    .node_at_level(head_logical, level)?
+                    .unwrap_or_else(|| crate::map::Node::empty(&self.geometry));
+                let mut j = i;
+                while j < level_children.len() {
+                    let (logical, child) = level_children[j];
+                    let d = crate::map::path(&self.geometry, logical);
+                    if d[..level] != head_digits[..level] {
+                        break;
+                    }
+                    node.set(d[level], child);
+                    j += 1;
+                }
+                let block = self.claim_block()?;
+                let sealed = crate::record::seal(
+                    &self.space_key,
+                    &node_ctx(format_hash, self.space, block, level as u64, generation),
+                    &node.encode(),
+                );
+                writes.push(self.block_write(&stamp, block, &sealed));
+                parents.push((head_logical, block));
+                i = j;
+            }
+            level_children = parents;
+        }
+        let new_root_block = level_children[0].1;
+
+        let retires: Vec<crate::tx::BlockRetire> =
+            old_blocks.iter().map(|b| self.block_retire(&stamp, *b)).collect();
+
         let anchor = self.anchors[root::next_anchor(&self.live)];
-        let root = Root {
-            generation,
-            map_root: new_root_block,
-            transaction,
-            mapped_blocks: self.live.root.mapped_blocks.max(1),
-        };
+        let root = Root { generation, map_root: new_root_block, transaction, mapped_blocks: n_data };
         let sealed_root = root::seal_root(&self.space_key, format_hash, self.space, anchor, &root);
+        let manifest_at = payload_at(&self.geometry, anchor) + ROOT_RAW as u64;
+        let manifest = crate::manifest::Manifest {
+            transaction,
+            root_generation: generation,
+            retire: old_blocks.clone(),
+            release: Vec::new(),
+        };
+        let sealed_manifest =
+            crate::manifest::seal_manifest(&layer, format_hash, self.space, anchor, &manifest);
 
         let commit = crate::tx::Commit::build(
             &writes,
-            (payload_at(&self.geometry, anchor), Vec::new()), // manifest: none to retire yet
+            (manifest_at, sealed_manifest),
             (payload_at(&self.geometry, anchor), sealed_root),
-            &[],
-            (payload_at(&self.geometry, anchor), Vec::new()),
+            &retires,
+            (manifest_at, vec![0u8; 1]),
         );
         crate::medium::apply(commit.steps(), &mut self.medium)?;
 
-        // Only now is the session's own view allowed to move: everything above could have failed,
-        // and a view that advanced before the commit did would answer reads from a version that is
-        // not on disk.
-        for b in &fresh {
+        // Only now may the session's view move: everything above could have failed, and a view
+        // that advanced first would answer reads from a version that is not on disk.
+        for (_, b) in &placed {
             self.free.set(*b, false);
+        }
+        for b in &old_blocks {
+            self.free.set(*b, true);
         }
         self.live = Live { root, anchor: root::next_anchor(&self.live) };
         Ok(())
+    }
+
+    /// The physical blocks the slot maps right now — what a replace has to retire.
+    ///
+    /// An object is a contiguous run of logical blocks by construction, so the first gap is the
+    /// end. The bound is a guard against a corrupt map, never a normal exit.
+    fn mapped_blocks_of(&self, slot: u64) -> Result<Vec<u64>, VaultError> {
+        let (base, _) = Geometry::slice(slot);
+        let mut out = Vec::new();
+        let mut logical = base;
+        while let Some(block) = self.walk(logical)? {
+            out.push(block);
+            logical += 1;
+            if out.len() > 1 << 20 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Take one block the CAPSULES agree is free. The index is only a hint — see
+    /// `believes_allocatable`.
+    fn claim_block(&mut self) -> Result<u64, VaultError> {
+        loop {
+            let candidate = self
+                .allocator
+                .next_candidate()
+                .ok_or(VaultError::Refused(crate::tx::Refusal::NoSpace))?;
+            if candidate == crate::geometry::RESERVED_BLOCK || self.anchors.contains(&candidate) {
+                continue;
+            }
+            if self.believes_allocatable(candidate)? {
+                return Ok(candidate);
+            }
+            self.free.set(candidate, false);
+        }
+    }
+
+    /// One retired block: overwrite the payload with random, then mark it free — two stages with a
+    /// barrier between them, which `Commit::build` provides. A block advertised free while its
+    /// retired ciphertext is still on disk stays that way until something reuses it, which may be
+    /// never.
+    fn block_retire(&self, s: &Stamp<'_>, block: u64) -> crate::tx::BlockRetire {
+        let mut noise = vec![0u8; self.geometry.logical_data()];
+        {
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut noise);
+        }
+        let free = crate::capsule::Claim {
+            state: State::Free,
+            generation: s.generation,
+            transaction: s.transaction,
+            // A witness that changes on every release, so a stale FREE capsule cannot be replayed
+            // onto a block that has since been reused.
+            binding: {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(b"karst-vault-free-witness");
+                h.update(block.to_le_bytes());
+                h.update(s.generation.to_le_bytes());
+                h.finalize().into()
+            },
+        };
+        crate::tx::BlockRetire {
+            block,
+            wipe: (payload_at(&self.geometry, block), noise),
+            free_capsule: (
+                self.geometry.capsule_offset(header_len(), block, 0),
+                crate::capsule::frame(
+                    &free,
+                    crate::capsule::seal_claim(s.layer, s.format_hash, block, 0, &free),
+                ),
+            ),
+        }
     }
 
     /// Whether a block's own capsules say it may be handed out.
@@ -582,13 +667,7 @@ impl Vault {
             let raw = self.medium.read(payload_at(&self.geometry, block), self.sealed_node_len())?;
             let plain = crate::record::open(
                 &self.space_key,
-                &node_ctx(
-                    self.params.format_hash(),
-                    self.space,
-                    block,
-                    l as u64,
-                    self.live.root.generation,
-                ),
+                &node_ctx(self.params.format_hash(), self.space, block, l as u64, 0),
                 &raw,
             )
             .ok_or(VaultError::Unreadable { block })?;
@@ -995,6 +1074,74 @@ mod tests {
         assert_eq!(v.read_object(0).expect("read"), Some(b"second, and longer".to_vec()));
     }
 
+    /// An object spanning MANY blocks round-trips. This is what a snapshot actually is.
+    #[test]
+    fn a_multi_block_object_round_trips() {
+        let p = scratch("multiblock");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let per = v.geometry().logical_data();
+        // Three blocks' worth, with a recognisable pattern so a mis-ordered chunk shows up.
+        let body: Vec<u8> = (0..(per * 3 - 8)).map(|i| (i % 251) as u8).collect();
+        v.write_object(0, &body).expect("write");
+        assert_eq!(v.read_object(0).expect("read"), Some(body.clone()));
+        drop(v);
+        let v = Vault::open(&p, b"protect-me", SIZE).expect("reopen");
+        assert_eq!(v.read_object(0).expect("read"), Some(body), "the multi-block write did not survive");
+    }
+
+    /// **A shrinking object does not leak its tail.** Write big, write small, and the blocks the
+    /// big version used must come back.
+    ///
+    /// Without retirement the map entries past the new end still point at live, owned,
+    /// root-reachable blocks that nothing ever releases. Snapshots shrink constantly — delete a
+    /// conversation, clear a history — so it is the normal case, and its signature is a container
+    /// that fills up over months with no visible cause.
+    ///
+    /// Discriminating: the assertion is that free space RECOVERS. A version that retired nothing
+    /// still round-trips both objects and still passes every other test in this file.
+    #[test]
+    fn shrinking_an_object_gives_its_blocks_back() {
+        let p = scratch("shrink");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        let per = v.geometry().logical_data();
+
+        let big: Vec<u8> = (0..(per * 4 - 8)).map(|i| (i % 251) as u8).collect();
+        v.write_object(0, &big).expect("write big");
+        let after_big = v.free_space().blocks();
+
+        v.write_object(0, b"small again").expect("write small");
+        let after_small = v.free_space().blocks();
+        assert_eq!(v.read_object(0).expect("read"), Some(b"small again".to_vec()));
+
+        assert!(
+            after_small > after_big,
+            "free space did not recover: {after_big} blocks after the big write, {after_small} \
+             after shrinking — the big version's blocks were never retired"
+        );
+    }
+
+    /// Rewriting the same size repeatedly must not consume the container. Ten writes of one block
+    /// each should not cost ten blocks' worth of permanent space.
+    #[test]
+    fn rewriting_in_place_does_not_consume_the_container() {
+        let p = scratch("churn");
+        Vault::create(&p, SIZE, &pw()).expect("create");
+        let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
+        v.write_object(0, b"first").expect("write");
+        let baseline = v.free_space().blocks();
+        for i in 0..10u8 {
+            v.write_object(0, &[i; 200]).expect("rewrite");
+        }
+        let after = v.free_space().blocks();
+        assert_eq!(
+            after, baseline,
+            "ten rewrites moved free space from {baseline} to {after}; each one is leaking"
+        );
+        assert_eq!(v.read_object(0).expect("read"), Some(vec![9u8; 200]));
+    }
+
     /// **The public space and the hidden space do not see each other's objects.** Writing in one
     /// must not make anything appear in the other, and this is the property the whole format is
     /// for.
@@ -1020,20 +1167,36 @@ mod tests {
         );
     }
 
-    /// An object too big for the current increment is REFUSED, never truncated. A snapshot
+    /// An object that does not FIT is refused before anything is written, never truncated.
+    ///
+    /// The old version of this test asserted the one-block limit, which no longer exists — a
+    /// snapshot spans as many blocks as it needs. What still has to hold is the refusal that
+    /// matters: an object bigger than the container can hold is turned away by the credit check
+    /// BEFORE a byte moves, and whatever was there before is still readable afterwards. A snapshot
     /// silently cut down is an account silently destroyed.
     #[test]
-    fn an_oversized_object_is_refused_rather_than_cut() {
+    fn an_object_that_does_not_fit_is_refused_before_anything_is_written() {
         let p = scratch("toobig");
         Vault::create(&p, SIZE, &pw()).expect("create");
         let mut v = Vault::open(&p, b"protect-me", SIZE).expect("open");
-        let huge = vec![7u8; v.geometry().logical_data() + 1];
+        v.write_object(0, b"the version that must survive").expect("first write");
+
+        // Bigger than the whole FILE, so no arithmetic about reserves or copy-on-write can make
+        // it fit. Sized from `container_bytes` rather than from `max_rewritable_bytes`: the latter
+        // is a conservative half-the-usable-space figure, and four times it still fitted here —
+        // which is how this test found that the refusal has to come from running out of blocks,
+        // not from that estimate.
+        let huge = vec![7u8; (v.container_bytes() * 2) as usize];
         match v.write_object(0, &huge) {
-            Err(VaultError::ObjectTooLarge { .. }) => {}
+            Err(VaultError::Refused(_)) | Err(VaultError::ObjectTooLarge { .. }) => {}
             Err(other) => panic!("wrong refusal: {other}"),
-            Ok(()) => panic!("an oversized object must be refused, not truncated"),
+            Ok(()) => panic!("an object larger than the container must be refused"),
         }
-        assert_eq!(v.read_object(0).expect("read"), None, "the refusal wrote something anyway");
+        assert_eq!(
+            v.read_object(0).expect("read"),
+            Some(b"the version that must survive".to_vec()),
+            "the refused write damaged the version that was already there"
+        );
     }
 
     /// A container survives being closed and reopened — the roots are on disk, not in memory.
